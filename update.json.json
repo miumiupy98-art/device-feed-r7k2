@@ -1,0 +1,8 @@
+{
+  "version": "0.3.3.1",
+  "name": "Personal Device Test 0.3.3.1",
+  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v0.3.3.1/device-test-v0.3.3.1-ota.zip",
+  "sha256": "6128e4fcd3f2d1f329fb7b31b6061df7faa3f5d85888cb5d59eb9162d4f82cc8",
+  "notes": "Personal validation build: read-report lifecycle fixes, active-reader-only reporting, 10-minute inactivity pause, and diagnostic logging.",
+  "delete_list": []
+}
