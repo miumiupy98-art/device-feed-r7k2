@@ -1,8 +1,8 @@
 {
-  "version": "0.3.4.1",
-  "name": "WeRead v0.3.4.1 Stable Channel Migration",
-  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v0.3.4.1-migrate-stable/weread-v0.3.4.1-ota-switch-to-stable.zip",
-  "sha256": "495c6c05db81310934dec743ee0fc37aef3e2e46b02edb5ef50fe7def5a4a12b",
-  "notes": "修复新版书籍下载流程。本次更新通过内测通道安装；安装后，后续更新将切换至正式仓库。",
+  "version": "0.3.4.2",
+  "name": "Personal Device Test 0.3.4.2",
+  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v0.3.4.2/device-test-v0.3.4.2-ota.zip",
+  "sha256": "18afb712291f126540ff90bf384fe570646e805694cc731df47385c0e91bca6e",
+  "notes": "Fix reading-time reporting after Kindle wake-up and Wi-Fi recovery; refresh the current book reader context before retrying. This build remains on the internal test channel.",
   "delete_list": []
 }
