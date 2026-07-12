@@ -1,8 +1,8 @@
 {
-  "version": "0.3.4.2",
-  "name": "Personal Device Test 0.3.4.2",
+  "version": "0.0.0",
+  "name": "Internal update channel paused",
   "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v0.3.4.2/device-test-v0.3.4.2-ota.zip",
-  "sha256": "18afb712291f126540ff90bf384fe570646e805694cc731df47385c0e91bca6e",
-  "notes": "Fix reading-time reporting after Kindle wake-up and Wi-Fi recovery; refresh the current book reader context before retrying. This build remains on the internal test channel.",
+  "sha256": "",
+  "notes": "内测更新通道暂时关闭。",
   "delete_list": []
 }
