@@ -1,8 +1,8 @@
 {
-  "version": "0.3.3.2",
-  "name": "Personal Device Test 0.3.3.2",
-  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v0.3.3.2/device-test-v0.3.3.2-ota.zip",
-  "sha256": "ab10e8ad2ccce409cbdbbbaf79c8a1c8508672153927585a352525a7eeb5a339",
-  "notes": "Personal test build: single fixed test feed and synckey confirmation repair for reading-time reports.",
+  "version": "0.3.4.1",
+  "name": "WeRead Internal Test v0.3.4.1",
+  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v0.3.4.1-internal/weread-v0.3.4.1-ota-stay-internal.zip",
+  "sha256": "78a0f13c0bef6b80e9bf0e2cf0a507a84d3726a71df29b3f649141cbad993a84",
+  "notes": "修复新版书籍下载流程；保留新版内容解析、图片、脚注及注释处理修复。更新后继续使用内测通道。",
   "delete_list": []
 }
