@@ -1,8 +1,8 @@
 {
-  "version": "0.3.6",
-  "name": "WeRead KOReader Plugin v0.3.6（内测通道）",
-  "notes": "内测构建：验证非阻塞阅读时长与进度上报。功能代码与正式 0.3.6 相同，后续更新继续指向 device-feed-r7k2 内测通道。",
-  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v0.3.6/device-test-v0.3.6-ota.zip",
-  "sha256": "ab7b02b783eef21bf3bcffac584dd5f111efecc32bb799b543b5ed41907da507",
+  "version": "0.3.6.1",
+  "name": "WeRead v0.3.6.1 内测版",
+  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v0.3.6.1-internal/device-test-v0.3.6.1-ota.zip",
+  "sha256": "f2aff41e29a7e8c8f83ea0941d32aef5706027c7d9a234f0dd3d4990353196b8",
+  "notes": "内测更新：新增四列低分辨率封面书架和离线书架；单章纯净版与评论版分离；章节读完后可选择下一章纯净版或评论版；新增本地评论收藏第一版；精简重复菜单并修复单章被误识别为整本缓存的问题。",
   "delete_list": []
 }
