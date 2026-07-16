@@ -2,7 +2,7 @@
   "version": "0.3.6.2",
   "name": "WeRead v0.3.6.2 内测版",
   "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v0.3.6.2-internal/device-test-v0.3.6.2-ota.zip",
-  "sha256": "f2aff41e29a7e8c8f83ea0941d32aef5706027c7d9a234f0dd3d4990353196b8",
-  "notes": "内测更新：新增四列低分辨率封面书架和离线书架；单章纯净版与评论版分离；章节读完后可选择下一章纯净版或评论版；新增本地评论收藏第一版；精简重复菜单并修复单章被误识别为整本缓存的问题。",
+  "sha256": "6b4603dc297fa4ae3cc1ca9c0429abbc488d02c7f655135801cce3c1a41c452d",
+  "notes": "稳定性内测更新：书架改为本地快照优先，停止打开书架时同步下载封面；增加触屏返回按钮并简化书架入口；恢复原有想法、评论和脚注弹窗；启用当前书云端进度检查与本机进度上传；修复单章与整本缓存混淆，并优化离线书架和同步状态。",
   "delete_list": []
 }
