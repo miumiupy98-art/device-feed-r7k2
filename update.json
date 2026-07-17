@@ -1,10 +1,1 @@
-{
-  "version": "0.3.6.6",
-  "name": "0.3.6.6 内测完善版",
-  "notes": "修复书籍详情跨书复用进度；普通界面不再使用历史最远进度；整书和单章均在下载时选择纯净版或划线与想法版；支持两个版本同时保留；章节点击不再直接下载。",
-  "package_url": "https://github.com/miumiupy98-art/weread.koplugin-fixed/releases/download/v0.3.6.6-beta/weread-koplugin-v0.3.6.6-beta-ota.zip",
-  "sha256": "e01141ddb302332103cbb006a7873acd2be5d705196b8d18b0e89c2cb5b4e5dd",
-  "delete_list": [
-    "RELEASE-NOTES-0.3.6.5.md"
-  ]
-}
+
