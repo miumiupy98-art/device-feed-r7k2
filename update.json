@@ -2,7 +2,7 @@
   "version": "0.3.6.7",
   "name": "0.3.6.7 内测修正版",
   "notes": "恢复独立可见的“阅读时间同步”入口；阅读界面可直接开关；“同步当前书籍位置”和“阅读时间同步”分开；同步状态分别显示位置与时间同步状态；保留0.3.6.6双版本下载和独立书籍进度逻辑。",
-  "package_url": "https://github.com/miumiupy98-art/weread.koplugin-fixed/releases/download/v0.3.6.7-beta/weread-koplugin-v0.3.6.7-beta-ota.zip",
+  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v0.3.6.7-beta/weread-koplugin-v0.3.6.7-beta-ota.zip",
   "sha256": "756c29b605216bd2096cdacc8f865d9a306c7e306a4de22f80a5d8045cc08eef",
   "delete_list": [
     "RELEASE-NOTES-0.3.6.6.md"
