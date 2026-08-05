@@ -6,6 +6,7 @@ local lfs = require("libs/libkoreader-lfs")
 local Thoughts = {}
 
 local POPUP_CACHE_LIMIT = 8
+local POPUP_CACHE_VERSION = "2"
 local popup_cache = {}
 local popup_cache_order = {}
 
@@ -204,9 +205,82 @@ function Thoughts.find(store, book_id, chapter_uid, range)
     return nil, legacy_error or err or "没有找到该划线对应的想法"
 end
 
-local function clean(value)
-    return U.trim(tostring(value or ""):gsub("[%z\1-\8\11\12\14-\31]", " "):gsub("%s+", " "))
+local function is_edge_blank_at(text, index, length)
+    local byte = text:byte(index)
+    if not byte then return false, 0 end
+    if byte == 0x09 or byte == 0x0A or byte == 0x0B or byte == 0x0C
+        or byte == 0x0D or byte == 0x20 then
+        return true, 1
+    end
+    if byte == 0xC2 and index + 1 <= length and text:byte(index + 1) == 0xA0 then
+        return true, 2 -- no-break space
+    end
+    if byte == 0xE2 and index + 2 <= length and text:byte(index + 1) == 0x80 then
+        local third = text:byte(index + 2)
+        if third == 0x8B or third == 0x8C then
+            return true, 3 -- zero-width space / non-joiner
+        end
+    end
+    if byte == 0xE3 and index + 2 <= length
+        and text:byte(index + 1) == 0x80 and text:byte(index + 2) == 0x80 then
+        return true, 3 -- ideographic space
+    end
+    if byte == 0xEF and index + 2 <= length
+        and text:byte(index + 1) == 0xBB and text:byte(index + 2) == 0xBF then
+        return true, 3 -- byte-order mark
+    end
+    return false, 0
 end
+
+local function trim_edge_blanks(text)
+    text = tostring(text or "")
+    local length = #text
+    if length == 0 then return text end
+    local first = 1
+    while first <= length do
+        local blank, bytes = is_edge_blank_at(text, first, length)
+        if not blank then break end
+        first = first + bytes
+    end
+    local last = length
+    while last >= first do
+        local start = last
+        while start > first do
+            local byte = text:byte(start)
+            if not byte or byte < 0x80 or byte >= 0xC0 then break end
+            start = start - 1
+        end
+        local blank, bytes = is_edge_blank_at(text, start, length)
+        if not blank or start + bytes - 1 ~= last then break end
+        last = start - 1
+    end
+    if first > last then return "" end
+    if first == 1 and last == length then return text end
+    return text:sub(first, last)
+end
+
+local function clean_body(value)
+    local text = U.clean_utf8 and U.clean_utf8(value) or tostring(value or "")
+    text = tostring(text or "")
+        :gsub("\239\191\189", "")
+        :gsub("\r\n", "\n")
+        :gsub("\r", "\n")
+        :gsub("[%z\1-\8\11\12\14-\31]", " ")
+        :gsub("[ \t]+\n", "\n")
+        :gsub("\n[ \t]+", "\n")
+    return trim_edge_blanks(text)
+end
+
+local function clean_inline(value)
+    return trim_edge_blanks(clean_body(value)
+        :gsub("\194\160", " ")
+        :gsub("\226\128[\139\140]", " ")
+        :gsub("\227\128\128", " ")
+        :gsub("[%c]+", " ")
+        :gsub("%s+", " "))
+end
+
+local clean = clean_inline
 
 local function preview(value, max_chars)
     local text = clean(value)
@@ -218,7 +292,7 @@ end
 local function split_entry(item, chunk_chars)
     local author = clean(item.author)
     if author == "" then author = "微信读书用户" end
-    local content = clean(item.content)
+    local content = clean_body(item.content)
     local abstract = clean(item.abstract)
     local base = {
         author = author,
@@ -330,7 +404,7 @@ function Thoughts.page_html(page, page_index, page_count, abstract)
         rows[#rows + 1] = source_box_html(preview(abstract, 72))
     end
     for _, item in ipairs(page or {}) do
-        if clean(item.content) ~= "" then rows[#rows + 1] = entry_html(item) end
+        if clean_body(item.content) ~= "" then rows[#rows + 1] = entry_html(item) end
     end
     return table.concat(rows)
 end
@@ -355,7 +429,7 @@ function Thoughts.popup_parts(group)
 
     local seen = {}
     for _, item in ipairs(group.texts or {}) do
-        local content = clean(item.content)
+        local content = clean_body(item.content)
         if content ~= "" then
             local author = clean(item.author)
             if author == "" then author = "微信读书用户" end
@@ -381,7 +455,7 @@ function Thoughts.popup_parts_cached(store, book_id, chapter_uid, range, group, 
     token = type(token) == "table" and token or {}
     local path = tostring(token.path or Thoughts.cache_path(store, book_id, chapter_uid))
     local signature = tostring(token.signature or file_signature(path) or "missing")
-    local key = table.concat({path, signature, tostring(range or "")}, "|")
+    local key = table.concat({POPUP_CACHE_VERSION, path, signature, tostring(range or "")}, "|")
     local cached = popup_cache[key]
     if cached then
         cache_touch(popup_cache_order, key)
@@ -402,7 +476,7 @@ function Thoughts.native_parts(group)
     local source = preview(Thoughts.group_abstract(group), 240)
     local comments, seen = {}, {}
     for _, item in ipairs(group.texts or {}) do
-        local content = clean(item.content)
+        local content = clean_body(item.content)
         if content ~= "" then
             local author = clean(item.author)
             if author == "" then author = "微信读书用户" end
@@ -426,7 +500,7 @@ function Thoughts.native_parts_cached(store, book_id, chapter_uid, range, group,
     token = type(token) == "table" and token or {}
     local path = tostring(token.path or Thoughts.cache_path(store, book_id, chapter_uid))
     local signature = tostring(token.signature or file_signature(path) or "missing")
-    local key = table.concat({"native", path, signature, tostring(range or "")}, "|")
+    local key = table.concat({POPUP_CACHE_VERSION, "native", path, signature, tostring(range or "")}, "|")
     local cached = popup_cache[key]
     if cached and cached.native == true then
         cache_touch(popup_cache_order, key)
@@ -452,7 +526,7 @@ function Thoughts.plain_text(group)
     local seen = {}
     local count = 0
     for _, item in ipairs(group.texts or {}) do
-        local content = clean(item.content)
+        local content = clean_body(item.content)
         if content ~= "" then
             local author = clean(item.author)
             if author == "" then author = "微信读书用户" end
@@ -478,7 +552,7 @@ end
 function Thoughts.comment_count(group)
     local seen, count = {}, 0
     for _, item in ipairs((group and group.texts) or {}) do
-        local content = clean(item.content)
+        local content = clean_body(item.content)
         if content ~= "" then
             local author = clean(item.author)
             local review_id = tostring(item.review_id or "")
@@ -514,7 +588,7 @@ body{margin:0!important;padding:.18em .26em .20em .26em!important;line-height:1.
 .miu-meta{margin:0;padding:0;line-height:1.02;page-break-after:avoid}
 .miu-author{font-size:.47em;font-weight:normal;color:#666;line-height:1.02}
 .miu-likes{font-size:.45em;font-weight:normal;color:#777;line-height:1.02;white-space:nowrap}
-.miu-content{font-size:.80em;line-height:1.20;margin:.07em 0 0 0;padding:0 0 .08em 0;page-break-before:avoid;orphans:2;widows:2}
+.miu-content{font-size:.80em;line-height:1.20;margin:.07em 0 0 0;padding:0 0 .08em 0;page-break-before:avoid;orphans:2;widows:2;white-space:pre-wrap}
 .miu-empty{font-size:.70em;color:#666;margin:.45em 0;text-align:center}
 ]]
 end
