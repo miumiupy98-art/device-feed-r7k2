@@ -6,10 +6,9 @@ local ResourceRefs = require("miuread.resource_refs")
 local InternalLinks = require("miuread.internal_links")
 local Thoughts = require("miuread.thoughts")
 local Epub = require("miuread.epub")
-local Json = require("miuread.json")
 local Http = require("miuread.http")
 local DownloadPlan = require("miuread.download_plan")
-local AnnotationCache = require("miuread.annotation_cache")
+local DownloadDatabase = require("miuread.download_database")
 local EpubInstaller = require("miuread.epub_installer")
 local U = require("miuread.util")
 local logger = require("logger")
@@ -381,19 +380,6 @@ local function catalog_signature(chapters)
     return table.concat(rows, "\30")
 end
 
-local function read_json(path)
-    local raw = U.read_file(path, true)
-    if not raw then return nil end
-    local ok, data = pcall(Json.decode, raw)
-    return ok and type(data) == "table" and data or nil
-end
-
-local function write_json(path, value)
-    local ok, encoded = pcall(Json.encode, value)
-    if not ok then return nil, encoded end
-    return U.atomic_write(path, encoded, true)
-end
-
 local function relative(root, path)
     if path:sub(1, #root + 1) == root .. "/" then return path:sub(#root + 2) end
     return path
@@ -413,22 +399,23 @@ local function chapter_paths(cache, uid)
         base = dir .. "/base.xhtml",
         final = dir .. "/final.xhtml",
         css = dir .. "/style.css",
-        assets = dir .. "/assets.json",
         asset_dir = dir .. "/assets",
     }
 end
 
 local function cache_save(cache)
     cache.manifest.updated_at = os.time()
-    local ok, err = write_json(cache.path, cache.manifest)
+    local ok, err = DownloadDatabase.save_manifest(cache.root, cache.manifest)
     if not ok then error("无法保存下载断点：" .. tostring(err)) end
 end
 
 local function cache_new(store, book, opt, selected, format)
     local root = store:book_dir(book.bookId) .. "/.miuread-partial-" .. option_key(opt)
-    local path = root .. "/manifest.json"
+    local path = DownloadDatabase.partial_path(root)
     local signature = catalog_signature(selected)
-    local manifest = read_json(path)
+    local migrated, migration_error = DownloadDatabase.migrate_legacy_partial(root)
+    if migrated == nil then error("无法迁移旧下载断点：" .. tostring(migration_error)) end
+    local manifest = DownloadDatabase.load_manifest(root)
     local valid = manifest
         and tonumber(manifest.schema) == CACHE_SCHEMA
         and tostring(manifest.book_id or "") == tostring(book.bookId)
@@ -440,8 +427,6 @@ local function cache_new(store, book, opt, selected, format)
         local previous_record=type(opt.existing_download_record)=="table" and opt.existing_download_record or nil
         local inherited_title_version=previous_record and tonumber(previous_record.title_transform_version) or nil
         if not inherited_title_version and previous_record then
-            -- 3.2 records contain a task id. Older records do not and should
-            -- retain the 2.3.3 wrapper when their cache has been cleared.
             inherited_title_version=previous_record.task_id and TITLE_TRANSFORM_VERSION
                 or LEGACY_TITLE_TRANSFORM_VERSION
         end
@@ -457,12 +442,10 @@ local function cache_new(store, book, opt, selected, format)
             updated_at = os.time(),
             chapters = {},
         }
-        write_json(path, manifest)
+        local wrote, write_error = DownloadDatabase.save_manifest(root, manifest)
+        if not wrote then error("无法建立 SQLite 下载断点：" .. tostring(write_error)) end
     else
         U.mkdir(root .. "/chapters")
-        -- Catalog titles, word counts and order may change without changing the
-        -- underlying chapter. Preserve checkpoints by UID and refresh the
-        -- current catalog fingerprint instead of discarding the whole cache.
         manifest.signature = signature
         if tonumber(manifest.title_transform_version or 0) <= 0 then
             local detected
@@ -470,18 +453,14 @@ local function cache_new(store, book, opt, selected, format)
                 local version = tonumber(cached_entry.title_transform_version or 0)
                 if version > 0 then detected = version; break end
             end
-            -- Caches created before 3.2 used the 2.3.3 chapter wrapper. Lock
-            -- them to that layout instead of silently rebuilding the whole book.
             manifest.title_transform_version = detected or LEGACY_TITLE_TRANSFORM_VERSION
         end
         if tonumber(manifest.image_transform_version or 0)<=0 then
-            -- Existing beta.15 and older checkpoints were produced before the
-            -- picture/SVG/CSS resource scanner. Keep their generation marked
-            -- as legacy so individual chapters can be refreshed safely.
             manifest.image_transform_version=1
         end
         manifest.updated_at = os.time()
-        write_json(path, manifest)
+        local wrote, write_error = DownloadDatabase.save_manifest(root, manifest)
+        if not wrote then error("无法更新 SQLite 下载断点：" .. tostring(write_error)) end
     end
     return {root=root, path=path, manifest=manifest}
 end
@@ -509,13 +488,12 @@ local function cache_save_assets(cache, uid, assets)
             file = relative(cache.root, file),
         }
     end
-    local ok, err = write_json(paths.assets, meta)
-    if not ok then error("无法保存图片清单：" .. tostring(err)) end
+    local ok, err = DownloadDatabase.save_assets(cache.root, uid, meta)
+    if not ok then error("无法保存 SQLite 图片清单：" .. tostring(err)) end
 end
 
 local function cache_load_assets(cache, entry)
-    local path = absolute(cache.root, entry.assets_file)
-    local meta = read_json(path)
+    local meta = DownloadDatabase.load_assets(cache.root, entry.uid)
     if type(meta) ~= "table" then return nil, "图片断点清单缺失" end
     local assets = {}
     for _, item in ipairs(meta) do
@@ -545,7 +523,6 @@ local function cache_save_base(cache, chapter, body, style, assets, state)
     entry.complete = false
     entry.base_file = relative(cache.root, paths.base)
     entry.css_file = relative(cache.root, paths.css)
-    entry.assets_file = relative(cache.root, paths.assets)
     entry.content_format = state and state.content_format
     entry.structural = state and state.structural == true or false
     entry.image_only = state and state.image_only == true or false
@@ -608,8 +585,7 @@ local function cache_save_final(cache, chapter, body, annotation, style, footnot
 end
 
 local function cache_load_asset_sources(cache, entry)
-    local path = absolute(cache.root, entry.assets_file)
-    local meta = read_json(path)
+    local meta = DownloadDatabase.load_assets(cache.root, entry.uid)
     if type(meta) ~= "table" then return nil, "图片断点清单缺失" end
     local assets = {}
     for _, item in ipairs(meta) do
@@ -1021,12 +997,11 @@ function Downloader:book(input, opt, progress)
     opt = opt or {}
     progress = progress or function() end
     local function respect_reader_priority(stage)
-        local pause_path=tostring(opt.pause_path or "")
         local pause_logged=false
-        -- The parent writes this marker before suspend and page transitions.
-        -- Waiting here preserves the child and its checkpoints without starting
-        -- another chapter, request or annotation batch.
-        while pause_path~="" and U.file_exists(pause_path) do
+        local function worker_paused()
+            return type(opt.paused)=="function" and opt.paused()==true
+        end
+        while worker_paused() do
             if type(opt.cancelled)=="function" and opt.cancelled() then error("download cancelled") end
             if not pause_logged then
                 pause_logged=true
@@ -1042,15 +1017,11 @@ function Downloader:book(input, opt, progress)
         local waited=0
         while busy_until>os.time() and waited<30 do
             if type(opt.cancelled)=="function" and opt.cancelled() then error("download cancelled") end
-            if pause_path~="" and U.file_exists(pause_path) then
-                return respect_reader_priority(stage)
-            end
+            if worker_paused() then return respect_reader_priority(stage) end
             pause(.25)
             waited=waited+.25
             busy_until=tonumber(U.read_file(tostring(opt.reader_busy_path or ""),true) or 0) or 0
         end
-        -- Even while the reader is merely open, leave short gaps between heavy
-        -- batches so page turns and comment scrolling remain responsive.
         pause(stage=="chapter" and .12 or .05)
     end
     local book = normalized_book(input)
@@ -1105,7 +1076,7 @@ function Downloader:book(input, opt, progress)
     local failure_map, restricted_map = {}, {}
     local requested_annotations=opt.annotations==true
     opt.download_run_id=tostring(opt.download_run_id or (os.time().."-"..math.random(100000,999999)))
-    local annotation_account_key=AnnotationCache.account_key(self.store)
+    local annotation_account_key=DownloadDatabase.account_key(self.store)
     local annotation_suspended=false
     local annotation_error_kind=nil
     local annotation_error_map={}
@@ -1124,7 +1095,7 @@ function Downloader:book(input, opt, progress)
 
     local function fetch_annotation(chapter,report_progress)
         local uid=chapter_uid(chapter)
-        local previous=AnnotationCache.load(cache.root,uid,annotation_account_key,self.annotations)
+        local previous=DownloadDatabase.load_annotation_data(cache.root,uid,annotation_account_key,self.annotations)
         if annotation_suspended then
             local cached=previous or self.annotations:from_cache({book_id=book.bookId,chapter_uid=uid})
             cached.complete=false
@@ -1146,9 +1117,9 @@ function Downloader:book(input, opt, progress)
         local function persist_checkpoint(snapshot)
             local merged=self.annotations:merge(previous,snapshot)
             merged.saved_at=os.time()
-            local saved,save_error=AnnotationCache.save(cache.root,uid,annotation_account_key,self.annotations,merged)
+            local saved,save_error=DownloadDatabase.save_annotation_data(cache.root,uid,annotation_account_key,self.annotations,merged)
             if not saved then error("无法保存批注断点："..tostring(save_error)) end
-            previous=AnnotationCache.load(cache.root,uid,annotation_account_key,self.annotations) or merged
+            previous=DownloadDatabase.load_annotation_data(cache.root,uid,annotation_account_key,self.annotations) or merged
             -- Keep the compact per-download checkpoint after every successful
             -- batch, but update the shared popup cache only once when the
             -- chapter finishes. This avoids dozens of redundant Kindle writes.
@@ -1210,7 +1181,7 @@ function Downloader:book(input, opt, progress)
             merged=self.annotations:merge(previous,current)
         end
         merged.saved_at=os.time()
-        local saved,save_error=AnnotationCache.save(cache.root,uid,annotation_account_key,self.annotations,merged)
+        local saved,save_error=DownloadDatabase.save_annotation_data(cache.root,uid,annotation_account_key,self.annotations,merged)
         if not saved then error("无法保存批注断点："..tostring(save_error)) end
 
         if current.auth_required==true then
@@ -1228,7 +1199,7 @@ function Downloader:book(input, opt, progress)
             if #merged.errors==0 then
                 merged.errors[#merged.errors+1]="划线和想法请求暂时受限，正文继续下载，稍后可从断点补全"
             end
-            local resaved,resave_error=AnnotationCache.save(
+            local resaved,resave_error=DownloadDatabase.save_annotation_data(
                 cache.root,uid,annotation_account_key,self.annotations,merged)
             if not resaved then error("无法保存批注断点："..tostring(resave_error)) end
             logger.warn("[MiuRead][Download] annotation rate limit deferred without stopping content",
