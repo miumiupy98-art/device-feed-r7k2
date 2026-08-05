@@ -10598,6 +10598,9 @@ function Plugin:_commit_complete_book_delete(book_id,documents)
     local repair_pending=self._book_repair_pending
     if type(repair_pending)=="table" then repair_pending[book_id]=nil end
     Thoughts.clear_memory_cache()
+    if ThoughtNativePopup and type(ThoughtNativePopup.clear_cache)=="function" then
+        pcall(ThoughtNativePopup.clear_cache)
+    end
     self.store:prune_missing_files()
     self:_notify_home_data_changed("content")
 end
@@ -11601,6 +11604,9 @@ function Plugin:_run_book_repair(context,report,force)
             checked_at=os.time(),
         })
         Thoughts.clear_memory_cache()
+        if ThoughtNativePopup and type(ThoughtNativePopup.clear_cache)=="function" then
+            pcall(ThoughtNativePopup.clear_cache)
+        end
         if value.cancelled then
             self:info("迁移已停止。已完成的章节会保留，下次可继续。")
         elseif value.ok then
@@ -12717,16 +12723,18 @@ function Plugin:_teardown_thought_tap()
     self._thought_tap_setup=nil
 end
 function Plugin:_thought_font_size(level)
-    -- Scale once and keep proportional gaps. The former fixed 26 px ceiling
-    -- collapsed every choice to the same size on high-DPI Kindle screens.
-    local standard=math.max(15,Device.screen:scaleBySize(15))
+    -- Shift every visible level down once: the previous "small" is now the
+    -- default "standard", while the former oversized xlarge level is removed.
+    local former_standard=math.max(15,Device.screen:scaleBySize(15))
+    local former_small=math.max(12,math.floor(former_standard*.78+.5))
     local sizes={
-        small=math.max(12,math.floor(standard*.78+.5)),
-        standard=standard,
-        large=math.floor(standard*1.24+.5),
-        xlarge=math.floor(standard*1.50+.5),
+        small=math.max(10,math.floor(former_small*.82+.5)),
+        standard=former_small,
+        large=former_standard,
+        xlarge=math.floor(former_standard*1.24+.5),
     }
-    sizes.large=math.max(sizes.standard+3,sizes.large)
+    sizes.small=math.min(sizes.standard-2,sizes.small)
+    sizes.large=math.max(sizes.standard+2,sizes.large)
     sizes.xlarge=math.max(sizes.large+3,sizes.xlarge)
     return sizes[tostring(level or "standard")] or sizes.standard
 end
@@ -12864,7 +12872,7 @@ function Plugin:_open_thought_info(info,generation)
         if not group then notice=tostring(err or "没有想法内容"); return end
         local prefs=self.store:preferences().thoughts or {}
         local function on_close() self:_finish_thought_popup(generation) end
-        self:_write_thought_popup_marker("build",info,{mode="native_rounded_layered"})
+        self:_write_thought_popup_marker("build",info,{mode="native_rounded_paged_swipe"})
         local source,comments,count,native_cache_hit=Thoughts.native_parts_cached(
             self.store,info.book_id,info.chapter_uid,info.range,group,token
         )
@@ -12872,6 +12880,11 @@ function Plugin:_open_thought_info(info,generation)
         popup=ThoughtNativePopup.show{
             source_text=source,
             comments=comments,
+            cache_key=table.concat({
+                tostring(info.book_id or ""), tostring(info.chapter_uid or ""),
+                tostring(info.range or ""), tostring(token and token.path or ""),
+                tostring(token and token.signature or ""),
+            }, "|"),
             font_size=self:_thought_font_size(prefs.font),
             font_name=self:_thought_font_name(prefs),
             width_ratio=tonumber(prefs.width_ratio) or 0.91,
@@ -12883,7 +12896,7 @@ function Plugin:_open_thought_info(info,generation)
             end,
         }
         logger.info("[MiuRead][ThoughtPopup] opened",
-            "mode=","native_rounded_layered",
+            "mode=","native_rounded_paged_swipe",
             "book=",tostring(info.book_id),"chapter=",tostring(info.chapter_uid),
             "comments=",tostring(count or 0),
             "source=",token and token.index_hit and "compact_index" or "chapter_cache",
@@ -13333,6 +13346,9 @@ function Plugin:onCloseDocument()
     end
     self:_mark_reader_busy(6)
     self:_close_active_thought_popup("document closed")
+    if ThoughtNativePopup and type(ThoughtNativePopup.cleanup)=="function" then
+        pcall(ThoughtNativePopup.cleanup)
+    end
     if self._reader_checkpoint_task then
         UIManager:unschedule(self._reader_checkpoint_task)
         self._reader_checkpoint_task=nil
