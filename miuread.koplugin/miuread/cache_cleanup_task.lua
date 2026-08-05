@@ -86,8 +86,11 @@ local function is_download_temp_name(name)
     name = tostring(name or "")
     return name == "download-task-owner.json"
         or name:match("^download%-settings%-.+%.lua$") ~= nil
+        or name:match("^download%-diagnostic%-.+%.txt$") ~= nil
         or name:match("^download%-progress%-.+%.json$") ~= nil
         or name:match("^download%-result%-.+%.json$") ~= nil
+        or name:match("^download%-recovery%-.+%.json$") ~= nil
+        or name:match("^download%-pause%-.+%.json$") ~= nil
         or name:match("^download%-cancel%-.+") ~= nil
 end
 
