@@ -1,0 +1,17 @@
+{
+  "version": "4.1.2-beta.2",
+  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 4.1.2-beta.2 \u5185\u6d4b\u7248",
+  "channel": "beta",
+  "package_type": "full",
+  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.1.2-beta.2/miuread-v4.1.2-beta.2-full.zip",
+  "package_urls": [
+    "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.1.2-beta.2/miuread-v4.1.2-beta.2-full.zip",
+    "https://ghfast.top/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.1.2-beta.2/miuread-v4.1.2-beta.2-full.zip",
+    "https://gh-proxy.com/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.1.2-beta.2/miuread-v4.1.2-beta.2-full.zip",
+    "https://ghproxy.net/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.1.2-beta.2/miuread-v4.1.2-beta.2-full.zip"
+  ],
+  "size": 488016,
+  "sha256": "b139ef468a5f7fc278f9e59232301e79af7061cf6d6ff31d861748671a834d52",
+  "summary": "\u65b0\u589e: \u60f3\u6cd5 \u8bc4\u8bba\u548c\u4e0b\u8f7d\u65ad\u70b9\u7edf\u4e00\u6539\u7528 SQLite\n\u8fc1\u79fb: \u6253\u5f00\u65e7\u4e66\u65f6\u53ef\u7acb\u5373\u8fc1\u79fb \u7a0d\u540e\u5904\u7406\u6216\u4e0d\u518d\u63d0\u793a\n\u8fdb\u5ea6: \u5927\u91cf\u6570\u636e\u8fc1\u79fb\u65f6\u663e\u793a\u8fdb\u5ea6 \u652f\u6301\u505c\u6b62\u540e\u7ee7\u7eed\n\u4f18\u5316: \u53d6\u6d88\u5916\u90e8\u8bc4\u8bba\u7d22\u5f15 \u73b0\u6709\u4e66\u7c4d\u65e0\u9700\u91cd\u65b0\u4e0b\u8f7d",
+  "notes": "\u65b0\u589e: \u60f3\u6cd5 \u8bc4\u8bba\u548c\u4e0b\u8f7d\u65ad\u70b9\u7edf\u4e00\u6539\u7528 SQLite\n\u8fc1\u79fb: \u6253\u5f00\u65e7\u4e66\u65f6\u53ef\u7acb\u5373\u8fc1\u79fb \u7a0d\u540e\u5904\u7406\u6216\u4e0d\u518d\u63d0\u793a\n\u8fdb\u5ea6: \u5927\u91cf\u6570\u636e\u8fc1\u79fb\u65f6\u663e\u793a\u8fdb\u5ea6 \u652f\u6301\u505c\u6b62\u540e\u7ee7\u7eed\n\u4f18\u5316: \u53d6\u6d88\u5916\u90e8\u8bc4\u8bba\u7d22\u5f15 \u73b0\u6709\u4e66\u7c4d\u65e0\u9700\u91cd\u65b0\u4e0b\u8f7d"
+}
