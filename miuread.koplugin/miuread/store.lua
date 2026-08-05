@@ -3,6 +3,7 @@ local lfs=require("libs/libkoreader-lfs")
 local LuaSettings=require("luasettings")
 local Config=require("miuread.config")
 local Json=require("miuread.json")
+local DownloadDatabase=require("miuread.download_database")
 local U=require("miuread.util")
 local logger=require("logger")
 local Store={}; Store.__index=Store
@@ -145,7 +146,8 @@ function Store:new(options)
         updates_dir=data.."/updates",
         settings_path=settings_path,
         settings_backup_path=settings_backup_path,
-        download_state_path=data.."/download-state.json",
+        legacy_download_state_path=data.."/download-state.json",
+        download_database_path=DownloadDatabase.runtime_path(data),
         isolated=options.isolated==true,
     },self)
     o.db=LuaSettings:open(o.settings_path)
@@ -1792,19 +1794,37 @@ function Store:cover_path(id) return self.covers_dir.."/"..U.id_name(id)..".img"
 function Store:update_state() return self:get("update_state",{}) end
 function Store:save_update_state(v) self:set("update_state",v or {}) end
 function Store:download_state()
-    local raw=U.read_file(self.download_state_path,true)
-    if not raw or raw=="" then return {} end
-    local ok,value=pcall(Json.decode,raw)
-    return ok and type(value)=="table" and value or {}
+    local value=DownloadDatabase.get_download_state(self)
+    if type(value)=="table" and next(value)~=nil then return value end
+    local legacy_path=tostring(self.legacy_download_state_path or "")
+    local raw=legacy_path~="" and U.read_file(legacy_path,true) or nil
+    if raw and raw~="" then
+        local ok,legacy=pcall(Json.decode,raw)
+        if ok and type(legacy)=="table" then
+            DownloadDatabase.set_download_state(self,legacy)
+            os.remove(legacy_path)
+            return legacy
+        end
+    end
+    return {}
 end
 function Store:save_download_state(value)
-    local ok,encoded=pcall(Json.encode,value or {})
-    if not ok then return false,encoded end
-    return U.atomic_write(self.download_state_path,encoded,true)
+    return DownloadDatabase.set_download_state(self,value or {})
 end
-function Store:clear_download_state() os.remove(self.download_state_path) end
+function Store:clear_download_state()
+    if self.legacy_download_state_path then os.remove(self.legacy_download_state_path) end
+    return DownloadDatabase.clear_download_state(self)
+end
 function Store:download_queue()
-    local queue=self:get("download_queue",{})
+    local queue=DownloadDatabase.get_download_queue(self)
+    if type(queue)~="table" or next(queue)==nil then
+        local legacy=self:get("download_queue",{})
+        if type(legacy)=="table" and #legacy>0 then
+            DownloadDatabase.set_download_queue(self,legacy)
+            self:set("download_queue",{})
+            queue=legacy
+        end
+    end
     if type(queue)~="table" then return {} end
     if #queue<=1 then return queue end
     return {queue[1]}
@@ -1813,7 +1833,7 @@ function Store:save_download_queue(queue)
     queue=type(queue)=="table" and queue or {}
     local kept={}
     if type(queue[1])=="table" then kept[1]=U.copy(queue[1]) end
-    self:set("download_queue",kept)
+    return DownloadDatabase.set_download_queue(self,kept)
 end
 function Store:enqueue_download(job)
     local queue=self:download_queue()
