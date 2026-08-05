@@ -61,7 +61,9 @@ local ReaderSettingsDialog=require("miuread.reader_settings_dialog")
 local ReaderControlCenter=require("miuread.reader_control_center")
 local ReaderTocDialog=require("miuread.reader_toc_dialog")
 local ReaderFrontlightDialog=require("miuread.reader_frontlight_dialog")
-local BookRepair=require("miuread.book_repair")
+local DataMigration=require("miuread.data_migration")
+local MigrationProgress=require("miuread.migration_progress")
+local DownloadDatabase=require("miuread.download_database")
 local StatusToast=require("miuread.status_toast")
 local ReaderTransitionGuard=require("miuread.reader_transition_guard")
 local Actions=require("miuread.actions")
@@ -386,7 +388,7 @@ function Plugin:init()
         os.remove(self._reader_busy_path)
     end
     self.memory_mode=MemoryMode:new(self.store)
-    self.book_repair=BookRepair:new(self.store)
+    self.book_repair=DataMigration:new(self.store)
     logger.info("[MiuRead] initialized", "version=", tostring(Config.VERSION),
         "schema=", tostring(Config.SCHEMA), "root=", tostring(ROOT))
     sanitize_saved_auth(self.store)
@@ -6164,7 +6166,7 @@ function Plugin:show_home_quick_panel(more_expanded)
         end},
         {key="cache",icon="⌫",label="清理缓存",detail="安全清理",callback=function() self:show_download_cleanup_dialog() end},
         {key="diagnostics",icon="!",label="诊断修复",detail="日志与记录",callback=function()
-            self:_show_standalone_menu("诊断与修复",self:book_repair_settings_menu())
+            self:_show_standalone_menu("评论迁移与修复",self:book_repair_settings_menu())
         end},
         {key="restart",icon="↺",label="重启",detail="KOReader",callback=function() self:_restart_koreader() end},
     }
@@ -10329,8 +10331,11 @@ local function is_download_temp_name(name)
     name=tostring(name or "")
     return name=="download-task-owner.json"
         or name:match("^download%-settings%-.+%.lua$")
+        or name:match("^download%-diagnostic%-.+%.txt$")
         or name:match("^download%-progress%-.+%.json$")
         or name:match("^download%-result%-.+%.json$")
+        or name:match("^download%-recovery%-.+%.json$")
+        or name:match("^download%-pause%-.+%.json$")
         or name:match("^download%-cancel%-.+")
 end
 local function is_epub_residue_name(name)
@@ -11475,46 +11480,141 @@ function Plugin:_record_repair_history(result,status)
 end
 
 function Plugin:_repair_message(report)
-    local lines={"发现书籍数据需要修复。"}
-    for _,issue in ipairs((report and report.issues) or {}) do
-        lines[#lines+1]=""
-        lines[#lines+1]=tostring(issue.detail or issue.title or "书籍数据异常")
-    end
+    local lines={"检测到本书仍有旧版 JSON 想法与评论数据。"}
     lines[#lines+1]=""
-    lines[#lines+1]="修复只处理本地数据，不会重新下载整本书。"
+    lines[#lines+1]="迁移后将直接使用 SQLite，旧评论索引不再需要。"
+    lines[#lines+1]="迁移不会重新下载书籍，也不会改动 EPUB 正文。"
+    if tonumber(report and report.pending or 0)>0 then
+        lines[#lines+1]=""
+        lines[#lines+1]="待迁移章节："..tostring(report.pending)
+    end
     return table.concat(lines,"\n")
+end
+
+function Plugin:_close_migration_progress(token)
+    if token and self._migration_token~=token then return end
+    if self._migration_progress_poll then
+        UIManager:unschedule(self._migration_progress_poll)
+        self._migration_progress_poll=nil
+    end
+    if self._migration_progress_delay then
+        UIManager:unschedule(self._migration_progress_delay)
+        self._migration_progress_delay=nil
+    end
+    if self._migration_progress_widget then
+        self._migration_progress_widget:close()
+        self._migration_progress_widget=nil
+    end
+    local active_token=self._migration_token
+    if active_token then DownloadDatabase.clear_task(DownloadDatabase.runtime_path(self.store),active_token) end
+    self._migration_token=nil
+end
+
+function Plugin:_schedule_migration_progress(token,title)
+    self:_close_migration_progress()
+    self._migration_token=token
+    local path=DownloadDatabase.runtime_path(self.store)
+    local function poll()
+        if self._migration_token~=token then return end
+        local state=DownloadDatabase.get_task_value(path,token,"migration_progress",nil)
+        if self._migration_progress_widget and type(state)=="table" then
+            self._migration_progress_widget:set_state(state)
+        end
+        if self.repair_async and self.repair_async:busy() then
+            self._migration_progress_poll=poll
+            UIManager:scheduleIn(.7,poll)
+        end
+    end
+    local delay
+    delay=function()
+        if self._migration_token~=token or not (self.repair_async and self.repair_async:busy()) then return end
+        self._migration_progress_delay=nil
+        local widget=MigrationProgress:new{
+            title="正在迁移《"..tostring(title or "当前书籍").."》",
+            on_cancel=function()
+                DownloadDatabase.set_cancelled(path,token,true)
+            end,
+        }
+        self._migration_progress_widget=widget
+        widget:show()
+        local state=DownloadDatabase.get_task_value(path,token,"migration_progress",nil)
+        if type(state)=="table" then widget:set_state(state) end
+        poll()
+    end
+    self._migration_progress_delay=delay
+    UIManager:scheduleIn(1.0,delay)
 end
 
 function Plugin:_run_book_repair(context,report,force)
     context=context or self:_repair_context()
-    if not context or not context.book then self:info("当前没有可修复的觅阅书籍"); return false end
-    if self.repair_async and self.repair_async:busy() then self:toast("已有修复任务正在进行"); return false end
+    if not context or not context.book then self:info("当前没有可迁移的觅阅书籍"); return false end
+    if self.repair_async and self.repair_async:busy() then self:toast("已有迁移任务正在进行"); return false end
+    if type(report)~="table" then
+        local repair=self.book_repair
+        self:toast("正在检查本书旧评论数据",2)
+        local started,err=self.repair_async:run("book-migration-check",function()
+            return repair:inspect(context)
+        end,function(result)
+            if not result or result.ok~=true or type(result.value)~="table" then
+                self:info("检查失败：\n"..tostring(result and result.error or "未知原因")); return
+            end
+            self:_run_book_repair(context,result.value,force)
+        end,120)
+        if not started then self:info("无法开始检查：\n"..tostring(err or "未知原因")) end
+        return started
+    end
+    if #(report.issues or {})==0 then
+        self:info("当前书籍已经使用 SQLite，无需迁移。")
+        return true
+    end
     local title=tostring((context.book or {}).title or context.title or "当前书籍")
-    self:toast("正在修复《"..title.."》",2)
+    local token="migration-"..tostring(os.time()).."-"..tostring(math.random(10000,99999))
+    local path=DownloadDatabase.runtime_path(self.store)
+    DownloadDatabase.clear_task(path,token)
+    self:_schedule_migration_progress(token,title)
     local repair=self.book_repair
-    local started,err=self.repair_async:run("book-repair",function()
-        return repair:repair(context,report,force==true)
+    local started,err=self.repair_async:run("book-data-migration",function()
+        return repair:migrate(context,report,{
+            force=force==true,
+            archive_legacy=false,
+            progress=function(state)
+                DownloadDatabase.set_task_value(path,token,"migration_progress",state)
+            end,
+            cancelled=function()
+                return DownloadDatabase.is_cancelled(path,token)
+            end,
+        })
     end,function(result)
+        self:_close_migration_progress(token)
         if not result or result.ok~=true or type(result.value)~="table" then
-            local message=tostring(result and result.error or "修复任务未完成")
+            local message=tostring(result and result.error or "迁移任务未完成")
             self:_record_repair_history({title=title,book_id=(context.book or {}).book_id},"失败")
-            self:info("修复失败：\n"..message)
+            self:info("迁移失败：\n"..message)
             return
         end
         local value=result.value
-        self:_record_repair_history(value,value.ok and "已完成" or "部分失败")
+        local status=value.cancelled and "已停止" or (value.ok and "已完成" or "部分失败")
+        self:_record_repair_history(value,status)
         self:_save_repair_state(value.book_id,{
             signature=value.signature,
-            status=value.ok and "fixed" or "failed",
+            status=value.ok and "fixed" or (value.cancelled and "pending" or "failed"),
             checked_at=os.time(),
         })
-        if value.ok then
-            self:info("修复完成，可以继续阅读。")
+        Thoughts.clear_memory_cache()
+        if value.cancelled then
+            self:info("迁移已停止。已完成的章节会保留，下次可继续。")
+        elseif value.ok then
+            self:info("迁移完成。\n\n已处理 "..tostring(value.processed or 0).." 个章节、新迁移 "
+                ..tostring(value.comments or 0).." 条评论。以后将直接使用 SQLite。")
         else
-            self:info("部分内容没有修复成功，请在“修复记录”中查看后重试。")
+            self:info("部分章节迁移失败，成功数据已保留，可稍后继续迁移。")
         end
-    end,180)
-    if not started then self:info("无法开始修复：\n"..tostring(err or "未知原因")); return false end
+    end,900)
+    if not started then
+        self:_close_migration_progress(token)
+        self:info("无法开始迁移：\n"..tostring(err or "未知原因"))
+        return false
+    end
     return true
 end
 
@@ -11523,19 +11623,21 @@ function Plugin:_show_book_repair_prompt(context,report)
     self._repair_prompt_open=true
     local book_id=tostring(report and report.book_id or ((context.book or {}).book_id or ""))
     local signature=tostring(report and report.signature or self.book_repair:signature(context))
-    UIManager:show(ConfirmBox:new{
-        text=self:_repair_message(report),
-        ok_text="一键修复",
-        cancel_text="暂不处理",
-        ok_callback=function()
-            self._repair_prompt_open=false
+    local dialog
+    dialog=ButtonDialog:new{title=self:_repair_message(report),title_align="center",buttons={
+        {{text="立即迁移",callback=function()
+            UIManager:close(dialog); self._repair_prompt_open=false
             self:_run_book_repair(context,report,false)
-        end,
-        cancel_callback=function()
-            self._repair_prompt_open=false
+        end}},
+        {{text="稍后处理",callback=function()
+            UIManager:close(dialog); self._repair_prompt_open=false
+        end}},
+        {{text="本书不再自动提示",callback=function()
+            UIManager:close(dialog); self._repair_prompt_open=false
             self:_save_repair_state(book_id,{signature=signature,status="ignored",checked_at=os.time()})
-        end,
-    })
+        end}},
+    }}
+    UIManager:show(dialog)
 end
 
 function Plugin:_schedule_current_book_repair_check(current,urgent)
@@ -11545,10 +11647,10 @@ function Plugin:_schedule_current_book_repair_check(current,urgent)
     if not context or not context.book then return false end
     local book_id=tostring((context.book or {}).book_id or (context.book or {}).bookId or "")
     if book_id=="" then return false end
-    local signature=self.book_repair:signature(context)
     local previous=self:_repair_state()[book_id]
-    if urgent~=true and type(previous)=="table" and tostring(previous.signature or "")==signature
-        and (previous.status=="ok" or previous.status=="fixed" or previous.status=="ignored") then
+    if urgent~=true and type(previous)=="table"
+        and (previous.status=="ok" or previous.status=="fixed" or previous.status=="ignored")
+        and os.time()-(tonumber(previous.checked_at) or 0)<7*24*60*60 then
         return false
     end
     if self.repair_async and self.repair_async:busy() then return false end
@@ -11558,7 +11660,7 @@ function Plugin:_schedule_current_book_repair_check(current,urgent)
         local active=self:_current_document_path()
         if tostring(active or "")~=tostring(context.path or "") then return end
         if self.repair_async:busy() then return end
-        local started=self.repair_async:run("book-repair-check",function()
+        local started=self.repair_async:run("book-migration-check",function()
             return repair:inspect(context)
         end,function(result)
             if not result or result.ok~=true or type(result.value)~="table" then return end
@@ -11572,8 +11674,8 @@ function Plugin:_schedule_current_book_repair_check(current,urgent)
             if urgent~=true and type(row)=="table" and tostring(row.signature or "")==tostring(report.signature or "")
                 and row.status=="ignored" then return end
             self:_show_book_repair_prompt(context,report)
-        end,90)
-        if not started then logger.dbg("[MiuRead][Repair] check deferred") end
+        end,120)
+        if not started then logger.dbg("[MiuRead][Migration] check deferred") end
     end)
     return true
 end
@@ -11583,8 +11685,8 @@ function Plugin:repair_current_book(confirmed)
     if not context then self:info("请先打开一本觅阅书籍"); return end
     if confirmed~=true and self:_active_reader_ui() and self:_notice_enabled("repair_while_reading") then
         local dialog
-        dialog=ButtonDialog:new{title="修复会重新检查当前书籍，期间评论、菜单或翻页可能暂时变慢。",title_align="center",buttons={
-            {{text="继续修复",callback=function() UIManager:close(dialog); self:repair_current_book(true) end}},
+        dialog=ButtonDialog:new{title="迁移会读取本书旧评论数据。大书可能短暂变慢，但不会重新下载正文。",title_align="center",buttons={
+            {{text="继续迁移",callback=function() UIManager:close(dialog); self:repair_current_book(true) end}},
             {{text="继续并不再提示",callback=function() UIManager:close(dialog); self:_set_notice_enabled("repair_while_reading",false); self:repair_current_book(true) end}},
             {{text="稍后处理",callback=function() UIManager:close(dialog) end}},
         }}
@@ -11599,10 +11701,10 @@ function Plugin:scan_downloaded_books_for_repair(confirmed)
         self:_confirm_library_scan(function() self:scan_downloaded_books_for_repair(true) end)
         return
     end
-    if self.repair_async:busy() then self:toast("已有检查或修复任务正在进行"); return end
+    if self.repair_async:busy() then self:toast("已有检查或迁移任务正在进行"); return end
     self:toast("正在检查已下载书籍",2)
     local repair=self.book_repair
-    local started,err=self.repair_async:run("scan-book-repair",function()
+    local started,err=self.repair_async:run("scan-book-migration",function()
         return repair:scan_downloaded()
     end,function(result)
         if not result or result.ok~=true or type(result.value)~="table" then
@@ -11610,45 +11712,92 @@ function Plugin:scan_downloaded_books_for_repair(confirmed)
         end
         local scan=result.value
         if tonumber(scan.affected or 0)==0 then
-            self:info("检查完成，没有发现需要修复的已下载书籍。")
+            self:info("检查完成，没有发现需要迁移的已下载书籍。")
             return
         end
         UIManager:show(ConfirmBox:new{
-            text="发现 "..tostring(scan.affected).." 本书需要修复。\n\n是否一键修复？",
-            ok_text="全部修复",
-            cancel_text="暂不处理",
+            text="发现 "..tostring(scan.affected).." 本书仍有旧版评论数据。\n\n是否全部迁移到 SQLite？",
+            ok_text="全部迁移",cancel_text="暂不处理",
             ok_callback=function()
-                if self.repair_async:busy() then self:toast("已有修复任务正在进行"); return end
-                local ok_start,error_start=self.repair_async:run("repair-downloaded-books",function()
-                    return repair:repair_scan(scan)
+                if self.repair_async:busy() then self:toast("已有迁移任务正在进行"); return end
+                local token="migration-batch-"..tostring(os.time()).."-"..tostring(math.random(10000,99999))
+                local path=DownloadDatabase.runtime_path(self.store)
+                DownloadDatabase.clear_task(path,token)
+                self:_schedule_migration_progress(token,"已下载书籍评论")
+                local ok_start,error_start=self.repair_async:run("migrate-downloaded-books",function()
+                    local output={checked=0,migrated=0,failed=0,cancelled=false,details={},groups=0,comments=0}
+                    local total_chapters=0
+                    for _,row in ipairs(scan.contexts or {}) do
+                        total_chapters=total_chapters+#((row.report or {}).files or {})
+                    end
+                    local completed=0
+                    for _,row in ipairs(scan.contexts or {}) do
+                        if DownloadDatabase.is_cancelled(path,token) then output.cancelled=true; break end
+                        local book_title=tostring(((row.context or {}).book or {}).title or (row.context or {}).title or "书籍")
+                        local value=repair:migrate(row.context,row.report,{
+                            archive_legacy=false,
+                            cancelled=function() return DownloadDatabase.is_cancelled(path,token) end,
+                            progress=function(state)
+                                state=type(state)=="table" and state or {}
+                                DownloadDatabase.set_task_value(path,token,"migration_progress",{
+                                    current=completed+(tonumber(state.current) or 0),
+                                    total=total_chapters,
+                                    chapter=book_title.." · "..tostring(state.chapter or ""),
+                                    groups=output.groups+(tonumber(state.groups) or 0),
+                                    comments=output.comments+(tonumber(state.comments) or 0),
+                                    percent=total_chapters>0 and (completed+(tonumber(state.current) or 0))/total_chapters or 1,
+                                })
+                            end,
+                        })
+                        output.checked=output.checked+1
+                        output.groups=output.groups+(tonumber(value.groups) or 0)
+                        output.comments=output.comments+(tonumber(value.comments) or 0)
+                        completed=completed+#((row.report or {}).files or {})
+                        if value.cancelled then output.cancelled=true end
+                        if value.ok then output.migrated=output.migrated+1 else output.failed=output.failed+1 end
+                        output.details[#output.details+1]=value
+                        if output.cancelled then break end
+                    end
+                    output.ok=output.failed==0 and output.cancelled~=true
+                    return output
                 end,function(fixed)
+                    self:_close_migration_progress(token)
                     if not fixed or fixed.ok~=true or type(fixed.value)~="table" then
-                        self:info("批量修复失败：\n"..tostring(fixed and fixed.error or "未知原因")); return
+                        self:info("批量迁移失败：\n"..tostring(fixed and fixed.error or "未知原因")); return
                     end
                     local value=fixed.value
-                    self:_record_repair_history({title="批量修复",book_id=""},value.ok and "已完成" or "部分失败")
-                    self:info(value.ok and "修复完成。" or "部分书籍修复失败，请稍后重试。")
-                end,300)
-                if not ok_start then self:info("无法开始批量修复：\n"..tostring(error_start or "未知原因")) end
+                    local status=value.cancelled and "已停止" or (value.ok and "已完成" or "部分失败")
+                    self:_record_repair_history({title="批量迁移",book_id=""},status)
+                    if value.cancelled then
+                        self:info("批量迁移已停止。已完成的数据会保留，下次可继续。")
+                    elseif value.ok then
+                        self:info("全部迁移完成。\n\n新迁移 "..tostring(value.comments or 0).." 条评论。")
+                    else
+                        self:info("部分书籍迁移失败，可稍后重试。")
+                    end
+                end,1800)
+                if not ok_start then
+                    self:_close_migration_progress(token)
+                    self:info("无法开始批量迁移：\n"..tostring(error_start or "未知原因"))
+                end
             end,
         })
-    end,180)
+    end,240)
     if not started then self:info("无法开始检查：\n"..tostring(err or "未知原因")) end
 end
 
 function Plugin:clear_invalid_comment_indexes()
-    if self.repair_async:busy() then self:toast("已有检查或修复任务正在进行"); return end
+    if self.repair_async:busy() then self:toast("已有检查或迁移任务正在进行"); return end
     local repair=self.book_repair
-    local started,err=self.repair_async:run("clear-invalid-comment-indexes",function()
-        return repair:clear_invalid_downloaded_indexes()
+    local started,err=self.repair_async:run("clear-legacy-comment-data",function()
+        return repair:remove_verified_legacy_downloaded()
     end,function(result)
         if result and result.ok==true then
-            Thoughts.clear_memory_cache()
-            self:info("已清理失效的评论索引。需要时会自动重新建立。")
+            self:info("已清理 "..tostring(result.value or 0).." 本书的旧 JSON 备份。SQLite 数据不会受到影响。")
         else
             self:info("清理失败：\n"..tostring(result and result.error or "未知原因"))
         end
-    end,120)
+    end,300)
     if not started then self:info("无法开始清理：\n"..tostring(err or "未知原因")) end
 end
 
@@ -11656,14 +11805,11 @@ function Plugin:show_repair_history()
     local history=self.store:get("book_repair_history",{})
     local items={}
     for _,row in ipairs(type(history)=="table" and history or {}) do
-        items[#items+1]={
-            text=tostring(row.title or "书籍"),
-            post_text=os.date("%m-%d %H:%M",tonumber(row.at) or os.time()).." · "..tostring(row.status or ""),
-            enabled=false,
-        }
+        items[#items+1]={text=tostring(row.title or "书籍"),
+            post_text=os.date("%m-%d %H:%M",tonumber(row.at) or os.time()).." · "..tostring(row.status or ""),enabled=false}
     end
-    if #items==0 then items[1]={text="还没有修复记录",enabled=false} end
-    self:list("修复记录",items)
+    if #items==0 then items[1]={text="还没有迁移记录",enabled=false} end
+    self:list("迁移记录",items)
 end
 
 function Plugin:_confirm_library_scan(callback)
@@ -11680,21 +11826,21 @@ end
 
 function Plugin:book_repair_settings_menu()
     return {
-        {text="自动检查书籍问题",checked_func=function()
+        {text="打开书籍时检查旧评论数据",checked_func=function()
             return (self.store:preferences().repair or {}).auto_check~=false
         end,keep_menu_open=true,callback=function()
             local p=self.store:preferences(); p.repair=p.repair or {}
             p.repair.auto_check=p.repair.auto_check==false
             self.store:save_preferences(p)
         end},
-        {text="修复当前书籍",callback=function() self:repair_current_book() end},
-        {text="扫描已下载书籍",callback=function() self:scan_downloaded_books_for_repair() end},
+        {text="迁移当前书籍评论",callback=function() self:repair_current_book() end},
+        {text="扫描所有待迁移书籍",callback=function() self:scan_downloaded_books_for_repair() end},
         {text="重新扫描本地书籍与封面",callback=function() self:show_miuread_home(true) end},
-        {text="清理失效评论索引",callback=function() self:clear_invalid_comment_indexes() end},
-        {text="修复记录",callback=function() self:show_repair_history() end},
-        {text="重置检查结果",callback=function()
+        {text="清理已验证的旧 JSON 备份",callback=function() self:clear_invalid_comment_indexes() end},
+        {text="迁移记录",callback=function() self:show_repair_history() end},
+        {text="重置迁移提示状态",callback=function()
             self.store:set("book_repair_state",{})
-            self:toast("已重置书籍检查结果")
+            self:toast("已重置评论迁移提示状态")
         end},
     }
 end
@@ -12085,7 +12231,7 @@ end
 function Plugin:more_settings_menu()
     return {
         {text="提醒与确认",sub_item_table_func=function() return self:notice_settings_menu() end},
-        {text="书籍检查与修复",sub_item_table_func=function() return self:book_repair_settings_menu() end},
+        {text="评论数据迁移与修复",sub_item_table_func=function() return self:book_repair_settings_menu() end},
         {text="更新设置",sub_item_table_func=function() return self:update_settings_menu() end},
         {text="关于觅阅",callback=self:safe("about",function() self:show_about() end)},
     }
@@ -12563,52 +12709,7 @@ local function extract_thought_href(value,seen,depth)
     for _,child in pairs(value) do local found=extract_thought_href(child,seen,depth+1); if found then return found end end
 end
 function Plugin:_start_thought_index_maintenance()
-    local home=self:_home_preferences()
-    if home.background_thought_index~=true then return false end
-    if self:_home_background_blocked() then
-        self._home_resume_pending_work=self._home_resume_pending_work or {}
-        self._home_resume_pending_work.thoughts=true
-        return false
-    end
-    if not self.thought_index_async or not self.ui or self.ui.document then return false end
-    if self:_home_enabled() and not HomeView.is_shown() then return false end
-    local now=os.time()
-    if THOUGHT_MAINTENANCE.running==true or now-(tonumber(THOUGHT_MAINTENANCE.last_at) or 0)<120 then return false end
-    if self.download_task and self.download_task:busy() then
-        UIManager:scheduleIn(10,function() self:_start_thought_index_maintenance() end)
-        return false
-    end
-    if self.thought_index_async:busy() or not self.thought_index_async:available() then return false end
-    local data_dir=self.store.data_dir
-    local pause_path=self._thought_index_pause_path
-    os.remove(pause_path)
-    THOUGHT_MAINTENANCE.running=true
-    THOUGHT_MAINTENANCE.last_at=now
-    local started,err=self.thought_index_async:run("thought-index-maintenance",function()
-        local ok,ffi=pcall(require,"ffi")
-        if ok and ffi then
-            pcall(ffi.cdef,"int setpriority(int which, int who, int prio);")
-            pcall(function() ffi.C.setpriority(0,0,15) end)
-        end
-        return Thoughts.build_missing_indexes(data_dir,pause_path,100000)
-    end,function(result)
-        THOUGHT_MAINTENANCE.running=false
-        THOUGHT_MAINTENANCE.last_at=os.time()
-        if not result or result.ok~=true or type(result.value)~="table" then
-            logger.warn("[MiuRead][Thoughts] background index maintenance failed",
-                tostring(result and result.error or "unknown"))
-            return
-        end
-        local value=result.value
-        logger.info("[MiuRead][Thoughts] background index maintenance",
-            "checked=",tostring(value.checked or 0),"built=",tostring(value.built or 0),
-            "failed=",tostring(value.failed or 0),"paused=",tostring(value.paused==true))
-    end,900)
-    if not started then
-        THOUGHT_MAINTENANCE.running=false
-        logger.dbg("[MiuRead][Thoughts] index maintenance deferred",tostring(err))
-    end
-    return started==true
+    return false
 end
 
 function Plugin:_teardown_thought_tap()
@@ -13246,7 +13347,7 @@ function Plugin:onCloseDocument()
         HOME_SESSION.opening_at=0
     end
     self:_cancel_network_waits()
-    if self.repair_async and self.repair_async.job and self.repair_async.job.label=="book-repair-check" then
+    if self.repair_async and self.repair_async.job and self.repair_async.job.label=="book-migration-check" then
         self.repair_async:cancel("document closed")
     end
     self._repair_prompt_open=false
