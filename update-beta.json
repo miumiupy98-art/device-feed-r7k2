@@ -1,17 +1,17 @@
 {
-  "version": "4.1.2-beta.7",
-  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 4.1.2-beta.7 \u5185\u6d4b\u7248",
+  "version": "4.1.2-beta.8",
+  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 4.1.2-beta.8 \u5185\u6d4b\u7248",
   "channel": "beta",
   "package_type": "full",
-  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.1.2-beta.7/miuread-v4.1.2-beta.7-full.zip",
+  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.1.2-beta.8/miuread-v4.1.2-beta.8-full.zip",
   "package_urls": [
-    "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.1.2-beta.7/miuread-v4.1.2-beta.7-full.zip",
-    "https://ghfast.top/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.1.2-beta.7/miuread-v4.1.2-beta.7-full.zip",
-    "https://gh-proxy.com/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.1.2-beta.7/miuread-v4.1.2-beta.7-full.zip",
-    "https://ghproxy.net/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.1.2-beta.7/miuread-v4.1.2-beta.7-full.zip"
+    "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.1.2-beta.8/miuread-v4.1.2-beta.8-full.zip",
+    "https://ghfast.top/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.1.2-beta.8/miuread-v4.1.2-beta.8-full.zip",
+    "https://gh-proxy.com/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.1.2-beta.8/miuread-v4.1.2-beta.8-full.zip",
+    "https://ghproxy.net/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.1.2-beta.8/miuread-v4.1.2-beta.8-full.zip"
   ],
-  "size": 495539,
-  "sha256": "8bce0db1491087476370f7681a78b34263182204930d22cd2b60f56934d57f30",
-  "summary": "\u4fee\u590d: \u8bc4\u8bba\u5b57\u53f7\u6539\u4e3a18 22 26 30\u56db\u6863\u6700\u7ec8\u503c\n\u4fee\u590d: \u8bc4\u8bba\u7279\u5927\u5b57\u53f7\u4ecd\u5c0f\u4e8e\u5e38\u7528\u6b63\u6587\u5b57\u53f7\u7684\u95ee\u9898\n\u65b0\u589e: \u4e3b\u9875\u89c5\u9605\u8bbe\u7f6e\u5f39\u7a97\u589e\u52a0\u66f4\u65b0\u8bbe\u7f6e\u5165\u53e3\n\u4fee\u590d: \u4e3b\u9875Wi-Fi\u957f\u6309\u65e0\u6cd5\u8fdb\u5165\u7f51\u7edc\u5217\u8868\u7684\u95ee\u9898",
-  "notes": "\u4fee\u590d: \u8bc4\u8bba\u5b57\u53f7\u6539\u4e3a18 22 26 30\u56db\u6863\u6700\u7ec8\u503c\n\u4fee\u590d: \u8bc4\u8bba\u7279\u5927\u5b57\u53f7\u4ecd\u5c0f\u4e8e\u5e38\u7528\u6b63\u6587\u5b57\u53f7\u7684\u95ee\u9898\n\u65b0\u589e: \u4e3b\u9875\u89c5\u9605\u8bbe\u7f6e\u5f39\u7a97\u589e\u52a0\u66f4\u65b0\u8bbe\u7f6e\u5165\u53e3\n\u4fee\u590d: \u4e3b\u9875Wi-Fi\u957f\u6309\u65e0\u6cd5\u8fdb\u5165\u7f51\u7edc\u5217\u8868\u7684\u95ee\u9898"
+  "size": 495735,
+  "sha256": "93f32f0ccb58e98ff59280f484e87f348532e0efa67f19cea572114a3317857c",
+  "summary": "\u4fee\u590d: \u5df2\u8fde\u63a5\u65f6Wi-Fi\u7f51\u7edc\u5217\u8868\u6253\u5f00\u540e\u7acb\u5373\u6d88\u5931\n\u4fee\u590d: \u5207\u6362\u7f51\u7edc\u671f\u95f4\u4e3b\u9875\u5237\u65b0\u8986\u76d6\u7f51\u7edc\u9009\u62e9\u7a97\u53e3\n\u4f18\u5316: \u7f51\u7edc\u5217\u8868\u5173\u95ed\u540e\u518d\u5237\u65b0\u4e3b\u9875Wi-Fi\u72b6\u6001\n\u4fdd\u6301: Wi-Fi\u77ed\u6309\u5f00\u5173 \u957f\u6309\u8fdb\u5165\u7f51\u7edc\u5217\u8868",
+  "notes": "\u4fee\u590d: \u5df2\u8fde\u63a5\u65f6Wi-Fi\u7f51\u7edc\u5217\u8868\u6253\u5f00\u540e\u7acb\u5373\u6d88\u5931\n\u4fee\u590d: \u5207\u6362\u7f51\u7edc\u671f\u95f4\u4e3b\u9875\u5237\u65b0\u8986\u76d6\u7f51\u7edc\u9009\u62e9\u7a97\u53e3\n\u4f18\u5316: \u7f51\u7edc\u5217\u8868\u5173\u95ed\u540e\u518d\u5237\u65b0\u4e3b\u9875Wi-Fi\u72b6\u6001\n\u4fdd\u6301: Wi-Fi\u77ed\u6309\u5f00\u5173 \u957f\u6309\u8fdb\u5165\u7f51\u7edc\u5217\u8868"
 }
