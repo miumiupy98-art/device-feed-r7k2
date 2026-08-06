@@ -2,6 +2,7 @@ local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
 local Font = require("ui/font")
+local ThoughtFaceFactory = require("miuread.thought_face_factory")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
@@ -23,11 +24,13 @@ local Size = require("ui/size")
 
 local Screen = Device.screen
 local MUTED_TEXT_COLOR = Blitbuffer.COLOR_GRAY or Blitbuffer.COLOR_DARK_GRAY
+local INACTIVE_TEXT_COLOR = Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_GRAY or Blitbuffer.COLOR_DARK_GRAY
 local SEPARATOR_COLOR = Blitbuffer.COLOR_GRAY or Blitbuffer.COLOR_DARK_GRAY
 local live_popup
 local pooled_popup
 
 local LAYOUT_CACHE_LIMIT = 3
+local GHOSTING_REFRESH_INTERVAL = 6
 local layout_cache = {}
 local layout_cache_order = {}
 
@@ -239,8 +242,10 @@ end
 
 local function make_face(name, size, fallback)
     local requested = clean(name)
-    local ok, value
-    if requested ~= "" then
+    if requested == "" then requested = nil end
+    local ok, value = pcall(ThoughtFaceFactory.getFace, ThoughtFaceFactory, requested, size, fallback or "cfont")
+    if ok and value then return value end
+    if requested then
         ok, value = pcall(function() return Font:getFace(requested, size) end)
         if ok and value then return value end
     end
@@ -361,6 +366,7 @@ function NativePopup:_layout_cache_key(width, maximum_height, metrics)
         tostring(metrics.meta_size),
         tostring(metrics.source_size),
         clean(self.font_name),
+        ThoughtFaceFactory:signature(),
     }, "|")
 end
 
@@ -727,16 +733,46 @@ end
 function NativePopup:_build_page_indicator(width, metrics, height)
     local text = self:_page_indicator_text()
     if text == "" then return nil, 0, nil end
+
+    local count = #(self.pages or {})
+    local current = clamp(self.page_index, 1, count)
+    local face = make_face(
+        self.font_name, math.max(10, math.floor(metrics.meta_size * .92 + .5)), "smallinfofont"
+    )
     local label = TextWidget:new{
         text = text,
-        face = make_face(self.font_name, math.max(10, math.floor(metrics.meta_size * .92 + .5)), "smallinfofont"),
+        face = face,
         fgcolor = Blitbuffer.COLOR_DARK_GRAY,
     }
-    local measured = label:getSize()
-    local indicator_h = math.max(tonumber(height) or 0, measured.h + math.max(2, Screen:scaleBySize(1)))
-    local container = CenterContainer:new{
-        dimen = Geom:new{w = math.max(1, width), h = indicator_h},
-        label,
+    local left = TextWidget:new{
+        text = "‹",
+        face = face,
+        fgcolor = current > 1 and Blitbuffer.COLOR_DARK_GRAY or INACTIVE_TEXT_COLOR,
+    }
+    local right = TextWidget:new{
+        text = "›",
+        face = face,
+        fgcolor = current < count and Blitbuffer.COLOR_DARK_GRAY or INACTIVE_TEXT_COLOR,
+    }
+
+    local label_size = label:getSize()
+    local left_size = left:getSize()
+    local right_size = right:getSize()
+    local indicator_h = math.max(
+        tonumber(height) or 0,
+        label_size.h, left_size.h, right_size.h
+    ) + math.max(2, Screen:scaleBySize(1))
+    local side_w = math.max(
+        left_size.w, right_size.w,
+        math.floor(math.max(1, width) * .16)
+    )
+    side_w = math.min(side_w, math.max(1, math.floor((width - label_size.w) / 2)))
+    local center_w = math.max(1, width - side_w * 2)
+
+    local container = HorizontalGroup:new{
+        CenterContainer:new{dimen = Geom:new{w = side_w, h = indicator_h}, left},
+        CenterContainer:new{dimen = Geom:new{w = center_w, h = indicator_h}, label},
+        CenterContainer:new{dimen = Geom:new{w = side_w, h = indicator_h}, right},
     }
     return container, indicator_h, label
 end
@@ -1009,6 +1045,10 @@ function NativePopup:_change_page(delta)
         self.page_index = target
         local previous_popup, current_popup = self:_replace_comment_page()
         self.page_refresh_count = (tonumber(self.page_refresh_count) or 0) + 1
+        local eink = type(Device.hasEinkScreen) == "function" and Device:hasEinkScreen()
+        local flash_refresh = eink and self.page_refresh_count >= GHOSTING_REFRESH_INTERVAL
+        if flash_refresh then self.page_refresh_count = 0 end
+        local refresh_mode = flash_refresh and "flashui" or "ui"
 
         local dimensions_changed = previous_popup and current_popup
             and (previous_popup.x ~= current_popup.x or previous_popup.y ~= current_popup.y
@@ -1019,10 +1059,10 @@ function NativePopup:_change_page(delta)
             local right = math.max(previous_popup.x + previous_popup.w, current_popup.x + current_popup.w)
             local bottom = math.max(previous_popup.y + previous_popup.h, current_popup.y + current_popup.h)
             local dirty = Geom:new{x = left, y = top, w = right - left, h = bottom - top}
-            UIManager:setDirty("all", function() return "ui", dirty end)
+            UIManager:setDirty("all", function() return refresh_mode, dirty end)
         else
             local dirty = self.content_refresh_dimen or current_popup or previous_popup
-            UIManager:setDirty(self, function() return "ui", dirty end)
+            UIManager:setDirty(flash_refresh and "all" or self, function() return refresh_mode, dirty end)
         end
     end, debug.traceback)
     if not ok then
@@ -1196,6 +1236,7 @@ end
 
 function M.clear_cache()
     clear_layout_cache()
+    ThoughtFaceFactory:clearCache()
 end
 
 function M.cleanup()
@@ -1206,6 +1247,7 @@ function M.cleanup()
     live_popup = nil
     pooled_popup = nil
     clear_layout_cache()
+    ThoughtFaceFactory:clearCache()
     if popup then
         popup.on_close_callback = nil
         popup.on_interact_callback = nil
