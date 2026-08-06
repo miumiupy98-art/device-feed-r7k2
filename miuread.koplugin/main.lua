@@ -3077,7 +3077,7 @@ function Plugin:home_panel_settings_menu() return self:_home_group_settings_menu
 
 local READER_QUICK_LABELS={
     toc="目录",progress="阅读进度",font="字体排版",frontlight="前光",sync="阅读同步",
-    comment_font="评论字号",page_display="页面显示",home="觅阅书架",typeset="高级排版",
+    comment_font="评论显示",page_display="页面显示",home="觅阅书架",typeset="高级排版",
     current_book="当前书籍",downloads="下载管理",full_refresh="全屏刷新",
     koreader_menu="KOReader 高级菜单",sleep="休眠",
 }
@@ -6008,25 +6008,64 @@ end
 function Plugin:_home_wifi_settings()
     local ok_nm,NetworkMgr=pcall(require,"ui/network/manager")
     if not ok_nm or not NetworkMgr then self:info("当前设备无法使用网络设置"); return false end
-    local function open_picker()
+
+    local function refresh_status()
+        UIManager:scheduleIn(.4,function() self:_refresh_home_view(nil,"header") end)
+        UIManager:scheduleIn(2,function() self:_refresh_home_view(nil,"header") end)
+    end
+
+    local function show_network_list()
+        -- When Wi-Fi is already running, open KOReader's own network list
+        -- directly instead of turning the radio off and back on.
+        if type(NetworkMgr.getNetworkList)=="function" then
+            local ok_list,networks=pcall(NetworkMgr.getNetworkList,NetworkMgr)
+            if ok_list and type(networks)=="table" then
+                local ok_widget,NetworkSetting=pcall(require,"ui/widget/networksetting")
+                if ok_widget and NetworkSetting and type(NetworkSetting.new)=="function" then
+                    local dialog=NetworkSetting:new{
+                        network_list=networks,
+                        connect_callback=refresh_status,
+                        disconnect_callback=refresh_status,
+                    }
+                    UIManager:show(dialog)
+                    refresh_status()
+                    return true
+                end
+            end
+        end
+        -- Device backends that manage their own picker use KOReader's
+        -- long-press flag on the normal Wi-Fi toggle entry.
         if type(NetworkMgr.toggleWifiOn)=="function" then
-            local ok=pcall(NetworkMgr.toggleWifiOn,NetworkMgr,nil,true,true)
+            local ok=pcall(NetworkMgr.toggleWifiOn,NetworkMgr,refresh_status,true,true)
             if ok then return true end
         end
         if type(NetworkMgr.turnOnWifi)=="function" then
-            pcall(NetworkMgr.turnOnWifi,NetworkMgr)
+            local ok=pcall(NetworkMgr.turnOnWifi,NetworkMgr,refresh_status,true)
+            if ok then return true end
         end
-        self:_show_native_koreader_menu()
-        return true
+        return false
     end
+
     local on=false
     local ok_state,value=pcall(NetworkMgr.isWifiOn,NetworkMgr)
     if ok_state then on=value==true end
-    if on and type(NetworkMgr.toggleWifiOff)=="function" then
-        local ok=pcall(NetworkMgr.toggleWifiOff,NetworkMgr,function() open_picker() end,true)
+    if on then
+        if show_network_list() then return true end
+    elseif type(NetworkMgr.toggleWifiOn)=="function" then
+        -- The long-press flag asks KOReader to display the available network
+        -- list after enabling Wi-Fi, rather than silently reconnecting only.
+        local ok=pcall(NetworkMgr.toggleWifiOn,NetworkMgr,refresh_status,true,true)
+        if ok then refresh_status(); return true end
+    elseif type(NetworkMgr.turnOnWifi)=="function" then
+        local ok=pcall(NetworkMgr.turnOnWifi,NetworkMgr,function()
+            UIManager:scheduleIn(.1,show_network_list)
+            refresh_status()
+        end,true)
         if ok then return true end
     end
-    return open_picker()
+
+    self:info("Wi-Fi 网络列表暂时无法打开")
+    return false
 end
 
 function Plugin:_home_frontlight()
@@ -6122,7 +6161,9 @@ function Plugin:show_home_quick_panel(more_expanded)
         wifi={
             icon="Wi-Fi",
             icon_path=ROOT.."/resources/"..(wifi_on==false and "wifi-off.svg" or (state.online==true and "wifi-connected.svg" or "wifi-disconnected.svg")),
-            label="Wi-Fi",detail=wifi_detail,callback=function() self:_home_wifi_toggle() end
+            label="Wi-Fi",detail=wifi_detail,
+            callback=function() self:_home_wifi_toggle() end,
+            hold_callback=function() self:_home_wifi_settings() end
         },
         rotate={icon="↻",icon_key="rotate",label="旋转",detail="",callback=function() self:_home_rotate() end},
         screenshot={icon="▣",icon_key="screenshot",label="截图",detail="延时截取",callback=function(anchor) ScreenshotMode.start(self,anchor) end},
@@ -6631,17 +6672,25 @@ function Plugin:_set_thought_font_size(level)
     local p=self.store:preferences(); p.thoughts=p.thoughts or {}
     p.thoughts.font=level
     self.store:save_preferences(p)
-    if ThoughtNativePopup and type(ThoughtNativePopup.refresh_font)=="function" then
-        pcall(ThoughtNativePopup.refresh_font,self:_thought_font_size(level),self:_thought_font_name(p.thoughts))
-    end
+    self:_refresh_thought_display(p.thoughts)
     self:toast("评论字号已设为："..self:_thought_font_size_label(),2)
     return true
+end
+
+function Plugin:_refresh_thought_display(prefs)
+    prefs=prefs or (self.store:preferences().thoughts or {})
+    if ThoughtNativePopup and type(ThoughtNativePopup.refresh_font)=="function" then
+        pcall(ThoughtNativePopup.refresh_font,
+            self:_thought_font_size(prefs.font or "standard"),
+            self:_thought_font_name(prefs))
+    end
 end
 
 function Plugin:_toggle_thought_follow_body_font()
     local p=self.store:preferences(); p.thoughts=p.thoughts or {}
     p.thoughts.follow_body_font=p.thoughts.follow_body_font~=true
     self.store:save_preferences(p)
+    self:_refresh_thought_display(p.thoughts)
     return true
 end
 
@@ -6864,9 +6913,6 @@ function Plugin:_show_reader_font_panel(back_callback)
                     {label="正文字体",value=self:_reader_font_label(),callback=function() self:_show_reader_font_face_menu(return_to_font) end},
                     {label="行距与页边距",value=tostring(math.floor(self:_reader_line_spacing_value()+.5)).."%",callback=function() self:_show_reader_spacing_panel(return_to_font) end},
                     {label="字体粗细与对齐",value=self:_reader_font_weight_label(),callback=function() self:_show_reader_weight_panel(return_to_font) end},
-                    {label="评论显示",value=self:_thought_font_size_label(),callback=function()
-                        self:_show_reader_comment_settings(return_to_font)
-                    end},
                 }},
                 {title="高级",rows={
                     {label="KOReader 高级排版",value="页边距、字距与复杂版式",value_bold=true,callback=function() self:_show_reader_typeset_menu(return_to_font) end},
@@ -7418,7 +7464,7 @@ function Plugin:_reader_panel_definitions(progress)
         font={key="font",icon="Aa",label="字体排版",detail="字号 "..self:_reader_font_size_label(),callback=function() self:_show_reader_font_panel() end},
         frontlight={key="frontlight",icon="☼",label="前光",detail=Device:hasFrontlight() and "亮度与色温" or "设备不支持",enabled=Device:hasFrontlight(),callback=function() self:_show_reader_frontlight_panel() end},
         sync={key="sync",icon="⇅",label="阅读同步",detail=self:progress_sync_label(),callback=function() self:_show_reader_sync_panel() end},
-        comment_font={key="comment_font",icon="A✎",label="评论字号",detail=self:_thought_font_size_label(),callback=function()
+        comment_font={key="comment_font",icon="A✎",label="评论显示",detail=self:_thought_font_size_label(),callback=function()
             self:_show_reader_comment_settings(function() self:show_reader_quick_panel() end)
         end},
         page_display={key="page_display",icon="▤",label="页面显示",detail="状态栏与刷新",callback=function() self:_show_reader_page_display_panel() end},
@@ -12274,6 +12320,7 @@ function Plugin:thought_font_settings_menu()
             local p=self.store:preferences(); p.thoughts=p.thoughts or {}
             p.thoughts.follow_body_font=p.thoughts.follow_body_font~=true
             self.store:save_preferences(p)
+            self:_refresh_thought_display(p.thoughts)
             if p.thoughts.follow_body_font then
                 self:toast("评论字体将跟随正文")
             else
@@ -12292,41 +12339,85 @@ function Plugin:_thought_font_face_label(prefs)
     local name=U.trim(tostring(prefs.font_face or ""))
     return name~="" and name or "KOReader 默认"
 end
-function Plugin:thought_font_face_menu()
-    local rows={
-        {text="KOReader 默认字体（最快）",radio=true,menu_item_id="__default__",checked_func=function()
-            return U.trim(tostring((self.store:preferences().thoughts or {}).font_face or ""))==""
-        end,callback=function()
-            local p=self.store:preferences(); p.thoughts=p.thoughts or {}
-            p.thoughts.font_face=""; p.thoughts.follow_body_font=false
-            self.store:save_preferences(p); self:toast("评论字体已设为 KOReader 默认字体")
-        end},
-    }
+function Plugin:_reader_font_face_choices()
+    local choices={}
+    local seen={}
+    local font=self.ui and self.ui.font or nil
+    if font and type(font.setupFaceMenuTable)=="function" then
+        pcall(font.setupFaceMenuTable,font)
+    end
+    for _,item in ipairs(font and type(font.face_table)=="table" and font.face_table or {}) do
+        local name=U.trim(tostring(item.menu_item_id or ""))
+        if name~="" and not seen[name] then
+            seen[name]=true
+            local label=name
+            if type(item.text_func)=="function" then
+                local ok,value=pcall(item.text_func)
+                if ok and U.trim(tostring(value or ""))~="" then label=tostring(value) end
+            elseif U.trim(tostring(item.text or ""))~="" then
+                label=tostring(item.text)
+            end
+            choices[#choices+1]={name=name,label=label,font_func=item.font_func}
+        end
+    end
+    if #choices>0 then return choices end
+
+    -- Compatibility fallback for older KOReader versions that do not expose
+    -- ReaderFont.face_table. This is the same CRE font source used by KOReader.
     local ok,faces=pcall(function()
         local cre=require("document/credocument"):engineInit()
         return cre and cre.getFontFaces and cre.getFontFaces() or {}
     end)
-    if not ok or type(faces)~="table" then
-        rows[#rows+1]={text="无法读取设备字体列表",enabled=false}
-        return rows
+    if ok and type(faces)=="table" then
+        for _,value in ipairs(faces) do
+            local name=U.trim(tostring(value or ""))
+            if name~="" and not seen[name] then
+                seen[name]=true
+                choices[#choices+1]={name=name,label=name}
+            end
+        end
+        table.sort(choices,function(a,b) return a.name:lower()<b.name:lower() end)
     end
-    local unique,list={},{}
-    for _,face in ipairs(faces) do
-        face=U.trim(tostring(face or ""))
-        if face~="" and not unique[face] then unique[face]=true; list[#list+1]=face end
-    end
-    table.sort(list,function(a,b) return a:lower()<b:lower() end)
-    for _,face in ipairs(list) do
-        local selected=face
-        rows[#rows+1]={text=selected,radio=true,menu_item_id=selected,checked_func=function()
-            return tostring((self.store:preferences().thoughts or {}).font_face or "")==selected
+    return choices
+end
+
+function Plugin:thought_font_face_menu()
+    local rows={
+        {text="KOReader 默认字体",radio=true,menu_item_id="__default__",checked_func=function()
+            return U.trim(tostring((self.store:preferences().thoughts or {}).font_face or ""))==""
         end,callback=function()
             local p=self.store:preferences(); p.thoughts=p.thoughts or {}
-            p.thoughts.font_face=selected; p.thoughts.follow_body_font=false
-            self.store:save_preferences(p); self:toast("评论字体已设为："..selected)
-        end}
+            p.thoughts.font_face=""; p.thoughts.follow_body_font=false
+            self.store:save_preferences(p)
+            self:_refresh_thought_display(p.thoughts)
+            self:toast("评论字体已设为 KOReader 默认字体")
+        end},
+    }
+    local choices=self:_reader_font_face_choices()
+    if #choices==0 then
+        rows[#rows+1]={text="无法读取正文字体列表",enabled=false}
+        return rows
     end
-    rows.max_per_page=7
+    for _,choice in ipairs(choices) do
+        local selected=choice.name
+        rows[#rows+1]={
+            text=choice.label,
+            font_func=choice.font_func,
+            radio=true,
+            menu_item_id=selected,
+            checked_func=function()
+                return tostring((self.store:preferences().thoughts or {}).font_face or "")==selected
+            end,
+            callback=function()
+                local p=self.store:preferences(); p.thoughts=p.thoughts or {}
+                p.thoughts.font_face=selected; p.thoughts.follow_body_font=false
+                self.store:save_preferences(p)
+                self:_refresh_thought_display(p.thoughts)
+                self:toast("评论字体已设为："..selected)
+            end,
+        }
+    end
+    rows.max_per_page=5
     rows.open_on_menu_item_id_func=function()
         local face=U.trim(tostring((self.store:preferences().thoughts or {}).font_face or ""))
         return face~="" and face or "__default__"
@@ -12723,19 +12814,15 @@ function Plugin:_teardown_thought_tap()
     self._thought_tap_setup=nil
 end
 function Plugin:_thought_font_size(level)
-    -- Shift every visible level down once: the previous "small" is now the
-    -- default "standard", while the former oversized xlarge level is removed.
-    local former_standard=math.max(15,Device.screen:scaleBySize(15))
-    local former_small=math.max(12,math.floor(former_standard*.78+.5))
+    -- One visible level maps to one final rendered size. Do not shift the
+    -- labels through a second legacy scale before passing them to the popup.
+    local standard=math.max(15,Device.screen:scaleBySize(15))
     local sizes={
-        small=math.max(10,math.floor(former_small*.82+.5)),
-        standard=former_small,
-        large=former_standard,
-        xlarge=math.floor(former_standard*1.24+.5),
+        small=math.max(12,math.floor(standard*.84+.5)),
+        standard=standard,
+        large=math.max(standard+2,math.floor(standard*1.16+.5)),
+        xlarge=math.max(standard+5,math.floor(standard*1.32+.5)),
     }
-    sizes.small=math.min(sizes.standard-2,sizes.small)
-    sizes.large=math.max(sizes.standard+2,sizes.large)
-    sizes.xlarge=math.max(sizes.large+3,sizes.xlarge)
     return sizes[tostring(level or "standard")] or sizes.standard
 end
 local function usable_font_name(value)
@@ -12749,9 +12836,6 @@ function Plugin:_thought_font_name(prefs)
     if prefs.follow_body_font~=true then
         return usable_font_name(prefs.font_face)
     end
-    local name=usable_font_name(self.ui and self.ui.font and self.ui.font.font_face)
-    if name then return name end
-
     local doc=self.ui and self.ui.document
     if doc and type(doc.getFontFace)=="function" then
         local ok,value=pcall(doc.getFontFace,doc)
@@ -12760,6 +12844,9 @@ function Plugin:_thought_font_name(prefs)
             if name then return name end
         end
     end
+
+    local name=usable_font_name(self.ui and self.ui.font and self.ui.font.font_face)
+    if name then return name end
 
     if _G.G_reader_settings and type(_G.G_reader_settings.readSetting)=="function" then
         local ok,value=pcall(_G.G_reader_settings.readSetting,_G.G_reader_settings,"cre_font")
