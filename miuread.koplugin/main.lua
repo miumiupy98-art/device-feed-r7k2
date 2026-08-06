@@ -4624,6 +4624,7 @@ function Plugin:_show_home_settings_popup(anchor)
             {icon="A",label="阅读界面",detail="阅读快捷栏和显示方式",callback=function() self:_show_standalone_menu("阅读界面",self:reader_quick_panel_settings_menu()) end},
             {icon="⇩",label="下载与存储",detail="下载策略、目录和清理",callback=function() self:_show_standalone_menu("下载与存储",self:download_settings_menu()) end},
             {icon="⇅",label="账号与同步",detail="登录状态和同步设置",callback=function() self:_show_standalone_menu("账号与同步",self:account_sync_settings_menu()) end},
+            {icon="↻",label="更新设置",detail="检查更新、频率和安装后操作",callback=function() self:_show_standalone_menu("更新设置",self:update_settings_menu()) end},
             {icon="⚙",label="全部设置",detail="打开完整觅阅设置",callback=function() self:_show_standalone_menu("觅阅设置",self:settings_menu()) end},
         },
     }
@@ -6161,7 +6162,7 @@ function Plugin:show_home_quick_panel(more_expanded)
         wifi={
             icon="Wi-Fi",
             icon_path=ROOT.."/resources/"..(wifi_on==false and "wifi-off.svg" or (state.online==true and "wifi-connected.svg" or "wifi-disconnected.svg")),
-            label="Wi-Fi",detail=wifi_detail,
+            label="Wi-Fi",detail=wifi_detail.." · 长按换网",
             callback=function() self:_home_wifi_toggle() end,
             hold_callback=function() self:_home_wifi_settings() end
         },
@@ -6662,7 +6663,7 @@ end
 
 function Plugin:_thought_font_size_label()
     local level=tostring((self.store:preferences().thoughts or {}).font or "standard")
-    local labels={small="小",standard="标准",large="大",xlarge="特大"}
+    local labels={small="小（18）",standard="标准（22）",large="大（26）",xlarge="特大（30）"}
     return labels[level] or labels.standard
 end
 
@@ -6713,10 +6714,10 @@ function Plugin:_show_reader_comment_settings(back_callback)
                 {label="固定字体",value=self:_thought_font_face_label(prefs),enabled=not follow,callback=function()
                     self:_show_standalone_menu("评论字体",self:thought_font_face_menu(),{native_input=true,reader_context=true,on_home=function() return self:return_to_miuread_home("reader surface") end,on_close=return_to_comments})
                 end},
-                {label="小",value=level=="small" and "已选择" or "",checked=level=="small",keep_open=true,callback=function() self:_set_thought_font_size("small") end},
-                {label="标准",value=level=="standard" and "已选择" or "",checked=level=="standard",keep_open=true,callback=function() self:_set_thought_font_size("standard") end},
-                {label="大",value=level=="large" and "已选择" or "",checked=level=="large",keep_open=true,callback=function() self:_set_thought_font_size("large") end},
-                {label="特大",value=level=="xlarge" and "已选择" or "",checked=level=="xlarge",keep_open=true,callback=function() self:_set_thought_font_size("xlarge") end},
+                {label="小",value=level=="small" and "18 · 已选择" or "18",checked=level=="small",keep_open=true,callback=function() self:_set_thought_font_size("small") end},
+                {label="标准",value=level=="standard" and "22 · 已选择" or "22",checked=level=="standard",keep_open=true,callback=function() self:_set_thought_font_size("standard") end},
+                {label="大",value=level=="large" and "26 · 已选择" or "26",checked=level=="large",keep_open=true,callback=function() self:_set_thought_font_size("large") end},
+                {label="特大",value=level=="xlarge" and "30 · 已选择" or "30",checked=level=="xlarge",keep_open=true,callback=function() self:_set_thought_font_size("xlarge") end},
             }
         end,
     }
@@ -12814,16 +12815,12 @@ function Plugin:_teardown_thought_tap()
     self._thought_tap_setup=nil
 end
 function Plugin:_thought_font_size(level)
-    -- One visible level maps to one final rendered size. Do not shift the
-    -- labels through a second legacy scale before passing them to the popup.
-    local standard=math.max(15,Device.screen:scaleBySize(15))
-    local sizes={
-        small=math.max(12,math.floor(standard*.84+.5)),
-        standard=standard,
-        large=math.max(standard+2,math.floor(standard*1.16+.5)),
-        xlarge=math.max(standard+5,math.floor(standard*1.32+.5)),
-    }
-    return sizes[tostring(level or "standard")] or sizes.standard
+    -- These are final KOReader font-size values, matching the scale used by
+    -- document text. Each level is scaled exactly once for the current device;
+    -- no hidden ratio or legacy level conversion is applied afterwards.
+    local nominal={small=18,standard=22,large=26,xlarge=30}
+    local value=nominal[tostring(level or "standard")] or nominal.standard
+    return math.max(value,Device.screen:scaleBySize(value))
 end
 local function usable_font_name(value)
     if type(value)~="string" then return nil end
