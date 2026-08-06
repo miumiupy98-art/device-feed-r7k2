@@ -22,6 +22,8 @@ local U = require("miuread.util")
 local Size = require("ui/size")
 
 local Screen = Device.screen
+local MUTED_TEXT_COLOR = Blitbuffer.COLOR_GRAY or Blitbuffer.COLOR_DARK_GRAY
+local SEPARATOR_COLOR = Blitbuffer.COLOR_GRAY or Blitbuffer.COLOR_DARK_GRAY
 local live_popup
 local pooled_popup
 
@@ -66,6 +68,43 @@ function OffsetContainer:getSize()
 end
 function OffsetContainer:paintTo(bb, x, y)
     self[1]:paintTo(bb, x + self.x_off, y + self.y_off)
+end
+
+local Separator = Widget:extend{
+    dimen = nil,
+    dashed = false,
+    inset = 0,
+    top_padding = 0,
+    line_size = 1,
+    dash_width = 8,
+    dash_gap = 6,
+    color = SEPARATOR_COLOR,
+}
+function Separator:getSize()
+    return self.dimen or Geom:new{w = 1, h = 1}
+end
+function Separator:paintTo(bb, x, y)
+    local dimen = self:getSize()
+    self.dimen.x, self.dimen.y = x, y
+    local inset = math.max(0, math.floor(tonumber(self.inset) or 0))
+    local line_size = math.max(1, math.floor(tonumber(self.line_size) or 1))
+    local line_width = math.max(1, math.floor(dimen.w - inset * 2))
+    local line_x = x + inset
+    local line_y = y + math.max(0, math.floor(tonumber(self.top_padding) or 0))
+    local color = self.color or SEPARATOR_COLOR
+    if not self.dashed then
+        bb:paintRect(line_x, line_y, line_width, line_size, color)
+        return
+    end
+
+    local dash_width = math.max(1, math.floor(tonumber(self.dash_width) or 1))
+    local dash_gap = math.max(1, math.floor(tonumber(self.dash_gap) or 1))
+    local offset = 0
+    while offset < line_width do
+        local width = math.min(dash_width, line_width - offset)
+        bb:paintRect(line_x + offset, line_y, width, line_size, color)
+        offset = offset + dash_width + dash_gap
+    end
 end
 
 local CloseButton = InputContainer:extend{dimen = nil, callback = nil}
@@ -351,6 +390,11 @@ function NativePopup:_layout_metrics(base_size)
     local body_size = math.max(12, math.floor((tonumber(base_size) or 15) + .5))
     local meta_size = math.max(10, math.floor(body_size * .72 + .5))
     local source_size = math.max(11, math.floor(body_size * .82 + .5))
+    local separator_line_size = math.max(1, Screen:scaleBySize(1))
+    local source_separator_top = math.max(6, math.floor(body_size * .40))
+    local source_separator_bottom = math.max(8, math.floor(body_size * .52))
+    local comment_separator_top = math.max(6, math.floor(body_size * .40))
+    local comment_separator_bottom = comment_separator_top
     return {
         body_size = body_size,
         meta_size = meta_size,
@@ -359,10 +403,46 @@ function NativePopup:_layout_metrics(base_size)
         meta_face = make_face(self.font_name, meta_size, "smallinfofont"),
         source_face = make_face(self.font_name, source_size, "smallinfofont"),
         meta_body_gap = math.max(5, math.floor(body_size * .22)),
-        entry_gap = math.max(11, math.floor(body_size * .42)),
         body_line_height = 0.20,
         frame_guard = math.max(6, math.floor(body_size * .22)),
+        separator_side_inset = math.max(10, math.floor(body_size * .65)),
+        separator_line_size = separator_line_size,
+        separator_dash_width = math.max(8, math.floor(body_size * .58)),
+        separator_dash_gap = math.max(6, math.floor(body_size * .42)),
+        source_separator_top = source_separator_top,
+        source_separator_bottom = source_separator_bottom,
+        source_separator_height = source_separator_top + separator_line_size + source_separator_bottom,
+        comment_separator_top = comment_separator_top,
+        comment_separator_bottom = comment_separator_bottom,
+        comment_separator_height = comment_separator_top + separator_line_size + comment_separator_bottom,
     }
+end
+
+function NativePopup:_separator_widget(width, metrics, dashed, source_separator, extra_inset)
+    local top_padding = source_separator and metrics.source_separator_top or metrics.comment_separator_top
+    local bottom_padding = source_separator and metrics.source_separator_bottom or metrics.comment_separator_bottom
+    local line_size = metrics.separator_line_size
+    return Separator:new{
+        dimen = Geom:new{
+            w = math.max(1, width),
+            h = math.max(1, top_padding + line_size + bottom_padding),
+        },
+        dashed = dashed == true,
+        inset = math.max(0, (tonumber(extra_inset) or 0) + metrics.separator_side_inset),
+        top_padding = top_padding,
+        line_size = line_size,
+        dash_width = metrics.separator_dash_width,
+        dash_gap = metrics.separator_dash_gap,
+        color = SEPARATOR_COLOR,
+    }
+end
+
+local function needs_comment_separator(previous_piece, current_piece)
+    if not previous_piece or not current_piece then return false end
+    local previous_index = tonumber(previous_piece.comment_index)
+    local current_index = tonumber(current_piece.comment_index)
+    if previous_index and current_index then return previous_index ~= current_index end
+    return not current_piece.continuation
 end
 
 function NativePopup:_piece_widget(piece, width, metrics)
@@ -383,11 +463,11 @@ function NativePopup:_piece_widget(piece, width, metrics)
 
     -- Let KOReader measure the author row with the same face it will paint.
     -- A forced height clipped or completely hid author names on later pages on
-    -- some Kindle font metrics. Keep it natural and dark enough to remain
-    -- visible on e-ink.
+    -- some Kindle font metrics. Keep the row muted so the comment body remains
+    -- the primary reading focus.
     group[#group + 1] = self:_text_box(meta, metrics.meta_face, width, {
         line_height = 0.10,
-        fgcolor = Blitbuffer.COLOR_BLACK,
+        fgcolor = MUTED_TEXT_COLOR,
     })
     group[#group + 1] = VerticalSpan:new{height = metrics.meta_body_gap}
     group[#group + 1] = self:_text_box(content, metrics.body_face, width, {
@@ -446,7 +526,9 @@ function NativePopup:_paginate_comments(width, maximum_height, metrics)
     local function page_height(items)
         local total = 0
         for index, piece in ipairs(items or {}) do
-            if index > 1 then total = total + metrics.entry_gap end
+            if index > 1 and needs_comment_separator(items[index - 1], piece) then
+                total = total + metrics.comment_separator_height
+            end
             local measured = self:_measure_piece(piece, width, metrics)
             total = total + measured
         end
@@ -460,7 +542,8 @@ function NativePopup:_paginate_comments(width, maximum_height, metrics)
         end
     end
     local function add(piece, height)
-        local gap = #page > 0 and metrics.entry_gap or 0
+        local gap = #page > 0 and needs_comment_separator(page[#page], piece)
+            and metrics.comment_separator_height or 0
         page[#page + 1] = piece
         used = used + gap + height
     end
@@ -477,15 +560,17 @@ function NativePopup:_paginate_comments(width, maximum_height, metrics)
             local remaining_content = item.content
             local continuation = false
             while remaining_content ~= "" do
-                local gap = #page > 0 and metrics.entry_gap or 0
-                local available = math.max(1, maximum_height - used - gap)
-                local whole_piece = {
+                local probe_piece = {
                     author = item.author,
                     likes = item.likes,
                     content = remaining_content,
                     continuation = continuation,
                     comment_index = item.comment_index,
                 }
+                local gap = #page > 0 and needs_comment_separator(page[#page], probe_piece)
+                    and metrics.comment_separator_height or 0
+                local available = math.max(1, maximum_height - used - gap)
+                local whole_piece = probe_piece
                 local whole_height = self:_measure_piece(whole_piece, width, metrics)
 
                 if whole_height <= available then
@@ -613,8 +698,8 @@ function NativePopup:_build_comment_page(width, metrics, target_height)
         })
     else
         for index, piece in ipairs(page) do
-            if index > 1 then
-                group[#group + 1] = VerticalSpan:new{height = metrics.entry_gap}
+            if index > 1 and needs_comment_separator(page[index - 1], piece) then
+                group[#group + 1] = self:_separator_widget(width, metrics, true, false)
             end
             local widget = self:_piece_widget(piece, width, metrics)
             group[#group + 1] = widget
@@ -679,14 +764,15 @@ function NativePopup:_build(reset_pages, anchor_comment)
     local comment_w = math.max(1, inner_w - frame_guard * 2)
 
     local source_group, source_h = self:_build_source(inner_w, metrics, close_size)
-    local source_gap = clean(self.source_text) ~= "" and math.max(10, Screen:scaleBySize(7)) or 0
+    local has_source = clean(self.source_text) ~= ""
+    local source_separator_h = has_source and metrics.source_separator_height or 0
     local bottom_padding = math.max(4, Screen:scaleBySize(3))
     local indicator_gap = math.max(4, Screen:scaleBySize(3))
     local indicator_height = math.max(metrics.meta_size + math.max(4, Screen:scaleBySize(2)), Screen:scaleBySize(14))
     local indicator_reserve = indicator_gap + indicator_height
     local maximum_comments_h = math.max(
         metrics.body_size * 3,
-        maximum_height - inset * 2 - source_h - source_gap - bottom_padding - indicator_reserve
+        maximum_height - inset * 2 - source_h - source_separator_h - bottom_padding - indicator_reserve
     )
 
     if reset_pages or not self.pages then
@@ -730,7 +816,11 @@ function NativePopup:_build(reset_pages, anchor_comment)
 
     local content_group = VerticalGroup:new{align = "left"}
     content_group[#content_group + 1] = source_group
-    if source_gap > 0 then content_group[#content_group + 1] = VerticalSpan:new{height = source_gap} end
+    if has_source then
+        content_group[#content_group + 1] = self:_separator_widget(
+            inner_w, metrics, false, true, frame_guard
+        )
+    end
     content_group[#content_group + 1] = guarded_comments
     local indicator_index
     if indicator_container then
@@ -761,7 +851,7 @@ function NativePopup:_build(reset_pages, anchor_comment)
     self.popup_dimen = Geom:new{x = popup_x, y = popup_y, w = width, h = height}
     self.comments_dimen = Geom:new{
         x = popup_x + inset + frame_guard,
-        y = popup_y + inset + source_h + source_gap,
+        y = popup_y + inset + source_h + source_separator_h,
         w = comment_w,
         h = math.max(1, comments_h),
     }
