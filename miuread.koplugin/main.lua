@@ -6010,14 +6010,17 @@ function Plugin:_home_wifi_settings()
     local ok_nm,NetworkMgr=pcall(require,"ui/network/manager")
     if not ok_nm or not NetworkMgr then self:info("当前设备无法使用网络设置"); return false end
 
-    local function refresh_status()
-        UIManager:scheduleIn(.4,function() self:_refresh_home_view(nil,"header") end)
-        UIManager:scheduleIn(2,function() self:_refresh_home_view(nil,"header") end)
+    -- Only refresh the MiuRead home after KOReader's network picker has
+    -- actually closed. Refreshing while it is visible rebuilds the home view
+    -- over the picker and makes the network list disappear immediately.
+    local function refresh_after_picker_close()
+        UIManager:scheduleIn(.15,function()
+            self:_refresh_home_view(nil,"header")
+        end)
     end
 
     local function show_network_list()
-        -- When Wi-Fi is already running, open KOReader's own network list
-        -- directly instead of turning the radio off and back on.
+        -- Wi-Fi is already on: build KOReader's native network picker directly.
         if type(NetworkMgr.getNetworkList)=="function" then
             local ok_list,networks=pcall(NetworkMgr.getNetworkList,NetworkMgr)
             if ok_list and type(networks)=="table" then
@@ -6025,23 +6028,38 @@ function Plugin:_home_wifi_settings()
                 if ok_widget and NetworkSetting and type(NetworkSetting.new)=="function" then
                     local dialog=NetworkSetting:new{
                         network_list=networks,
-                        connect_callback=refresh_status,
-                        disconnect_callback=refresh_status,
+                        -- NetworkSetting may stay open after a disconnect or a
+                        -- failed attempt. Do not rebuild the home from these
+                        -- callbacks; its close hook performs the single refresh.
+                        connect_callback=function() end,
+                        disconnect_callback=function() end,
                     }
+                    local original_on_close=dialog.onCloseWidget
+                    dialog.onCloseWidget=function(widget)
+                        if type(original_on_close)=="function" then
+                            local ok_close,err=xpcall(function()
+                                original_on_close(widget)
+                            end,debug.traceback)
+                            if not ok_close then
+                                logger.warn("[MiuRead][Home] network picker close failed",tostring(err))
+                            end
+                        end
+                        refresh_after_picker_close()
+                    end
                     UIManager:show(dialog)
-                    refresh_status()
                     return true
                 end
             end
         end
-        -- Device backends that manage their own picker use KOReader's
-        -- long-press flag on the normal Wi-Fi toggle entry.
+
+        -- Backends with their own picker use KOReader's long-press flag.
+        -- Their completion callback runs after the picker has been dismissed.
         if type(NetworkMgr.toggleWifiOn)=="function" then
-            local ok=pcall(NetworkMgr.toggleWifiOn,NetworkMgr,refresh_status,true,true)
+            local ok=pcall(NetworkMgr.toggleWifiOn,NetworkMgr,refresh_after_picker_close,true,true)
             if ok then return true end
         end
         if type(NetworkMgr.turnOnWifi)=="function" then
-            local ok=pcall(NetworkMgr.turnOnWifi,NetworkMgr,refresh_status,true)
+            local ok=pcall(NetworkMgr.turnOnWifi,NetworkMgr,refresh_after_picker_close,true)
             if ok then return true end
         end
         return false
@@ -6053,14 +6071,12 @@ function Plugin:_home_wifi_settings()
     if on then
         if show_network_list() then return true end
     elseif type(NetworkMgr.toggleWifiOn)=="function" then
-        -- The long-press flag asks KOReader to display the available network
-        -- list after enabling Wi-Fi, rather than silently reconnecting only.
-        local ok=pcall(NetworkMgr.toggleWifiOn,NetworkMgr,refresh_status,true,true)
-        if ok then refresh_status(); return true end
+        -- Ask KOReader to enable Wi-Fi and show the available network list.
+        local ok=pcall(NetworkMgr.toggleWifiOn,NetworkMgr,refresh_after_picker_close,true,true)
+        if ok then return true end
     elseif type(NetworkMgr.turnOnWifi)=="function" then
         local ok=pcall(NetworkMgr.turnOnWifi,NetworkMgr,function()
             UIManager:scheduleIn(.1,show_network_list)
-            refresh_status()
         end,true)
         if ok then return true end
     end
