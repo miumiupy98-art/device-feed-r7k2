@@ -57,10 +57,21 @@ local function fixed_frame(width, height, options, content)
     }
 end
 
-local TapBox = InputContainer:extend{dimen = nil, callback = nil}
+local TapBox = InputContainer:extend{
+    dimen = nil,
+    callback = nil,
+    hold_callback = nil,
+    _hold_handled = false,
+}
 function TapBox:init()
     self.dimen = self.dimen or Geom:new{w = 1, h = 1}
-    self.ges_events = {TapSelect = {GestureRange:new{ges = "tap", range = self.dimen}}}
+    self.ges_events = {
+        TapSelect = {GestureRange:new{ges = "tap", range = self.dimen}},
+    }
+    if self.hold_callback then
+        self.ges_events.HoldSelect = {GestureRange:new{ges = "hold", range = self.dimen}}
+        self.ges_events.HoldReleaseSelect = {GestureRange:new{ges = "hold_release", range = self.dimen}}
+    end
 end
 function TapBox:getSize() return Geom:new{w = self.dimen.w, h = self.dimen.h} end
 function TapBox:paintTo(bb, x, y)
@@ -68,12 +79,35 @@ function TapBox:paintTo(bb, x, y)
     if self[1] then self[1]:paintTo(bb, x, y) end
 end
 function TapBox:onTapSelect()
+    if self._hold_handled then
+        self._hold_handled = false
+        return true
+    end
     if self.callback then self.callback(self.dimen and self.dimen:copy() or nil) end
     return true
 end
+function TapBox:onHoldSelect()
+    self._hold_handled = false
+    if self.hold_callback then
+        self._hold_handled = true
+        self.hold_callback(self.dimen and self.dimen:copy() or nil)
+    end
+    return true
+end
+function TapBox:onHoldReleaseSelect()
+    if self._hold_handled then
+        self._hold_handled = false
+        return true
+    end
+    return false
+end
 
-local function tappable(width, height, child, callback)
-    local tap = TapBox:new{dimen = Geom:new{w = width, h = height}, callback = callback}
+local function tappable(width, height, child, callback, hold_callback)
+    local tap = TapBox:new{
+        dimen = Geom:new{w = width, h = height},
+        callback = callback,
+        hold_callback = hold_callback,
+    }
     tap[1] = CenterContainer:new{dimen = Geom:new{w = width, h = height}, child}
     return tap
 end
@@ -120,21 +154,26 @@ local function panel_button(entry, width, height, close_callback, compact)
         background = Blitbuffer.COLOR_WHITE,
         color = enabled and Blitbuffer.COLOR_GRAY or (Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_GRAY),
     }, CenterContainer:new{dimen = Geom:new{w = inner_w, h = math.max(1, height - pad * 2)}, content})
-    return tappable(width, height, card, function(anchor)
-        if not enabled then return end
+
+    local function run_action(action, anchor)
+        if not enabled or type(action) ~= "function" then return end
         if entry.keep_open == true then
-            if entry.callback then
-                UIManager:nextTick(function()
-                    local ok, err = pcall(entry.callback, anchor)
-                    if not ok then logger.warn("[MiuRead][QuickPanel] action failed", tostring(err)) end
-                end)
-            end
+            UIManager:nextTick(function()
+                local ok, err = pcall(action, anchor)
+                if not ok then logger.warn("[MiuRead][QuickPanel] action failed", tostring(err)) end
+            end)
             return
         end
         if close_callback then
-            close_callback(entry.callback and function() return entry.callback(anchor) end or nil)
+            close_callback(function() return action(anchor) end)
         end
-    end)
+    end
+
+    return tappable(width, height, card,
+        function(anchor) run_action(entry.callback, anchor) end,
+        type(entry.hold_callback) == "function"
+            and function(anchor) run_action(entry.hold_callback, anchor) end
+            or nil)
 end
 
 local QuickPanelWidget = InputContainer:extend{
