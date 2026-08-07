@@ -43,7 +43,6 @@ local HomeView=require("miuread.home_view")
 local HomeQuickPanel=require("miuread.home_quick_panel")
 local ActionSheet=require("miuread.action_sheet")
 local ScreenshotMode=require("miuread.screenshot_mode")
-local NativeMenuBackdrop=require("miuread.native_menu_backdrop")
 local GestureBridge=require("miuread.gesture_bridge")
 local HomeData=require("miuread.home_data")
 local LocalLibrary=require("miuread.local_library")
@@ -231,7 +230,7 @@ end
 -- native menus and is raised again after the last native page closes.
 local NATIVE_MENU_GUARD=rawget(_G,"__MIUREAD_NATIVE_MENU_GUARD")
 if type(NATIVE_MENU_GUARD)~="table" then
-    NATIVE_MENU_GUARD={token=0,active=false,finishing=false,menu=nil,container=nil,watch=nil,backdrop=nil}
+    NATIVE_MENU_GUARD={token=0,active=false,finishing=false,menu=nil,container=nil,watch=nil}
     rawset(_G,"__MIUREAD_NATIVE_MENU_GUARD",NATIVE_MENU_GUARD)
 end
 local DIRECT_MENU_INSERTED=false
@@ -5776,9 +5775,7 @@ function Plugin:_cancel_native_menu_guard()
     NATIVE_MENU_GUARD.menu=nil
     NATIVE_MENU_GUARD.container=nil
     NATIVE_MENU_GUARD.watch=nil
-    NATIVE_MENU_GUARD.backdrop=nil
     NATIVE_MENU_GUARD.original_close=nil
-    NativeMenuBackdrop.close()
 end
 
 function Plugin:_return_from_native_filemanager()
@@ -5810,11 +5807,10 @@ function Plugin:_native_menu_overlay_present()
     local ok_fm,FileManager=pcall(require,"apps/filemanager/filemanager")
     local fm=ok_fm and FileManager and FileManager.instance or nil
     local reader=self:_active_reader_ui()
-    local backdrop=NativeMenuBackdrop.current()
     for _,window in ipairs(UIManager._window_stack or {}) do
         local widget=window and window.widget or nil
         if widget and widget~=fm and widget~=reader and widget~=HomeView.current()
-            and widget~=backdrop and widget.toast~=true then
+            and widget.toast~=true then
             return true
         end
     end
@@ -5898,7 +5894,6 @@ function Plugin:_guard_native_koreader_menu(menu)
     NATIVE_MENU_GUARD.finishing=false
     NATIVE_MENU_GUARD.menu=menu
     NATIVE_MENU_GUARD.container=menu.menu_container
-    NATIVE_MENU_GUARD.backdrop=nil
 
     HOME_SESSION_SUPPRESSED=false
     HOME_NATIVE_VISIT=false
@@ -5943,7 +5938,6 @@ function Plugin:_show_native_koreader_menu()
     HOME_SESSION.home_restore_generation=(tonumber(HOME_SESSION.home_restore_generation) or 0)+1
     HOME_SESSION.home_restore_active=false
     self:_ensure_filemanager_base(HOME_RETURN_FILE)
-    NativeMenuBackdrop.close()
     if HomeView.is_shown() then HomeView.raise(true) end
 
     HOME_SESSION_SUPPRESSED=false
@@ -8893,19 +8887,6 @@ function Plugin:_preferred_record(book_id)
     end
     return fallback
 end
-function Plugin:reverify_book_and_open(book_id,preferred_path)
-    book_id=tostring(book_id or "")
-    local record
-    if preferred_path then local _,matched=self.store:identify_file(preferred_path,false); record=matched end
-    record=record or self:_preferred_record(book_id) or self.access:first_record(book_id,nil,false)
-    local path=preferred_path or (record and record.file)
-    if not path then self:info("本地书籍记录不存在，请重新生成本书。"); return end
-    local resolved=self.access:resolve_path(book_id,path)
-    if resolved and U.file_exists(resolved) then self:_open_file_direct(resolved)
-    else self:info("本地 EPUB 不存在，请重新生成本书。") end
-end
-
-
 local function mp_date(value)
     value=tonumber(value or 0) or 0
     return value>0 and os.date("%Y-%m-%d",value) or ""

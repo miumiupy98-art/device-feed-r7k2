@@ -769,10 +769,6 @@ function Reader:state(book_id,chapter_uid)
     return load_reader_context(self,book_id,chapter_uid,true)
 end
 
-function Reader:access_state(book_id)
-    return load_reader_context(self,book_id,nil,false)
-end
-
 function Reader:catalog(book_id)
     local function load_catalog()
         local data = self.http:post_json(BASE .. "/web/book/chapterInfos", {bookIds={tostring(book_id)}},

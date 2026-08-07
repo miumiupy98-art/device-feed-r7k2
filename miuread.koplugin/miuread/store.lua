@@ -1278,32 +1278,6 @@ function Store:book_dir(id) local p=self:book_cache_path(id); U.mkdir(p); return
 function Store:epub_path(filename) local p=self:epub_root().."/"..tostring(filename); U.mkdir(self:epub_root()); return p end
 
 local function basename(path) return tostring(path or ""):match("([^/]+)$") end
-function Store:migrate_legacy_epubs()
-    local all=self.db:readSetting("library",{}) or {}
-    local changed=false
-    local root=self:epub_root()
-    local function move_record(record)
-        if type(record)~="table" or type(record.file)~="string" or record.file=="" then return end
-        if not U.file_exists(record.file) then return end
-        if record.file:sub(1,#root+1)==root.."/" then return end
-        if record.file:sub(1,#self.cache_books_dir+1)~=self.cache_books_dir.."/" then return end
-        local name=basename(record.file); if not name then return end
-        local target=root.."/"..name
-        if U.file_exists(target) then
-            local stem,ext=name:match("^(.*)(%.epub)$")
-            target=root.."/"..tostring(stem or name).." [迁移]"..tostring(ext or "")
-        end
-        local ok=os.rename(record.file,target)
-        if not ok then ok=U.copy_file(record.file,target); if ok then os.remove(record.file) end end
-        if ok then record.file=target; record.directory=root; changed=true end
-    end
-    for _,book in pairs(all) do
-        for _,record in pairs(book.variants or {}) do move_record(record) end
-        for _,row in pairs(book.chapters or {}) do for _,record in pairs(row or {}) do move_record(record) end end
-        if changed then book.directory=root end
-    end
-    if changed then self.db:saveSetting("library",all) end
-end
 function Store:library() return self:get("library",{}) end
 function Store:book(id) return self:library()[tostring(id)] end
 function Store:save_book(id,patch)
