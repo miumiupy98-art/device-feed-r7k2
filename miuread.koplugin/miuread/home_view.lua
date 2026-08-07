@@ -162,6 +162,9 @@ local function image_widget(path, width, height, ink_boost)
             -- target ratio, and this avoids the visible inner blank frame that
             -- scale-to-fit produced on Kindle.
             scale_factor = nil,
+            -- Always use MuPDF scaling for covers. Legacy scaling is faster on
+            -- a few old devices but visibly softer at small e-ink sizes.
+            use_legacy_image_scaling = false,
             file_do_cache = true,
         }
         image:getSize()
@@ -271,7 +274,7 @@ local function hero_card(book, width, height, callback, compact, hold_callback)
         math.floor(inner_h * .82)
     ))
     local cover_h = math.max(UiScale.dp(108, 92, 155), math.min(inner_h, math.floor(cover_w / .68)))
-    local cover = image_widget(book.cover_path, cover_w, cover_h, .10) or placeholder(cover_w, cover_h, book.title)
+    local cover = image_widget(book.cover_path, cover_w, cover_h, .05) or placeholder(cover_w, cover_h, book.title)
     local gap = math.max(UiScale.dp(9, 7, 14), math.floor(width * .014))
     local text_w = math.max(1, inner_w - cover_w - gap)
     local heading_h = UiScale.dp(22, 20, 30)
@@ -445,6 +448,23 @@ local function shelf_folder_card(folder, width, height, callback)
     end)
 end
 
+local function outlined_badge_text(text, width, height, badge_face)
+    local layer = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
+    local offsets = {{-1,0},{1,0},{0,-1},{0,1}}
+    for _, off in ipairs(offsets) do
+        layer[#layer + 1] = OffsetContainer:new{
+            x_off = off[1], y_off = off[2],
+            CenterContainer:new{dimen = Geom:new{w = width, h = height}, TextWidget:new{
+                text = text, face = badge_face, bold = true, fgcolor = Blitbuffer.COLOR_WHITE,
+            }},
+        }
+    end
+    layer[#layer + 1] = CenterContainer:new{dimen = Geom:new{w = width, h = height}, TextWidget:new{
+        text = text, face = badge_face, bold = true, fgcolor = Blitbuffer.COLOR_BLACK,
+    }}
+    return layer
+end
+
 local function shelf_book_card(book, width, height, callback, hold_callback)
     if book and (book.local_folder==true or book.kind=="folder") then
         return shelf_folder_card(book,width,height,callback)
@@ -457,24 +477,30 @@ local function shelf_book_card(book, width, height, callback, hold_callback)
         or book.downloaded == true or tostring(book.shelf_section or "") == "generated"
         or (book.file and tostring(book.file) ~= "" and U.file_exists(tostring(book.file)))
     local reading_badge = ""
-    if progress >= 100 then reading_badge = "已读"
+    if progress >= 100 then reading_badge = "100%"
     elseif progress > 0 then reading_badge = tostring(math.floor(progress + .5)) .. "%" end
 
+    local download_active = book.download_active == true
+    local download_progress = math.max(0, math.min(1, tonumber(book.download_progress) or 0))
     if status == "已生成" or status == "已下载" or status == "未生成" or status == "未开始"
-        or status == "已读完" or status:match("^阅读%s+%d+%%$") then
+        or status == "已读完" or status:match("^阅读%s+%d+%%$")
+        or status:match("下载中") or status:match("生成中") then
         status = ""
     end
     status = U.utf8_truncate(status, 10, "")
-    local status_important = status:match("下载中") or status:match("生成中")
-        or status == "失败" or status == "待修复" or status == "排队中"
+    local status_important = status == "失败" or status == "待修复" or status == "排队中"
+        or status == "批注待补全"
     if not status_important then status = "" end
 
     local title_h = math.max(UiScale.dp(29, 25, 40), math.min(UiScale.dp(39, 32, 47), math.floor(height * .155)))
     local status_h = status ~= "" and UiScale.dp(18, 15, 25) or 0
+    local download_h = download_active and UiScale.dp(4, 3, 6) or 0
     local vgap = UiScale.dp(2, 2, 4)
-    local cover_h = math.max(UiScale.dp(78, 64, 108), height - title_h - status_h - vgap * (status_h > 0 and 2 or 1))
+    local extra_h = status_h + download_h
+    local extra_gaps = (status_h > 0 and 1 or 0) + (download_h > 0 and 1 or 0)
+    local cover_h = math.max(UiScale.dp(78, 64, 108), height - title_h - extra_h - vgap * (1 + extra_gaps))
     local cover_w = math.max(UiScale.dp(54, 46, 78), math.min(math.floor(inner_w * .995), math.floor(cover_h * .715)))
-    local cover = image_widget(book.cover_path, cover_w, cover_h, .13) or placeholder(cover_w, cover_h, book.title)
+    local cover = image_widget(book.cover_path, cover_w, cover_h, .06) or placeholder(cover_w, cover_h, book.title)
 
     local cover_layer = OverlapGroup:new{dimen = Geom:new{w = cover_w, h = cover_h}, allow_mirroring = false}
     cover_layer[#cover_layer + 1] = cover
@@ -483,23 +509,17 @@ local function shelf_book_card(book, width, height, callback, hold_callback)
         local inset = UiScale.dp(2, 1, 4)
         cover_layer[#cover_layer + 1] = OffsetContainer:new{
             x_off = inset, y_off = inset,
-            fixed_frame(badge, badge, {
-                bordersize = UiScale.line("thin"), radius = UiScale.radius(5, 4, 8), padding = 0,
-                background = Blitbuffer.COLOR_WHITE, color = Blitbuffer.COLOR_BLACK,
-            }, TextWidget:new{text = "✓", face = face("cfont", 9.2, 13), bold = true, fgcolor = Blitbuffer.COLOR_BLACK}),
+            outlined_badge_text("✓", badge, badge, face("cfont", 9.4, 13.5)),
         }
     end
     if reading_badge ~= "" then
         local chars = math.max(2, U.utf8_len(reading_badge))
-        local badge_w = math.max(UiScale.dp(31, 26, 45), UiScale.dp(11, 9, 16) + chars * UiScale.dp(7, 6, 10))
+        local badge_w = math.max(UiScale.dp(31, 26, 45), UiScale.dp(9, 8, 14) + chars * UiScale.dp(7, 6, 10))
         local badge_h = UiScale.dp(20, 17, 27)
         local inset = UiScale.dp(2, 1, 4)
         cover_layer[#cover_layer + 1] = OffsetContainer:new{
             x_off = math.max(0, cover_w - badge_w - inset), y_off = inset,
-            fixed_frame(badge_w, badge_h, {
-                bordersize = UiScale.line("thin"), radius = UiScale.radius(5, 4, 8), padding = UiScale.dp(1, 1, 2),
-                background = Blitbuffer.COLOR_WHITE, color = Blitbuffer.COLOR_BLACK,
-            }, TextWidget:new{text = reading_badge, face = face("smallinfofont", 9.2, 13), bold = true, fgcolor = Blitbuffer.COLOR_BLACK}),
+            outlined_badge_text(reading_badge, badge_w, badge_h, face("smallinfofont", 9.2, 13)),
         }
     end
 
@@ -509,7 +529,13 @@ local function shelf_book_card(book, width, height, callback, hold_callback)
         face = face("cfont", 11.5, 16), bold = true, width = inner_w, height = title_h,
         height_adjust = false, height_overflow_show_ellipsis = true, alignment = "center",
     }
-    if status_h > 0 then
+    if download_h > 0 then
+        body[#body + 1] = VerticalSpan:new{height = vgap}
+        body[#body + 1] = CenterContainer:new{
+            dimen = Geom:new{w = inner_w, h = download_h},
+            progress_bar(math.max(UiScale.dp(44, 38, 68), math.floor(cover_w * .86)), download_h, download_progress),
+        }
+    elseif status_h > 0 then
         body[#body + 1] = TextBoxWidget:new{
             text = status, face = face("smallinfofont", 8.5, 12), bold = true, width = inner_w, height = status_h,
             height_adjust = false, height_overflow_show_ellipsis = true, alignment = "center", fgcolor = Blitbuffer.COLOR_BLACK,

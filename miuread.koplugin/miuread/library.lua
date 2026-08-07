@@ -13,6 +13,15 @@ local COVER_EXTENSIONS={
     [".svg"]=true,
 }
 
+local function cover_download_url(url)
+    url=tostring(url or "")
+    if url=="" then return url end
+    -- WeRead CDN cover URLs encode image size in the /tN_ token. t9 keeps a
+    -- noticeably cleaner source for e-ink downscaling without downloading
+    -- full-resolution artwork. Non-WeRead URLs are left untouched.
+    return url:gsub("/t%d+_", "/t9_")
+end
+
 local function truthy(value)
     if value==true then return true end
     if tonumber(value)==1 then return true end
@@ -570,7 +579,8 @@ function Library:cache_cover(b,options)
         if cached then return cached end
         if removed and persist_index then self.store:set("cover_index",index) end
     end
-    local data=self.http:download(b.cover,{
+    local download_url=cover_download_url(b.cover)
+    local data=self.http:download(download_url,{
         auth=false,
         retries=options.retries==nil and 1 or options.retries,
         timeout=options.timeout or {8,15},

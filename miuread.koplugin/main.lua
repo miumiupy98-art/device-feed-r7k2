@@ -6,6 +6,8 @@ local RawMenu=require("ui/widget/menu")
 local RawPathChooser=require("ui/widget/pathchooser")
 local UIManager=require("ui/uimanager")
 local Device=require("device")
+local Blitbuffer=require("ffi/blitbuffer")
+local ImageWidget=require("ui/widget/imagewidget")
 local Event=require("ui/event")
 local WidgetContainer=require("ui/widget/container/widgetcontainer")
 local logger=require("logger")
@@ -45,6 +47,7 @@ local ActionSheet=require("miuread.action_sheet")
 local ScreenshotMode=require("miuread.screenshot_mode")
 local GestureBridge=require("miuread.gesture_bridge")
 local HomeData=require("miuread.home_data")
+local TimeZone=require("miuread.timezone")
 local LocalLibrary=require("miuread.local_library")
 local LocalMetadata=require("miuread.local_metadata")
 local NetworkMetadata=require("miuread.network_metadata")
@@ -298,6 +301,8 @@ function Plugin:init()
     math.randomseed(os.time()+math.floor(collectgarbage("count")))
     sync_home_session()
     self.store=Store:new()
+    local timezone_ok,timezone_error=TimeZone.apply((self.store:preferences() or {}).time_display)
+    if not timezone_ok then logger.warn("[MiuRead][TimeZone] startup apply failed",tostring(timezone_error or "unknown")) end
     if HOME_SESSION.runtime_home_enabled==nil then
         local configured=((self.store:preferences().home_ui or {}).enabled~=false)
         HOME_SESSION.runtime_home_enabled=configured
@@ -392,6 +397,12 @@ function Plugin:init()
     self.download_task=DownloadTask:new(self.store)
     self.cache_cleanup_task=CacheCleanupTask:new(self.store)
     self.library=Library:new(self.api,self.http,self.store)
+    local cover_quality_version=tonumber(self.store:get("cover_quality_version",0)) or 0
+    if cover_quality_version<2 then
+        local cleared,clear_error=pcall(self.library.clear_covers,self.library)
+        if not cleared then logger.warn("[MiuRead][Cover] quality cache reset failed",tostring(clear_error or "unknown")) end
+        self.store:set("cover_quality_version",2)
+    end
     self.access=Access:new(self.library,self.api,self.reader,self.store)
     self.async=Async:new(self.store,{allow_android=true,disable_fallback=true})
     self.mp_async=Async:new(self.store,{poll_interval=.35,allow_android=true})
@@ -1325,6 +1336,8 @@ function Plugin:_prepare_shelf_rows(rows)
     local cover_index_changed=false
     local download_state=self:_download_state()
     for _,b in ipairs(rows or {}) do
+        b.download_active=false
+        b.download_progress=nil
         local removed
         b.cover_path,removed=self.library:cached_cover_path(b.bookId,cover_index)
         if removed then
@@ -1340,7 +1353,10 @@ function Plugin:_prepare_shelf_rows(rows)
             b.download_status=nil
         end
         if tostring(download_state.book_id or "")~="" and tostring(download_state.book_id)==tostring(b.bookId or "") then
-            if download_state.status=="active" then b.download_status="生成中 "..tostring(self:_download_percent(download_state)).."%"
+            if download_state.status=="active" then
+                b.download_active=true
+                b.download_progress=math.max(0,math.min(1,self:_download_percent(download_state)/100))
+                b.download_status=nil
             elseif download_state.status=="pending_install" then
                 b.download_status=DownloadResult.shelf_status(download_state,true)
             elseif download_state.status=="failed" or download_state.status=="interrupted" then b.download_status="生成未完成"
@@ -2786,6 +2802,140 @@ function Plugin:_set_home_section(section)
     end
 end
 
+function Plugin:_home_prepare_lockscreen_cover(book)
+    local source=book and tostring(book.cover_path or "") or ""
+    if source=="" or lfs.attributes(source,"mode")~="file" then return source~="" and source or nil end
+    local width,height=Device.screen:getWidth(),Device.screen:getHeight()
+    if width<=0 or height<=0 then return source end
+    local id=tostring(book.bookId or book.book_id or "")
+    if id=="" then
+        local hash=5381
+        for i=1,#source do hash=(hash*33+source:byte(i))%4294967296 end
+        id=string.format("local-%08x",hash)
+    end
+    local dir=self.store.data_dir.."/lockscreen"
+    U.mkdir(dir)
+    local target=dir.."/"..U.id_name(id).."-"..tostring(width).."x"..tostring(height)..".png"
+    local source_mtime=tonumber(lfs.attributes(source,"modification") or 0) or 0
+    local target_mtime=tonumber(lfs.attributes(target,"modification") or 0) or 0
+    if target_mtime>=source_mtime and (tonumber(U.file_size(target) or 0) or 0)>0 then return target end
+
+    local image,canvas
+    local ok,err=pcall(function()
+        local bbtype=Device.screen.bb and Device.screen.bb:getType() or Blitbuffer.TYPE_BB8
+        canvas=Blitbuffer.new(width,height,bbtype)
+        canvas:fill(Blitbuffer.COLOR_WHITE)
+        local margin=math.max(0,math.floor(math.min(width,height)*.025))
+        local inner_w=math.max(1,width-margin*2)
+        local inner_h=math.max(1,height-margin*2)
+        image=ImageWidget:new{
+            file=source,width=inner_w,height=inner_h,scale_factor=0,
+            use_legacy_image_scaling=false,file_do_cache=false,
+        }
+        image:getSize()
+        image:paintTo(canvas,margin,margin)
+        local written,write_error=pcall(canvas.writePNG,canvas,target)
+        if not written then error(write_error or "lockscreen write failed") end
+    end)
+    if image and type(image.free)=="function" then pcall(image.free,image) end
+    if canvas and type(canvas.free)=="function" then pcall(canvas.free,canvas) end
+    if not ok or lfs.attributes(target,"mode")~="file" then
+        os.remove(target)
+        logger.warn("[MiuRead][Cover] lockscreen cache failed",tostring(err or "unknown"))
+        return source
+    end
+    logger.info("[MiuRead][Cover] lockscreen cache ready",tostring(id),tostring(width).."x"..tostring(height))
+    return target
+end
+
+function Plugin:_time_preferences()
+    local preferences=self.store:preferences()
+    preferences.time_display=TimeZone.normalize(preferences.time_display)
+    return preferences.time_display,preferences
+end
+
+function Plugin:_save_time_preferences(value,preferences,message)
+    preferences=preferences or self.store:preferences()
+    preferences.time_display=TimeZone.normalize(value)
+    self.store:save_preferences(preferences)
+    local ok,err=TimeZone.apply(preferences.time_display)
+    if not ok then
+        self:info("时区设置无法应用：\n"..tostring(err or "当前设备不支持"))
+        return false
+    end
+    if HomeView.is_shown() then self:_refresh_home_view(message or "时间显示已更新","full")
+    elseif message then self:toast(message,2) end
+    return true
+end
+
+function Plugin:_set_time_mode(mode)
+    local value,preferences=self:_time_preferences()
+    value.mode=mode
+    self:_save_time_preferences(value,preferences,"时间来源已更新")
+end
+
+function Plugin:time_mode_menu()
+    return {
+        {text="跟随设备",post_text="使用 Kindle / KOReader 当前时区",checked_func=function()
+            return (self:_time_preferences()).mode=="device"
+        end,callback=function() self:_set_time_mode("device") end},
+        {text="地区时区",post_text="支持常用地区及夏令时",checked_func=function()
+            return (self:_time_preferences()).mode=="zone"
+        end,callback=function() self:_set_time_mode("zone") end},
+        {text="固定 UTC 偏移",post_text="适合没有地区时区数据的旧设备",checked_func=function()
+            return (self:_time_preferences()).mode=="fixed"
+        end,callback=function() self:_set_time_mode("fixed") end},
+    }
+end
+
+function Plugin:time_zone_menu()
+    local rows={}
+    for _,zone in ipairs(TimeZone.zones()) do
+        local id,label=zone.id,zone.label
+        rows[#rows+1]={text=label,post_text=id,checked_func=function()
+            local value=self:_time_preferences()
+            return value.mode=="zone" and value.zone==id
+        end,callback=function()
+            local value,preferences=self:_time_preferences()
+            value.mode="zone"; value.zone=id
+            self:_save_time_preferences(value,preferences,"时区已切换为"..label)
+        end}
+    end
+    return rows
+end
+
+function Plugin:time_fixed_offset_dialog()
+    local value,preferences=self:_time_preferences()
+    local dialog
+    dialog=InputDialog:new{
+        title="固定 UTC 偏移",
+        description="输入例如 +09:00、+08:00 或 -05:00",
+        input=TimeZone.offset_text(value.offset_minutes),
+        buttons={{
+            {text=_("Cancel"),id="close",callback=function() UIManager:close(dialog) end},
+            {text="保存",is_enter_default=true,callback=function()
+                local parsed=TimeZone.parse_offset(dialog:getInputText())
+                if parsed==nil then self:toast("请输入 -14:00 到 +14:00 之间的有效偏移",3); return end
+                UIManager:close(dialog)
+                value.mode="fixed"; value.offset_minutes=parsed
+                self:_save_time_preferences(value,preferences,"固定时区已更新")
+            end},
+        }},
+    }
+    UIManager:show(dialog); dialog:onShowKeyboard()
+end
+
+function Plugin:time_display_settings_menu()
+    local value=self:_time_preferences()
+    return {
+        {text="时间来源",post_text=TimeZone.label(value),sub_item_table_func=function() return self:time_mode_menu() end},
+        {text="地区时区",post_text=TimeZone.zone(value.zone) and TimeZone.zone(value.zone).label or "日本 · 东京",sub_item_table_func=function() return self:time_zone_menu() end},
+        {text="固定 UTC 偏移",post_text=TimeZone.offset_text(value.offset_minutes),callback=function() self:time_fixed_offset_dialog() end},
+        {text="当前时间",post_text=os.date("%Y-%m-%d %H:%M"),enabled=false},
+        {text="说明",post_text="只调整 KOReader 显示，不修改 Kindle 系统时钟",enabled=false},
+    }
+end
+
 function Plugin:_toggle_home_lockscreen(confirmed)
     local home,preferences=self:_home_preferences()
     local enabling=home.lockscreen_recent==false
@@ -3779,9 +3929,9 @@ function Plugin:_home_status_text(book,is_local)
     local state_id=tostring(state.book_id or (state.book and state.book.bookId) or "")
     if id~="" and state_id==id then
         if state.status=="active" then
-            local percent=self:_download_percent(state)
-            local generating={underlines=true,thoughts=true,footnotes=true,images=true,package=true}
-            return (generating[tostring(state.stage or "")] and "生成中 " or "下载中 ")..tostring(percent).."%"
+            -- Active progress is rendered as a thin bar on the matching shelf
+            -- card. Keep it out of Recent Reading and out of status text.
+            return ""
         end
         if state.status=="failed" then return "失败" end
         if state.status=="annotation_pending" then return "批注待补全" end
@@ -4655,6 +4805,7 @@ function Plugin:_show_home_settings_popup(anchor)
             {icon="A",label="阅读界面",detail="阅读快捷栏和显示方式",callback=function() self:_show_standalone_menu("阅读界面",self:reader_quick_panel_settings_menu()) end},
             {icon="⇩",label="下载与存储",detail="下载策略、目录和清理",callback=function() self:_show_standalone_menu("下载与存储",self:download_settings_menu()) end},
             {icon="⇅",label="账号与同步",detail="登录状态和同步设置",callback=function() self:_show_standalone_menu("账号与同步",self:account_sync_settings_menu()) end},
+            {icon="◷",label="时间与时区",detail="修正 KOReader 的本地时间显示",callback=function() self:_show_standalone_menu("时间与时区",self:time_display_settings_menu()) end},
             {icon="↻",label="更新设置",detail="检查更新、频率和安装后操作",callback=function() self:_show_standalone_menu("更新设置",self:update_settings_menu()) end},
             {icon="⚙",label="全部设置",detail="打开完整觅阅设置",callback=function() self:_show_standalone_menu("觅阅设置",self:settings_menu()) end},
         },
@@ -8188,8 +8339,9 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     end
     local tabs=self:_home_build_tabs(active)
 
+    local screensaver_file=home.lockscreen_recent~=false and self:_home_prepare_lockscreen_cover(hero) or nil
     HOME_SESSION.lockscreen_recent_enabled=home.lockscreen_recent~=false
-    HOME_SESSION.screensaver_file=hero and hero.cover_path or nil
+    HOME_SESSION.screensaver_file=screensaver_file
     local view,err=HomeView.show({
         title="觅阅",
         status_line=self:_home_status_line(),
@@ -8203,10 +8355,11 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         shelf_page=shelf_page,
         shelf_pages=shelf_pages,
         empty_text=selected.empty,
-        download_notice=self:_home_download_notice(),
+        -- Download progress belongs to the matching shelf card; only true
+        -- account/health alerts occupy the home notice strip.
         alerts=self:_home_alerts(),
         lockscreen_enabled=home.lockscreen_recent~=false,
-        screensaver_file=hero and hero.cover_path or nil,
+        screensaver_file=screensaver_file,
         on_quick_panel=function() self:show_home_quick_panel() end,
         on_account=function() self:_home_leave_and_run("account status",function() self:show_account_status() end) end,
         on_menu=function() self:show_home_menu() end,
@@ -12339,6 +12492,7 @@ function Plugin:settings_menu()
     return {
         {text="运行模式",post_text=self:_home_mode_label(),sub_item_table_func=function() return self:home_mode_menu() end},
         {text="首页与书架",post_text="布局、来源与快捷面板",sub_item_table_func=function() return self:display_settings_menu() end},
+        {text="时间与时区",post_text=TimeZone.label((self:_time_preferences())),sub_item_table_func=function() return self:time_display_settings_menu() end},
         {text="阅读界面",post_text="快捷面板与阅读状态",sub_item_table_func=function() return self:reader_quick_panel_settings_menu() end},
         {text="评论与标注",post_text=self:_thought_display_label(),sub_item_table_func=function() return self:thought_font_settings_menu() end},
         {text="账号与同步",post_text=self:progress_sync_label(),sub_item_table_func=function() return self:account_sync_settings_menu() end},
