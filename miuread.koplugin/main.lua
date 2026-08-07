@@ -220,11 +220,6 @@ local function mark_reader_origin(path)
     HOME_READER_FILE=normalized_reader_file(path) or HOME_READER_FILE
     persist_home_session()
 end
-local THOUGHT_MAINTENANCE=rawget(_G,"__MIUREAD_THOUGHT_MAINTENANCE")
-if type(THOUGHT_MAINTENANCE)~="table" then
-    THOUGHT_MAINTENANCE={running=false,last_at=0}
-    rawset(_G,"__MIUREAD_THOUGHT_MAINTENANCE",THOUGHT_MAINTENANCE)
-end
 -- Track a temporary KOReader menu visit globally because FileManager and
 -- ReaderUI use different plugin instances. MiuRead remains visible underneath
 -- native menus and is raised again after the last native page closes.
@@ -330,7 +325,6 @@ function Plugin:init()
     else
         self:_set_navigation_state("native","file manager plugin initialized")
     end
-    self._thought_index_pause_path=self.store.temp_dir.."/thought-index.pause"
     self._reader_active_path="/tmp/miuread-reader-active.flag"
     self._reader_busy_path="/tmp/miuread-reader-busy.until"
     self._thought_popup_marker_path=self.store.temp_dir.."/thought-popup.pending.json"
@@ -378,11 +372,9 @@ function Plugin:init()
         HOME_SESSION.opening_at=0
     end
     if self._reader_context then
-        U.atomic_write(self._thought_index_pause_path,"1",true)
         U.atomic_write(self._reader_active_path,"1",true)
         U.atomic_write(self._reader_busy_path,tostring(os.time()+3),true)
     else
-        os.remove(self._thought_index_pause_path)
         os.remove(self._reader_active_path)
         os.remove(self._reader_busy_path)
     end
@@ -407,8 +399,6 @@ function Plugin:init()
     self.shelf_async=Async:new(self.store,{poll_interval=.4,allow_android=true})
     self.cover_async=Async:new(self.store,{poll_interval=.30,allow_android=true})
     self.identity_async=Async:new(self.store,{poll_interval=.20,allow_android=true,
-        disable_fallback=true})
-    self.thought_index_async=Async:new(self.store,{poll_interval=.75,allow_android=true,
         disable_fallback=true})
     self.repair_async=Async:new(self.store,{poll_interval=.35,allow_android=true})
     self.home_async=Async:new(self.store,{poll_interval=.45,allow_android=true,disable_fallback=true})
@@ -1896,14 +1886,12 @@ function Plugin:_home_preferences()
         changed=true
     end
     if (tonumber(home.performance_defaults_version) or 0)<1 then
-        -- Older builds enabled full local scans, network metadata and global
-        -- thought-index maintenance by default. On e-ink devices these jobs
-        -- compete with first paint and touch handling, so beta.8 migrates once
-        -- to the cache-first defaults. Users may still enable optional jobs.
+        -- Older builds enabled full local scans and network metadata by default.
+        -- On e-ink devices these jobs compete with first paint and touch handling,
+        -- so beta.8 migrates once to the cache-first defaults.
         home.performance_defaults_version=1
         home.auto_scan=false
         home.network_metadata=false
-        home.background_thought_index=false
         changed=true
     end
     if home.layout_style~="compact" and home.layout_style~="desk" then
@@ -1986,7 +1974,7 @@ function Plugin:_home_preferences()
     if type(home.hidden_local_files)~="table" then home.hidden_local_files={}; changed=true end
     if home.more_expanded==nil then home.more_expanded=false; changed=true end
     if home.network_metadata==nil then home.network_metadata=false; changed=true end
-    if home.background_thought_index==nil then home.background_thought_index=false; changed=true end
+    if home.background_thought_index~=nil then home.background_thought_index=nil; changed=true end
     if home.active_section~="account" and home.active_section~="generated" and home.active_section~="local" and home.active_section~="mp" then home.active_section="account"; changed=true end
     if home.lockscreen_recent==nil then home.lockscreen_recent=true; changed=true end
     home.local_root=tostring(home.local_root or "")
@@ -2283,7 +2271,6 @@ function Plugin:_home_freeze_for_suspend()
         remote=self._home_remote_refreshing==true or (self.shelf_async and self.shelf_async:busy()) or false,
         metadata=(self.home_metadata_async and self.home_metadata_async:busy()) or false,
         covers=(self.home_cover_async and self.home_cover_async:busy()) or false,
-        thoughts=(self.thought_index_async and self.thought_index_async:busy()) or THOUGHT_MAINTENANCE.running==true,
     }
     if self._home_refresh_pending_kind then self:_home_defer_refresh_kind(self._home_refresh_pending_kind) end
 
@@ -2305,9 +2292,6 @@ function Plugin:_home_freeze_for_suspend()
     if self.home_metadata_async then self.home_metadata_async:cancel("device suspended") end
     if self.home_cover_async then self.home_cover_async:cancel("device suspended") end
     if self.shelf_async and self._home_resume_pending_work.remote then self.shelf_async:cancel("device suspended") end
-    if self.thought_index_async then self.thought_index_async:cancel("device suspended") end
-    THOUGHT_MAINTENANCE.running=false
-    if self._thought_index_pause_path then U.atomic_write(self._thought_index_pause_path,"1",true) end
 
     logger.info("[MiuRead][Resume] home tasks frozen",
         "generation=",tostring(self._home_resume_generation),
@@ -2341,7 +2325,6 @@ function Plugin:_home_finish_resume_background(generation)
     self._home_resume_pending_kind=nil
     local pending=self._home_resume_pending_work or {}
     self._home_resume_pending_work=nil
-    if self._thought_index_pause_path then os.remove(self._thought_index_pause_path) end
 
     logger.info("[MiuRead][Resume] background released",
         "generation=",tostring(generation),"refresh=",tostring(pending_kind or "none"))
@@ -2372,13 +2355,6 @@ function Plugin:_home_finish_resume_background(generation)
             local metadata_targets,cover_targets=self:_home_resume_visible_targets()
             if pending.metadata then self:_home_schedule_local_metadata(metadata_targets) end
             if pending.covers then self:_home_schedule_remote_covers(cover_targets) end
-        end)
-    end
-    if pending.thoughts then
-        UIManager:scheduleIn(2.0,function()
-            if generation==self._home_resume_generation and not self:_home_background_blocked() and HomeView.is_shown() then
-                self:_start_thought_index_maintenance()
-            end
         end)
     end
     if self.download_task then self.download_task:on_resume() end
@@ -4924,8 +4900,6 @@ function Plugin:_home_stop_background(reason)
     self:_cancel_home_directory_request(reason or "home hidden")
     if self.home_metadata_async then self.home_metadata_async:cancel(reason or "home hidden") end
     if self.home_cover_async then self.home_cover_async:cancel(reason or "home hidden") end
-    if self.thought_index_async then self.thought_index_async:cancel(reason or "reader opening") end
-    if self._thought_index_pause_path then U.atomic_write(self._thought_index_pause_path,"1",true) end
 end
 
 function Plugin:_home_merge_directory_snapshot(snapshot,old_snapshot)
@@ -8217,7 +8191,6 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
             if HomeView.is_shown() and self._home_active_section=="local" then self:_home_ensure_local_inline_loaded() end
         end)
     end
-    if self._thought_index_pause_path then os.remove(self._thought_index_pause_path) end
 
     local metadata_targets={}
     local cover_targets={}
@@ -8251,9 +8224,6 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         -- Remote shelves are shown from cache at startup. A network refresh is
         -- performed only from the explicit refresh action.
     end
-    if home.background_thought_index==true and not force_scan then UIManager:scheduleIn(20,function()
-        if HomeView.is_shown() and not self._home_refreshing then self:_start_thought_index_maintenance() end
-    end) end
     return true
 end
 
@@ -9734,7 +9704,7 @@ function Plugin:_merge_download_result(result,book,opt)
         content_type=book.content_type,
     })
     if type(self.store.clear_book_access)=="function" then self.store:clear_book_access(book.bookId) end
-    self.access:unlock_book(book.bookId,"all")
+    self.access:unlock_book(book.bookId)
 
     if type(result.session)=="table" then
         local allowed={"psvts","pclts","token","reader_url","chapters","context_updated_at","app_id"}
@@ -12803,10 +12773,6 @@ local function extract_thought_href(value,seen,depth)
     for _,key in ipairs({"href","url","target","link","uri","dest","destination"}) do local found=extract_thought_href(value[key],seen,depth+1); if found then return found end end
     for _,child in pairs(value) do local found=extract_thought_href(child,seen,depth+1); if found then return found end end
 end
-function Plugin:_start_thought_index_maintenance()
-    return false
-end
-
 function Plugin:_teardown_thought_tap()
     if self._thought_tap_setup and self.ui and self.ui.unRegisterTouchZones then pcall(function() self.ui:unRegisterTouchZones({{id="miuread_thought_popup",overrides={"tap_link"}}}) end) end
     self._thought_tap_setup=nil
@@ -13117,7 +13083,6 @@ function Plugin:onReaderReady()
             logger.info("[MiuRead][ThoughtPopup] local tap ready before cloud sync")
         end
     end)
-    if self._thought_index_pause_path then U.atomic_write(self._thought_index_pause_path,"1",true) end
     self:_teardown_thought_tap()
     self._progress_prompted_book_id=nil
     self._progress_check_running=false
@@ -13281,8 +13246,8 @@ function Plugin:onResume()
     if not close_pending and not native_menu_pending and not reader_active and HomeView.is_shown() then
         self:_set_foreground("home")
         -- Restore the already-built surface and its input ranges first.  Shelf
-        -- refresh, scans, covers, metadata and index maintenance remain behind
-        -- the interaction barrier until the page has been released and idle.
+        -- refresh, scans, covers and metadata remain behind the interaction
+        -- barrier until the page has been released and idle.
         self:_home_begin_resume(slept)
         UIManager:scheduleIn(1.0,function()
             if HomeView.is_shown() and not self:_active_reader_ui() then
@@ -13448,7 +13413,6 @@ function Plugin:onCloseDocument()
         self.repair_async:cancel("document closed")
     end
     self._repair_prompt_open=false
-    if self._thought_index_pause_path then os.remove(self._thought_index_pause_path) end
     if self._reader_active_path then os.remove(self._reader_active_path) end
     -- Keep the worker paused just long enough for the bookshelf to become
     -- responsive, then release the marker. Uploading the final reading tail is
