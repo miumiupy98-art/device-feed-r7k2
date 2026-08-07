@@ -2957,13 +2957,13 @@ function Plugin:_home_toggle_group_item(group,key)
     local is_action=group=="action"
     local items_key=is_action and "action_items" or "panel_items"
     local order=is_action and HOME_ACTION_ITEM_ORDER or HOME_PANEL_ITEM_ORDER
-    local max_count=is_action and 6 or 8
+    local max_count=is_action and 6 or 12
     local items=home[items_key] or {}
     local currently=items[key]==true
     local count=0
     for _,name in ipairs(order) do if items[name]==true then count=count+1 end end
     if not currently and count>=max_count then
-        self:toast((is_action and "主页快捷栏最多显示六项" or "下滑工具栏最多显示八项"),2)
+        self:toast((is_action and "主页快捷栏最多显示六项" or "下滑工具栏最多显示十二项"),2)
         return false
     end
     items[key]=not currently
@@ -3081,7 +3081,7 @@ end
 function Plugin:home_customization_menu()
     return {
         {text="主页快捷栏",post_text=tostring(self:_home_group_enabled_count("action")).." / 6",sub_item_table_func=function() return self:home_action_settings_menu() end},
-        {text="下滑工具栏",post_text=tostring(self:_home_group_enabled_count("panel")).." / 8",sub_item_table_func=function() return self:home_panel_settings_menu() end},
+        {text="下滑工具栏",post_text=tostring(self:_home_group_enabled_count("panel")).." / 12",sub_item_table_func=function() return self:home_panel_settings_menu() end},
         {text="恢复全部推荐布局",post_text="主页 + 下滑工具栏",callback=function() self:_home_restore_all_quick_defaults() end},
     }
 end
@@ -6217,20 +6217,20 @@ function Plugin:show_home_quick_panel(more_expanded)
         wifi={
             icon="Wi-Fi",
             icon_path=ROOT.."/resources/"..(wifi_on==false and "wifi-off.svg" or (state.online==true and "wifi-connected.svg" or "wifi-disconnected.svg")),
-            label="Wi-Fi",detail=wifi_detail.." · 长按换网",
+            label="Wi-Fi",detail=wifi_detail,
             callback=function() self:_home_wifi_toggle() end,
             hold_callback=function() self:_home_wifi_settings() end
         },
         rotate={icon="↻",icon_key="rotate",label="旋转",detail="",callback=function() self:_home_rotate() end},
-        screenshot={icon="▣",icon_key="screenshot",label="截图",detail="延时截取",callback=function(anchor) ScreenshotMode.start(self,anchor) end},
-        koreader_settings={icon="⚙",icon_key="ko-reader",label="KOReader",detail="设置",callback=function() self:_show_native_koreader_menu() end},
-        return_koreader={icon="←",icon_key="return",label="返回",detail="KOReader",callback=function() self:_home_close_to_native(true) end},
-        quit={icon="⏻",icon_key="power",label="退出",detail="KOReader",callback=function() self:_quit_koreader() end},
-        sync={icon="⇅",icon_key="sync",label="阅读同步",detail=self:progress_sync_label(),callback=function() self:_show_standalone_menu("阅读同步",self:sync_menu()) end},
+        screenshot={icon="▣",icon_key="screenshot",label="截图",detail="",callback=function(anchor) ScreenshotMode.start(self,anchor) end},
+        koreader_settings={icon="⚙",icon_key="ko-reader",label="KOReader",detail="",callback=function() self:_show_native_koreader_menu() end},
+        return_koreader={icon="←",icon_key="return",label="返回",detail="",callback=function() self:_home_close_to_native(true) end},
+        quit={icon="⏻",icon_key="power",label="退出",detail="",callback=function() self:_quit_koreader() end},
+        sync={icon="⇅",icon_key="sync",label="阅读同步",detail=(self:progress_sync_label()=="上传失败" and "上传失败" or ""),callback=function() self:_show_standalone_menu("阅读同步",self:sync_menu()) end},
         miuread_settings={icon="⚙",icon_key="settings",label="觅阅设置",detail="",callback=function() self:_show_standalone_menu("觅阅设置",self:settings_menu()) end},
         downloads={icon="⇩",icon_key="download",label="下载管理",detail=download_detail,callback=function() self:show_downloads() end},
-        restart={icon="↺",icon_key="restart",label="重启",detail="KOReader",callback=function() self:_restart_koreader() end},
-        full_refresh={icon="▤",icon_key="full-refresh",label="全屏刷新",detail="清除残影",callback=function() self:_home_full_refresh() end},
+        restart={icon="↺",icon_key="restart",label="重启",detail="",callback=function() self:_restart_koreader() end},
+        full_refresh={icon="▤",icon_key="full-refresh",label="全屏刷新",detail="",callback=function() self:_home_full_refresh() end},
     }
     if Device:hasFrontlight() then
         definitions.frontlight={icon="☼",icon_key="frontlight",label="前光",detail="",callback=function() self:_home_frontlight() end}
@@ -6243,37 +6243,25 @@ function Plugin:show_home_quick_panel(more_expanded)
     local buttons={}
     for _,key in ipairs(home.panel_order or HOME_PANEL_ITEM_ORDER) do
         if home.panel_items[key]==true and definitions[key] then buttons[#buttons+1]=definitions[key] end
-        if #buttons>=8 then break end
+        if #buttons>=12 then break end
     end
 
-    local enabled_panel_keys={}
-    for _,key in ipairs(home.panel_order or HOME_PANEL_ITEM_ORDER) do
-        if home.panel_items[key]==true and definitions[key] then enabled_panel_keys[key]=true end
-    end
-    local more_candidates={
-        {key="scan_all",icon="⌕",label="扫描书籍",detail="全部来源",callback=function() self:_home_complete_refresh() end},
-        {key="metadata_all",icon="i",label="更新元数据",detail="全部书籍",callback=function()
+    local maintenance_items={
+        {text="扫描书籍",post_text="全部来源",callback=function() self:_home_complete_refresh() end},
+        {text="更新全部元数据",post_text="全部书籍",callback=function()
             self:_home_reset_local_metadata(); self:_home_complete_refresh(true)
         end},
-        {key="covers_all",icon="▧",label="重建封面",detail="全部书籍",callback=function() self:_clear_cover_cache() end},
-        {key="repair_books",icon="✚",label="修复书籍",detail="批量检查",callback=function() self:scan_downloaded_books_for_repair() end},
-        {key="repair_comments",icon="☷",label="修复评论",detail="重建索引",callback=function() self:clear_invalid_comment_indexes() end},
-        {key="rebuild_shelf",icon="▦",label="重建书架",detail="索引与状态",callback=function()
-            self.store:reload(); self.store:prune_missing_files(); self:_show_miuread_home_now(false,true,true,"full")
-        end},
-        {key="cache",icon="⌫",label="清理缓存",detail="安全清理",callback=function() self:show_download_cleanup_dialog() end},
-        {key="diagnostics",icon="!",label="诊断修复",detail="日志与记录",callback=function()
+        {text="重建封面",post_text="全部书籍",callback=function() self:_clear_cover_cache() end},
+        {text="修复书籍",post_text="批量检查",callback=function() self:scan_downloaded_books_for_repair() end},
+        {text="评论迁移与修复",callback=function()
             self:_show_standalone_menu("评论迁移与修复",self:book_repair_settings_menu())
         end},
-        {key="restart",icon="↺",label="重启",detail="KOReader",callback=function() self:_restart_koreader() end},
+        {text="重建书架",post_text="索引与状态",callback=function()
+            self.store:reload(); self.store:prune_missing_files(); self:_show_miuread_home_now(false,true,true,"full")
+        end},
+        {text="清理缓存",callback=function() self:show_download_cleanup_dialog() end},
+        {text="重启 KOReader",callback=function() self:_restart_koreader() end},
     }
-    local more_buttons={}
-    for _,entry in ipairs(more_candidates) do
-        -- Defaults avoid exact duplicates. Users may still place the same
-        -- command in both areas through customization if they explicitly want it.
-        if not enabled_panel_keys[entry.key] then more_buttons[#more_buttons+1]=entry end
-    end
-
 
     local battery=tonumber(state.battery) and (tostring(math.floor(state.battery+.5)).."%") or "未知"
     local notice=self:_home_download_notice()
@@ -6285,15 +6273,14 @@ function Plugin:show_home_quick_panel(more_expanded)
         status_text="阅读同步需要处理"
     end
     local panel,err=HomeQuickPanel.show{
-        title=os.date("%H:%M").."　快捷控制　电量 "..battery,
-        subtitle="Wi-Fi "..wifi_detail,
+        time_text=os.date("%H:%M"),
+        wifi_text="Wi-Fi "..wifi_detail,
+        battery_text=battery,
         status_text=status_text,
         buttons=buttons,
-        more_buttons=more_buttons,
-        more_expanded=more_expanded==true,
         on_customize=function() self:show_home_customization() end,
-        on_toggle_more=function(expanded)
-            UIManager:scheduleIn(.04,function() self:show_home_quick_panel(expanded==true) end)
+        on_tools=function()
+            self:_show_standalone_menu("工具与维护",maintenance_items)
         end,
     }
     if not panel then

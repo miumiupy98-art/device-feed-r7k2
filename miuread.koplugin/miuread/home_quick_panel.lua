@@ -219,40 +219,32 @@ end
 function QuickPanelWidget:_build()
     local scale = UiScale.metrics()
     local sw, sh = scale.sw, scale.sh
-    local portrait = scale.portrait
-    -- Leave a little breathing room around the control center. The previous
-    -- edge-to-edge cards looked cramped, especially in large text mode.
     local margin = math.max(UiScale.dp(10, 9, 18), math.floor(scale.short * .018))
     local gap = UiScale.dp(7, 5, 12)
     local buttons = type(self.opts.buttons) == "table" and self.opts.buttons or {}
-    local more_buttons = type(self.opts.more_buttons) == "table" and self.opts.more_buttons or {}
-    local more_expanded = self.opts.more_expanded == true
-
-    local preferred_columns = portrait and 6 or 8
-    local min_button_w = UiScale.dp(78, 70, 112)
-    local possible_columns = math.max(1, math.floor((sw - margin * 2 + gap) / (min_button_w + gap)))
-    local columns = math.max(1, math.min(preferred_columns, possible_columns, math.max(1, #buttons)))
-    local rows = math.max(1, math.ceil(#buttons / columns))
-    local more_columns = math.max(1, math.min(preferred_columns, possible_columns, math.max(1, #more_buttons)))
-    local more_rows = more_expanded and math.max(1, math.ceil(#more_buttons / more_columns)) or 0
-
-    local title_h = UiScale.dp(54, 50, 74)
-    local status_h = (self.opts.status_text and self.opts.status_text ~= "") and UiScale.dp(30, 27, 42) or 0
-    local button_h = UiScale.dp(82, 74, 112)
-    local more_button_h = UiScale.dp(74, 66, 102)
-    local more_title_h = #more_buttons > 0 and UiScale.dp(40, 35, 52) or 0
     local line = UiScale.line("thin")
 
-    self.panel_h = margin * 2 + title_h + line + gap * 3
-        + rows * button_h + math.max(0, rows - 1) * gap
-    if more_title_h > 0 then
-        self.panel_h = self.panel_h + more_title_h + gap
-        if more_expanded then
-            self.panel_h = self.panel_h + more_rows * more_button_h + math.max(0, more_rows - 1) * gap
-        end
+    -- Six columns are the visual contract for the home pull-down panel. On a
+    -- genuinely narrower screen we still fall back instead of clipping.
+    local preferred_columns = 6
+    local min_button_w = UiScale.dp(72, 64, 104)
+    local possible_columns = math.max(1, math.floor((sw - margin * 2 + gap) / (min_button_w + gap)))
+    local columns = math.max(1, math.min(preferred_columns, possible_columns))
+    local rows = #buttons > 0 and math.ceil(math.min(#buttons, 12) / columns) or 0
+
+    local title_h = UiScale.dp(48, 44, 66)
+    local button_h = UiScale.dp(82, 74, 108)
+    local tools_h = self.opts.on_tools and UiScale.dp(46, 41, 62) or 0
+    local status_h = (self.opts.status_text and self.opts.status_text ~= "") and UiScale.dp(30, 27, 42) or 0
+
+    self.panel_h = margin * 2 + title_h + line + gap * 2
+    if rows > 0 then
+        self.panel_h = self.panel_h + rows * button_h + math.max(0, rows - 1) * gap + gap
     end
     if status_h > 0 then self.panel_h = self.panel_h + status_h + gap end
+    if tools_h > 0 then self.panel_h = self.panel_h + tools_h end
     self.panel_h = math.min(sh - margin, self.panel_h)
+
     self.dimen = Geom:new{x = 0, y = 0, w = sw, h = sh}
     self.panel_dimen = Geom:new{x = 0, y = 0, w = sw, h = self.panel_h}
     self.ges_events = {
@@ -263,20 +255,27 @@ function QuickPanelWidget:_build()
     local children = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
     self:_add(children, 0, 0, fixed_frame(sw, self.panel_h, {background = Blitbuffer.COLOR_WHITE}))
 
-    local close_w = UiScale.dp(62, 58, 78)
-    local customize_w = self.opts.on_customize and UiScale.dp(72, 66, 92) or 0
-    local title_w = math.max(1, sw - margin * 2 - close_w - customize_w - gap * (customize_w > 0 and 2 or 1))
+    local customize_w = self.opts.on_customize and UiScale.dp(72, 66, 94) or 0
+    local close_w = UiScale.dp(62, 58, 82)
+    local time_w = UiScale.dp(92, 82, 122)
+    local controls_gap_count = (customize_w > 0 and 3 or 2)
+    local state_w = math.max(1, sw - margin * 2 - time_w - customize_w - close_w - gap * controls_gap_count)
+    local wifi_w = math.floor(state_w * .62)
+    local battery_w = math.max(1, state_w - wifi_w)
+
     local title_row = HorizontalGroup:new{
         align = "center",
-        LeftContainer:new{dimen = Geom:new{w = title_w, h = title_h}, VerticalGroup:new{
-            align = "left",
-            Ui.textbox(tostring(self.opts.title or "快捷控制"), title_w, math.floor(title_h * .56),
-                face("cfont", 18.5, 26), {bold = true, alignment = "left"}),
-            Ui.textbox(tostring(self.opts.subtitle or ""), title_w, math.ceil(title_h * .44),
-                face("smallinfofont", 10.6, 15.5), {alignment = "left", fgcolor = Blitbuffer.COLOR_BLACK}),
-        }},
+        LeftContainer:new{dimen = Geom:new{w = time_w, h = title_h},
+            Ui.text(tostring(self.opts.time_text or os.date("%H:%M")), time_w, title_h,
+                face("cfont", 18.5, 26), {bold = true, halign = "left"})},
+        HorizontalSpan:new{width = gap},
+        Ui.text(tostring(self.opts.wifi_text or "Wi-Fi"), wifi_w, title_h,
+            face("smallinfofont", 10.2, 14.5), {bold = true}),
+        Ui.text(tostring(self.opts.battery_text or ""), battery_w, title_h,
+            face("smallinfofont", 10.2, 14.5), {bold = true}),
         HorizontalSpan:new{width = gap},
     }
+
     if customize_w > 0 then
         title_row[#title_row + 1] = tappable(customize_w, title_h, fixed_frame(customize_w, math.max(1, title_h - gap), {
             bordersize = line,
@@ -291,15 +290,16 @@ function QuickPanelWidget:_build()
         end)
         title_row[#title_row + 1] = HorizontalSpan:new{width = gap}
     end
+
     title_row[#title_row + 1] = tappable(close_w, title_h, fixed_frame(close_w, math.max(1, title_h - gap), {
-            bordersize = line,
-            radius = UiScale.radius(5, 4, 9),
-            background = Blitbuffer.COLOR_WHITE,
-            color = Blitbuffer.COLOR_GRAY,
-        }, Ui.text("收起", close_w - UiScale.dp(8, 6, 12), math.max(1, title_h - gap),
-            face("smallinfofont", 10, 14), {bold = true})), function()
-            self:_close()
-        end)
+        bordersize = line,
+        radius = UiScale.radius(5, 4, 9),
+        background = Blitbuffer.COLOR_WHITE,
+        color = Blitbuffer.COLOR_GRAY,
+    }, Ui.text("收起", close_w - UiScale.dp(8, 6, 12), math.max(1, title_h - gap),
+        face("smallinfofont", 10, 14), {bold = true})), function()
+        self:_close()
+    end)
     self:_add(children, margin, margin, title_row)
 
     local y = margin + title_h + gap
@@ -309,48 +309,19 @@ function QuickPanelWidget:_build()
     })
     y = y + line + gap
 
-    local button_w = math.floor((sw - margin * 2 - gap * (columns - 1)) / columns)
-    for index, entry in ipairs(buttons) do
-        local row = math.floor((index - 1) / columns)
-        local col = (index - 1) % columns
-        self:_add(children, margin + col * (button_w + gap), y + row * (button_h + gap),
-            panel_button(entry, button_w, button_h, function(action) self:_close(action) end, false))
-    end
-    y = y + rows * button_h + math.max(0, rows - 1) * gap + gap
-
-    if more_title_h > 0 and y + more_title_h <= self.panel_h then
-        local marker = more_expanded and "⌃" or "⌄"
-        local more_header = tappable(sw - margin * 2, more_title_h, fixed_frame(sw - margin * 2, more_title_h, {
-            bordersize = 0,
-            background = Blitbuffer.COLOR_WHITE,
-        }, HorizontalGroup:new{
-            align = "center",
-            Ui.text("更多功能", sw - margin * 2 - UiScale.dp(42, 38, 50), more_title_h,
-                face("cfont", 14.2, 20), {bold = true, halign = "left"}),
-            Ui.text(marker, UiScale.dp(42, 38, 50), more_title_h, face("cfont", 14.5, 19), {bold = true}),
-        }), function()
-            self:_close(function()
-                if self.opts.on_toggle_more then self.opts.on_toggle_more(not more_expanded) end
-            end)
-        end)
-        self:_add(children, margin, y, more_header)
-        y = y + more_title_h + gap
-    end
-
-    if more_expanded and #more_buttons > 0 then
-        local more_w = math.floor((sw - margin * 2 - gap * (more_columns - 1)) / more_columns)
-        for index, entry in ipairs(more_buttons) do
-            local row = math.floor((index - 1) / more_columns)
-            local col = (index - 1) % more_columns
-            if y + row * (more_button_h + gap) + more_button_h <= self.panel_h then
-                self:_add(children, margin + col * (more_w + gap), y + row * (more_button_h + gap),
-                    panel_button(entry, more_w, more_button_h, function(action) self:_close(action) end, true))
-            end
+    if rows > 0 then
+        local button_w = math.floor((sw - margin * 2 - gap * (columns - 1)) / columns)
+        for index, entry in ipairs(buttons) do
+            if index > 12 then break end
+            local row = math.floor((index - 1) / columns)
+            local col = (index - 1) % columns
+            self:_add(children, margin + col * (button_w + gap), y + row * (button_h + gap),
+                panel_button(entry, button_w, button_h, function(action) self:_close(action) end, true))
         end
-        y = y + more_rows * more_button_h + math.max(0, more_rows - 1) * gap + gap
+        y = y + rows * button_h + math.max(0, rows - 1) * gap + gap
     end
 
-    if status_h > 0 and y + status_h <= self.panel_h - gap then
+    if status_h > 0 and y + status_h <= self.panel_h then
         self:_add(children, margin, y, fixed_frame(sw - margin * 2, status_h, {
             bordersize = line,
             padding = UiScale.dp(3, 2, 5),
@@ -360,6 +331,28 @@ function QuickPanelWidget:_build()
         }, Ui.textbox(tostring(self.opts.status_text or ""),
             sw - margin * 2 - UiScale.dp(12, 10, 18), status_h - UiScale.dp(6, 4, 10),
             face("smallinfofont", 9.2, 13), {alignment = "left", fgcolor = Blitbuffer.COLOR_BLACK})))
+        y = y + status_h + gap
+    end
+
+    if tools_h > 0 and y + tools_h <= self.panel_h then
+        local arrow_w = UiScale.dp(42, 36, 52)
+        local tools = tappable(sw - margin * 2, tools_h, fixed_frame(sw - margin * 2, tools_h, {
+            bordersize = line,
+            padding = UiScale.dp(4, 3, 7),
+            radius = UiScale.radius(6, 4, 10),
+            background = Blitbuffer.COLOR_WHITE,
+            color = Blitbuffer.COLOR_GRAY,
+        }, HorizontalGroup:new{
+            align = "center",
+            Ui.text("工具与维护", sw - margin * 2 - arrow_w - UiScale.dp(16, 12, 22), tools_h,
+                face("cfont", 13.2, 18.5), {bold = true, halign = "left"}),
+            Ui.text("›", arrow_w, tools_h, face("cfont", 18, 24), {bold = true}),
+        }), function()
+            self:_close(function()
+                if self.opts.on_tools then self.opts.on_tools() end
+            end)
+        end)
+        self:_add(children, margin, y, tools)
     end
 
     self:_add(children, 0, self.panel_h - UiScale.line("thick"), LineWidget:new{
