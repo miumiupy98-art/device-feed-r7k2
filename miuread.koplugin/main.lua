@@ -1888,10 +1888,18 @@ function Plugin:_home_preferences()
     if (tonumber(home.performance_defaults_version) or 0)<1 then
         -- Older builds enabled full local scans and network metadata by default.
         -- On e-ink devices these jobs compete with first paint and touch handling,
-        -- so beta.8 migrates once to the cache-first defaults.
+        -- so beta.8 migrated once to cache-first defaults.
         home.performance_defaults_version=1
         home.auto_scan=false
         home.network_metadata=false
+        changed=true
+    end
+    if (tonumber(home.network_metadata_defaults_version) or 0)<1 then
+        -- The home metadata worker now touches only the current recent-reading
+        -- book, and a successful network result is kept until a manual refresh.
+        -- Re-enable network completion once for users migrated by beta.8.
+        home.network_metadata_defaults_version=1
+        home.network_metadata=true
         changed=true
     end
     if home.layout_style~="compact" and home.layout_style~="desk" then
@@ -1966,14 +1974,11 @@ function Plugin:_home_preferences()
     if not Device:hasFrontlight() then
         if home.action_items.frontlight==true then home.action_items.frontlight=false; changed=true end
         if home.panel_items.frontlight==true then home.panel_items.frontlight=false; changed=true end
-        local action_count=0
-        for _,key in ipairs(HOME_ACTION_ITEM_ORDER) do if home.action_items[key]==true then action_count=action_count+1 end end
-        if action_count<6 and home.action_items.history~=true then home.action_items.history=true; changed=true end
     end
     if not Device:canSuspend() and home.panel_items.sleep==true then home.panel_items.sleep=false; changed=true end
     if type(home.hidden_local_files)~="table" then home.hidden_local_files={}; changed=true end
     if home.more_expanded==nil then home.more_expanded=false; changed=true end
-    if home.network_metadata==nil then home.network_metadata=false; changed=true end
+    if home.network_metadata==nil then home.network_metadata=true; changed=true end
     if home.background_thought_index~=nil then home.background_thought_index=nil; changed=true end
     if home.active_section~="account" and home.active_section~="generated" and home.active_section~="local" and home.active_section~="mp" then home.active_section="account"; changed=true end
     if home.lockscreen_recent==nil then home.lockscreen_recent=true; changed=true end
@@ -2953,7 +2958,6 @@ function Plugin:_home_toggle_group_item(group,key)
     local items_key=is_action and "action_items" or "panel_items"
     local order=is_action and HOME_ACTION_ITEM_ORDER or HOME_PANEL_ITEM_ORDER
     local max_count=is_action and 6 or 8
-    local min_count=4
     local items=home[items_key] or {}
     local currently=items[key]==true
     local count=0
@@ -2963,12 +2967,6 @@ function Plugin:_home_toggle_group_item(group,key)
         return false
     end
     items[key]=not currently
-    count=count+(currently and -1 or 1)
-    if count<min_count then
-        items[key]=true
-        self:toast("至少保留四项",2)
-        return false
-    end
     home[items_key]=items
     self:_save_home_preferences(home,preferences)
     if HomeView.is_shown() then self:_refresh_home_view(nil,"content") end
@@ -3049,6 +3047,48 @@ end
 
 function Plugin:home_action_settings_menu() return self:_home_group_settings_menu("action") end
 function Plugin:home_panel_settings_menu() return self:_home_group_settings_menu("panel") end
+
+function Plugin:_home_group_enabled_count(group)
+    local home=self:_home_preferences()
+    local is_action=group=="action"
+    local order=is_action and HOME_ACTION_ITEM_ORDER or HOME_PANEL_ITEM_ORDER
+    local items=home[is_action and "action_items" or "panel_items"] or {}
+    local count=0
+    for _,key in ipairs(order) do if items[key]==true then count=count+1 end end
+    return count
+end
+
+function Plugin:_home_restore_all_quick_defaults()
+    local home,preferences=self:_home_preferences()
+    home.action_items={}
+    for _,key in ipairs(HOME_ACTION_ITEM_ORDER) do home.action_items[key]=HOME_ACTION_ITEM_DEFAULT[key]==true end
+    home.action_order=U.copy(HOME_ACTION_ITEM_ORDER)
+    home.action_layout_version=1
+    home.panel_items={}
+    for _,key in ipairs(HOME_PANEL_ITEM_ORDER) do home.panel_items[key]=HOME_PANEL_ITEM_DEFAULT[key]==true end
+    home.panel_order=U.copy(HOME_PANEL_ITEM_ORDER)
+    home.panel_layout_version=1
+    if not Device:hasFrontlight() then
+        home.action_items.frontlight=false
+        home.panel_items.frontlight=false
+    end
+    if not Device:canSuspend() then home.panel_items.sleep=false end
+    self:_save_home_preferences(home,preferences)
+    if HomeView.is_shown() then self:_refresh_home_view(nil,"content") end
+    self:toast("主页快捷布局已恢复推荐设置",2)
+end
+
+function Plugin:home_customization_menu()
+    return {
+        {text="主页快捷栏",post_text=tostring(self:_home_group_enabled_count("action")).." / 6",sub_item_table_func=function() return self:home_action_settings_menu() end},
+        {text="下滑工具栏",post_text=tostring(self:_home_group_enabled_count("panel")).." / 8",sub_item_table_func=function() return self:home_panel_settings_menu() end},
+        {text="恢复全部推荐布局",post_text="主页 + 下滑工具栏",callback=function() self:_home_restore_all_quick_defaults() end},
+    }
+end
+
+function Plugin:show_home_customization()
+    return self:_show_standalone_menu("主页自定义",self:home_customization_menu())
+end
 
 local READER_QUICK_LABELS={
     toc="目录",progress="阅读进度",font="字体排版",frontlight="前光",sync="阅读同步",
@@ -4494,6 +4534,22 @@ function Plugin:_home_refresh_one_book_metadata(book,network_too)
     return local_changed or network_started
 end
 
+function Plugin:_home_refresh_current_network_metadata(book)
+    if type(book)~="table" then return false end
+    if not self:is_online() then
+        self:toast("当前未联网，无法更新图书信息",2)
+        return false
+    end
+    local started=self:_home_schedule_network_metadata(book,true)==true
+    if started then self:toast("正在更新当前书籍的网络信息…",2)
+    elseif self.home_metadata_async and self.home_metadata_async:busy() then
+        self:toast("已有图书信息任务正在进行，请稍后再试",2)
+    else
+        self:toast("当前暂时无法开始网络更新",2)
+    end
+    return started
+end
+
 function Plugin:_home_hide_local_book(book)
     local path=tostring(book and book.file or ""):gsub("\\","/"):gsub("/+","/")
     if path=="" then return false end
@@ -4807,11 +4863,6 @@ function Plugin:_home_action_entries()
             used[key]=true; entries[#entries+1]=definitions[key]
             if #entries>=6 then break end
         end
-    end
-    -- Keep six useful positions on devices without frontlight.
-    for _,key in ipairs({"history","all_books","file_manager","screenshot"}) do
-        if #entries>=6 then break end
-        if definitions[key] and not used[key] then used[key]=true; entries[#entries+1]=definitions[key] end
     end
     return entries
 end
@@ -5207,7 +5258,6 @@ function Plugin:_home_update_miuread_metadata(filepath,metadata)
 end
 
 
-local HOME_NETWORK_METADATA_TTL=30*24*60*60
 
 function Plugin:_home_network_metadata_key(book)
     if type(book)~="table" then return "" end
@@ -5226,6 +5276,14 @@ function Plugin:_home_network_metadata_cache()
     cache=type(cache)=="table" and cache or {version=1,rows={}}
     cache.rows=type(cache.rows)=="table" and cache.rows or {}
     return cache
+end
+
+local function home_network_patch_has_data(patch)
+    if type(patch)~="table" then return false end
+    for _,key in ipairs({"title","author","description","category","publisher","published_date","language","isbn","pages"}) do
+        if U.trim(tostring(patch[key] or ""))~="" then return true end
+    end
+    return false
 end
 
 function Plugin:_home_merge_network_patch(book,patch)
@@ -5254,11 +5312,15 @@ function Plugin:_home_apply_cached_network_metadata(book)
     return self:_home_merge_network_patch(book,row.patch)
 end
 
-function Plugin:_home_save_network_metadata(book,patch)
+function Plugin:_home_save_network_metadata(book,patch,completed)
     local key=self:_home_network_metadata_key(book)
     if key=="" then return false end
     local cache=self:_home_network_metadata_cache()
-    cache.rows[key]={checked_at=os.time(),patch=type(patch)=="table" and patch or {}}
+    cache.rows[key]={
+        checked_at=os.time(),
+        completed=completed==true,
+        patch=type(patch)=="table" and patch or {},
+    }
     local count=0
     local ordered={}
     for cache_key,row in pairs(cache.rows) do
@@ -5281,14 +5343,14 @@ function Plugin:_home_schedule_network_metadata(book,force)
     end
     if type(book)~="table" or not HomeView.is_shown() then return false end
     local home=self:_home_preferences()
-    if home.network_metadata==false then return false end
-    if (book.source=="local" or book.local_file==true) and home.local_library_mode=="direct" then return false end
+    if home.network_metadata==false and force~=true then return false end
     local key=self:_home_network_metadata_key(book)
     if key=="" then return false end
     local cache=self:_home_network_metadata_cache()
     local cached=cache.rows[key]
-    local age=os.time()-(tonumber(type(cached)=="table" and cached.checked_at or 0) or 0)
-    if force~=true and type(cached)=="table" and age>=0 and age<HOME_NETWORK_METADATA_TTL then
+    local cached_completed=type(cached)=="table" and (cached.completed==true
+        or home_network_patch_has_data(cached.patch))
+    if force~=true and cached_completed then
         if type(cached.patch)=="table" and self:_home_merge_network_patch(book,cached.patch) then
             self:_home_schedule_render_refresh("content")
         end
@@ -5333,14 +5395,24 @@ function Plugin:_home_schedule_network_metadata(book,force)
     end,function(result)
         if not result or result.ok~=true then
             logger.warn("[MiuRead][Home] network metadata unavailable",tostring(result and result.error or "unknown"))
-            self:_home_save_network_metadata(candidate,{})
+            if not cached_completed then self:_home_save_network_metadata(candidate,{},false) end
+            if force==true then self:toast("网络图书信息更新失败，请稍后重试",2) end
             return
         end
         local patch=type(result.value)=="table" and result.value or {}
-        self:_home_save_network_metadata(candidate,patch)
+        local saved_patch={}
+        if type(cached)=="table" and type(cached.patch)=="table" then
+            for k,v in pairs(cached.patch) do if v~=nil and v~="" then saved_patch[k]=v end end
+        end
+        for k,v in pairs(patch) do if v~=nil and v~="" then saved_patch[k]=v end end
+        local completed=home_network_patch_has_data(saved_patch)
+        self:_home_save_network_metadata(candidate,saved_patch,completed)
         if self._home_hero and self:_home_network_metadata_key(self._home_hero)==key then
             local changed=self:_home_merge_network_patch(self._home_hero,patch)
             if changed and HomeView.is_shown() then self:_home_schedule_render_refresh("content") end
+        end
+        if force==true then
+            self:toast(completed and "当前书籍的网络信息已更新" or "暂未找到可补全的网络信息",2)
         end
     end,35)
     if not started then logger.warn("[MiuRead][Home] network metadata worker not started",tostring(err)) end
@@ -5996,11 +6068,10 @@ function Plugin:_home_wifi_settings()
                 if ok_widget and NetworkSetting and type(NetworkSetting.new)=="function" then
                     local dialog=NetworkSetting:new{
                         network_list=networks,
-                        -- NetworkSetting may stay open after a disconnect or a
-                        -- failed attempt. Do not rebuild the home from these
-                        -- callbacks; its close hook performs the single refresh.
-                        connect_callback=function() end,
-                        disconnect_callback=function() end,
+                        -- Deliberately omit connect_callback here. KOReader
+                        -- auto-dismisses an already-connected network picker
+                        -- when that callback is present. The close hook below
+                        -- performs the single MiuRead header refresh instead.
                     }
                     local original_on_close=dialog.onCloseWidget
                     dialog.onCloseWidget=function(widget)
@@ -6220,6 +6291,7 @@ function Plugin:show_home_quick_panel(more_expanded)
         buttons=buttons,
         more_buttons=more_buttons,
         more_expanded=more_expanded==true,
+        on_customize=function() self:show_home_customization() end,
         on_toggle_more=function(expanded)
             UIManager:scheduleIn(.04,function() self:show_home_quick_panel(expanded==true) end)
         end,
@@ -8072,7 +8144,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         row.status_text=self:_home_status_text(row,false)
     end
 
-    local home=self:_home_preferences()
+    local home,home_preferences=self:_home_preferences()
     local hero=self:_home_recent_book(miuread_rows,local_rows,account_rows)
     if hero then
         hero=U.copy(hero)
@@ -8092,6 +8164,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
             hero.edition_text="纯净版"
         end
         hero.on_tap=function() self:_home_open_book(hero) end
+        hero.on_refresh_metadata=function() self:_home_refresh_current_network_metadata(hero) end
     end
 
     local sections={
@@ -8211,11 +8284,20 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         or U.trim(tostring(hero.published_date or ""))==""
         or U.trim(tostring(hero.isbn or ""))==""
     )
-    if hero_needs_network and home.network_metadata~=false then
-        -- Network metadata is a low-priority opt-in job. Give the home screen
-        -- time to become idle before issuing any external request.
-        UIManager:scheduleIn(20,function()
-            if HomeView.is_shown() and not self:_active_reader_ui() then self:_home_schedule_network_metadata(hero,false) end
+    local hero_key=hero and self:_home_network_metadata_key(hero) or ""
+    local hero_recent_changed=hero_key~="" and tostring(home.last_network_metadata_recent_key or "")~=hero_key
+    if hero_recent_changed then
+        home.last_network_metadata_recent_key=hero_key
+        self:_save_home_preferences_deferred(home,home_preferences)
+    end
+    if hero_recent_changed and hero_needs_network and home.network_metadata~=false then
+        -- Only the newly changed recent-reading book may start an automatic
+        -- network lookup. Successful results stay cached until manual refresh.
+        UIManager:scheduleIn(2.5,function()
+            if HomeView.is_shown() and not self:_active_reader_ui()
+                and self._home_hero and self:_home_network_metadata_key(self._home_hero)==hero_key then
+                self:_home_schedule_network_metadata(self._home_hero,false)
+            end
         end)
     end
 
@@ -11880,7 +11962,7 @@ function Plugin:_toggle_home_network_metadata()
     local home,preferences=self:_home_preferences()
     home.network_metadata=home.network_metadata==false
     self:_save_home_preferences(home,preferences)
-    if home.network_metadata and self._home_hero then self:_home_schedule_network_metadata(self._home_hero,true) end
+    if home.network_metadata and self._home_hero then self:_home_schedule_network_metadata(self._home_hero,false) end
     self:toast(home.network_metadata and "已开启网络补全图书信息" or "已关闭网络补全图书信息",2)
 end
 

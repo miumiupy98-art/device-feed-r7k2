@@ -275,6 +275,8 @@ local function hero_card(book, width, height, callback, compact, hold_callback)
     local gap = math.max(UiScale.dp(9, 7, 14), math.floor(width * .014))
     local text_w = math.max(1, inner_w - cover_w - gap)
     local heading_h = UiScale.dp(22, 20, 30)
+    local refresh_w = book.on_refresh_metadata and math.max(UiScale.dp(28, 25, 40), heading_h) or 0
+    local heading_text_w = math.max(1, text_w - (refresh_w > 0 and refresh_w + UiScale.dp(3, 2, 5) or 0))
     local title_h = UiScale.dp(compact and 44 or 54, compact and 40 or 48, compact and 64 or 76)
     local line_h = UiScale.dp(27, 23, 36)
     local description_h = math.max(UiScale.dp(52, 44, 78), inner_h - heading_h - title_h - line_h * 3)
@@ -313,7 +315,7 @@ local function hero_card(book, width, height, callback, compact, hold_callback)
     table.insert(text, TextBoxWidget:new{
         text = tostring(book.heading or "最近阅读"),
         face = face("smallinfofont", 10.5, 15), bold = true,
-        width = text_w, height = heading_h, height_adjust = false,
+        width = heading_text_w, height = heading_h, height_adjust = false,
         height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
     })
     table.insert(text, TextBoxWidget:new{
@@ -364,9 +366,28 @@ local function hero_card(book, width, height, callback, compact, hold_callback)
             text,
         }),
     }
-    return tappable(width, height, content, callback, function(anchor)
+    local layers = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
+    -- Paint the card once, then place small transparent input zones over it.
+    -- The refresh zone is registered before the full-card zone so tapping the
+    -- icon cannot accidentally open the book underneath.
+    layers[#layers + 1] = content
+    if refresh_w > 0 then
+        local refresh_x = frame_inset + pad + cover_w + gap + math.max(0, text_w - refresh_w)
+        local refresh_y = frame_inset + pad
+        layers[#layers + 1] = OffsetContainer:new{
+            x_off = refresh_x, y_off = refresh_y,
+            tappable(refresh_w, heading_h, Ui.icon("refresh", refresh_w, heading_h,
+                math.max(UiScale.dp(17, 15, 24), math.floor(heading_h * .72)), {
+                    face = UiScale.iconFace("cfont", 14, 19, 11),
+                }), function()
+                if book.on_refresh_metadata then book.on_refresh_metadata() end
+            end),
+        }
+    end
+    layers[#layers + 1] = tappable(width, height, Widget:new{dimen = Geom:new{w = width, h = height}}, callback, function(anchor)
         if hold_callback then hold_callback(book, anchor) end
     end)
+    return layers
 end
 
 local function welcome_card(width, height, callback)

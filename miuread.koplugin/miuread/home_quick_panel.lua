@@ -264,7 +264,8 @@ function QuickPanelWidget:_build()
     self:_add(children, 0, 0, fixed_frame(sw, self.panel_h, {background = Blitbuffer.COLOR_WHITE}))
 
     local close_w = UiScale.dp(62, 58, 78)
-    local title_w = math.max(1, sw - margin * 2 - close_w - gap)
+    local customize_w = self.opts.on_customize and UiScale.dp(72, 66, 92) or 0
+    local title_w = math.max(1, sw - margin * 2 - close_w - customize_w - gap * (customize_w > 0 and 2 or 1))
     local title_row = HorizontalGroup:new{
         align = "center",
         LeftContainer:new{dimen = Geom:new{w = title_w, h = title_h}, VerticalGroup:new{
@@ -275,7 +276,22 @@ function QuickPanelWidget:_build()
                 face("smallinfofont", 10.6, 15.5), {alignment = "left", fgcolor = Blitbuffer.COLOR_BLACK}),
         }},
         HorizontalSpan:new{width = gap},
-        tappable(close_w, title_h, fixed_frame(close_w, math.max(1, title_h - gap), {
+    }
+    if customize_w > 0 then
+        title_row[#title_row + 1] = tappable(customize_w, title_h, fixed_frame(customize_w, math.max(1, title_h - gap), {
+            bordersize = line,
+            radius = UiScale.radius(5, 4, 9),
+            background = Blitbuffer.COLOR_WHITE,
+            color = Blitbuffer.COLOR_GRAY,
+        }, Ui.text("自定义", customize_w - UiScale.dp(8, 6, 12), math.max(1, title_h - gap),
+            face("smallinfofont", 10, 14), {bold = true})), function()
+            self:_close(function()
+                if self.opts.on_customize then self.opts.on_customize() end
+            end)
+        end)
+        title_row[#title_row + 1] = HorizontalSpan:new{width = gap}
+    end
+    title_row[#title_row + 1] = tappable(close_w, title_h, fixed_frame(close_w, math.max(1, title_h - gap), {
             bordersize = line,
             radius = UiScale.radius(5, 4, 9),
             background = Blitbuffer.COLOR_WHITE,
@@ -283,8 +299,7 @@ function QuickPanelWidget:_build()
         }, Ui.text("收起", close_w - UiScale.dp(8, 6, 12), math.max(1, title_h - gap),
             face("smallinfofont", 10, 14), {bold = true})), function()
             self:_close()
-        end),
-    }
+        end)
     self:_add(children, margin, margin, title_row)
 
     local y = margin + title_h + gap
