@@ -597,6 +597,8 @@ function Library:cache_cover(b,options)
     end
 
     local base=self.store.covers_dir.."/"..U.id_name(b.bookId)
+    local suffix=tostring(options.cache_suffix or ""):gsub("[^%w_%-]","")
+    if suffix~="" then base=base.."-"..suffix end
     local path=base..ext
     local written,write_error=U.atomic_write(path,data,true)
     if not written then error("cover write failed: "..tostring(write_error or "unknown")) end

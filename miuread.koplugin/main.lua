@@ -4684,20 +4684,168 @@ function Plugin:_home_refresh_one_book_metadata(book,network_too)
     return local_changed or network_started
 end
 
+function Plugin:_home_remove_lockscreen_cover_cache(book)
+    if type(book)~="table" then return false end
+    local id=tostring(book.bookId or book.book_id or "")
+    if id=="" then return false end
+    local dir=self.store.data_dir.."/lockscreen"
+    if lfs.attributes(dir,"mode")~="directory" then return false end
+    local prefix=U.id_name(id).."-"
+    local removed=false
+    local ok,iter,state,var=pcall(lfs.dir,dir)
+    if not ok or not iter then return false end
+    for name in iter,state,var do
+        if name~="." and name~=".." and name:sub(1,#prefix)==prefix and name:match("%.png$") then
+            if os.remove(dir.."/"..name) then removed=true end
+        end
+    end
+    return removed
+end
+
+function Plugin:_home_force_refresh_current_cover(book,on_done)
+    if type(book)~="table" then return false end
+    local id=tostring(book.bookId or book.book_id or "")
+    local cover=tostring(book.cover or book.coverUrl or "")
+    if cover=="" and id~="" then
+        local remote_books=self.library:cached()
+        for _,row in ipairs(type(remote_books)=="table" and remote_books or {}) do
+            if tostring(row.bookId or row.book_id or "")==id then
+                cover=tostring(row.cover or row.coverUrl or "")
+                if cover~="" then break end
+            end
+        end
+    end
+    if id=="" or cover=="" or not self.home_cover_async or self.home_cover_async:busy() then return false end
+    if not self:is_online() then return false end
+
+    local old_cached=self.library:cached_cover_path(id)
+    local refresh_token="manual-"..tostring(os.time()).."-"..tostring(math.floor((os.clock()%1)*1000))
+    local item={bookId=id,cover=cover}
+    local background=self.home_cover_async:available()
+    local covers_dir=self.store.covers_dir
+    local worker
+    if background then
+        worker=function()
+            local HttpChild=require("miuread.http")
+            local LibraryChild=require("miuread.library")
+            local store={
+                covers_dir=covers_dir,
+                auth=function() return {cookies={}} end,
+                save_auth=function() end,
+                get=function(_,_,default) return default end,
+                set=function() end,
+            }
+            return LibraryChild:new(nil,HttpChild:new(store),store):cache_cover(item,{
+                retries=1,timeout={8,15},persist_index=false,skip_index_lookup=true,
+                cache_suffix=refresh_token,
+            })
+        end
+    else
+        worker=function()
+            return self.library:cache_cover(item,{
+                retries=0,timeout={4,7},persist_index=false,skip_index_lookup=true,
+                cache_suffix=refresh_token,
+            })
+        end
+    end
+
+    local started=self.home_cover_async:run("home-cover-manual-refresh",worker,function(result)
+        if not result or result.ok~=true or not result.value then
+            logger.warn("[MiuRead][Cover] manual refresh failed",tostring(id),
+                tostring(result and result.error or "unknown"))
+            if on_done then on_done(false) end
+            return
+        end
+        local path=tostring(result.value)
+        local index=self.store:get("cover_index",{})
+        index[tostring(id)]=path
+        self.store:set("cover_index",index)
+        if self._cover_index_pending then self._cover_index_pending[tostring(id)]=nil end
+
+        book.cover_path=path
+        self:_home_apply_cover_path(id,path)
+        for key,section in pairs(self._home_sections or {}) do
+            for _,row in ipairs(section.rows or {}) do
+                if tostring(row.bookId or row.book_id or "")==id then
+                    row.cover_path=path
+                    self:_home_bump_section_revision(key)
+                    break
+                end
+            end
+        end
+
+        self:_home_remove_lockscreen_cover_cache(book)
+        local home=self:_home_preferences()
+        if home.lockscreen_recent~=false then
+            local hero=self._home_hero
+            if hero and tostring(hero.bookId or hero.book_id or "")==id then
+                hero.cover_path=path
+                local screensaver=self:_home_prepare_lockscreen_cover(hero)
+                HOME_SESSION.screensaver_file=screensaver
+                local current=HomeView.current()
+                if current and current.opts then current.opts.screensaver_file=screensaver end
+            end
+        end
+
+        if old_cached and old_cached~=path then os.remove(old_cached) end
+        if HomeView.is_shown() then self:_home_schedule_render_refresh("content") end
+        logger.info("[MiuRead][Cover] manual refresh complete",tostring(id),tostring(path))
+        if on_done then on_done(true) end
+    end,background and 35 or 14)
+    return started==true
+end
+
 function Plugin:_home_refresh_current_network_metadata(book)
     if type(book)~="table" then return false end
     if not self:is_online() then
-        self:toast("当前未联网，无法更新图书信息",2)
+        self:toast("当前未联网，无法更新书籍信息和封面",2)
         return false
     end
-    local started=self:_home_schedule_network_metadata(book,true)==true
-    if started then self:toast("正在更新当前书籍的网络信息…",2)
-    elseif self.home_metadata_async and self.home_metadata_async:busy() then
-        self:toast("已有图书信息任务正在进行，请稍后再试",2)
-    else
-        self:toast("当前暂时无法开始网络更新",2)
+
+    self:toast("正在更新这本书的信息和封面…",2)
+    local state={metadata_done=false,metadata_ok=false,cover_done=false,cover_ok=false,finished=false}
+    local function finish()
+        if state.finished or not state.metadata_done or not state.cover_done then return end
+        state.finished=true
+        if state.metadata_ok and state.cover_ok then
+            self:toast("书籍信息和封面已更新",2)
+        elseif state.cover_ok then
+            self:toast("封面已更新，网络书籍信息暂未补全",2)
+        elseif state.metadata_ok then
+            self:toast("书籍信息已更新，封面更新失败",2)
+        else
+            self:toast("当前书籍更新失败，请稍后重试",2)
+        end
     end
-    return started
+
+    local metadata_started=self:_home_schedule_network_metadata(book,true,true,function(ok)
+        state.metadata_done=true
+        state.metadata_ok=ok==true
+        finish()
+    end)==true
+    if not metadata_started then state.metadata_done=true end
+
+    local cover_started=self:_home_force_refresh_current_cover(book,function(ok)
+        state.cover_done=true
+        state.cover_ok=ok==true
+        finish()
+    end)==true
+    if not cover_started then state.cover_done=true end
+
+    if metadata_started or cover_started then
+        finish()
+        return true
+    end
+    if self.home_metadata_async and self.home_metadata_async:busy() then
+        self:toast("已有图书信息任务正在进行，请稍后再试",2)
+    elseif self.home_cover_async and self.home_cover_async:busy() then
+        self:toast("已有封面任务正在进行，请稍后再试",2)
+    elseif tostring(book.cover or book.coverUrl or "")=="" then
+        self:toast("当前书籍没有可更新的网络封面",2)
+    else
+        self:toast("当前暂时无法开始更新",2)
+    end
+    return false
 end
 
 function Plugin:_home_hide_local_book(book)
@@ -5486,7 +5634,7 @@ function Plugin:_home_save_network_metadata(book,patch,completed)
     return count>0
 end
 
-function Plugin:_home_schedule_network_metadata(book,force)
+function Plugin:_home_schedule_network_metadata(book,force,silent,on_done)
     if self:_home_background_blocked() then
         self._home_resume_pending_work=self._home_resume_pending_work or {}
         self._home_resume_pending_work.metadata=true
@@ -5547,7 +5695,8 @@ function Plugin:_home_schedule_network_metadata(book,force)
         if not result or result.ok~=true then
             logger.warn("[MiuRead][Home] network metadata unavailable",tostring(result and result.error or "unknown"))
             if not cached_completed then self:_home_save_network_metadata(candidate,{},false) end
-            if force==true then self:toast("网络图书信息更新失败，请稍后重试",2) end
+            if force==true and silent~=true then self:toast("网络图书信息更新失败，请稍后重试",2) end
+            if on_done then on_done(false) end
             return
         end
         local patch=type(result.value)=="table" and result.value or {}
@@ -5562,9 +5711,10 @@ function Plugin:_home_schedule_network_metadata(book,force)
             local changed=self:_home_merge_network_patch(self._home_hero,patch)
             if changed and HomeView.is_shown() then self:_home_schedule_render_refresh("content") end
         end
-        if force==true then
+        if force==true and silent~=true then
             self:toast(completed and "当前书籍的网络信息已更新" or "暂未找到可补全的网络信息",2)
         end
+        if on_done then on_done(completed,patch) end
     end,35)
     if not started then logger.warn("[MiuRead][Home] network metadata worker not started",tostring(err)) end
     return started==true
