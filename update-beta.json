@@ -1,17 +1,17 @@
 {
-  "version": "4.2.0-beta.3",
-  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 4.2.0-beta.3 \u5185\u6d4b\u7248",
+  "version": "4.2.0-beta.4",
+  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 4.2.0-beta.4 \u5185\u6d4b\u7248",
   "channel": "beta",
   "package_type": "full",
-  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.3/miuread-v4.2.0-beta.3-full.zip",
+  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.4/miuread-v4.2.0-beta.4-full.zip",
   "package_urls": [
-    "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.3/miuread-v4.2.0-beta.3-full.zip",
-    "https://ghfast.top/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.3/miuread-v4.2.0-beta.3-full.zip",
-    "https://gh-proxy.com/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.3/miuread-v4.2.0-beta.3-full.zip",
-    "https://ghproxy.net/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.3/miuread-v4.2.0-beta.3-full.zip"
+    "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.4/miuread-v4.2.0-beta.4-full.zip",
+    "https://ghfast.top/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.4/miuread-v4.2.0-beta.4-full.zip",
+    "https://gh-proxy.com/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.4/miuread-v4.2.0-beta.4-full.zip",
+    "https://ghproxy.net/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.4/miuread-v4.2.0-beta.4-full.zip"
   ],
-  "size": 501336,
-  "sha256": "18d798ac5060f307f575bf47f98ec14f9a0e695abe0999963114811e99fb7526",
-  "summary": "MiuRead v4.2.0-beta.3\n\u4fee\u590d: \u5355\u672c\u4e66\u540c\u6b65\u5f02\u5e38\u65f6\u76f4\u63a5\u63d0\u4f9b\u4fee\u590d\u540c\u6b65 \u4e0d\u518d\u540e\u53f0\u53cd\u590d\u91cd\u8bd5\n\u4fee\u590d: \u7279\u6b8a\u7ae0\u8282\u53ef\u6309\u53ef\u4fe1\u7ae0\u8282 ID \u5efa\u7acb\u540c\u6b65 \u4e0d\u518d\u56e0\u5b57\u6570\u4e3a\u96f6\u76f4\u63a5\u4e22\u5f03\n\u4f18\u5316: \u9605\u8bfb\u65f6\u95f4\u5931\u8d25\u4e0d\u8865\u4f20 \u540c\u6b65\u5f02\u5e38\u4ec5\u6682\u505c\u5f53\u524d\u4e66 \u5176\u4ed6\u4e66\u7c4d\u4e0d\u53d7\u5f71\u54cd",
-  "notes": "MiuRead v4.2.0-beta.3\n\u4fee\u590d: \u5355\u672c\u4e66\u540c\u6b65\u5f02\u5e38\u65f6\u76f4\u63a5\u63d0\u4f9b\u4fee\u590d\u540c\u6b65 \u4e0d\u518d\u540e\u53f0\u53cd\u590d\u91cd\u8bd5\n\u4fee\u590d: \u7279\u6b8a\u7ae0\u8282\u53ef\u6309\u53ef\u4fe1\u7ae0\u8282 ID \u5efa\u7acb\u540c\u6b65 \u4e0d\u518d\u56e0\u5b57\u6570\u4e3a\u96f6\u76f4\u63a5\u4e22\u5f03\n\u4f18\u5316: \u9605\u8bfb\u65f6\u95f4\u5931\u8d25\u4e0d\u8865\u4f20 \u540c\u6b65\u5f02\u5e38\u4ec5\u6682\u505c\u5f53\u524d\u4e66 \u5176\u4ed6\u4e66\u7c4d\u4e0d\u53d7\u5f71\u54cd"
+  "size": 502553,
+  "sha256": "cef51750ce625774c622e414c4085d41dee67d2ca1d26c116c919ea6abb0c7db",
+  "summary": "MiuRead v4.2.0-beta.4\n\u4fee\u590d: \u4fee\u590d\u540c\u6b65\u5148\u9a8c\u8bc1\u767b\u5f55\u5e76\u4fdd\u7559\u539f\u6709\u7ae0\u8282\u72b6\u6001 \u4e0d\u518d\u63d0\u524d\u6e05\u7a7a\u540c\u6b65\u4e0a\u4e0b\u6587\n\u4fee\u590d: \u65b0\u7ae0\u8282\u4e0a\u4e0b\u6587\u4ec5\u5728\u5fae\u4fe1\u8bfb\u4e66\u786e\u8ba4\u540c\u6b65\u6210\u529f\u540e\u66ff\u6362\u65e7\u72b6\u6001\n\u4f18\u5316: \u589e\u52a0\u7ae0\u8282\u6620\u5c04\u8bca\u65ad\u5e76\u9690\u85cf\u666e\u901a\u754c\u9762\u7684\u5185\u90e8\u9519\u8bef\u8def\u5f84",
+  "notes": "MiuRead v4.2.0-beta.4\n\u4fee\u590d: \u4fee\u590d\u540c\u6b65\u5148\u9a8c\u8bc1\u767b\u5f55\u5e76\u4fdd\u7559\u539f\u6709\u7ae0\u8282\u72b6\u6001 \u4e0d\u518d\u63d0\u524d\u6e05\u7a7a\u540c\u6b65\u4e0a\u4e0b\u6587\n\u4fee\u590d: \u65b0\u7ae0\u8282\u4e0a\u4e0b\u6587\u4ec5\u5728\u5fae\u4fe1\u8bfb\u4e66\u786e\u8ba4\u540c\u6b65\u6210\u529f\u540e\u66ff\u6362\u65e7\u72b6\u6001\n\u4f18\u5316: \u589e\u52a0\u7ae0\u8282\u6620\u5c04\u8bca\u65ad\u5e76\u9690\u85cf\u666e\u901a\u754c\u9762\u7684\u5185\u90e8\u9519\u8bef\u8def\u5f84"
 }
