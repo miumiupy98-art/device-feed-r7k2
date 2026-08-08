@@ -155,6 +155,17 @@ function Dialog:_build_content()
     local max_rows = math.max(5, math.floor((max_h - pad * 2 - header_h - footer_h - handle_h - gap * 2) / row_h))
     max_rows = math.min(10, max_rows)
     local items = self:_items()
+    -- Follow the current reading chapter once whenever the directory is opened.
+    -- After that, manual directory paging is respected until the dialog closes.
+    if self.opts and self.opts.auto_follow ~= false and not self._auto_follow_applied then
+        for index, item in ipairs(items) do
+            if item.current == true then
+                self.page = math.max(1, math.ceil(index / max_rows))
+                break
+            end
+        end
+        self._auto_follow_applied = true
+    end
     local total_pages = math.max(1, math.ceil(math.max(1, #items) / max_rows))
     self.page = math.max(1, math.min(total_pages, tonumber(self.page) or 1))
     local first = (self.page - 1) * max_rows + 1

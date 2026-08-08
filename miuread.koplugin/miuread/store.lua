@@ -1251,6 +1251,21 @@ function Store:migrate()
             if current.thoughts.enabled==nil then current.thoughts.enabled=true end
             self:save_preferences(current)
         end
+        if schema<100 then
+            -- 4.2.0-beta.10 replaces the bottom six-item reader surface with a
+            -- transient top control center. The hidden reading state remains
+            -- completely clean and the primary row is fixed to five reader tools.
+            local current=self:preferences()
+            current.reader_ui=type(current.reader_ui)=="table" and current.reader_ui or {}
+            current.reader_ui.show_title=false
+            current.reader_ui.show_status=false
+            current.reader_ui.show_recent=false
+            current.reader_ui.recent_actions={}
+            current.reader_ui.quick_layout_version=9
+            current.reader_ui.quick_items={toc=true,progress=true,font=true,comments=true,search=true}
+            current.reader_ui.quick_order={"toc","progress","font","comments","search"}
+            self:save_preferences(current)
+        end
         self.db:saveSetting("schema",Config.SCHEMA)
     end
 end
