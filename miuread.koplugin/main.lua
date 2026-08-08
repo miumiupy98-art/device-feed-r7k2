@@ -71,7 +71,8 @@ local MigrationProgress=require("miuread.migration_progress")
 local DownloadDatabase=require("miuread.download_database")
 local StatusToast=require("miuread.status_toast")
 local ReaderTransitionGuard=require("miuread.reader_transition_guard")
-local ModeGuard=require("miuread.mode_guard")
+local PluginMenu=require("miuread.plugin_menu")
+local PluginSettings=require("miuread.plugin_settings")
 local Actions=require("miuread.actions")
 local function gesture_aware_class(base, attributes)
     local class=base:extend(attributes or {})
@@ -291,6 +292,7 @@ local function install_home_screensaver_patch()
     return true
 end
 local source=debug.getinfo(1,"S").source:gsub("^@",""); local ROOT=source:match("^(.*)/main%.lua$") or "."
+local RUNTIME_MODE_KEY="__MIUREAD_RUNTIME_MODE"
 local Plugin=WidgetContainer:extend{name="miuread",is_doc_only=false,version=Config.VERSION}
 local function normalize(v) local b=v.bookInfo or v.book or v; return {bookId=tostring(b.bookId or v.bookId or ""),title=b.title or v.title or "未命名",author=b.author or v.author or "",cover=b.cover or v.cover,category=b.category or v.category,progress=tonumber(v.progress or b.progress or 0) or 0,updateTime=tonumber(v.updateTime or b.updateTime or 0) or 0} end
 local function sanitize_saved_auth(store)
@@ -307,6 +309,14 @@ function Plugin:init()
     math.randomseed(os.time()+math.floor(collectgarbage("count")))
     sync_home_session()
     self.store=Store:new()
+    local runtime_mode=rawget(_G,RUNTIME_MODE_KEY)
+    if runtime_mode~="desktop" and runtime_mode~="plugin" then
+        local configured=((self.store:preferences().home_ui or {}).enabled~=false)
+        runtime_mode=configured and "desktop" or "plugin"
+        rawset(_G,RUNTIME_MODE_KEY,runtime_mode)
+    end
+    self._runtime_mode=runtime_mode
+    logger.info("[MiuRead][Mode] runtime frozen",tostring(runtime_mode))
     local timezone_ok,timezone_error=TimeZone.apply((self.store:preferences() or {}).time_display)
     if not timezone_ok then logger.warn("[MiuRead][TimeZone] startup apply failed",tostring(timezone_error or "unknown")) end
     self._reader_context=self.ui and self.ui.document~=nil
@@ -318,7 +328,7 @@ function Plugin:init()
             logger.info("[MiuRead][Home] reader origin restored",tostring(path or "unknown"))
         end
     end
-    HomeView.prune_duplicates()
+    if self:_home_enabled() then HomeView.prune_duplicates() end
     if HOME_SESSION.suspended==true then
         self:_set_navigation_state("suspended","plugin initialized while suspended")
     elseif reader_close_active() then
@@ -424,7 +434,7 @@ function Plugin:init()
     self.identity_async=Async:new(self.store,{poll_interval=.20,allow_android=true,
         disable_fallback=true})
     self.repair_async=Async:new(self.store,{poll_interval=.35,allow_android=true})
-    if ((self.store:preferences().home_ui or {}).enabled~=false) then
+    if self:_home_enabled() then
         self.home_async=Async:new(self.store,{poll_interval=.45,allow_android=true,disable_fallback=true})
         -- Desktop-only workers are not created in plugin mode.
         self.local_browser_async=Async:new(self.store,{poll_interval=.20,allow_android=true,disable_fallback=true})
@@ -539,22 +549,14 @@ function Plugin:init()
             UIManager:scheduleIn(1,function() self:info("更新文件已经替换，但当前运行版本与目标版本不一致。\n\n请完整退出并重新启动 KOReader。\n当前运行："..tostring(self.version)) end)
         end
         UIManager:scheduleIn(.8,function() if not self:_current_document_path() then self:_install_pending_downloads(false) end end)
-        UIManager:scheduleIn(1.2,function() self:_show_auth_notice() end)
+        UIManager:scheduleIn(1.4,function() self:_show_auth_notice() end)
         UIManager:scheduleIn(5.0,function() self:maybe_auto_check_update(false) end)
-        local startup_environment=self:_mode_environment()
-        local startup_key=self:_mode_environment_key(self:_home_enabled(),startup_environment)
-        local startup_conflict=self:_home_enabled() and #(startup_environment.conflicts or {})>0
-            and self:_notice_enabled("mode_environment")
-            and not self:_mode_environment_acknowledged(startup_key)
-        if startup_conflict then
-            -- Do not reveal MiuRead Desktop before the user chooses how to handle
-            -- another enabled desktop/UI plugin.
-            UIManager:scheduleIn(.65,function() self:_check_mode_environment(false) end)
-        else
-            UIManager:scheduleIn(1.8,function() self:_check_mode_environment(false) end)
-            if self:_home_enabled() and not HOME_SESSION_SUPPRESSED then
-                self:_schedule_home_startup(.65)
-            end
+        if self:_mode_intro_needed() then
+            -- New users and users who have just entered another mode see one
+            -- concise explanation before Desktop Home is revealed.
+            UIManager:scheduleIn(.55,function() self:_show_mode_intro() end)
+        elseif self:_home_enabled() and not HOME_SESSION_SUPPRESSED then
+            self:_schedule_home_startup(.65)
         end
     end
 end
@@ -580,7 +582,12 @@ function Plugin:addToMainMenu(items)
     items.miuread={
         text=Config.NAME,
         sorting_hint="tools",
-        sub_item_table_func=function() return self.ui.document and self:reader_menu() or self:home_menu() end,
+        sub_item_table_func=function()
+            if self:_home_enabled() then
+                return self.ui.document and self:reader_menu() or self:home_menu()
+            end
+            return self.ui.document and PluginMenu.reader(self) or PluginMenu.home(self)
+        end,
     }
 end
 function Plugin:info(t) UIManager:show(InfoMessage:new{text=tostring(t or "")}) end
@@ -2222,71 +2229,65 @@ function Plugin:_home_bump_section_revision(section)
 end
 
 function Plugin:_home_enabled()
+    return tostring(self._runtime_mode or rawget(_G,RUNTIME_MODE_KEY) or "desktop")=="desktop"
+end
+
+function Plugin:_configured_home_enabled()
     local home=self:_home_preferences()
     return home.enabled~=false
 end
 
-function Plugin:_configured_home_enabled()
-    return self:_home_enabled()
+function Plugin:_runtime_mode_label()
+    return self:_home_enabled() and "觅阅桌面" or "插件模式"
 end
 
-function Plugin:_mode_environment()
-    local ok,result=pcall(ModeGuard.scan)
-    if not ok or type(result)~="table" then
-        logger.warn("[MiuRead][ModeGuard] scan failed",tostring(result or "unknown"))
-        return {conflicts={},signature="unknown",scan_failed=true}
-    end
-    return result
-end
-
-function Plugin:_mode_guard_preferences()
-    local preferences=self.store:preferences()
-    preferences.mode_guard=type(preferences.mode_guard)=="table" and preferences.mode_guard or {}
-    preferences.mode_guard.acknowledged=type(preferences.mode_guard.acknowledged)=="table" and preferences.mode_guard.acknowledged or {}
-    return preferences.mode_guard,preferences
-end
-
-function Plugin:_mode_environment_key(desktop,environment)
-    return (desktop and "desktop" or "plugin").."|"..tostring((environment or {}).signature or "unknown")
-end
-
-function Plugin:_ack_mode_environment(key)
-    local guard,preferences=self:_mode_guard_preferences()
-    guard.acknowledged[tostring(key or "")]=true
-    self.store:save_preferences(preferences)
-end
-
-function Plugin:_mode_environment_acknowledged(key)
-    local guard=self:_mode_guard_preferences()
-    return guard.acknowledged[tostring(key or "")]==true
-end
-
-function Plugin:_mode_environment_status(environment)
-    environment=environment or self:_mode_environment()
-    local count=#(environment.conflicts or {})
-    if self:_home_enabled() then
-        if count>0 then return "觅阅桌面 · 检测到 "..tostring(count).." 个界面冲突" end
-        return environment.scan_failed and "觅阅桌面 · 未能检查其他 UI" or "觅阅桌面 · 未发现界面冲突"
-    end
-    if count>0 then return "插件模式 · 与其他界面共存" end
-    return environment.scan_failed and "插件模式 · 未能检查其他 UI" or "插件模式 · 未检测到其他桌面 UI"
+function Plugin:_configured_mode_label()
+    return self:_configured_home_enabled() and "觅阅桌面" or "插件模式"
 end
 
 function Plugin:_home_mode_label()
-    return self:_mode_environment_status(self:_mode_environment())
+    local current=self:_runtime_mode_label()
+    local configured=self:_configured_mode_label()
+    if current==configured then return current end
+    return "当前"..current.." · 重启后"..configured
+end
+
+function Plugin:_mode_intro_preferences()
+    local preferences=self.store:preferences()
+    preferences.mode_intro=type(preferences.mode_intro)=="table" and preferences.mode_intro or {}
+    return preferences.mode_intro,preferences
+end
+
+function Plugin:_mode_intro_needed()
+    if self._reader_context then return false end
+    if not self:_notice_enabled("mode_environment") then return false end
+    local intro=self:_mode_intro_preferences()
+    local mode=self:_home_enabled() and "desktop" or "plugin"
+    return tostring(intro.last_confirmed_mode or "")~=mode
+end
+
+function Plugin:_ack_mode_intro()
+    local intro,preferences=self:_mode_intro_preferences()
+    intro.last_confirmed_mode=self:_home_enabled() and "desktop" or "plugin"
+    intro.confirmed_at=os.time()
+    self.store:save_preferences(preferences)
+end
+
+function Plugin:_desktop_compatibility_info()
+    self:info("觅阅桌面会接管 KOReader 的部分主页、菜单、手势和阅读界面。\n\n如果同时启用了其他美化 UI 或美化补丁，可能造成卡顿、闪烁、菜单异常、手势失效或返回异常。\n\n建议使用觅阅桌面时，先禁用或删除其他美化 UI 和相关补丁。需要保留其他美化界面时，请使用插件模式。")
 end
 
 function Plugin:_show_mode_restart_notice(enabled)
     local text=enabled
-        and "重启后将使用觅阅桌面。觅阅会提供主页及桌面阅读交互。"
-        or "重启后将使用插件模式。觅阅不会接管 KOReader 主页或阅读界面，书架、下载、评论、同步、修复和账号功能仍可使用。"
+        and "重启后将使用觅阅桌面。觅阅会提供完整主页和阅读快捷界面。"
+        or "重启后将使用插件模式。KOReader 将继续管理主页和主要阅读界面，觅阅书架、下载、评论、同步、修复和账号功能仍可使用。"
     if not self:_notice_enabled("mode_switch") then
         self:toast("运行模式已保存，重启 KOReader 后生效",3)
         return true
     end
     local dialog
     dialog=ButtonDialog:new{title=text,title_align="center",buttons={
-        {{text="立即重启",callback=function() UIManager:close(dialog); self:_restart_koreader() end}},
+        {{text="立即重启",callback=function() UIManager:close(dialog); self:_restart_koreader("mode switch") end}},
         {{text="稍后重启",callback=function() UIManager:close(dialog); self:toast("运行模式将在重启后生效",3) end}},
         {{text="稍后重启并不再提示",callback=function()
             UIManager:close(dialog); self:_set_notice_enabled("mode_switch",false); self:toast("运行模式将在重启后生效",3)
@@ -2299,132 +2300,67 @@ end
 function Plugin:_set_home_mode(use_miuread_home)
     local enabled=use_miuread_home==true
     local home,preferences=self:_home_preferences()
-    if (home.enabled~=false)==enabled then
-        self:toast(enabled and "当前已是觅阅桌面模式" or "当前已是插件模式",2)
+    local configured=home.enabled~=false
+    if configured==enabled then
+        if self:_home_enabled()==enabled then
+            self:toast(enabled and "当前已是觅阅桌面模式" or "当前已是插件模式",2)
+        else
+            self:toast(enabled and "已设置重启后使用觅阅桌面" or "已设置重启后使用插件模式",2)
+        end
         return false
     end
     home.enabled=enabled
     home.layout_version=23
     self:_save_home_preferences(home,preferences)
+    if self:_home_enabled()==enabled then
+        self:toast("已取消待切换模式，当前继续使用"..self:_runtime_mode_label(),3)
+        return true
+    end
     return self:_show_mode_restart_notice(enabled)
 end
 
-function Plugin:_show_desktop_conflict_followup(environment,key)
-    local names=ModeGuard.labels(environment,3)
-    local dialog
-    dialog=ButtonDialog:new{
-        title="觅阅桌面仍将保持启用。\n\n建议在 KOReader 的插件管理中关闭「"..tostring(names).."」，避免主页、返回位置或手势同时被多个界面接管。",
-        title_align="center",
-        buttons={
-            {{text="打开 KOReader 菜单",callback=function()
-                UIManager:close(dialog); self:_ack_mode_environment(key); self:_show_native_koreader_menu()
-            end}},
-            {{text="知道了",callback=function()
-                UIManager:close(dialog); self:_ack_mode_environment(key)
-                if self:_home_enabled() and not self._reader_context and not HomeView.is_shown() then self:_schedule_home_startup(.10) end
-            end}},
-        },
-    }
-    UIManager:show(dialog)
-end
-
-function Plugin:_show_desktop_conflict_prompt(environment,key,from_switch)
-    local names=ModeGuard.labels(environment,3)
-    local dialog
-    dialog=ButtonDialog:new{
-        title="检测到其他界面插件\n\n当前启用了「"..tostring(names).."」。与觅阅桌面同时运行可能造成主页覆盖、返回位置异常或手势冲突。\n\n推荐使用插件模式，保留当前界面插件。",
-        title_align="center",
-        buttons={
-            {{text="切换到插件模式",callback=function()
-                UIManager:close(dialog)
-                if self:_home_enabled() then self:_set_home_mode(false) else self:toast("当前已是插件模式",2) end
-            end}},
-            {{text=from_switch and "仍切换到觅阅桌面" or "继续使用觅阅桌面",callback=function()
-                UIManager:close(dialog)
-                if from_switch and not self:_home_enabled() then
-                    self:_show_desktop_switch_followup(environment,key)
-                else
-                    self:_show_desktop_conflict_followup(environment,key)
-                end
-            end}},
-        },
-    }
-    UIManager:show(dialog)
-end
-
-function Plugin:_show_desktop_switch_followup(environment,key)
-    local names=ModeGuard.labels(environment,3)
-    local dialog
-    dialog=ButtonDialog:new{
-        title="如果继续启用觅阅桌面，建议随后在 KOReader 插件管理中关闭「"..tostring(names).."」。\n\n两个桌面界面同时启用时，仍可能互相覆盖。",
-        title_align="center",
-        buttons={
-            {{text="仍切换到觅阅桌面",callback=function()
-                UIManager:close(dialog); self:_set_home_mode(true); self:_ack_mode_environment(key)
-            end}},
-            {{text="保持插件模式",callback=function() UIManager:close(dialog) end}},
-        },
-    }
-    UIManager:show(dialog)
-end
-
 function Plugin:_request_home_mode(enabled)
-    enabled=enabled==true
-    local environment=self:_mode_environment()
-    if not enabled then
-        local changed=self:_set_home_mode(false)
-        self:_ack_mode_environment(self:_mode_environment_key(false,environment))
-        return changed
-    end
-    if #(environment.conflicts or {})>0 then
-        return self:_show_desktop_conflict_prompt(environment,self:_mode_environment_key(true,environment),true)
-    end
-    return self:_set_home_mode(true)
+    return self:_set_home_mode(enabled==true)
 end
 
-function Plugin:_show_plugin_mode_suggestion(environment,key)
-    local dialog
-    dialog=ButtonDialog:new{
-        title="当前未检测到其他桌面界面。\n\n现在使用的是觅阅插件模式。如果主要使用觅阅阅读微信读书，可以切换到觅阅桌面，获得主页和完整桌面阅读界面。",
-        title_align="center",
-        buttons={
-            {{text="切换到觅阅桌面",callback=function() UIManager:close(dialog); self:_request_home_mode(true) end}},
-            {{text="继续使用插件模式",callback=function() UIManager:close(dialog); self:_ack_mode_environment(key) end}},
-        },
-    }
-    UIManager:show(dialog)
-end
-
-function Plugin:_check_mode_environment(force)
+function Plugin:_show_mode_intro()
     if self._reader_context then return false end
-    if not force and not self:_notice_enabled("mode_environment") then return false end
-    local environment=self:_mode_environment()
     local desktop=self:_home_enabled()
-    local key=self:_mode_environment_key(desktop,environment)
-    local count=#(environment.conflicts or {})
-    if environment.scan_failed then
-        if force then self:info("运行模式检查暂时不可用。当前模式："..(desktop and "觅阅桌面" or "插件模式")) end
+    if not self:_mode_intro_needed() then
+        if desktop and not HOME_SESSION_SUPPRESSED and not HomeView.is_shown() then self:_schedule_home_startup(.10) end
         return false
     end
-    if desktop and count>0 then
-        if force or not self:_mode_environment_acknowledged(key) then
-            self:_show_desktop_conflict_prompt(environment,key,false)
-            return true
-        end
-    elseif (not desktop) and count==0 then
-        if force or not self:_mode_environment_acknowledged(key) then
-            self:_show_plugin_mode_suggestion(environment,key)
-            return true
-        end
-    elseif force then
-        if desktop then
-            self:info("运行模式：觅阅桌面\n\n未发现其他会接管桌面界面的插件。")
-        else
-            self:info("运行模式：插件模式\n\n检测到其他界面插件，当前模式可与它们共存，无需切换。")
-        end
-        return true
+    local dialog
+    if desktop then
+        dialog=ButtonDialog:new{
+            title="当前使用：觅阅桌面\n\n觅阅桌面会提供完整主页、书架和阅读快捷界面，并接管 KOReader 的部分主页、菜单、手势和返回操作。\n\n如果同时启用了其他美化 UI 或美化补丁，可能造成卡顿、闪烁、菜单异常、手势失效或返回异常。\n\n建议先禁用或删除其他美化 UI 和相关补丁。需要保留 KOReader 原界面或其他美化 UI 时，可改用插件模式。",
+            title_align="center",
+            buttons={
+                {{text="继续使用觅阅桌面",callback=function()
+                    UIManager:close(dialog); self:_ack_mode_intro()
+                    if not HOME_SESSION_SUPPRESSED and not HomeView.is_shown() then self:_schedule_home_startup(.10) end
+                end}},
+                {{text="改用插件模式",callback=function()
+                    UIManager:close(dialog); self:_ack_mode_intro()
+                    if not HOME_SESSION_SUPPRESSED and not HomeView.is_shown() then self:_schedule_home_startup(.10) end
+                    self:_request_home_mode(false)
+                end}},
+            },
+        }
+    else
+        dialog=ButtonDialog:new{
+            title="当前使用：插件模式\n\n插件模式不会替换 KOReader 的主页和主要阅读界面，适合使用 KOReader 原界面，或搭配其他美化 UI 和美化补丁。\n\n微信书架、搜索、下载、评论、同步、修复和公众号等觅阅功能仍可使用。\n\n如果希望使用觅阅完整主页和阅读快捷界面，可以恢复觅阅桌面。恢复前建议先禁用或删除其他美化 UI 和相关补丁。",
+            title_align="center",
+            buttons={
+                {{text="继续使用插件模式",callback=function() UIManager:close(dialog); self:_ack_mode_intro() end}},
+                {{text="恢复觅阅桌面",callback=function()
+                    UIManager:close(dialog); self:_ack_mode_intro(); self:_request_home_mode(true)
+                end}},
+            },
+        }
     end
-    return false
+    UIManager:show(dialog)
+    return true
 end
 
 function Plugin:_return_to_configured_home()
@@ -2437,17 +2373,17 @@ function Plugin:_return_to_configured_home()
 end
 
 function Plugin:home_mode_menu()
-    local environment=self:_mode_environment()
-    return {
+    local rows={
         {text="使用觅阅桌面",post_text="主页 + 完整桌面阅读界面",radio=true,checked_func=function() return self:_configured_home_enabled() end,callback=function()
             self:_request_home_mode(true)
         end},
         {text="使用插件模式",post_text="保留 KOReader 或其他美化界面",radio=true,checked_func=function() return not self:_configured_home_enabled() end,callback=function()
             self:_request_home_mode(false)
         end},
-        {text="当前环境",post_text=self:_mode_environment_status(environment),enabled=false},
-        {text="重新检查界面冲突",callback=function() self:_check_mode_environment(true) end},
+        {text="当前运行",post_text=self:_home_mode_label(),enabled=false},
+        {text="桌面模式兼容说明",callback=function() self:_desktop_compatibility_info() end},
     }
+    return rows
 end
 
 function Plugin:_home_refresh_priority(kind)
@@ -3533,7 +3469,7 @@ end
 local NOTICE_LABELS={
     reader_download="阅读时下载提醒",low_battery="低电量下载提醒",low_storage="存储空间提醒",
     full_refresh="全屏刷新说明",lockscreen="锁屏封面影响说明",library_scan="扫描书库提醒",
-    repair_while_reading="阅读中修复提醒",mode_switch="运行模式切换说明",mode_environment="运行模式环境建议",
+    repair_while_reading="阅读中修复提醒",mode_switch="运行模式切换说明",mode_environment="进入模式说明",
 }
 
 function Plugin:notice_settings_menu()
@@ -6867,6 +6803,7 @@ function Plugin:_quit_koreader()
 end
 
 function Plugin:show_home_menu()
+    if not self:_home_enabled() then return self:_show_standalone_menu("插件设置",PluginSettings.menu(self)) end
     return self:_show_standalone_menu("觅阅设置",self:settings_menu())
 end
 
@@ -7705,8 +7642,8 @@ function Plugin:_show_reader_records(initial_kind,back_callback)
             }
         end,
         page_size=5,
-        on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_back=back_callback or (self:_home_enabled() and function() self:show_reader_quick_panel() end or function() self:_show_koreader_reader_menu() end),
+        on_home=self:_home_enabled() and function() return self:return_to_miuread_home("reader surface") end or nil,
     }
     return true
 end
