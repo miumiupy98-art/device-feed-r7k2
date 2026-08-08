@@ -131,6 +131,7 @@ function Dialog:_row_widget(row, width, height)
     local pad = Skin.dp(8, 6, 11)
     local icon = tostring(row.icon or "")
     local value = tostring(row.value or row.detail or "")
+    if row.checked == true then value = value ~= "" and (value .. "  ✓") or "✓" end
     local arrow = row.arrow ~= false and row.callback ~= nil and row.keep_open ~= true
     local icon_w = icon ~= "" and Skin.dp(28, 23, 38) or 0
     local arrow_w = arrow and Skin.dp(17, 14, 23) or 0
@@ -152,7 +153,7 @@ function Dialog:_row_widget(row, width, height)
 
     row_content[#row_content + 1] = Ui.textbox(tostring(row.label or row.text or ""), label_w, inner_h,
         Skin.face("cfont", 10.9, 14.8, 9.4), {
-            bold = row.bold == true, alignment = "left",
+            bold = row.bold == true or row.checked == true, alignment = "left",
             fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
         })
 
@@ -186,18 +187,12 @@ function Dialog:_section_widget(section, width, row_h)
     local rows = type(section.rows) == "table" and section.rows or {}
     local height = math.max(row_h, #rows * row_h)
     local layers = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
-    layers[#layers + 1] = Skin.frame(width, height, {
-        bordersize = Skin.line("thin"),
-        radius = Skin.radius(7, 5, 11),
-        background = Blitbuffer.COLOR_WHITE,
-        color = Blitbuffer.COLOR_DARK_GRAY,
-    }, Widget:new{dimen = Geom:new{w = 1, h = 1}})
-    local border_inset = Skin.line("thick")
+    local inset = Skin.dp(2, 2, 4)
     for index = 1, #rows - 1 do
         layers[#layers + 1] = OffsetContainer:new{
-            x_off = border_inset,
+            x_off = inset,
             y_off = index * row_h,
-            Skin.divider(math.max(1, width - border_inset * 2), Blitbuffer.COLOR_GRAY),
+            Skin.divider(math.max(1, width - inset * 2), Blitbuffer.COLOR_LIGHT_GRAY),
         }
     end
     for index, row in ipairs(rows) do
@@ -220,10 +215,10 @@ function Dialog:_section_widget(section, width, row_h)
 end
 
 function Dialog:_hero_widget(hero, width, height)
-    local button_w = math.max(Skin.dp(54, 46, 76), math.floor(width * .14))
-    local value_w = math.max(Skin.dp(86, 72, 120), width - button_w * 2 - math.floor(width * .16))
-    local gap = math.max(Skin.dp(8, 6, 12), math.floor((width - button_w * 2 - value_w) / 2))
     local button_h = math.max(Skin.dp(46, 40, 61), math.min(height, Skin.dp(58, 48, 72)))
+    local button_w = button_h
+    local value_w = math.max(Skin.dp(86, 72, 120), width - button_w * 2 - math.floor(width * .18))
+    local gap = math.max(Skin.dp(8, 6, 12), math.floor((width - button_w * 2 - value_w) / 2))
 
     local function step_button(label, callback)
         local tap = TapBox:new{
@@ -241,7 +236,7 @@ function Dialog:_hero_widget(hero, width, height)
         }
         tap[1] = Skin.frame(button_w, button_h, {
             bordersize = Skin.line("thin"),
-            radius = Skin.radius(6, 5, 10),
+            radius = math.floor(button_h / 2),
             background = Blitbuffer.COLOR_WHITE,
             color = Blitbuffer.COLOR_DARK_GRAY,
         }, Ui.icon(label == "+" and "plus" or "minus",

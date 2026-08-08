@@ -60,6 +60,7 @@ local Cookies=require("miuread.cookies")
 local Thoughts=require("miuread.thoughts")
 local ThoughtNativePopup=require("miuread.thought_native_popup")
 local ReaderToolbar=require("miuread.reader_toolbar")
+local ReaderListDialog=require("miuread.reader_list_dialog")
 local ReaderControlCenter=require("miuread.reader_control_center")
 local ReaderProgressDialog=require("miuread.reader_progress_dialog")
 local ReaderSettingsDialog=require("miuread.reader_settings_dialog")
@@ -3403,8 +3404,8 @@ function Plugin:_reader_preferences()
     if reader.show_recent~=false then reader.show_recent=false; changed=true end
     if type(reader.recent_actions)~="table" or #reader.recent_actions>0 then reader.recent_actions={}; changed=true end
 
-    local fixed_order={"toc","progress","font","page","comments","search","bookmark","back","rotation","screenshot"}
-    local fixed_items={toc=true,progress=true,font=true,page=true,comments=true,search=true,bookmark=true,back=true,rotation=true,screenshot=true}
+    local fixed_order={"toc","progress","search","back","font","spacing","page","comments","bookmark","highlight","thought","sync"}
+    local fixed_items={toc=true,progress=true,search=true,back=true,font=true,spacing=true,page=true,comments=true,bookmark=true,highlight=true,thought=true,sync=true}
     local order_ok=type(reader.quick_order)=="table" and #reader.quick_order==#fixed_order
     if order_ok then
         for index,key in ipairs(fixed_order) do
@@ -3422,8 +3423,8 @@ function Plugin:_reader_preferences()
         end
         if count~=#fixed_order then items_ok=false end
     end
-    if tonumber(reader.quick_layout_version)~=10 or not order_ok or not items_ok then
-        reader.quick_layout_version=10
+    if tonumber(reader.quick_layout_version)~=11 or not order_ok or not items_ok then
+        reader.quick_layout_version=11
         reader.quick_order=U.copy(fixed_order)
         reader.quick_items=U.copy(fixed_items)
         changed=true
@@ -6963,18 +6964,9 @@ function Plugin:_show_reader_font_face_menu(back_callback)
     if type(font.setupFaceMenuTable)=="function" then pcall(font.setupFaceMenuTable,font) end
     local items=font.face_table
     if type(items)=="table" and #items>0 then
-        self:_show_standalone_menu("正文字体",items,{native_input=true,reader_context=true,on_home=function() return self:return_to_miuread_home("reader surface") end,on_close=back_callback})
-        return true
+        return self:_show_reader_menu_table("正文字体",items,back_callback)
     end
-    for _,method in ipairs({"onShowFontMenu","onShowFontFaceMenu"}) do
-        if type(font[method])=="function" then
-            return self:_reader_open_native_page("正文字体",function()
-                local ok=pcall(font[method],font)
-                return ok
-            end,back_callback)
-        end
-    end
-    self:info("当前 KOReader 版本暂时无法单独打开字体列表")
+    self:info("当前 KOReader 版本没有提供可供觅阅读取的字体列表")
     return false
 end
 function Plugin:_show_reader_spacing_panel(back_callback)
@@ -7041,18 +7033,19 @@ function Plugin:_set_thoughts_enabled(enabled)
     if (p.thoughts.enabled~=false)==enabled then return true end
     p.thoughts.enabled=enabled
     self.store:save_preferences(p)
+    local current=self.sync and self.sync.current or nil
+    local record=current and current.record or {}
+    local variant=tostring(current and (current.variant or record.variant) or "")
+    local annotation_book=current and (record.annotation_requested==true or variant:find("notes",1,true))
     if enabled then
-        local current=self.sync and self.sync.current or nil
-        local record=current and current.record or {}
-        local variant=tostring(current and (current.variant or record.variant) or "")
-        if current and (record.annotation_requested==true or variant:find("notes",1,true)) then
-            self:_setup_thought_tap()
-        end
+        if annotation_book then self:_setup_thought_tap() end
         self:toast("阅读评论已开启",1.5)
     else
         self:_close_active_thought_popup("comments disabled")
-        self:_teardown_thought_tap()
-        self:toast("阅读评论已关闭, 划线和评论数据不会删除",2)
+        -- Keep the MiuRead internal-link guard installed. Hiding comments must
+        -- not hand #miuthought links back to KOReader as invalid external links.
+        if annotation_book then self:_setup_thought_tap() end
+        self:toast("阅读评论已关闭，划线和评论数据不会删除",2)
     end
     return true
 end
@@ -7118,7 +7111,7 @@ function Plugin:_show_reader_comment_settings(back_callback)
                 {label="阅读评论",value=self:_thoughts_enabled_label(),value_bold=true,keep_open=true,callback=function() self:_toggle_thoughts_enabled() end},
                 {label="评论字体跟随正文",value=follow and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:_toggle_thought_follow_body_font() end},
                 {label="固定字体",value=self:_thought_font_face_label(prefs),enabled=not follow,callback=function()
-                    self:_show_standalone_menu("评论字体",self:thought_font_face_menu(),{native_input=true,reader_context=true,on_home=function() return self:return_to_miuread_home("reader surface") end,on_close=return_to_comments})
+                    self:_show_reader_menu_table("评论字体",self:thought_font_face_menu(),return_to_comments)
                 end},
                 {label="小",value=level=="small" and "18 · 已选择" or "18",checked=level=="small",keep_open=true,callback=function() self:_set_thought_font_size("small") end},
                 {label="标准",value=level=="standard" and "22 · 已选择" or "22",checked=level=="standard",keep_open=true,callback=function() self:_set_thought_font_size("standard") end},
@@ -7197,18 +7190,33 @@ end
 
 function Plugin:_reader_toolbar_header(title)
     local wifi_label,wifi_alert=self:_reader_wifi_summary()
-    local sync_label,sync_alert=self:_reader_sync_summary()
+    local wifi_text=wifi_label
+    if wifi_label=="Wi-Fi关" then wifi_text="Wi-Fi 已关闭"
+    elseif wifi_label=="Wi-Fi✓" then wifi_text="Wi-Fi 已连接"
+    elseif wifi_label=="Wi-Fi!" then wifi_text="Wi-Fi 未连接"
+    elseif wifi_label=="Wi-Fi" then wifi_text="Wi-Fi 状态未知" end
+
+    local page=self:_reader_current_page()
+    local total=self.ui and self.ui.document and self.ui.document.info and tonumber(self.ui.document.info.number_of_pages) or nil
+    local chapter=""
+    local toc=self.ui and self.ui.toc or nil
+    if toc and type(toc.getTocTitleByPage)=="function" and page then
+        local ok,value=pcall(toc.getTocTitleByPage,toc,page)
+        if ok and value then chapter=U.trim(tostring(value)) end
+    end
+    local parts={tostring(title or "正在阅读")}
+    if chapter~="" then parts[#parts+1]=chapter end
+    if page and total and total>0 then parts[#parts+1]=tostring(math.floor(page+.5)).."/"..tostring(math.floor(total+.5)) end
+    local battery=self:_reader_battery_label()
     return {
-        title=tostring(title or "正在阅读"),
+        title=table.concat(parts," · "),
         home_callback=function() return self:return_to_miuread_home("reader surface") end,
         book_callback=function() return self:_show_reader_current_book_panel(function() self:show_reader_quick_panel() end) end,
-        wifi_label=wifi_label,wifi_alert=wifi_alert,
-        wifi_callback=function() return self:_reader_wifi_toggle() end,
+        more_callback=function() return self:show_reader_control_center("reading") end,
+        status_left=wifi_text,status_left_alert=wifi_alert,
+        wifi_callback=function() return self:_show_reader_wifi_quick_panel(function() self:show_reader_quick_panel() end) end,
         wifi_hold_callback=function() return self:_reader_wifi_settings(function() self:show_reader_quick_panel() end) end,
-        sync_label=sync_label,sync_alert=sync_alert,
-        sync_callback=function() return self:upload_local_progress(true) end,
-        sync_hold_callback=function() return self:_show_reader_sync_panel(function() self:show_reader_quick_panel() end) end,
-        battery_label=self:_reader_battery_label(),
+        status_right=battery~="" and ("电量 "..battery) or "",
     }
 end
 
@@ -7280,32 +7288,260 @@ function Plugin:_reader_open_footer_settings()
     return false
 end
 
-function Plugin:_reader_show_bookmarks(back_callback)
+function Plugin:_reader_menu_rows_from_table(source,title,back_callback)
+    local rows={}
+    for _,item in ipairs(type(source)=="table" and source or {}) do
+        if type(item)=="table" then
+            local visible=true
+            if type(item.show_func)=="function" then
+                local ok,value=pcall(item.show_func)
+                visible=ok and value~=false
+            end
+            if visible then
+                local label=item.text
+                if type(item.text_func)=="function" then
+                    local ok,value=pcall(item.text_func)
+                    if ok then label=value end
+                end
+                label=U.trim(tostring(label or ""))
+                if label~="" then
+                    local value=item.post_text
+                    if type(item.post_text_func)=="function" then
+                        local ok,result=pcall(item.post_text_func)
+                        if ok then value=result end
+                    end
+                    local checked=false
+                    if type(item.checked_func)=="function" then
+                        local ok,result=pcall(item.checked_func)
+                        checked=ok and result==true
+                    elseif item.checked==true then checked=true end
+                    local enabled=item.enabled~=false
+                    if type(item.enabled_func)=="function" then
+                        local ok,result=pcall(item.enabled_func)
+                        enabled=ok and result~=false
+                    end
+                    local submenu=item.sub_item_table
+                    if type(item.sub_item_table_func)=="function" then
+                        local ok,result=pcall(item.sub_item_table_func)
+                        if ok then submenu=result end
+                    end
+                    local row={
+                        label=label,
+                        value=checked and ((value and tostring(value)~="") and (tostring(value).." · ✓") or "✓") or tostring(value or ""),
+                        checked=checked, enabled=enabled,
+                        keep_open=item.keep_menu_open==true,
+                    }
+                    if type(submenu)=="table" then
+                        row.callback=function()
+                            self:_show_reader_menu_table(label,submenu,function()
+                                self:_show_reader_menu_table(title,source,back_callback)
+                            end)
+                        end
+                    elseif type(item.callback)=="function" then
+                        row.callback=item.callback
+                    else
+                        row.arrow=false
+                    end
+                    rows[#rows+1]=row
+                end
+            end
+        end
+    end
+    return rows
+end
+
+function Plugin:_show_reader_menu_table(title,source,back_callback)
+    ReaderListDialog.show{
+        title=tostring(title or "阅读设置"),
+        items=function() return self:_reader_menu_rows_from_table(source,title,back_callback) end,
+        page_size=tonumber(type(source)=="table" and source.max_per_page) or 6,
+        on_back=back_callback or function() self:show_reader_quick_panel() end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
+    }
+    return true
+end
+
+function Plugin:_reader_annotation_type(item)
+    if type(item)~="table" then return nil end
+    if item.drawer then return item.note and "thought" or "highlight" end
+    return "bookmark"
+end
+
+function Plugin:_reader_annotation_page(item)
+    if type(item)~="table" then return nil end
+    local page=tonumber(item.page or item.pageno)
+    if page then return math.floor(page+.5) end
+    local xp=item.pos0 or item.start or item.xpointer
+    local doc=self.ui and self.ui.document or nil
+    if xp and doc and type(doc.getPageFromXPointer)=="function" then
+        local ok,value=pcall(doc.getPageFromXPointer,doc,xp)
+        if ok and tonumber(value) then return math.floor(tonumber(value)+.5) end
+    end
+    return nil
+end
+
+function Plugin:_reader_annotation_excerpt(item,kind)
+    if type(item)~="table" then return "" end
+    local text
+    if kind=="thought" then text=item.note or item.text or item.notes
+    elseif kind=="highlight" then text=item.text or item.notes
+    else text=item.text end
+    text=U.trim(tostring(text or ""):gsub("%s+"," "))
+    if text=="" and kind=="bookmark" then text="书页书签" end
+    text=U.utf8_truncate(text,120)
+    return text
+end
+
+function Plugin:_reader_goto_annotation(item)
     local bookmark=self.ui and self.ui.bookmark or nil
-    if not bookmark then self:info("当前 KOReader 版本暂时无法直接打开书签"); return false end
-    return self:_reader_open_native_page("书签与标注",function()
-        for _,method in ipairs({"onShowBookmark","onShowBookmarks","showBookmarks"}) do
-            if type(bookmark[method])=="function" then
-                local ok=pcall(bookmark[method],bookmark)
-                if ok then return true end
-            end
-        end
-        return false
-    end,back_callback or function() self:show_reader_quick_panel(true) end)
+    if bookmark and type(bookmark.gotoBookmark)=="function" then
+        local primary=item and (item.page or item.pos0 or item.start or item.xpointer) or nil
+        local marker=item and (item.pos0 or item.start or item.xpointer) or nil
+        local ok,result=pcall(bookmark.gotoBookmark,bookmark,primary,marker)
+        if ok and result~=false then return true end
+    end
+    local ui=self.ui
+    local target=item and (item.pos0 or item.start or item.xpointer)
+    if ui and type(ui.handleEvent)=="function" then
+        if type(target)=="string" and target~="" then ui:handleEvent(Event:new("GotoXPointer",target)); return true end
+        local page=self:_reader_annotation_page(item)
+        if page then ui:handleEvent(Event:new("GotoPage",page)); return true end
+    end
+    self:info("当前记录暂时无法定位")
+    return false
 end
-function Plugin:_reader_show_search(back_callback)
+
+function Plugin:_reader_record_rows(kind)
+    local annotations=(self.ui and self.ui.annotation and self.ui.annotation.annotations)
+        or (self.ui and self.ui.bookmark and self.ui.bookmark.bookmarks) or {}
+    local rows={}
+    for _,item in ipairs(type(annotations)=="table" and annotations or {}) do
+        if self:_reader_annotation_type(item)==kind then
+            local page=self:_reader_annotation_page(item)
+            local excerpt=self:_reader_annotation_excerpt(item,kind)
+            local target=item
+            rows[#rows+1]={
+                label=excerpt~="" and excerpt or (kind=="bookmark" and "书页书签" or "无文字内容"),
+                value=page and ("第 "..tostring(page).." 页") or "",
+                detail=tostring(item.datetime or item.date or ""),
+                callback=function() self:_reader_goto_annotation(target) end,
+            }
+        end
+    end
+    return rows
+end
+
+function Plugin:_show_reader_records(initial_kind,back_callback)
+    local labels={bookmark="书签",highlight="划线",thought="想法"}
+    ReaderListDialog.show{
+        title="阅读记录",
+        initial_category=labels[initial_kind] and initial_kind or "bookmark",
+        categories=function()
+            return {
+                {key="bookmark",label="书签",items=self:_reader_record_rows("bookmark"),empty_text="当前书籍还没有书签"},
+                {key="highlight",label="划线",items=self:_reader_record_rows("highlight"),empty_text="当前书籍还没有划线"},
+                {key="thought",label="想法",items=self:_reader_record_rows("thought"),empty_text="当前书籍还没有自己的想法"},
+            }
+        end,
+        page_size=5,
+        on_back=back_callback or function() self:show_reader_quick_panel() end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
+    }
+    return true
+end
+
+function Plugin:_reader_show_bookmarks(back_callback)
+    return self:_show_reader_records("bookmark",back_callback)
+end
+
+function Plugin:_reader_search_results(query,results,back_callback)
+    local rows={}
+    for _,item in ipairs(type(results)=="table" and results or {}) do
+        local excerpt=table.concat({
+            tostring(item.prev_text or ""), tostring(item.matched_word_prefix or ""),
+            tostring(item.matched_text or ""), tostring(item.matched_word_suffix or ""),
+            tostring(item.next_text or ""),
+        },"")
+        excerpt=U.trim(excerpt:gsub("%s+"," "))
+        if excerpt=="" then excerpt="匹配结果" end
+        excerpt=U.utf8_truncate(excerpt,150)
+        local start_pos=item.start
+        local page
+        local doc=self.ui and self.ui.document or nil
+        if tonumber(start_pos) then page=math.floor(tonumber(start_pos)+.5)
+        elseif start_pos and doc and type(doc.getPageFromXPointer)=="function" then
+            local ok,value=pcall(doc.getPageFromXPointer,doc,start_pos)
+            if ok and tonumber(value) then page=math.floor(tonumber(value)+.5) end
+        end
+        local target=start_pos
+        rows[#rows+1]={label=excerpt,value=page and ("第 "..page.." 页") or "",callback=function()
+            local link=self.ui and self.ui.link or nil
+            if link and type(link.addCurrentLocationToStack)=="function" then pcall(link.addCurrentLocationToStack,link) end
+            local ui=self.ui
+            if ui and type(ui.handleEvent)=="function" then
+                if type(target)=="string" then ui:handleEvent(Event:new("GotoXPointer",target))
+                elseif tonumber(target) then ui:handleEvent(Event:new("GotoPage",tonumber(target))) end
+            end
+        end}
+    end
+    ReaderListDialog.show{
+        title="搜索结果",
+        subtitle="“"..tostring(query).."” · "..tostring(#rows).." 处",
+        items=rows,page_size=5,
+        empty_text="没有找到匹配内容",
+        on_back=function() self:_reader_show_search(back_callback) end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
+    }
+    return true
+end
+
+function Plugin:_reader_run_search(query,back_callback)
+    local doc=self.ui and self.ui.document or nil
+    if not doc or type(doc.findAllText)~="function" then
+        self:info("当前书籍暂不支持全文搜索")
+        if back_callback then UIManager:scheduleIn(.05,back_callback) end
+        return false
+    end
+    local results
     local search=self.ui and self.ui.search or nil
-    if not search then self:info("当前 KOReader 版本暂时无法直接打开全文搜索"); return false end
-    return self:_reader_open_native_page("全文搜索",function()
-        for _,method in ipairs({"onShowSearchDialog","onShowSearch","showSearchDialog"}) do
-            if type(search[method])=="function" then
-                local ok=pcall(search[method],search)
-                if ok then return true end
-            end
-        end
-        return false
-    end,back_callback or function() self:show_reader_quick_panel(true) end)
+    local context=tonumber(search and search.findall_nb_context_words) or 6
+    local maximum=tonumber(search and search.findall_max_hits) or 100
+    local flags=search and search.current_search_type and search.current_search_type.flags or nil
+    local ok,value=pcall(doc.findAllText,doc,query,true,context,maximum,false,flags)
+    if not ok then ok,value=pcall(doc.findAllText,doc,query,true,context,maximum) end
+    if ok and type(value)=="table" then results=value else results={} end
+    return self:_reader_search_results(query,results,back_callback)
 end
+
+function Plugin:_reader_show_search(back_callback)
+    local dialog
+    dialog=InputDialog:new{
+        title="书内搜索",
+        description="搜索当前书籍正文",
+        input=tostring(self._reader_last_search or ""),
+        buttons={{
+            {text="取消",id="close",callback=function()
+                UIManager:close(dialog)
+                if back_callback then UIManager:scheduleIn(.05,back_callback) end
+            end},
+            {text="搜索",is_enter_default=true,callback=function()
+                local query=U.trim(dialog:getInputText())
+                UIManager:close(dialog)
+                if query=="" then
+                    if back_callback then UIManager:scheduleIn(.05,back_callback) end
+                    return
+                end
+                self._reader_last_search=query
+                self:status_toast("书内搜索","正在查找“"..query.."”",2)
+                UIManager:nextTick(function() self:_reader_run_search(query,back_callback) end)
+            end},
+        }},
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+    return true
+end
+
 function Plugin:_reader_go_back_location()
     local link=self.ui and self.ui.link or nil
     if link then
@@ -7353,14 +7589,40 @@ function Plugin:_show_reader_font_panel(back_callback)
         on_home=function() return self:return_to_miuread_home("reader surface") end,
         sections=function()
             return {
-                {title="常用",rows={
+                {title="字体",rows={
                     {label="正文字体",value=self:_reader_font_label(),callback=function() self:_show_reader_font_face_menu(return_to_font) end},
-                    {label="行距",value=tostring(math.floor(self:_reader_line_spacing_value()+.5)).."%",callback=function() self:_show_reader_spacing_panel(return_to_font) end},
                     {label="字体粗细",value=self:_reader_font_weight_label(),callback=function() self:_show_reader_weight_panel(return_to_font) end},
-                    {label="字间距与空格",value=self:_reader_word_spacing_label(),callback=function() self:_show_reader_word_spacing_panel(return_to_font) end},
                 }},
-                {title="高级",rows={
-                    {label="高级排版",value="版式与渲染",value_bold=true,callback=function() self:_show_reader_advanced_typeset_panel(return_to_font) end},
+                {title="更多",rows={
+                    {label="高级排版",value="版式与字符间距",callback=function() self:_show_reader_advanced_typeset_panel(return_to_font) end},
+                }},
+            }
+        end,
+    }
+    return true
+end
+
+function Plugin:_show_reader_sync_diagnostics_panel(back_callback)
+    local diagnostics=self:sync_diagnostics_menu()
+    local current=self.sync and self.sync:record() or nil
+    local logged_in=self.auth and type(self.auth.is_logged_in)=="function" and self.auth:is_logged_in() or nil
+    ReaderSettingsDialog.show{
+        title="同步诊断",
+        subtitle="所有检查都在觅阅页面内完成",
+        on_back=back_callback or function() self:_show_reader_sync_panel() end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        sections=function()
+            local state=tostring(self:progress_sync_label() or "")
+            return {
+                {title="当前状态",rows={
+                    {label="当前书籍识别",value=current and current.book and "正常" or "未识别",callback=diagnostics[1] and diagnostics[1].callback},
+                    {label="登录状态",value=logged_in==false and "未登录" or "检查",callback=diagnostics[2] and diagnostics[2].callback},
+                    {label="云端进度读取",value=state~="" and state or "检查",callback=diagnostics[3] and diagnostics[3].callback},
+                    {label="当前进度上传",value="测试",callback=diagnostics[4] and diagnostics[4].callback},
+                    {label="阅读时间上传",value="测试 30 秒",callback=diagnostics[5] and diagnostics[5].callback},
+                }},
+                {title="恢复",rows={
+                    {label="重置当前书籍同步状态",value="不删除书籍与阅读数据",callback=diagnostics[7] and diagnostics[7].callback},
                 }},
             }
         end,
@@ -7378,19 +7640,21 @@ function Plugin:_show_reader_sync_panel(back_callback)
         sections=function()
             local sync=self.store:preferences().sync or {}
             return {
-                {title="同步状态",rows={
-                    {label="当前状态",value=self:progress_sync_label(),value_bold=true,keep_open=true,callback=function() self:show_sync_status(false) end},
-                    {label="自动同步阅读进度",value=sync.progress_enabled~=false and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_progress_sync() end},
-                    {label="自动同步阅读时间",value=sync.time_enabled==true and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_time_sync() end},
-                    {label="同步成功提醒",value=self:_sync_success_notice_enabled() and "已开启" or "已关闭",keep_open=true,callback=function() self:toggle_sync_success_notice() end},
+                {title="当前状态",rows={
+                    {label="同步状态",value=self:progress_sync_label(),value_bold=true,arrow=false},
                 }},
                 {title="立即操作",rows={
-                    {icon="⇧",label="上传当前阅读进度",value="执行",value_bold=true,keep_open=true,callback=function() self:upload_local_progress(true) end},
-                    {icon="↻",label="修复当前书籍同步",value="执行",value_bold=true,keep_open=true,callback=function() self:repair_current_sync() end},
-                    {icon="⇩",label="读取云端阅读进度",value="执行",value_bold=true,keep_open=true,callback=function() self:manual_sync() end},
-                    {icon="◉",label="同步诊断",value="进入",callback=function()
-                        self:_show_standalone_menu("同步诊断",self:sync_diagnostics_menu(),{native_input=true,reader_context=true,on_home=function() return self:return_to_miuread_home("reader surface") end,on_close=return_to_sync})
-                    end},
+                    {icon="upload",label="上传当前进度",value="执行",callback=function() self:upload_local_progress(true) end},
+                    {icon="download",label="读取云端进度",value="执行",callback=function() self:manual_sync() end},
+                    {icon="repair",label="修复当前书籍同步",value="执行",callback=function() self:repair_current_sync() end},
+                }},
+                {title="自动同步",rows={
+                    {label="阅读进度",value=sync.progress_enabled~=false and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_progress_sync() end},
+                    {label="阅读时间",value=sync.time_enabled==true and "已开启" or "已关闭",value_bold=true,callback=function() self:toggle_time_sync() end},
+                    {label="成功提醒",value=self:_sync_success_notice_enabled() and "已开启" or "已关闭",keep_open=true,callback=function() self:toggle_sync_success_notice() end},
+                }},
+                {title="诊断",rows={
+                    {icon="diagnostics",label="同步诊断",value="检查与修复",callback=function() self:_show_reader_sync_diagnostics_panel(return_to_sync) end},
                 }},
             }
         end,
@@ -7399,8 +7663,7 @@ function Plugin:_show_reader_sync_panel(back_callback)
 end
 
 function Plugin:_show_reader_current_book_panel(back_callback)
-    self:_show_standalone_menu("当前书籍",self:current_book_menu(),{native_input=true,reader_context=true,on_home=function() return self:return_to_miuread_home("reader surface") end,on_close=back_callback})
-    return true
+    return self:_show_reader_menu_table("当前书籍",self:current_book_menu(),back_callback)
 end
 function Plugin:_show_koreader_reader_menu(back_callback)
     local current_ui=self.ui
@@ -7916,7 +8179,7 @@ end
 
 function Plugin:_show_reader_word_spacing_panel(back_callback)
     ReaderSettingsDialog.show{
-        title="字间距与空格",
+        title="字符间距（高级）",
         subtitle=function() return "空格缩放/压缩 "..self:_reader_word_spacing_label() end,
         on_back=back_callback or function() self:show_reader_control_center("typeset") end,
         on_home=function() return self:return_to_miuread_home("reader surface") end,
@@ -7970,7 +8233,7 @@ function Plugin:_show_reader_advanced_typeset_panel(back_callback)
                 {label="渲染模式",value=mode_labels[mode] or tostring(mode),value_bold=true,keep_open=true,callback=function()
                     self:_reader_emit_config("SetBlockRenderingMode",(mode+1)%4)
                 end},
-                {label="字间距与空格",value=self:_reader_word_spacing_label(),callback=function() self:_show_reader_word_spacing_panel(function() self:_show_reader_advanced_typeset_panel(back_callback) end) end},
+                {label="字符间距（高级）",value=self:_reader_word_spacing_label(),callback=function() self:_show_reader_word_spacing_panel(function() self:_show_reader_advanced_typeset_panel(back_callback) end) end},
                 {label="页边距",value=self:_reader_margin_label(),callback=function() self:_show_reader_margin_panel(function() self:_show_reader_advanced_typeset_panel(back_callback) end) end},
                 {label="页面显示",value="状态栏、进度与刷新",callback=function() self:_show_reader_page_display_panel(function() self:_show_reader_advanced_typeset_panel(back_callback) end) end},
             }
@@ -8045,7 +8308,7 @@ function Plugin:_show_reader_device_compat_panel(back_callback)
                     self:_show_koreader_reader_menu(function() self:_show_reader_device_compat_panel(back_callback) end)
                 end},
                 {label="觅阅阅读界面设置",value="评论与控制中心",callback=function()
-                    self:_show_standalone_menu("阅读界面",self:reader_quick_panel_settings_menu(),{native_input=true,reader_context=true,on_home=function() return self:return_to_miuread_home("reader surface") end,on_close=function() self:_show_reader_device_compat_panel(back_callback) end})
+                    self:_show_reader_menu_table("阅读界面",self:reader_quick_panel_settings_menu(),function() self:_show_reader_device_compat_panel(back_callback) end)
                 end},
             }
         end,
@@ -8057,31 +8320,27 @@ function Plugin:_reader_control_categories()
     local function back_to(key) return function() self:show_reader_control_center(key) end end
     return {
         {key="reading",label="阅读",sections={{items={
-            {icon="toc",label="目录",value="自动定位当前章节",callback=function() self:_show_reader_toc(back_to("reading")) end},
+            {icon="toc",label="目录",value="当前章节",callback=function() self:_show_reader_toc(back_to("reading")) end},
             {icon="progress",label="阅读进度",value=(self:_reader_progress_percent() and (tostring(math.floor(self:_reader_progress_percent()+.5)).."%") or ""),callback=function() self:_show_reader_progress_control(back_to("reading")) end},
-            {icon="page-jump",label="页面跳转",value="精确跳到位置",callback=function() self:_show_reader_position_jump(back_to("reading")) end},
-            {icon="undo",label="返回上一位置",value="回到跳转前位置",callback=function() self:_reader_go_back_location() end},
-            {icon="bookmark",label="书签与划线",value="查看书签与标注",callback=function() self:_reader_show_bookmarks(back_to("reading")) end},
-            {icon="search",label="全文搜索",value="搜索当前书籍",callback=function() self:_reader_show_search(back_to("reading")) end},
-            {icon="history",label="阅读历史",value="查看跳转记录",callback=function() self:_reader_show_history(back_to("reading")) end},
-            {icon="bookmark",label="评论",value=self:_thoughts_enabled_label(),value_bold=true,callback=function() self:_show_reader_comment_settings(back_to("reading")) end},
+            {icon="search",label="书内搜索",value="搜索当前书籍",callback=function() self:_reader_show_search(back_to("reading")) end},
+            {icon="undo",label="回到阅读处",value="返回跳转前位置",callback=function() self:_reader_go_back_location() end},
+            {icon="bookmark",label="书签",value="只看书页书签",callback=function() self:_show_reader_records("bookmark",back_to("reading")) end},
+            {icon="highlight",label="划线",value="只看正文划线",callback=function() self:_show_reader_records("highlight",back_to("reading")) end},
+            {icon="thought",label="想法",value="只看自己的想法",callback=function() self:_show_reader_records("thought",back_to("reading")) end},
+            {icon="comment",label="评论",value=self:_thoughts_enabled_label(),value_bold=true,callback=function() self:_show_reader_comment_settings(back_to("reading")) end},
         }}}},
         {key="typeset",label="排版",sections={{items={
             {icon="font",label="字体与字号",value=self:_reader_font_label().." · "..self:_reader_font_size_label(),callback=function() self:_show_reader_font_panel(back_to("typeset")) end},
-            {icon="font",label="行距",value=tostring(math.floor(self:_reader_line_spacing_value()+.5)).."%",callback=function() self:_show_reader_spacing_panel(back_to("typeset")) end},
-            {icon="display",label="页边距",value=self:_reader_margin_label(),callback=function() self:_show_reader_margin_panel(back_to("typeset")) end},
-            {icon="font",label="字体粗细",value=self:_reader_font_weight_label(),callback=function() self:_show_reader_weight_panel(back_to("typeset")) end},
-            {icon="font",label="字间距与空格",value=self:_reader_word_spacing_label(),callback=function() self:_show_reader_word_spacing_panel(back_to("typeset")) end},
-            {icon="display",label="页面显示",value="状态栏与阅读信息",callback=function() self:_show_reader_page_display_panel(back_to("typeset")) end},
-            {icon="refresh",label="刷新与夜间",value=self:_reader_refresh_rate_label(),callback=function() self:_show_reader_refresh_panel(back_to("typeset")) end},
-            {icon="settings",label="高级排版",value="更多版式选项",callback=function() self:_show_reader_advanced_typeset_panel(back_to("typeset")) end},
+            {icon="line-spacing",label="行距",value=tostring(math.floor(self:_reader_line_spacing_value()+.5)).."%",callback=function() self:_show_reader_spacing_panel(back_to("typeset")) end},
+            {icon="display",label="页面",value="页边距与阅读信息",callback=function() self:_show_reader_page_panel(back_to("typeset")) end},
+            {icon="settings",label="高级排版",value="字符间距与更多版式",callback=function() self:_show_reader_advanced_typeset_panel(back_to("typeset")) end},
         }}}},
         {key="book",label="书籍",sections={{items={
             {icon="current-book",label="当前书籍",value="信息与本地状态",callback=function() self:_show_reader_current_book_panel(back_to("book")) end},
             {icon="sync",label="阅读同步",value=self:progress_sync_label(),value_bold=true,callback=function() self:_show_reader_sync_panel(back_to("book")) end},
             {icon="download",label="下载与生成",value="任务、失败重试与重新生成",callback=function() self:show_downloads(back_to("book")) end},
-            {icon="bookmark",label="评论数据",value="迁移与显示设置",callback=function()
-                self:_show_standalone_menu("评论数据",self:book_repair_settings_menu(),{native_input=true,reader_context=true,on_home=function() return self:return_to_miuread_home("reader surface") end,on_close=back_to("book")})
+            {icon="comment",label="评论数据",value="迁移与显示设置",callback=function()
+                self:_show_reader_menu_table("评论数据",self:book_repair_settings_menu(),back_to("book"))
             end},
             {icon="repair",label="修复书籍",value="检查当前书籍",callback=function() self:repair_current_book() end},
         }}}},
@@ -8116,34 +8375,24 @@ function Plugin:show_reader_control_center(initial_category)
 end
 
 function Plugin:_reader_quick_definitions()
-    local comment_on=self:_thoughts_enabled()
     return {
         toc={key="toc",icon="toc",label="目录",callback=function() self:_show_reader_toc(function() self:show_reader_quick_panel() end) end},
         progress={key="progress",icon="progress",label="进度",callback=function() self:_show_reader_progress_control(function() self:show_reader_quick_panel() end) end},
+        search={key="search",icon="search",label="搜索",callback=function() self:_reader_show_search(function() self:show_reader_quick_panel() end) end},
+        back={key="back",icon="undo",label="回到阅读处",callback=function() self:_reader_go_back_location() end},
         font={key="font",icon="font",label="字体",callback=function() self:_show_reader_font_panel(function() self:show_reader_quick_panel() end) end},
+        spacing={key="spacing",icon="line-spacing",label="行距",callback=function() self:_show_reader_spacing_panel(function() self:show_reader_quick_panel() end) end},
         page={key="page",icon="display",label="页面",callback=function() self:_show_reader_page_panel(function() self:show_reader_quick_panel() end) end},
-        comments={key="comments",icon="bookmark",label=comment_on and "评论●" or "评论○",active=comment_on,callback=function()
+        comments={key="comments",icon="comment",label="评论",active=self:_thoughts_enabled(),callback=function()
             self:_show_reader_comment_settings(function() self:show_reader_quick_panel() end)
         end,hold_callback=function()
             self:_toggle_thoughts_enabled()
             UIManager:scheduleIn(.05,function() self:show_reader_quick_panel() end)
         end},
-        search={key="search",icon="search",label="搜索",callback=function() self:_reader_show_search(function() self:show_reader_quick_panel() end) end},
-        bookmark={key="bookmark",icon="bookmark",label="书签",callback=function() self:_reader_show_bookmarks(function() self:show_reader_quick_panel() end) end},
-        back={key="back",icon="undo",label="返回",callback=function() self:_reader_go_back_location() end},
-        rotation={key="rotation",icon="rotate",label="旋转",callback=function() self:_home_rotate() end},
-        screenshot={key="screenshot",icon="screenshot",label="截图",callback=function() ScreenshotMode.start(self) end},
-    }
-end
-
-function Plugin:_reader_top_actions()
-    local wifi_label,wifi_alert=self:_reader_wifi_summary()
-    local sync_label,sync_alert=self:_reader_sync_summary()
-    return {
-        {key="home",icon="home",label="主页",callback=function() return self:return_to_miuread_home("reader surface") end},
-        {key="wifi",icon="wifi",label=wifi_label,active=wifi_alert,callback=function() self:_show_reader_wifi_quick_panel(function() self:show_reader_quick_panel() end) end,hold_callback=function() self:_reader_wifi_settings(function() self:show_reader_quick_panel() end) end},
-        {key="sync",icon="sync",label=sync_label,active=sync_alert,callback=function() self:_show_reader_sync_quick_panel(function() self:show_reader_quick_panel() end) end,hold_callback=function() self:_show_reader_sync_panel(function() self:show_reader_quick_panel() end) end},
-        {key="all",icon="grid",label="全部",callback=function() self:show_reader_control_center("reading") end},
+        bookmark={key="bookmark",icon="bookmark",label="书签",callback=function() self:_show_reader_records("bookmark",function() self:show_reader_quick_panel() end) end},
+        highlight={key="highlight",icon="highlight",label="划线",callback=function() self:_show_reader_records("highlight",function() self:show_reader_quick_panel() end) end},
+        thought={key="thought",icon="thought",label="想法",callback=function() self:_show_reader_records("thought",function() self:show_reader_quick_panel() end) end},
+        sync={key="sync",icon="sync",label="同步",callback=function() self:_show_reader_sync_panel(function() self:show_reader_quick_panel() end) end},
     }
 end
 
@@ -8154,10 +8403,14 @@ end
 function Plugin:show_reader_quick_panel()
     if not (self.ui and self.ui.document) then return false end
     self:_mark_reader_busy(8)
+    local title=self:_reader_toolbar_title()
     local definitions=self:_reader_quick_definitions()
-    local primary={definitions.toc,definitions.progress,definitions.font,definitions.page,definitions.comments}
-    local secondary={definitions.search,definitions.bookmark,definitions.back,definitions.rotation,definitions.screenshot}
-    local frontlight,warmth
+    local groups={
+        {title="阅读位置",actions={definitions.toc,definitions.progress,definitions.search,definitions.back}},
+        {title="阅读显示",actions={definitions.font,definitions.spacing,definitions.page,definitions.comments}},
+        {title="阅读记录",actions={definitions.bookmark,definitions.highlight,definitions.thought,definitions.sync}},
+    }
+    local frontlight
     if Device:hasFrontlight() then
         local minimum,maximum=self:_reader_frontlight_bounds()
         frontlight={
@@ -8171,36 +8424,24 @@ function Plugin:show_reader_quick_panel()
                 return self:_reader_frontlight_value() or minimum
             end,
         }
-        local state=self:_reader_warmth_state()
-        if state then
-            warmth={
-                min=state.min,max=state.max,value=state.value,
-                on_set=function(value)
-                    if not self:_reader_set_warmth(value) then return false end
-                    local current=self:_reader_warmth_state()
-                    return current and current.value or value
-                end,
-            }
-        end
     end
     local panel,err=ReaderToolbar.show{
-        top_actions=self:_reader_top_actions(),
-        primary_actions=primary,
-        secondary_actions=secondary,
+        header=self:_reader_toolbar_header(title),
+        groups=groups,
         frontlight=frontlight,
-        warmth=warmth,
     }
     if not panel then
         logger.warn("[MiuRead][ReaderToolbar] unavailable",tostring(err or "unknown"))
         return false
     end
-    logger.info("[MiuRead][ReaderToolbar] opened fixed top reader panel")
+    logger.info("[MiuRead][ReaderToolbar] opened grouped reader panel")
     return true
 end
 
 function Plugin:_close_miuread_transients()
     HomeQuickPanel.close()
     ReaderToolbar.close()
+    ReaderListDialog.close()
     ReaderControlCenter.close()
     ReaderProgressDialog.close()
     ReaderSettingsDialog.close()
@@ -14029,8 +14270,10 @@ function Plugin:_open_thought_info(info,generation)
 end
 
 function Plugin:_show_thought_href(href)
-    if not self:_thoughts_enabled() then return false end
     local info=Thoughts.parse_href(href); if not info then return false end
+    -- A disabled comment layer still owns its internal links. Consume them
+    -- silently instead of letting KOReader report #miuthought as invalid.
+    if not self:_thoughts_enabled() then return true end
     if self._thought_popup_busy or self._thought_popup then return true end
     local runtime=self._download_runtime
     if runtime and self.download_task and self.download_task:busy() and runtime.comment_slow_notice~=true then
@@ -14061,7 +14304,6 @@ function Plugin:_on_thought_tap(ges)
     return self:_show_thought_href(href)
 end
 function Plugin:_setup_thought_tap()
-    if not self:_thoughts_enabled() then return end
     if self._thought_tap_setup or not self.ui or not self.ui.registerTouchZones then return end
     local ok,Device=pcall(require,"device"); if ok and Device.isTouchDevice and not Device:isTouchDevice() then return end
     self.ui:registerTouchZones({{id="miuread_thought_popup",ges="tap",screen_zone={ratio_x=0,ratio_y=0,ratio_w=1,ratio_h=1},overrides={"tap_link"},handler=function(ges) return self:_on_thought_tap(ges) end}})
@@ -14074,7 +14316,7 @@ function Plugin:on_sync_record_ready(current)
         local book_id,path=tostring(current.book.book_id),current.path
         local record=current.record or {}
         local variant=tostring(current.variant or record.variant or "")
-        if self:_thoughts_enabled() and (record.annotation_requested==true or variant:find("notes",1,true)) then
+        if record.annotation_requested==true or variant:find("notes",1,true) then
             self:_setup_thought_tap()
         end
         UIManager:scheduleIn(1.0,function()
