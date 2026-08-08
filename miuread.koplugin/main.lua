@@ -6565,17 +6565,11 @@ function Plugin:show_home_quick_panel(more_expanded)
         if ok then wifi_on=value==true end
     end
     local wifi_detail
+    local wifi_name=wifi_on==true and self:_reader_current_wifi_name(18) or nil
     if wifi_on==nil then wifi_detail="状态未知"
     elseif wifi_on~=true then wifi_detail="已关闭"
-    elseif state.online==true then
-        local ssid
-        if NetworkMgr and type(NetworkMgr.getCurrentNetwork)=="function" then
-            local ok_current,current=pcall(NetworkMgr.getCurrentNetwork,NetworkMgr)
-            if ok_current and type(current)=="table" then
-                ssid=U.trim(tostring(current.ssid or current.name or ""))
-            end
-        end
-        wifi_detail=ssid and ssid~="" and U.utf8_truncate(ssid,18,"…") or "已连接"
+    elseif wifi_name then wifi_detail=wifi_name
+    elseif state.online==true then wifi_detail="已连接"
     else wifi_detail="未连接" end
 
     local download_detail=""
@@ -7236,12 +7230,24 @@ function Plugin:_reader_toolbar_title()
     return tostring(title),status,progress,percent
 end
 
+function Plugin:_reader_current_wifi_name(max_chars)
+    local ok_nm,NetworkMgr=pcall(require,"ui/network/manager")
+    if not ok_nm or not NetworkMgr or type(NetworkMgr.getCurrentNetwork)~="function" then return nil end
+    local ok,current=pcall(NetworkMgr.getCurrentNetwork,NetworkMgr)
+    if not ok or type(current)~="table" then return nil end
+    local ssid=U.trim(tostring(current.ssid or current.name or ""))
+    if ssid=="" then return nil end
+    return U.utf8_truncate(ssid,tonumber(max_chars) or 18,"…")
+end
+
 function Plugin:_reader_wifi_summary()
     local wifi_on=self:_reader_wifi_state()
     if wifi_on==false then return "Wi-Fi关",false end
     if wifi_on==nil then return "Wi-Fi",true end
+    local ssid=self:_reader_current_wifi_name(18)
+    if ssid then return ssid,false end
     local state=HomeData.quick_device_state()
-    if state and state.online==true then return "Wi-Fi✓",false end
+    if state and state.online==true then return "已连接",false end
     return "Wi-Fi!",true
 end
 
@@ -7281,10 +7287,9 @@ end
 function Plugin:_reader_toolbar_header(title)
     local wifi_label,wifi_alert=self:_reader_wifi_summary()
     local wifi_text=wifi_label
-    if wifi_label=="Wi-Fi关" then wifi_text="Wi-Fi 已关闭"
-    elseif wifi_label=="Wi-Fi✓" then wifi_text="Wi-Fi 已连"
-    elseif wifi_label=="Wi-Fi!" then wifi_text="Wi-Fi 未连"
-    elseif wifi_label=="Wi-Fi" then wifi_text="Wi-Fi 未知" end
+    if wifi_label=="Wi-Fi关" then wifi_text="已关闭"
+    elseif wifi_label=="Wi-Fi!" then wifi_text="未连接"
+    elseif wifi_label=="Wi-Fi" then wifi_text="状态未知" end
 
     local sync_text,sync_alert=self:_reader_sync_summary()
     local page=self:_reader_current_page()

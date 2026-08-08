@@ -73,12 +73,12 @@ local function icon_box(icon, width, height, enabled, size)
 end
 
 local function circle_icon_button(icon, width, height, enabled)
-    local circle = math.min(Skin.dp(28, 24, 36), math.floor(height * .72), math.floor(width * .72))
+    local circle = math.min(Skin.dp(36, 31, 46), math.floor(height * .78), math.floor(width * .78))
     local frame = Skin.frame(circle, circle, {
         bordersize = Skin.line("thin"), padding = 0, radius = math.floor(circle / 2),
         background = Blitbuffer.COLOR_WHITE,
         color = enabled ~= false and Blitbuffer.COLOR_GRAY or (Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_GRAY),
-    }, icon_box(icon, circle, circle, enabled, math.floor(circle * .52)))
+    }, icon_box(icon, circle, circle, enabled, math.floor(circle * .60)))
     return CenterContainer:new{dimen = Geom:new{w = width, h = height}, frame}
 end
 
@@ -173,17 +173,18 @@ function SliderBar:handleEvent(event) return InputContainer.handleEvent(self, ev
 local function status_item(entry, width, height, callback, hold_callback)
     entry = type(entry) == "table" and entry or {}
     local enabled = entry.enabled ~= false
-    local icon_w = entry.icon and Skin.dp(26, 22, 34) or 0
-    local gap = entry.icon and Skin.dp(3, 2, 5) or 0
+    local icon_w = entry.icon and Skin.dp(31, 27, 40) or 0
+    local gap = entry.icon and Skin.dp(5, 4, 7) or 0
     local text_w = math.max(1, width - icon_w - gap)
+    local text_align = entry.text_align or (entry.icon and "left" or "center")
     local content = HorizontalGroup:new{
         align = "center",
-        entry.icon and icon_box(entry.icon, icon_w, height, enabled, Skin.dp(17, 15, 23)) or HorizontalSpan:new{width = 0},
+        entry.icon and icon_box(entry.icon, icon_w, height, enabled, Skin.dp(21, 18, 28)) or HorizontalSpan:new{width = 0},
         entry.icon and HorizontalSpan:new{width = gap} or HorizontalSpan:new{width = 0},
         Ui.textbox(tostring(entry.label or ""), text_w, height,
-            Skin.face("cfont", 8.9, 12.2, 7.6), {
-                alignment = "center", halign = "center",
-                bold = entry.bold == true or entry.alert == true,
+            Skin.face("cfont", 10.8, 14.3, 9.2), {
+                alignment = text_align, halign = text_align,
+                bold = entry.bold ~= false or entry.alert == true,
                 fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
             }),
     }
@@ -200,14 +201,14 @@ end
 local function plain_action_item(entry, width, height, activate, hold_activate)
     entry = type(entry) == "table" and entry or {}
     local enabled = entry.enabled ~= false
-    local icon_h = math.floor(height * .58)
+    local icon_h = math.floor(height * .60)
     local label_h = math.max(1, height - icon_h)
-    local icon_size = math.min(Skin.dp(25, 21, 32), math.floor(icon_h * .76))
+    local icon_size = math.min(Skin.dp(31, 27, 40), math.floor(icon_h * .80))
     local content = VerticalGroup:new{
         align = "center",
         icon_box(entry.icon or entry.icon_key, width, icon_h, enabled, icon_size),
         centered_text(entry.label or "", width, label_h,
-            Skin.face("cfont", 8.4, 11.4, 7.2), {
+            Skin.face("cfont", 10.4, 13.8, 8.8), {
                 bold = entry.active == true,
                 fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
             }),
@@ -225,14 +226,14 @@ end
 local function compact_action_item(entry, width, height, activate)
     entry = type(entry) == "table" and entry or {}
     local enabled = entry.enabled ~= false
-    local icon_w = Skin.dp(28, 24, 36)
-    local text_w = math.max(1, width - icon_w - Skin.dp(3, 2, 5))
+    local icon_w = Skin.dp(34, 29, 44)
+    local text_w = math.max(1, width - icon_w - Skin.dp(5, 4, 7))
     local content = HorizontalGroup:new{
         align = "center",
-        icon_box(entry.icon or entry.icon_key, icon_w, height, enabled, Skin.dp(18, 15, 23)),
-        HorizontalSpan:new{width = Skin.dp(3, 2, 5)},
+        icon_box(entry.icon or entry.icon_key, icon_w, height, enabled, Skin.dp(23, 20, 30)),
+        HorizontalSpan:new{width = Skin.dp(5, 4, 7)},
         Ui.textbox(tostring(entry.label or ""), text_w, height,
-            Skin.face("cfont", 8.2, 11.1, 7.0), {
+            Skin.face("cfont", 10.1, 13.4, 8.6), {
                 alignment = "left", halign = "left", bold = entry.active == true,
                 fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
             }),
@@ -308,13 +309,17 @@ end
 
 function Toolbar:_top_status_row(root, header, x, y, width, height)
     header = type(header) == "table" and header or {}
-    local weights = {17, 24, 24, 14, 21}
+    -- Keep navigation compact and give the SSID the widest slot. Icons and
+    -- labels sit next to each other instead of being visually separated by a
+    -- full-width text box. "More" is text-only: the old three-dot icon merely
+    -- duplicated the label and consumed useful width.
+    local weights = {15, 31, 24, 14, 16}
     local entries = {
-        {icon = "home", label = header.home_label or "首页", enabled = type(header.home_callback) == "function"},
-        {icon = "wifi", label = header.wifi_label or "Wi-Fi", enabled = type(header.wifi_callback) == "function", alert = header.wifi_alert == true},
-        {icon = "sync", label = header.sync_label or "同步", enabled = type(header.sync_callback) == "function", alert = header.sync_alert == true},
-        {icon = "battery", label = header.battery_label or "", enabled = true},
-        {icon = "more", label = header.more_label or "更多", enabled = type(header.more_callback) == "function"},
+        {icon = "home", label = header.home_label or "首页", enabled = type(header.home_callback) == "function", bold = true},
+        {icon = "wifi", label = header.wifi_label or "Wi-Fi", enabled = type(header.wifi_callback) == "function", alert = header.wifi_alert == true, bold = true},
+        {icon = "sync", label = header.sync_label or "同步", enabled = type(header.sync_callback) == "function", alert = header.sync_alert == true, bold = true},
+        {icon = "battery", label = header.battery_label or "", enabled = true, bold = true},
+        {label = header.more_label or "更多", enabled = type(header.more_callback) == "function", text_align = "center", bold = true},
     }
     local callbacks = {
         function() self:_activate(header.home_callback, "首页") end,
@@ -361,14 +366,14 @@ function Toolbar:_chapter_row(root, header, x, y, width, height)
         callback = function() self:_activate(header.chapter_callback, "章节") end,
     }
     chapter[1] = Ui.textbox(tostring(header.chapter_label or "当前章节"), left_w, height,
-        Skin.face("cfont", 9.5, 12.8, 8.0), {alignment = "left", halign = "left", bold = true})
+        Skin.face("cfont", 10.5, 13.8, 8.9), {alignment = "left", halign = "left", bold = true})
     local progress = TapBox:new{
         dimen = Geom:new{w = right_w, h = height},
         enabled = type(header.progress_callback) == "function",
         callback = function() self:_activate(header.progress_callback, "阅读进度") end,
     }
     progress[1] = Ui.textbox(tostring(header.progress_label or "") .. (header.progress_label and header.progress_label ~= "" and "  ›" or ""), right_w, height,
-        Skin.face("cfont", 9.3, 12.5, 7.8), {alignment = "right", halign = "right", bold = true})
+        Skin.face("cfont", 10.3, 13.6, 8.7), {alignment = "right", halign = "right", bold = true})
     root[#root + 1] = OffsetContainer:new{x_off = x, y_off = y, HorizontalGroup:new{align = "center", chapter, progress}}
 end
 
@@ -390,10 +395,10 @@ end
 
 function Toolbar:_stepper(root, setting, x, y, width, height)
     setting = type(setting) == "table" and setting or {}
-    local label_w = math.floor(width * .30)
-    local button_w = math.max(Skin.dp(34, 30, 44), math.floor(width * .16))
+    local label_w = math.floor(width * .29)
+    local button_w = math.max(Skin.dp(42, 36, 54), math.floor(width * .17))
     local value_w = math.max(1, width - label_w - button_w * 2)
-    local face = Skin.face("cfont", 9.0, 12.2, 7.6)
+    local face = Skin.face("cfont", 10.8, 14.2, 9.1)
     local value_widget, value_container = dynamic_value(setting.value or "", value_w, height, face, true)
 
     local label_tap = TapBox:new{
@@ -436,14 +441,14 @@ function Toolbar:_typeset_row(root, typeset, x, y, width, height)
         enabled = type(page.callback) == "function",
         callback = function() self:_activate(page.callback, page.label or "页面") end,
     }
-    local icon_w = Skin.dp(20, 17, 26)
+    local icon_w = Skin.dp(25, 21, 32)
     tap[1] = CenterContainer:new{
         dimen = Geom:new{w = page_w, h = height},
         HorizontalGroup:new{
             align = "center",
             Ui.textbox(tostring(page.label or "页面"), math.max(1, page_w - icon_w), height,
-                Skin.face("cfont", 9.0, 12.2, 7.6), {alignment = "right", halign = "right", bold = true}),
-            icon_box("chevron-right", icon_w, height, true, Skin.dp(13, 11, 17)),
+                Skin.face("cfont", 10.8, 14.2, 9.1), {alignment = "right", halign = "right", bold = true}),
+            icon_box("chevron-right", icon_w, height, true, Skin.dp(17, 14, 22)),
         },
     }
     root[#root + 1] = OffsetContainer:new{x_off = x + left, y_off = y, tap}
@@ -452,24 +457,24 @@ end
 function Toolbar:_light_row(root, setting, x, y, width, height)
     if type(setting) ~= "table" then return end
     local enabled = setting.enabled ~= false
-    local label_w = math.max(Skin.dp(112, 94, 146), math.floor(width * .22))
-    local button_w = Skin.dp(42, 36, 54)
-    local gap = Skin.dp(7, 6, 10)
+    local label_w = math.max(Skin.dp(132, 112, 170), math.floor(width * .25))
+    local button_w = Skin.dp(50, 43, 64)
+    local gap = Skin.dp(9, 7, 12)
     local slider_w = math.max(1, width - label_w - button_w * 2 - gap * 2)
-    local icon_w = Skin.dp(29, 25, 37)
-    local value_text_w = Skin.dp(36, 31, 47)
+    local icon_w = Skin.dp(36, 31, 46)
+    local value_text_w = Skin.dp(46, 39, 58)
     local label_text_w = math.max(1, label_w - icon_w - value_text_w)
     local value_widget = TextWidget:new{
         text = tostring(math.floor((tonumber(setting.value) or 0) + .5)),
-        face = Skin.face("cfont", 8.8, 11.9, 7.4),
+        face = Skin.face("cfont", 11.2, 14.8, 9.5),
         bold = true,
         fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
     }
     local label_content = HorizontalGroup:new{
         align = "center",
-        icon_box(setting.icon or "frontlight", icon_w, height, enabled, Skin.dp(18, 15, 24)),
+        icon_box(setting.icon or "frontlight", icon_w, height, enabled, Skin.dp(24, 20, 31)),
         Ui.textbox(tostring(setting.label or ""), label_text_w, height,
-            Skin.face("cfont", 8.7, 11.8, 7.3), {alignment = "left", halign = "left", bold = true}),
+            Skin.face("cfont", 10.7, 14.1, 9.0), {alignment = "left", halign = "left", bold = true}),
         CenterContainer:new{dimen = Geom:new{w = value_text_w, h = height}, value_widget},
     }
     local label = TapBox:new{dimen = Geom:new{w = label_w, h = height}, enabled = false}
@@ -550,13 +555,13 @@ function Toolbar:_build_content()
     local content_w = math.max(1, sw - side_pad * 2)
     local divider_h = math.max(1, Skin.line("thin"))
 
-    local status_h = math.max(Skin.dp(38, 33, 49), math.floor(sh * (portrait and .033 or .052)))
-    local title_h = math.max(Skin.dp(52, 44, 66), math.floor(sh * (portrait and .044 or .070)))
-    local chapter_h = math.max(Skin.dp(40, 34, 52), math.floor(sh * (portrait and .034 or .054)))
-    local content_h = math.max(Skin.dp(66, 56, 84), math.floor(sh * (portrait and .056 or .084)))
-    local typeset_h = math.max(Skin.dp(44, 38, 57), math.floor(sh * (portrait and .038 or .060)))
-    local light_h = math.max(Skin.dp(43, 37, 56), math.floor(sh * (portrait and .037 or .058)))
-    local device_h = math.max(Skin.dp(47, 40, 61), math.floor(sh * (portrait and .041 or .064)))
+    local status_h = math.max(Skin.dp(46, 40, 59), math.floor(sh * (portrait and .040 or .060)))
+    local title_h = math.max(Skin.dp(54, 46, 69), math.floor(sh * (portrait and .046 or .072)))
+    local chapter_h = math.max(Skin.dp(44, 38, 57), math.floor(sh * (portrait and .038 or .058)))
+    local content_h = math.max(Skin.dp(76, 65, 97), math.floor(sh * (portrait and .064 or .094)))
+    local typeset_h = math.max(Skin.dp(54, 46, 69), math.floor(sh * (portrait and .046 or .069)))
+    local light_h = math.max(Skin.dp(54, 46, 69), math.floor(sh * (portrait and .046 or .069)))
+    local device_h = math.max(Skin.dp(58, 50, 74), math.floor(sh * (portrait and .050 or .075)))
 
     local header = type(self.opts.header) == "table" and self.opts.header or {}
     local actions = type(self.opts.actions) == "table" and self.opts.actions or {}
