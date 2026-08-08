@@ -107,6 +107,7 @@ local function public_result(result)
     result = type(result) == "table" and result or {}
     return {
         accepted = result.accepted == true,
+        uncertain = result.uncertain == true,
         response = result.response or {},
         error = result.error,
         error_kind = result.error_kind,
@@ -245,20 +246,30 @@ function Service.run(job)
             if result.wr_wrpa_changed then auth.wr_wrpa = result.wr_wrpa or "" end
 
             local out = public_result(result)
-            local kind = result.accepted and nil or classify_error(result.error_kind,result.error)
+            local uncertain = result.uncertain == true or tostring(result.error_kind or "") == "unconfirmed"
+            local kind = result.accepted and nil or (uncertain and "unconfirmed" or classify_error(result.error_kind,result.error))
             if result.accepted then
+                consecutive_failures = 0
+                blocked = false
+            elseif uncertain then
+                -- Do not replay this elapsed interval: WeRead may already have
+                -- accepted it. Keep the service alive and continue with the
+                -- next fresh interval instead of escalating to book repair.
                 consecutive_failures = 0
                 blocked = false
             else
                 consecutive_failures = consecutive_failures + 1
-                blocked = true
+                blocked = kind == "authentication"
             end
             out.generation = generation
             out.seq = sequence
-            out.state = result.accepted and "waiting" or "error"
+            out.state = result.accepted and "waiting" or (uncertain and "unconfirmed" or "error")
+            out.uncertain = uncertain or nil
             out.error_kind = kind or result.error_kind
             out.paused = blocked
-            out.retry_delay = 0
+            local delay = (result.accepted or uncertain) and interval
+                or retry_delay(kind, consecutive_failures, interval)
+            out.retry_delay = delay
             out.consecutive_failures = consecutive_failures
             out.attempted_at = attempted_at
             out.completed_at = completed_at
@@ -269,7 +280,7 @@ function Service.run(job)
             out.recovery_probe = false
             out.final_flush = final_flush == true
             out.flush_reason = reason
-            out.next_due = (final_flush or blocked) and 0 or (completed_at + interval)
+            out.next_due = final_flush and 0 or (completed_at + delay)
             out.book_id = tostring(current_job.book_id or "")
             out.core_map_hash=tostring(current_job.core_map_hash or "")
             out.record_generation=tonumber(current_job.record_generation or 0) or 0
@@ -278,9 +289,10 @@ function Service.run(job)
         end
 
         consecutive_failures = consecutive_failures + 1
-        blocked = true
         local kind=classify_error(nil,result)
-        local due = 0
+        blocked = kind == "authentication"
+        local delay = retry_delay(kind, consecutive_failures, interval)
+        local due = final_flush and 0 or (completed_at + delay)
         write_service_status({
             generation = generation,
             seq = sequence,
@@ -288,7 +300,7 @@ function Service.run(job)
             accepted = false,
             error = tostring(result or "read report service failed"),
             error_kind = kind,
-            retry_delay = 0,
+            retry_delay = delay,
             consecutive_failures = consecutive_failures,
             attempted_at = attempted_at,
             completed_at = completed_at,

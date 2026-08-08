@@ -334,6 +334,10 @@ function Plugin:init()
     end
     self._reader_active_path="/tmp/miuread-reader-active.flag"
     self._reader_busy_path="/tmp/miuread-reader-busy.until"
+    self._reader_busy_until=tonumber(U.read_file(self._reader_busy_path,true) or 0) or 0
+    self._home_quick_panel_last_open=0
+    self._home_quick_panel_opening=false
+    self._reader_quick_panel_pending=false
     self._thought_popup_marker_path=self.store.temp_dir.."/thought-popup.pending.json"
     self._thought_popup_last_crash_path=self.store.data_dir.."/thought-popup-last-crash.json"
     local pending_popup=U.read_file(self._thought_popup_marker_path,true)
@@ -380,7 +384,8 @@ function Plugin:init()
     end
     if self._reader_context then
         U.atomic_write(self._reader_active_path,"1",true)
-        U.atomic_write(self._reader_busy_path,tostring(os.time()+3),true)
+        self._reader_busy_until=os.time()+3
+        U.atomic_write(self._reader_busy_path,tostring(self._reader_busy_until),true)
     else
         os.remove(self._reader_active_path)
         os.remove(self._reader_busy_path)
@@ -1409,6 +1414,15 @@ function Plugin:_prepare_shelf_rows(rows)
     for _,b in ipairs(rows or {}) do
         b.download_active=false
         b.download_progress=nil
+        local id=tostring(b.bookId or b.book_id or "")
+        if id~="" then
+            local session=self.store:session(id) or {}
+            local snapshot=type(session.local_position_snapshot)=="table" and session.local_position_snapshot or {}
+            local effective=tonumber(session.progress_local_percent)
+                or (snapshot.safe==true and tonumber(snapshot.progress) or nil)
+                or tonumber(session.verified_local_percent)
+            if effective~=nil then b.progress=math.max(0,math.min(100,effective)) end
+        end
         local removed
         b.cover_path,removed=self.library:cached_cover_path(b.bookId,cover_index)
         if removed then
@@ -3957,6 +3971,7 @@ function Plugin:_reader_wifi_toggle()
         elseif type(NetworkMgr.turnOnWifi)=="function" then ok=pcall(NetworkMgr.turnOnWifi,NetworkMgr) end
         if ok then self:toast("正在开启 Wi-Fi",1.5) end
     end
+    if ok then HomeData.invalidate_device_state() end
     return ok==true
 end
 
@@ -4021,23 +4036,18 @@ end
 
 function Plugin:_home_status_line()
     local parts={os.date("%H:%M")}
-    local ok_network,NetworkMgr=pcall(require,"ui/network/manager")
-    if ok_network and NetworkMgr and type(NetworkMgr.isWifiOn)=="function" then
-        local ok,value=pcall(NetworkMgr.isWifiOn,NetworkMgr)
-        if ok then
-            if value==true then
-                -- Keep the home header concise: time + the connected SSID.
-                parts[#parts+1]=self:_reader_current_wifi_name(18) or "Wi-Fi"
-            else
-                parts[#parts+1]="离线"
-            end
-        end
+    local state=HomeData.quick_device_state() or {}
+    if state.wifi_on==false then
+        parts[#parts+1]="离线"
+    elseif state.wifi_on==true then
+        local ssid=U.trim(tostring(state.wifi_name or ""))
+        parts[#parts+1]=ssid~="" and U.utf8_truncate(ssid,18,"…") or (state.online==true and "Wi-Fi" or "未连接")
     end
     return table.concat(parts,"  ·  ")
 end
 
 function Plugin:_home_battery_text()
-    local device=HomeData.device_state()
+    local device=HomeData.quick_device_state() or {}
     if tonumber(device.battery) then
         return tostring(math.floor(tonumber(device.battery)+.5)).."%"
     end
@@ -6498,6 +6508,7 @@ function Plugin:_home_wifi_toggle()
         elseif type(NetworkMgr.turnOnWifi)=="function" then ok=pcall(NetworkMgr.turnOnWifi,NetworkMgr) end
         if ok then self:toast("正在开启 Wi-Fi",1.5) end
     end
+    if ok then HomeData.invalidate_device_state() end
     UIManager:scheduleIn(1,function() self:_refresh_home_view(nil,"header") end)
     return ok==true
 end
@@ -6697,27 +6708,26 @@ function Plugin:_home_preview_books(rows,hero,limit)
 end
 
 function Plugin:show_home_quick_panel(more_expanded)
-    -- Use cached device state so the gesture opens the panel immediately.
-    -- Wi-Fi actions still query the live state when the user taps them.
-    local state=HomeData.quick_device_state()
-    local wifi_on=nil
-    local ok_nm,NetworkMgr=pcall(require,"ui/network/manager")
-    if ok_nm and NetworkMgr and type(NetworkMgr.isWifiOn)=="function" then
-        local ok,value=pcall(NetworkMgr.isWifiOn,NetworkMgr)
-        if ok then wifi_on=value==true end
-    end
+    local started=os.clock()
+    local now=started
+    if self._home_quick_panel_opening==true
+        or now-(tonumber(self._home_quick_panel_last_open) or 0)<.35 then return true end
+    self._home_quick_panel_opening=true
+    self._home_quick_panel_last_open=now
+
+    -- Opening the control center must never query Wi-Fi, disk or download
+    -- storage. The home surface already has a recent device snapshot.
+    local state=HomeData.cached_device_state() or {}
+    local wifi_on=state.wifi_on
+    local wifi_name=U.trim(tostring(state.wifi_name or ""))
     local wifi_detail
-    local wifi_name=wifi_on==true and self:_reader_current_wifi_name(11) or nil
     if wifi_on==nil then wifi_detail="状态未知"
     elseif wifi_on~=true then wifi_detail="已关闭"
-    elseif wifi_name then wifi_detail=wifi_name
+    elseif wifi_name~="" then wifi_detail=U.utf8_truncate(wifi_name,11,"…")
     elseif state.online==true then wifi_detail="已连接"
     else wifi_detail="未连接" end
-
-    local download_detail=""
-    if self:_has_download_status() or #self.store:download_queue()>0 then
-        download_detail=self:_download_menu_text():gsub("^下载管理%s*[·：]?%s*","")
-    end
+    local download_detail=tostring(self._home_panel_download_detail or "")
+    local sync_label=tostring(self._home_panel_sync_label or self:progress_sync_label() or "")
     local definitions={
         wifi={
             icon="Wi-Fi",
@@ -6731,7 +6741,7 @@ function Plugin:show_home_quick_panel(more_expanded)
         koreader_settings={icon="⚙",icon_key="ko-reader",label="KO设置",detail="",callback=function() self:_show_native_koreader_menu() end},
         return_koreader={icon="←",icon_key="return",label="返回KO",detail="",callback=function() self:_home_close_to_native(true) end},
         quit={icon="⏻",icon_key="power",label="退出 KOReader",detail="",callback=function() self:_quit_koreader() end},
-        sync={icon="⇅",icon_key="sync",label="阅读同步",detail=(self:progress_sync_label()=="上传失败" and "上传失败" or ""),callback=function() self:_show_standalone_menu("阅读同步",self:sync_menu()) end},
+        sync={icon="⇅",icon_key="sync",label="阅读同步",detail=(sync_label=="上传失败" and "上传失败" or ""),callback=function() self:_show_standalone_menu("阅读同步",self:sync_menu()) end},
         miuread_settings={icon="⚙",icon_key="settings",label="觅阅设置",detail="",callback=function() self:_show_standalone_menu("觅阅设置",self:settings_menu()) end},
         downloads={icon="⇩",icon_key="download",label="下载管理",detail=download_detail,callback=function() self:show_downloads() end},
         restart={icon="↺",icon_key="restart",label="重启",detail="",callback=function() self:_restart_koreader() end},
@@ -6781,14 +6791,9 @@ function Plugin:show_home_quick_panel(more_expanded)
     }
 
     local battery=tonumber(state.battery) and (tostring(math.floor(state.battery+.5)).."%") or "未知"
-    local notice=self:_home_download_notice()
-    local status_text
-    if notice then
-        status_text=tostring(notice.title or "")
-        if notice.detail and notice.detail~="" then status_text=status_text.." · "..tostring(notice.detail) end
-    elseif self:progress_sync_label()=="上传失败" then
-        status_text="阅读同步需要处理"
-    end
+    local status_text=tostring(self._home_panel_status_text or "")
+    if status_text=="" and sync_label=="上传失败" then status_text="阅读同步需要处理" end
+    local prepared=os.clock()
     local panel,err=HomeQuickPanel.show{
         time_text=os.date("%H:%M"),
         battery_text=battery,
@@ -6799,10 +6804,18 @@ function Plugin:show_home_quick_panel(more_expanded)
             self:_show_standalone_menu("工具与维护",maintenance_items)
         end,
     }
+    self._home_quick_panel_opening=false
+    local completed=os.clock()
+    logger.info("[MiuRead][QuickPanel] timing",
+        "prep_ms=",tostring(math.floor((prepared-started)*1000+.5)),
+        "show_ms=",tostring(math.floor((completed-prepared)*1000+.5)),
+        "total_ms=",tostring(math.floor((completed-started)*1000+.5)))
     if not panel then
         logger.warn("[MiuRead][QuickPanel] unavailable",tostring(err or "unknown"))
         self:info("快捷控制暂时无法打开")
+        return false
     end
+    return true
 end
 
 function Plugin:_begin_koreader_exit(reason)
@@ -6854,8 +6867,7 @@ function Plugin:_quit_koreader()
 end
 
 function Plugin:show_home_menu()
-    -- The status area and the header menu button share one action list.
-    return self:show_home_quick_panel()
+    return self:_show_standalone_menu("觅阅设置",self:settings_menu())
 end
 
 function Plugin:home_preview_menu()
@@ -6878,8 +6890,7 @@ function Plugin:_schedule_reader_interaction_resume(target)
         if self._reader_interaction_resume_task~=task
             or generation~=self._reader_interaction_resume_generation then return end
         local now=os.time()
-        local persisted=tonumber(U.read_file(tostring(self._reader_busy_path or ""),true) or 0) or 0
-        local deadline=math.max(tonumber(target) or 0,tonumber(self._reader_busy_until or 0) or 0,persisted)
+        local deadline=math.max(tonumber(target) or 0,tonumber(self._reader_busy_until or 0) or 0)
         if deadline>now then
             UIManager:scheduleIn(math.max(.25,deadline-now+.15),task)
             return
@@ -6895,15 +6906,14 @@ function Plugin:_mark_reader_busy(seconds)
     local path=tostring(self._reader_busy_path or "")
     if path=="" then return false end
     local now=os.time()
-    local requested=now+math.max(1,tonumber(seconds) or 4)
-    local persisted=tonumber(U.read_file(path,true) or 0) or 0
-    local current=math.max(tonumber(self._reader_busy_until or 0) or 0,persisted)
-    local target=math.max(requested,current)
-    local wrote=true
-    if target>persisted then wrote=U.atomic_write(path,tostring(target),true)==true end
+    local target=math.max(now+math.max(1,tonumber(seconds) or 4),tonumber(self._reader_busy_until or 0) or 0)
     self._reader_busy_until=target
-
-    if self.performance_mode and self.performance_mode:enabled() and self.download_task then
+    local active_download=(self.download_task and self.download_task:busy()) or self._download_runtime~=nil
+    local wrote=true
+    -- The subprocess only needs the shared marker while a download is actually
+    -- competing for I/O. Normal reader panel opens stay memory-only.
+    if active_download then wrote=U.atomic_write(path,tostring(target),true)==true end
+    if active_download and self.performance_mode and self.performance_mode:enabled() and self.download_task then
         self.download_task:pause("reader_interaction")
         self:_schedule_reader_interaction_resume(target)
     end
@@ -7360,7 +7370,8 @@ function Plugin:_reader_font_size_label()
 end
 
 function Plugin:_reader_toolbar_title()
-    local current=self:_current_book_record()
+    -- Never reload Store on a swipe. Sync already owns the current book record.
+    local current=self.sync and self.sync:record() or nil
     local title=current and current.book and current.book.title or nil
     if not title or title=="" then
         local path=self:_current_document_path()
@@ -7383,13 +7394,12 @@ function Plugin:_reader_current_wifi_name(max_chars)
 end
 
 function Plugin:_reader_wifi_summary()
-    local wifi_on=self:_reader_wifi_state()
-    if wifi_on==false then return "Wi-Fi关",false end
-    if wifi_on==nil then return "Wi-Fi",true end
-    local ssid=self:_reader_current_wifi_name(18)
-    if ssid then return ssid,false end
-    local state=HomeData.quick_device_state()
-    if state and state.online==true then return "已连接",false end
+    local state=HomeData.cached_device_state() or {}
+    if state.wifi_on==false then return "Wi-Fi关",false end
+    if state.wifi_on==nil then return "Wi-Fi",true end
+    local ssid=U.trim(tostring(state.wifi_name or ""))
+    if ssid~="" then return U.utf8_truncate(ssid,18,"…"),false end
+    if state.online==true then return "已连接",false end
     return "Wi-Fi!",true
 end
 
@@ -7411,17 +7421,8 @@ function Plugin:_reader_sync_summary()
 end
 
 function Plugin:_reader_battery_label()
-    if type(Device.hasBattery)=="function" and not Device:hasBattery() then return "" end
-    local powerd=type(Device.getPowerDevice)=="function" and Device:getPowerDevice() or nil
-    if not powerd then return "" end
-    local value
-    for _,method in ipairs({"getCapacity","getBatteryCapacity","batteryCapacity"}) do
-        if type(powerd[method])=="function" then
-            local ok,result=pcall(powerd[method],powerd)
-            if ok and tonumber(result) then value=tonumber(result); break end
-        end
-    end
-    value=value or tonumber(powerd.capacity or powerd.battery_capacity or powerd.batt_capacity)
+    local state=HomeData.cached_device_state() or {}
+    local value=tonumber(state.battery)
     if not value then return "" end
     return tostring(math.max(0,math.min(100,math.floor(value+.5)))).."%"
 end
@@ -8660,9 +8661,10 @@ function Plugin:show_reader_more_panel()
     return self:show_reader_control_center("reading")
 end
 
-function Plugin:show_reader_quick_panel()
+function Plugin:_show_reader_quick_panel_now()
     if not (self.ui and self.ui.document) then return false end
-    self:_mark_reader_busy(8)
+    local started=os.clock()
+    self:_mark_reader_busy(4)
     local title=self:_reader_toolbar_title()
     local definitions=self:_reader_quick_definitions()
 
@@ -8763,7 +8765,19 @@ function Plugin:show_reader_quick_panel()
         logger.warn("[MiuRead][ReaderToolbar] unavailable",tostring(err or "unknown"))
         return false
     end
-    logger.info("[MiuRead][ReaderToolbar] opened ordered reader toolbar")
+    logger.info("[MiuRead][ReaderToolbar] opened ordered reader toolbar",
+        "total_ms=",tostring(math.floor((os.clock()-started)*1000+.5)))
+    return true
+end
+
+function Plugin:show_reader_quick_panel()
+    if not (self.ui and self.ui.document) then return false end
+    if self._reader_quick_panel_pending==true then return true end
+    self._reader_quick_panel_pending=true
+    UIManager:nextTick(function()
+        self._reader_quick_panel_pending=false
+        if self.ui and self.ui.document then self:_show_reader_quick_panel_now() end
+    end)
     return true
 end
 
@@ -9400,6 +9414,10 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     local screensaver_file=home.lockscreen_recent~=false and self:_home_prepare_lockscreen_cover(hero) or nil
     HOME_SESSION.lockscreen_recent_enabled=home.lockscreen_recent~=false
     HOME_SESSION.screensaver_file=screensaver_file
+    local home_alerts=self:_home_alerts()
+    self._home_panel_sync_label=self:progress_sync_label()
+    self._home_panel_download_detail=""
+    self._home_panel_status_text=(home_alerts[1] and tostring(home_alerts[1].title or "")) or ""
     local view,err=HomeView.show({
         title="觅阅",
         status_line=self:_home_status_line(),
@@ -9416,7 +9434,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         empty_text=selected.empty,
         -- Download progress belongs to the matching shelf card; only true
         -- account/health alerts occupy the home notice strip.
-        alerts=self:_home_alerts(),
+        alerts=home_alerts,
         lockscreen_enabled=home.lockscreen_recent~=false,
         screensaver_file=screensaver_file,
         on_quick_panel=function() self:show_home_quick_panel() end,
@@ -12201,7 +12219,10 @@ function Plugin:progress_sync_label()
     if prefs.progress_enabled==false then return "已关闭" end
     local r=self.sync:record()
     local session=r and self.store:session(r.book.book_id) or {}
-    if session and session.sync_repair_required==true then return "需要修复" end
+    if session and session.sync_repair_required==true then
+        local kind=tostring(session.sync_repair_kind or "")
+        if kind=="context" or kind=="position" then return "需要修复" end
+    end
     local state=session and session.progress_sync_state or nil
     local labels={checking="正在检查",retrying="正在重试",mapping_pending="等待章节换算",aligned="已同步",local_selected="使用本机位置",local_uploaded="已上传并确认",uploading="正在上传",verifying_upload="正在确认",upload_failed="上传失败",upload_unconfirmed="云端未确认",source_conflict="云端来源冲突",remote_selected="已采用云端位置",different="等待选择",deferred="本次暂不处理",remote_unavailable="等待重新检查",remote_jump_unconfirmed="跳转待确认"}
     return labels[state] or "已开启"
@@ -12494,8 +12515,9 @@ function Plugin:upload_local_progress(manual,callback)
     end
     local id=tostring(r.book.book_id)
     local session=self.store:session(id) or {}
-    if session.sync_repair_required==true then
-        if manual then self:_show_sync_repair_prompt(session.sync_repair_error,session.sync_repair_kind,id) end
+    if session.sync_repair_required==true
+        and (tostring(session.sync_repair_kind or "")=="context" or tostring(session.sync_repair_kind or "")=="position") then
+        if manual then self:_show_sync_repair_prompt(session.sync_repair_error,"context",id) end
         if callback then callback(false,session.sync_repair_error or "当前书籍需要修复同步") end
         return false
     end
@@ -12505,9 +12527,18 @@ function Plugin:upload_local_progress(manual,callback)
     if manual then self:status_toast("阅读进度同步","正在上传 "..target.."%……",3) end
     local started=self.sync:upload_progress(function(ok,result,submitted)
         if not ok then
-            self:_save_progress_state(id,"upload_failed","阅读进度上传失败",target,nil)
-            self.sync:end_progress_sync("阅读进度上传失败")
-            if manual then self:_show_sync_repair_prompt(result,"context",id) end
+            local current_session=self.store:session(id) or {}
+            local repair=current_session.sync_repair_required==true
+                and (tostring(current_session.sync_repair_kind or "")=="context" or tostring(current_session.sync_repair_kind or "")=="position")
+            local kind=tostring(current_session.last_error_kind or self.sync.last_error_kind or "")
+            local state=(kind=="transport" or kind=="server" or kind=="unconfirmed") and "upload_unconfirmed" or "upload_failed"
+            self:_save_progress_state(id,state,repair and "当前书籍同步信息需要修复" or "本次上传暂未完成",target,nil)
+            self.sync:end_progress_sync(repair and "当前书籍同步信息需要修复" or "本次上传暂未完成，稍后可继续")
+            if manual then
+                if repair then self:_show_sync_repair_prompt(result,"context",id)
+                elseif kind=="authentication" then self:status_toast("阅读进度同步","登录状态需要重新验证",4)
+                else self:status_toast("阅读进度同步","本次未获确认，稍后可再次同步",4) end
+            end
             if callback then callback(false,result) end
             return
         end
@@ -12666,7 +12697,9 @@ function Plugin:show_sync_status(detail)
     elseif s.state=="verification_required" or s.state=="fetching_remote" or s.state=="progress_sync" then time_text="等待位置确认"
     elseif s.state=="repair_required" then time_text="需要修复同步"
     elseif s.state=="paused" then time_text="已暂停"
-    elseif type(s.last_error)=="string" and (tonumber(s.consecutive_failures) or 0)>=1 then time_text="需要修复同步"
+    elseif tostring(s.last_error_kind or "")=="authentication" then time_text="登录待验证"
+    elseif tostring(s.last_error_kind or "")=="transport" then time_text="等待网络恢复"
+    elseif tostring(s.last_error_kind or "")=="server" then time_text="等待自动重试"
     elseif s.state=="uploading" then time_text="正在同步"
     else time_text="运行中" end
 
@@ -12743,6 +12776,8 @@ function Plugin:repair_current_sync()
 end
 
 function Plugin:_show_sync_repair_prompt(err,kind,book_id)
+    kind=tostring(kind or "")
+    if kind~="context" and kind~="position" then return false end
     local r=self:_current_book_record()
     local current_id=r and r.book and tostring(r.book.book_id or "") or ""
     book_id=tostring(book_id or current_id)
@@ -12818,8 +12853,12 @@ function Plugin:on_read_report_interval_success(status)
     end
 end
 function Plugin:on_read_report_failure(err,kind,book_id)
-    if Http.is_auth_error(err) then self:_mark_auth_problem("read_report",err,false) end
-    self:_show_sync_repair_prompt(err,kind,book_id)
+    kind=tostring(kind or "")
+    if kind=="authentication" or Http.is_auth_error(err) then
+        self:_mark_auth_problem("read_report",err,false)
+        return
+    end
+    if kind=="context" or kind=="position" then self:_show_sync_repair_prompt(err,"context",book_id) end
 end
 function Plugin:_current_book_record()
     self.store:reload()
@@ -14781,6 +14820,9 @@ function Plugin:onReaderReady()
     -- cloud-progress work begins. Local comment taps are already installed by
     -- the next-tick block above, so this does not delay reading interaction.
     UIManager:scheduleIn(.35,task)
+    UIManager:scheduleIn(1.2,function()
+        if self.ui and self.ui.document and not reader_close_active() then HomeData.quick_device_state(true) end
+    end)
 end
 function Plugin:onSetDimensions()
     self:_close_miuread_transients()
@@ -14952,7 +14994,8 @@ function Plugin:onResume()
     local recheck=prefs.progress_enabled~=false and slept>=math.max(60,tonumber(prefs.resume_after) or 300)
     if recheck then
         self._progress_prompted_book_id=nil
-        self.sync:clear_verified("resume_recheck")
+        -- Keep the last verified state visible while wake-up revalidation runs.
+        -- A transient Wi-Fi delay must not turn a healthy book into an error.
     end
     self.sync:on_resume(slept)
     if recheck then

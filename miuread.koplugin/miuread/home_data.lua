@@ -75,12 +75,20 @@ function HomeData.reading_stats(force)
     return value
 end
 
-function HomeData.quick_device_state()
+function HomeData.invalidate_device_state()
+    device_cache = nil
+end
+
+function HomeData.cached_device_state()
+    return device_cache and device_cache.value or nil
+end
+
+function HomeData.quick_device_state(force)
     local now = os.time()
-    if device_cache and now - device_cache.at < 60 then
+    if not force and device_cache and now - device_cache.at < 60 then
         return device_cache.value
     end
-    local state = {online = nil, battery = nil, charging = false}
+    local state = {online = nil, wifi_on = nil, wifi_name = nil, battery = nil, charging = false}
     local ok_power, power = pcall(Device.getPowerDevice, Device)
     if ok_power and power then
         if type(power.getCapacity) == "function" then
@@ -93,38 +101,39 @@ function HomeData.quick_device_state()
         end
     end
     local ok_network, network = pcall(require, "ui/network/manager")
-    if ok_network and network and type(network.isOnline) == "function" then
-        local ok, online = pcall(network.isOnline, network)
-        if ok then state.online = online == true end
+    if ok_network and network then
+        if type(network.isWifiOn) == "function" then
+            local ok, value = pcall(network.isWifiOn, network)
+            if ok then state.wifi_on = value == true end
+        end
+        if type(network.isOnline) == "function" then
+            local ok, online = pcall(network.isOnline, network)
+            if ok then state.online = online == true end
+        end
+        if state.wifi_on == true and type(network.getCurrentNetwork) == "function" then
+            local ok, current = pcall(network.getCurrentNetwork, network)
+            if ok and type(current) == "table" then
+                local ssid = tostring(current.ssid or current.name or ""):gsub("^%s+", ""):gsub("%s+$", "")
+                if ssid ~= "" then state.wifi_name = ssid end
+            end
+        end
     end
+    device_cache = {at = now, value = state}
     return state
 end
 
 function HomeData.device_state(force)
     local now = os.time()
-    if not force and device_cache and now - device_cache.at < 60 then
+    local base = HomeData.quick_device_state(force)
+    if not force and device_cache and device_cache.value.storage_checked_at
+        and now - device_cache.value.storage_checked_at < 60 then
         return device_cache.value
     end
 
-    local state = {online = nil, battery = nil, charging = false, storage_free = nil, storage_total = nil}
-    local ok_power, power = pcall(Device.getPowerDevice, Device)
-    if ok_power and power then
-        if type(power.getCapacity) == "function" then
-            local ok, capacity = pcall(power.getCapacity, power)
-            if ok and tonumber(capacity) then state.battery = clamp_number(capacity, 0, 100) end
-        end
-        if type(power.isCharging) == "function" then
-            local ok, charging = pcall(power.isCharging, power)
-            if ok then state.charging = charging == true end
-        end
-    end
-
-    local ok_network, network = pcall(require, "ui/network/manager")
-    if ok_network and network and type(network.isOnline) == "function" then
-        local ok, online = pcall(network.isOnline, network)
-        if ok then state.online = online == true end
-    end
-
+    local state = {}
+    for key, value in pairs(base or {}) do state[key] = value end
+    state.storage_free = state.storage_free
+    state.storage_total = state.storage_total
     local ok_util, util = pcall(require, "util")
     if ok_util and util and type(util.diskUsage) == "function" then
         local drive = Device.home_dir or DataStorage:getDataDir() or "/"
@@ -134,7 +143,7 @@ function HomeData.device_state(force)
             state.storage_total = tonumber(usage.total)
         end
     end
-
+    state.storage_checked_at = now
     device_cache = {at = now, value = state}
     return state
 end

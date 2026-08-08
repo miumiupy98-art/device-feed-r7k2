@@ -803,14 +803,16 @@ function HomeWidget:onHomeShelfSwipe(_,ges)
 end
 
 function HomeWidget:_build_header(children, m)
-    -- The first row now has four stable zones: brand, time/network, battery, More.
-    -- Account information remains available from MiuRead settings instead of
-    -- competing with live device status in the narrow home header.
-    local gap = math.max(UiScale.dp(5, 4, 8), math.floor(m.content_w * .006))
-    local title_w = math.max(UiScale.dp(88, 78, 112), math.floor(m.content_w * .155))
-    local battery_w = math.max(UiScale.dp(72, 64, 94), math.floor(m.content_w * .115))
-    local menu_w = math.max(UiScale.dp(74, 66, 96), math.floor(m.content_w * .115))
-    local status_w = math.max(1, m.content_w - title_w - battery_w - menu_w - gap * 3)
+    -- Five stable zones keep account access visible without sacrificing SSID
+    -- or battery. Only the account/SSID fields may ellipsize.
+    local gap = math.max(UiScale.dp(3, 2, 6), math.floor(m.content_w * .0045))
+    local title_w = math.max(UiScale.dp(72, 64, 94), math.floor(m.content_w * .115))
+    local account_w = math.max(UiScale.dp(120, 105, 155), math.floor(m.content_w * .175))
+    local battery_w = math.max(UiScale.dp(62, 56, 82), math.floor(m.content_w * .085))
+    local menu_w = math.max(UiScale.dp(68, 60, 90), math.floor(m.content_w * .095))
+    local status_w = math.max(1, m.content_w - title_w - account_w - battery_w - menu_w - gap * 4)
+    local account_text=tostring(self.opts.account_name or "")
+    if account_text=="" then account_text="未登录" end
     local header = HorizontalGroup:new{
         align = "center",
         LeftContainer:new{dimen = Geom:new{w = title_w, h = m.header_h}, TextWidget:new{
@@ -818,6 +820,12 @@ function HomeWidget:_build_header(children, m)
             face = face("cfont", 16.8, 21),
             bold = true,
         }},
+        HorizontalSpan:new{width = gap},
+        tappable(account_w, m.header_h, Ui.textbox(account_text,
+            account_w, m.header_h, face("smallinfofont", 10.8, 14.8), {
+                bold = true, alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_BLACK,
+                height_overflow_show_ellipsis = true,
+            }), self.opts.on_account),
         HorizontalSpan:new{width = gap},
         tappable(status_w, m.header_h, Ui.textbox(tostring(self.opts.status_line or ""),
             status_w, m.header_h, face("smallinfofont", 10.8, 14.8), {
@@ -833,9 +841,9 @@ function HomeWidget:_build_header(children, m)
         tappable(menu_w, m.header_h,
             fixed_frame(menu_w, m.header_h, {bordersize = 0, background = Blitbuffer.COLOR_WHITE},
                 Ui.text("更多", menu_w, m.header_h, face("smallinfofont", 10.8, 14.8), {bold = true})), function()
-            logger.info("[MiuRead][Home] quick panel tapped")
-            if self.opts and self.opts.on_quick_panel then self.opts.on_quick_panel()
-            elseif self.opts and self.opts.on_menu then self.opts.on_menu() end
+            logger.info("[MiuRead][Home] more menu tapped")
+            if self.opts and self.opts.on_menu then self.opts.on_menu()
+            elseif self.opts and self.opts.on_quick_panel then self.opts.on_quick_panel() end
         end),
     }
     self:_add(children, m.margin, m.margin, header)

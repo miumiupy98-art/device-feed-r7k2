@@ -121,6 +121,7 @@ function Adapter.run(job)
     local path = "compat_read_report_" .. tostring(result.path or result.error_kind or "unknown")
     return {
         accepted = result.ok == true,
+        uncertain = result.uncertain == true,
         response = result.result or {},
         error = result.error,
         error_kind = result.error_kind,
@@ -135,7 +136,8 @@ function Adapter.run(job)
         wr_wrpa_changed = result.wr_wrpa_changed == true,
         wr_wrpa = result.wr_wrpa,
         response_summary = result.ok == true and "succ=1 (compatibility path)"
-            or tostring(result.error or "compatibility path rejected"),
+            or (result.uncertain == true and ("unconfirmed: " .. tostring(result.error or "no explicit acknowledgement"))
+            or tostring(result.error or "compatibility path rejected")),
         attempts = { { stage = tostring(result.path or "compatibility") } },
         payload_public = merge({ compatibility_path = true }, result.payload_public or {}),
         meta = result.meta,

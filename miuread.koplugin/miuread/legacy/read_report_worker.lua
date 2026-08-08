@@ -139,6 +139,22 @@ local function read_report_accepted(result)
         and (result.succ == true or tonumber(result.succ) == 1)
 end
 
+local function read_report_uncertain(result)
+    if type(result) ~= "table" or read_report_accepted(result) then return false end
+    local err_code = result.errCode or result.errcode or result.code
+    local err_message = result.errMsg or result.errmsg or result.message or result.msg
+    if err_code ~= nil then
+        local numeric = tonumber(err_code)
+        if numeric == nil or numeric ~= 0 then return false end
+    end
+    if err_message ~= nil and U.trim(tostring(err_message)) ~= "" then return false end
+    -- WeRead sometimes returns an empty/partial body after accepting a report.
+    -- Without an explicit failure code this is "not confirmed", not proof that
+    -- the account/book context is broken. The caller may verify progress later,
+    -- but must never repair/replay this elapsed interval blindly.
+    return true
+end
+
 local function result_summary(result)
     if type(result) ~= "table" then
         return "non_table_response"
@@ -436,6 +452,9 @@ local function attempt_report(client, book_id, elapsed_seconds, book, progress_r
         return true, result, nil, nil, position_or_error, payload_public, meta
     end
     local summary=result_summary(result)
+    if read_report_uncertain(result) then
+        return false, result, summary, "unconfirmed", position_or_error, payload_public, meta
+    end
     local kind=Http.is_auth_error(summary) and "authentication" or "server"
     return false, result, summary, kind, position_or_error, payload_public, meta
 end
@@ -559,9 +578,22 @@ function Worker.run(job)
         }, context_changed)
     end
 
-    -- beta.3: do not silently refresh/retry/renew in the worker. The caller
-    -- surfaces a Repair Sync action immediately, preventing long retry chains
-    -- and repeated unofficial requests after a book-specific failure.
+    if first_kind == "unconfirmed" then
+        return finish(settings, book, {
+            ok = false,
+            uncertain = true,
+            error = first_error,
+            error_kind = "unconfirmed",
+            result = confirmation(result),
+            position = first_position,
+            payload_public = first_public,
+            meta = first_meta,
+        }, context_changed)
+    end
+
+    -- Explicit failures are returned to the parent. Recovery policy belongs to
+    -- the parent/service so a single transient request can never rewrite the
+    -- current book context or trigger a user-facing repair by itself.
     return finish(settings, book, {
         ok = false,
         error = first_error,

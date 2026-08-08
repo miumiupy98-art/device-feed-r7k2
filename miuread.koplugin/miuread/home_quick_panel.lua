@@ -409,14 +409,19 @@ function QuickPanel.close()
     live_panel = nil
 end
 function QuickPanel.show(opts)
+    local started=os.clock()
     QuickPanel.close()
     local ok, panel = pcall(QuickPanelWidget.new, QuickPanelWidget, {opts = opts or {}})
+    local built=os.clock()
     if not ok or not panel then
         logger.warn("[MiuRead][QuickPanel] build failed", tostring(panel))
         return nil, tostring(panel)
     end
     live_panel = panel
     UIManager:show(panel, "ui", panel.panel_dimen)
+    logger.info("[MiuRead][QuickPanel] build timing",
+        "build_ms=",tostring(math.floor((built-started)*1000+.5)),
+        "submit_ms=",tostring(math.floor((os.clock()-built)*1000+.5)))
     return panel
 end
 return QuickPanel

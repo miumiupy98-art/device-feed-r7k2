@@ -139,7 +139,8 @@ function SliderBar:_refresh(force)
     local now = os.clock()
     if not force and now - (tonumber(self.last_refresh) or 0) < interval then return end
     self.last_refresh = now
-    UIManager:setDirty(self.owner, function() return "ui", Skin.expand_region(self.owner.panel_dimen, Skin.dp(2, 2, 3)) end)
+    local region=self.refresh_dimen or self.owner.panel_dimen
+    UIManager:setDirty(self.owner, function() return "ui", Skin.expand_region(region, Skin.dp(2, 2, 3)) end)
 end
 function SliderBar:setValue(value, force)
     self.value = math.max(self.min, math.min(self.max, tonumber(value) or self.value))
@@ -495,6 +496,7 @@ function Toolbar:_light_row(root, setting, x, y, width, height)
             return tonumber(result) or target
         end,
     }
+    slider.refresh_dimen=Geom:new{x=x,y=y,w=width,h=height}
 
     local function adjust(callback, direction)
         if type(callback) ~= "function" then return end
@@ -682,11 +684,16 @@ function M.close()
     live_toolbar = nil
 end
 function M.show(opts)
+    local started=os.clock()
     M.close()
     local ok, toolbar = pcall(Toolbar.new, Toolbar, {opts = opts or {}})
+    local built=os.clock()
     if not ok or not toolbar then return nil, tostring(toolbar) end
     live_toolbar = toolbar
     UIManager:show(toolbar, "ui", toolbar.panel_dimen)
+    logger.info("[MiuRead][ReaderToolbar] build timing",
+        "build_ms=",tostring(math.floor((built-started)*1000+.5)),
+        "submit_ms=",tostring(math.floor((os.clock()-built)*1000+.5)))
     return toolbar
 end
 return M
