@@ -106,6 +106,7 @@ function Adapter.run(job)
         book_id = job.book_id,
         book_title = job.book_title,
         book = copy(job.book or {}),
+        core_map_hash = job.core_map_hash,
         progress_ratio = job.progress_ratio,
         elapsed_seconds = job.elapsed_seconds,
         cookies = copy(job.cookies or {}),

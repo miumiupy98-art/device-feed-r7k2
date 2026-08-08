@@ -1669,7 +1669,7 @@ function Store:file_record_from_identity(path,meta,relink)
                 partial_range=meta.partial_range==true,range_start_index=tonumber(meta.range_start_index),
                 range_end_index=tonumber(meta.range_end_index),range_start_title=meta.range_start_title,
                 range_end_title=meta.range_end_title,annotation_pending=meta.annotation_pending==true or nil,
-                annotation_error_kind=meta.annotation_error_kind,recovered=true,
+                annotation_error_kind=meta.annotation_error_kind,core_map_hash=meta.core_map_hash,recovered=true,
             }
             if standalone and uid~="" then
                 record.chapter_uid=uid
@@ -1693,7 +1693,7 @@ function Store:file_record_from_identity(path,meta,relink)
             partial_range=meta.partial_range==true,range_start_index=tonumber(meta.range_start_index),
             range_end_index=tonumber(meta.range_end_index),range_start_title=meta.range_start_title,
             range_end_title=meta.range_end_title,annotation_pending=meta.annotation_pending==true or nil,
-            annotation_error_kind=meta.annotation_error_kind,
+            annotation_error_kind=meta.annotation_error_kind,core_map_hash=meta.core_map_hash,
         }
         if standalone and uid~="" then record.chapter_uid=uid; book.chapters[uid]={[kind]=record}
         else book.variants[kind]=record end
@@ -1736,6 +1736,26 @@ function Store:invalidate_report_contexts(reason)
 end
 function Store:session(id) return self:get("sessions",{})[tostring(id)] end
 function Store:save_session(id,patch,flush_now) local a=self:get("sessions",{}); local k=tostring(id); a[k]=U.merge(a[k] or {},patch or {}); self.db:saveSetting("sessions",a); if flush_now~=false then self:flush() end; return a[k] end
+function Store:invalidate_book_sync_context(id,reason,core_map_hash)
+    local sessions=self:get("sessions",{})
+    local key=tostring(id or "")
+    if key=="" then return false end
+    local row=type(sessions[key])=="table" and sessions[key] or {}
+    for _,field in ipairs({
+        "legacy_report_context","report_context","report_login_session_id","report_core_map_hash",
+        "remote_verified","verified_at","verified_reason","verified_local_percent","verified_remote_percent",
+        "verification_login_session_id","progress_upload_state","progress_upload_verified_at","progress_upload_source",
+        "pending_report_seconds"
+    }) do row[field]=nil end
+    row.sync_context_invalidated_at=os.time()
+    row.sync_context_invalidated_reason=tostring(reason or "book_context_changed")
+    row.book_core_map_hash=tostring(core_map_hash or row.book_core_map_hash or "")
+    row.pending_report_seconds=0
+    sessions[key]=row
+    self.db:saveSetting("sessions",sessions)
+    self:flush()
+    return true,row
+end
 function Store:clear_session(id) local a=self:get("sessions",{}); a[tostring(id)]=nil; self:set("sessions",a) end
 function Store:shelf_cache() return U.merge(defaults.shelf_cache,self:get("shelf_cache",{})) end
 function Store:save_shelf_cache(v) self:set("shelf_cache",U.merge(defaults.shelf_cache,v or {})) end

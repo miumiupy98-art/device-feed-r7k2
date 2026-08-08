@@ -489,7 +489,7 @@ local function shelf_book_card(book, width, height, callback, hold_callback)
     end
     status = U.utf8_truncate(status, 10, "")
     local status_important = status == "失败" or status == "待修复" or status == "排队中"
-        or status == "批注待补全"
+        or status == "批注待修复"
     if not status_important then status = "" end
 
     local title_h = math.max(UiScale.dp(29, 25, 40), math.min(UiScale.dp(39, 32, 47), math.floor(height * .155)))

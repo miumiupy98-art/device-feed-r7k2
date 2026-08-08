@@ -34,6 +34,7 @@ local Downloader=require("miuread.downloader")
 local DownloadProgress=require("miuread.download_progress")
 local DownloadTask=require("miuread.download_task")
 local DownloadResult=require("miuread.download_result")
+local BookIntegrity=require("miuread.book_integrity")
 local EpubInstaller=require("miuread.epub_installer")
 local CacheCleanupTask=require("miuread.cache_cleanup_task")
 local MemoryMode=require("miuread.memory_mode")
@@ -1360,7 +1361,7 @@ function Plugin:_prepare_shelf_rows(rows)
             elseif download_state.status=="pending_install" then
                 b.download_status=DownloadResult.shelf_status(download_state,true)
             elseif download_state.status=="failed" or download_state.status=="interrupted" then b.download_status="生成未完成"
-            elseif download_state.status=="annotation_pending" then b.download_status="批注待补全"
+            elseif download_state.status=="annotation_pending" then b.download_status="批注待修复"
             elseif download_state.status=="completed" and download_state.annotation_fallback==true then b.download_status="已生成"
             elseif download_state.status=="completed" and download_state.seen~=true then b.download_status="刚刚生成完成" end
         end
@@ -3934,7 +3935,7 @@ function Plugin:_home_status_text(book,is_local)
             return ""
         end
         if state.status=="failed" then return "失败" end
-        if state.status=="annotation_pending" then return "批注待补全" end
+        if state.status=="annotation_pending" then return "批注待修复" end
         if state.status=="interrupted" or state.status=="pending_install" then return "待修复" end
     end
     if id~="" then
@@ -4884,17 +4885,7 @@ end
 function Plugin:_home_repair_book(book)
     local id=tostring(book and (book.bookId or book.book_id) or "")
     if id=="" then self:info("这本书没有可用的修复记录") return false end
-    local stored=self.store:book(id)
-    local record=self:_preferred_record(id)
-    if not stored or not record then self:info("这本书尚未生成，暂时不需要修复") return false end
-    local context={
-        book={book_id=id,title=stored.title or book.title},
-        record=record,
-        variant=record.variant,
-        path=record.file,
-        title=stored.title or book.title,
-    }
-    return self:_run_book_repair(context,nil,true)
+    return self:_repair_downloaded_book(id)
 end
 
 function Plugin:_show_home_refresh_popup(anchor)
@@ -6553,9 +6544,9 @@ function Plugin:show_home_quick_panel(more_expanded)
             self:_home_reset_local_metadata(); self:_home_complete_refresh(true)
         end},
         {text="重建封面",post_text="全部书籍",callback=function() self:_clear_cover_cache() end},
-        {text="修复书籍",post_text="批量检查",callback=function() self:scan_downloaded_books_for_repair() end},
-        {text="评论迁移与修复",callback=function()
-            self:_show_standalone_menu("评论迁移与修复",self:book_repair_settings_menu())
+        {text="修复书籍",post_text="检查下载完整性",callback=function() self:scan_downloaded_books_for_integrity_repair() end},
+        {text="评论数据迁移",callback=function()
+            self:_show_standalone_menu("评论数据迁移",self:book_repair_settings_menu())
         end},
         {text="重建书架",post_text="索引与状态",callback=function()
             self.store:reload(); self.store:prune_missing_files(); self:_show_miuread_home_now(false,true,true,"full")
@@ -9940,7 +9931,7 @@ function Plugin:_download_status_label()
     if state.status=="pending_install" then
         return "后台下载 · 等待更新"
     end
-    if state.status=="annotation_pending" then return "后台下载 · 正文已完成，批注待补全" end
+    if state.status=="annotation_pending" then return "后台下载 · 正文已完成，批注待修复" end
     if state.status=="completed" then return "后台下载 · 已完成" end
     if state.status=="failed" and state.auth_required==true then return "后台下载 · 等待重新登录" end
     if state.status=="failed" and state.error_kind=="network" then return "后台下载 · 等待网络，可继续" end
@@ -11440,7 +11431,7 @@ function Plugin:ensure_read_report_progress(reason,automatic)
                 end
             end,{minimum_delay=2,max_wait=90,interval=3})
         else
-            self:info("Wi-Fi 尚未恢复。\n\n本地阅读时间和位置已保留，联网后会重新确认并补传。")
+            self:info("Wi-Fi 尚未恢复。\n\n本地阅读位置已保留。阅读时间失败部分不会补传，联网后会重新确认当前进度。")
         end
         return false
     end
@@ -12140,14 +12131,104 @@ function Plugin:_schedule_current_book_repair_check(current,urgent)
     return true
 end
 
-function Plugin:repair_current_book(confirmed)
+function Plugin:_repair_downloaded_book(book_ref,confirmed)
+    local id=tostring(type(book_ref)=="table" and (book_ref.bookId or book_ref.book_id) or book_ref or "")
+    if id=="" then self:info("没有找到可修复的书籍") return false end
+    self.store:reload()
+    local stored=self.store:book(id)
+    local record=self:_preferred_record(id)
+    if not stored or not record then self:info("这本书还没有可修复的已下载版本") return false end
+    local report=BookIntegrity.inspect(self.store,id,record)
+    if report.repair_kind=="none" then
+        local session=self.store:session(id) or {}
+        if session.sync_repair_required==true then
+            self:info("书籍内容完整。\n\n当前异常来自阅读同步，请打开这本书后使用“修复同步”。")
+        else
+            self:info("检查完成，没有发现需要修复的书籍内容或批注。")
+        end
+        return true
+    end
+    local annotations_only=report.repair_kind=="annotations"
+    local title=tostring(stored.title or record.title or "本书")
+    if confirmed~=true then
+        local text
+        if annotations_only then
+            text="《"..title.."》正文已经生成，但部分划线与想法未完整下载。\n\n修复时只补缺失内容，已完成正文和阅读位置会保留。"
+        else
+            text="《"..title.."》的书籍内容或章节映射需要修复。\n\n将优先使用现有断点，只补缺失内容；新文件验证成功前不会替换原文件。"
+        end
+        UIManager:show(ConfirmBox:new{
+            text=text,ok_text="开始修复",cancel_text="取消",
+            ok_callback=function() self:_repair_downloaded_book(id,true) end,
+        })
+        return true
+    end
+    if self.download_task and self.download_task:busy() then
+        self:info("已有下载或修复任务正在进行，请完成后再试。")
+        return false
+    end
+    local book={bookId=id,title=stored.title or record.title,author=stored.author or record.author,cover=stored.cover}
+    local options=BookIntegrity.repair_options(record)
+    self:status_toast("修复书籍",annotations_only and "正在补全缺失的划线与想法" or "正在检查并补全书籍内容",4)
+    return self:download(book,options,false,function(new_record)
+        self.store:reload()
+        if type(new_record)=="table" and new_record.pending_install==true then
+            self.store:save_session(id,{book_integrity_repaired_at=os.time(),book_integrity_pending_install=true})
+            self:info("修复内容已经生成。\n\n当前正在阅读这本书，新文件会在关闭本书后自动替换；替换后阅读同步会重新验证。")
+            self:_notify_home_data_changed("content")
+            return
+        end
+        local refreshed=self:_preferred_record(id) or new_record
+        local checked=BookIntegrity.inspect(self.store,id,refreshed)
+        if checked.repair_kind=="none" then
+            self.store:save_session(id,{book_integrity_repaired_at=os.time(),book_integrity_error=false})
+            local session=self.store:session(id) or {}
+            local extra=session.sync_repair_required==true and "\n\n书籍已修复。阅读同步仍需在打开本书后重新验证。" or ""
+            self:info((annotations_only and "书籍修复完成。\n\n已补全缺失的划线与想法，正文和阅读位置未重新下载。"
+                or "书籍修复完成。\n\n缺失内容已补全，新文件已经通过检查。")..extra)
+        else
+            self.store:save_session(id,{book_integrity_error=checked.error or checked.repair_kind,book_integrity_checked_at=os.time()})
+            self:info("书籍仍有未完成内容：\n"..tostring(checked.error or (checked.annotation_pending and "部分划线与想法仍待修复" or "完整性检查未通过")))
+        end
+        self:_notify_home_data_changed("content")
+    end,false)
+end
+
+function Plugin:repair_current_book()
+    local current=self:_current_book_record()
+    if not current or not current.book then self:info("请先打开一本觅阅书籍") return false end
+    return self:_repair_downloaded_book(current.book.book_id)
+end
+
+function Plugin:scan_downloaded_books_for_integrity_repair()
+    self.store:reload()
+    local rows={}
+    for _,book in ipairs(self.store:all_books()) do
+        local id=tostring(book.book_id or book.bookId or "")
+        local record=id~="" and self:_preferred_record(id) or nil
+        if record then
+            local report=BookIntegrity.inspect(self.store,id,record)
+            if report.repair_kind~="none" then
+                local book_id=id
+                local label=report.repair_kind=="annotations" and "批注待修复" or "书籍待修复"
+                rows[#rows+1]={text=tostring(book.title or record.title or id),post_text=label,
+                    callback=function() self:_repair_downloaded_book(book_id) end}
+            end
+        end
+    end
+    if #rows==0 then self:info("检查完成，没有发现需要修复的已下载书籍。") return true end
+    self:list("需要修复的书籍 · "..tostring(#rows).." 本",rows)
+    return true
+end
+
+function Plugin:migrate_current_book_comments(confirmed)
     local context=self:_repair_context()
     if not context then self:info("请先打开一本觅阅书籍"); return end
     if confirmed~=true and self:_active_reader_ui() and self:_notice_enabled("repair_while_reading") then
         local dialog
         dialog=ButtonDialog:new{title="迁移会读取本书旧评论数据。大书可能短暂变慢，但不会重新下载正文。",title_align="center",buttons={
-            {{text="继续迁移",callback=function() UIManager:close(dialog); self:repair_current_book(true) end}},
-            {{text="继续并不再提示",callback=function() UIManager:close(dialog); self:_set_notice_enabled("repair_while_reading",false); self:repair_current_book(true) end}},
+            {{text="继续迁移",callback=function() UIManager:close(dialog); self:migrate_current_book_comments(true) end}},
+            {{text="继续并不再提示",callback=function() UIManager:close(dialog); self:_set_notice_enabled("repair_while_reading",false); self:migrate_current_book_comments(true) end}},
             {{text="稍后处理",callback=function() UIManager:close(dialog) end}},
         }}
         UIManager:show(dialog)
@@ -12293,7 +12374,7 @@ function Plugin:book_repair_settings_menu()
             p.repair.auto_check=p.repair.auto_check==false
             self.store:save_preferences(p)
         end},
-        {text="迁移当前书籍评论",callback=function() self:repair_current_book() end},
+        {text="迁移当前书籍评论",callback=function() self:migrate_current_book_comments() end},
         {text="扫描所有待迁移书籍",callback=function() self:scan_downloaded_books_for_repair() end},
         {text="重新扫描本地书籍与封面",callback=function() self:show_miuread_home(true) end},
         {text="清理已验证的旧 JSON 备份",callback=function() self:clear_invalid_comment_indexes() end},
@@ -12691,7 +12772,7 @@ end
 function Plugin:more_settings_menu()
     return {
         {text="提醒与确认",sub_item_table_func=function() return self:notice_settings_menu() end},
-        {text="评论数据迁移与修复",sub_item_table_func=function() return self:book_repair_settings_menu() end},
+        {text="评论数据迁移",sub_item_table_func=function() return self:book_repair_settings_menu() end},
         {text="更新设置",sub_item_table_func=function() return self:update_settings_menu() end},
         {text="关于觅阅",callback=self:safe("about",function() self:show_about() end)},
     }

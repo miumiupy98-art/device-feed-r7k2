@@ -10,6 +10,7 @@ local Http = require("miuread.http")
 local DownloadPlan = require("miuread.download_plan")
 local DownloadDatabase = require("miuread.download_database")
 local EpubInstaller = require("miuread.epub_installer")
+local BookIntegrity = require("miuread.book_integrity")
 local U = require("miuread.util")
 local logger = require("logger")
 local ok_socket, socket = pcall(require, "socket")
@@ -794,6 +795,9 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
             word_count=chapter.word_count or 0, structural=chapter.structural == true,
         }
     end
+    local core_map_hash=BookIntegrity.core_map_hash(book.bookId,
+        type(opt.full_catalog_map)=="table" and opt.full_catalog_map or map,map)
+    local previous_core_map_hash=type(existing_record)=="table" and tostring(existing_record.core_map_hash or "") or ""
 
     local function ensure_not_cancelled()
         if opt.cancelled and opt.cancelled() then error("download cancelled") end
@@ -884,6 +888,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         annotation_pending=opt.annotation_pending==true or nil,
         annotation_fallback=opt.annotation_fallback==true or nil,
         annotation_error_kind=opt.annotation_error_kind,
+        core_map_hash=core_map_hash,
         images=U.copy(opt.image_summary or {}),
         image_transform_version=IMAGE_TRANSFORM_VERSION,
         internal_links={links=link_stats.links or 0,rewritten=link_stats.rewritten or 0,
@@ -950,6 +955,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         annotation_error_kind=opt.annotation_error_kind,
         annotation_errors=U.copy(opt.annotation_errors or {}),
         annotation_account_key=opt.annotations and annotation_account_key or nil,
+        core_map_hash=core_map_hash,
         image_count=#assets,image_summary=U.copy(opt.image_summary or {}),
         image_transform_version=IMAGE_TRANSFORM_VERSION,
     }
@@ -962,6 +968,8 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     self.store:save_book(book.bookId, {
         book_id=book.bookId, title=book.title, author=book.author, cover=book.cover,
         directory=dir, updated_at=now, catalog=(type(opt.full_catalog_map)=="table" and opt.full_catalog_map or map),
+        core_catalog_hash=BookIntegrity.core_map_hash(book.bookId,
+            type(opt.full_catalog_map)=="table" and opt.full_catalog_map or map,{}),
         content_type="book",
     })
     if type(self.store.clear_book_access)=="function" then self.store:clear_book_access(book.bookId) end
@@ -971,6 +979,14 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
             reader_url=session.url, chapters=map, context_updated_at=os.time(),
             app_id=Protocol.app_id(Protocol.USER_AGENT),
         })
+    end
+    if previous_core_map_hash~="" and core_map_hash~="" and previous_core_map_hash~=core_map_hash
+        and type(self.store.invalidate_book_sync_context)=="function" then
+        self.store:invalidate_book_sync_context(book.bookId,"book_core_map_changed",core_map_hash)
+        logger.info("[MiuRead][Download] book sync context invalidated after core map change",
+            "book=",tostring(book.bookId))
+    elseif type(self.store.save_session)=="function" then
+        self.store:save_session(book.bookId,{book_core_map_hash=core_map_hash},false)
     end
     return record
 end

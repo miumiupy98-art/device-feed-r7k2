@@ -334,12 +334,27 @@ local function estimate_position(book, progress_ratio)
         local words=trusted_words(book,chapter)
         local offset=tonumber(book.local_chapter_offset or book.chapter_offset) or 0
         if words>0 then offset=math.max(0,math.min(words,offset)) else offset=math.max(0,offset) end
+        local before,total,found=0,0,false
+        for _,item in ipairs(chapters) do
+            if not Content.is_structural_chapter(item) then
+                local item_words=trusted_words(book,item)
+                if not found and tostring(chapter_uid(item) or "")==tostring(chapter_uid(chapter) or "") then
+                    found=true
+                elseif not found then
+                    before=before+item_words
+                end
+                total=total+item_words
+            end
+        end
+        if found and words>0 and total>0 then
+            ratio=math.max(0,math.min(1,(before+offset)/total))
+        end
         return {
             chapter_uid=chapter_uid(chapter),
             chapter_idx=chapter_index(chapter,book.local_chapter_idx or book.chapter_idx),
             chapter_offset=offset,
             progress=math.floor(ratio*100+0.5),
-            source="trusted_local_chapter",
+            source=found and total>0 and "trusted_local_chapter_global" or "trusted_local_chapter",
         }
     end
 
@@ -433,7 +448,7 @@ local BOOK_PATCH_KEYS = {
     "source_chapter_word_count", "source_chapter_title",
     "catalog_complete", "remote_progress_loaded", "remote_progress",
     "remote_chapter_uid", "remote_chapter_idx", "remote_chapter_offset",
-    "app_id", "read_context_updated_at", "read_context_ready",
+    "app_id", "read_context_updated_at", "read_context_ready", "core_map_hash",
 }
 
 local function make_book_patch(book)
@@ -484,6 +499,20 @@ function Worker.run(job)
     local context_changed = false
     book.book_id = book.book_id or book.bookId or book_id
     book.title = book.title or job.book_title or book_id
+
+    if tostring(book.book_id or book.bookId or "")~=book_id then
+        return finish(settings, book, {
+            ok=false,error="book context identity mismatch",error_kind="context",
+        }, context_changed)
+    end
+    local job_core=tostring(job.core_map_hash or "")
+    local book_core=tostring(book.core_map_hash or "")
+    if job_core~="" and book_core~="" and job_core~=book_core then
+        return finish(settings, book, {
+            ok=false,error="book core map identity mismatch",error_kind="context",
+        }, context_changed)
+    end
+    if job_core~="" then book.core_map_hash=job_core end
 
     if book_id == "" then
         return finish(settings, book, {
