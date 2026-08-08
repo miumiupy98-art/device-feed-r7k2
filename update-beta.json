@@ -1,17 +1,17 @@
 {
-  "version": "4.2.0-beta.14",
-  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 4.2.0-beta.14 \u5185\u6d4b\u7248",
+  "version": "4.2.0-beta.15",
+  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 4.2.0-beta.15 \u5185\u6d4b\u7248",
   "channel": "beta",
   "package_type": "full",
-  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.14/miuread-v4.2.0-beta.14-full.zip",
+  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.15/miuread-v4.2.0-beta.15-full.zip",
   "package_urls": [
-    "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.14/miuread-v4.2.0-beta.14-full.zip",
-    "https://ghfast.top/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.14/miuread-v4.2.0-beta.14-full.zip",
-    "https://gh-proxy.com/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.14/miuread-v4.2.0-beta.14-full.zip",
-    "https://ghproxy.net/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.14/miuread-v4.2.0-beta.14-full.zip"
+    "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.15/miuread-v4.2.0-beta.15-full.zip",
+    "https://ghfast.top/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.15/miuread-v4.2.0-beta.15-full.zip",
+    "https://gh-proxy.com/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.15/miuread-v4.2.0-beta.15-full.zip",
+    "https://ghproxy.net/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.15/miuread-v4.2.0-beta.15-full.zip"
   ],
-  "size": 536022,
-  "sha256": "f134f2d308ff511b9deacafb0a5b08c98e73e5ecb856d436a9bd9b514228599b",
-  "summary": "MiuRead v4.2.0-beta.14\n\u4f18\u5316: \u4e0b\u6ed1\u5de5\u5177\u680f\u6539\u4e3a\u4e09\u5217\u53cc\u884c \u653e\u5927\u56fe\u6807\u4e0e\u6587\u5b57 Wi-Fi\u76f4\u63a5\u663e\u793a\u5f53\u524d\u7f51\u7edc\u540d\n\u8c03\u6574: \u9ed8\u8ba4\u52a0\u5165\u4f11\u7720 \u9000\u51fa\u4e0e\u91cd\u542f\u5173\u673a\u6536\u8fdb\u5de5\u5177\u4e0e\u7ef4\u62a4 \u5e76\u4fdd\u7559\u81ea\u5b9a\u4e49\u5e03\u5c40\n\u9605\u8bfb: \u653e\u5927\u9605\u8bfb\u9875\u9876\u90e8\u4e0e\u5feb\u6377\u64cd\u4f5c\u5b57\u4f53\u56fe\u6807 \u4f18\u5316\u9996\u9875 Wi-Fi \u540c\u6b65 \u7535\u91cf\u4e0e\u66f4\u591a\u7684\u95f4\u8ddd",
-  "notes": "MiuRead v4.2.0-beta.14\n\u4f18\u5316: \u4e0b\u6ed1\u5de5\u5177\u680f\u6539\u4e3a\u4e09\u5217\u53cc\u884c \u653e\u5927\u56fe\u6807\u4e0e\u6587\u5b57 Wi-Fi\u76f4\u63a5\u663e\u793a\u5f53\u524d\u7f51\u7edc\u540d\n\u8c03\u6574: \u9ed8\u8ba4\u52a0\u5165\u4f11\u7720 \u9000\u51fa\u4e0e\u91cd\u542f\u5173\u673a\u6536\u8fdb\u5de5\u5177\u4e0e\u7ef4\u62a4 \u5e76\u4fdd\u7559\u81ea\u5b9a\u4e49\u5e03\u5c40\n\u9605\u8bfb: \u653e\u5927\u9605\u8bfb\u9875\u9876\u90e8\u4e0e\u5feb\u6377\u64cd\u4f5c\u5b57\u4f53\u56fe\u6807 \u4f18\u5316\u9996\u9875 Wi-Fi \u540c\u6b65 \u7535\u91cf\u4e0e\u66f4\u591a\u7684\u95f4\u8ddd"
+  "size": 537434,
+  "sha256": "b29760b620490588f7938628d97c024ba1e687cc6e56a040b99eb1aad97e0550",
+  "summary": "MiuRead v4.2.0-beta.15\n\u4f18\u5316: \u4e0b\u6ed1\u5de5\u5177\u680f\u6062\u590d\u516d\u5217\u5e76\u653e\u5927\u56fe\u6807\u6587\u5b57 Wi-Fi\u663e\u793a\u5f53\u524d\u7f51\u7edc\u540d\n\u754c\u9762: \u4e3b\u9875\u76f8\u5173\u5165\u53e3\u7edf\u4e00\u89c5\u9605\u6837\u5f0f \u9605\u8bfb\u9875\u9876\u90e8\u548c\u5feb\u6377\u64cd\u4f5c\u653e\u5927\u5e76\u4f18\u5316\u95f4\u8ddd\n\u8c03\u6574: \u52a0\u5165\u4f11\u7720 \u7cfb\u7edf\u64cd\u4f5c\u6536\u8fdb\u5de5\u5177\u4e0e\u7ef4\u62a4 \u4fdd\u7559\u81ea\u5b9a\u4e49\u5e03\u5c40",
+  "notes": "MiuRead v4.2.0-beta.15\n\u4f18\u5316: \u4e0b\u6ed1\u5de5\u5177\u680f\u6062\u590d\u516d\u5217\u5e76\u653e\u5927\u56fe\u6807\u6587\u5b57 Wi-Fi\u663e\u793a\u5f53\u524d\u7f51\u7edc\u540d\n\u754c\u9762: \u4e3b\u9875\u76f8\u5173\u5165\u53e3\u7edf\u4e00\u89c5\u9605\u6837\u5f0f \u9605\u8bfb\u9875\u9876\u90e8\u548c\u5feb\u6377\u64cd\u4f5c\u653e\u5927\u5e76\u4f18\u5316\u95f4\u8ddd\n\u8c03\u6574: \u52a0\u5165\u4f11\u7720 \u7cfb\u7edf\u64cd\u4f5c\u6536\u8fdb\u5de5\u5177\u4e0e\u7ef4\u62a4 \u4fdd\u7559\u81ea\u5b9a\u4e49\u5e03\u5c40"
 }
