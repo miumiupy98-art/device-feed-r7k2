@@ -1017,6 +1017,10 @@ function Downloader:book(input, opt, progress)
         local function worker_paused()
             return type(opt.paused)=="function" and opt.paused()==true
         end
+        local function lightweight_mode()
+            local path=tostring(opt.performance_mode_path or "")
+            return path~="" and U.file_exists(path)
+        end
         while worker_paused() do
             if type(opt.cancelled)=="function" and opt.cancelled() then error("download cancelled") end
             if not pause_logged then
@@ -1038,7 +1042,17 @@ function Downloader:book(input, opt, progress)
             waited=waited+.25
             busy_until=tonumber(U.read_file(tostring(opt.reader_busy_path or ""),true) or 0) or 0
         end
-        pause(stage=="chapter" and .12 or .05)
+        local delay
+        if lightweight_mode() then
+            if stage=="package" then delay=.60
+            elseif stage=="chapter" then delay=.35
+            elseif stage=="annotation_batch" then delay=.30
+            elseif stage=="transform" then delay=.24
+            else delay=.18 end
+        else
+            delay=stage=="chapter" and .12 or .05
+        end
+        pause(delay)
     end
     local book = normalized_book(input)
     if book.bookId == "" then error("bookId missing") end
@@ -1597,6 +1611,7 @@ function Downloader:book(input, opt, progress)
         }
     end
 
+    respect_reader_priority("package")
     progress("package", #chapters, math.max(1,accessible_expected), book.title, {
         message=preview and (preview_mode=="info" and "正在生成试读信息版"
             or (preview_mode=="partial" and ("正在生成部分试读版 · "..tostring(readable_count).."/"..tostring(expected).." 章")

@@ -1,7 +1,7 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.2.0-beta.5",
-    SCHEMA = 96,
+    VERSION = "4.2.0-beta.6",
+    SCHEMA = 97,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
@@ -35,6 +35,16 @@ local C = {
 
     LOW_MEMORY_SETTING = "DGLOBAL_CACHE_FREE_PROPORTION",
     LOW_MEMORY_RATIO = 0.15,
+
+    -- Runtime performance protection is based on measured UI latency, not on
+    -- device model or age. The lightweight flag is shared with the download
+    -- subprocess so an already-running job can adapt immediately.
+    LIGHTWEIGHT_MODE_FLAG = "/tmp/miuread-lightweight-mode.flag",
+    PERFORMANCE_SLOW_MS = 1200,
+    PERFORMANCE_EXTREME_MS = 2500,
+    PERFORMANCE_WINDOW_SECONDS = 10 * 60,
+    PERFORMANCE_REPEAT_COUNT = 2,
+    PERFORMANCE_PROMPT_COOLDOWN = 7 * 24 * 60 * 60,
 
     -- Online features are verified by their real request. Renewal is recovery,
     -- never a prerequisite. Diagnostics never include account secrets.

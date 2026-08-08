@@ -38,6 +38,7 @@ local BookIntegrity=require("miuread.book_integrity")
 local EpubInstaller=require("miuread.epub_installer")
 local CacheCleanupTask=require("miuread.cache_cleanup_task")
 local MemoryMode=require("miuread.memory_mode")
+local PerformanceMode=require("miuread.performance_mode")
 local Library=require("miuread.library")
 local ShelfView=require("miuread.shelf_view")
 local FullShelfView=require("miuread.full_shelf_view")
@@ -385,6 +386,11 @@ function Plugin:init()
         os.remove(self._reader_busy_path)
     end
     self.memory_mode=MemoryMode:new(self.store)
+    self.performance_mode=PerformanceMode:new(self.store)
+    self._reader_interaction_resume_task=nil
+    self._reader_interaction_resume_generation=0
+    self._performance_prompt_pending=nil
+    self._performance_prompt_dialog=nil
     self.book_repair=DataMigration:new(self.store)
     logger.info("[MiuRead] initialized", "version=", tostring(Config.VERSION),
         "schema=", tostring(Config.SCHEMA), "root=", tostring(ROOT))
@@ -6642,13 +6648,48 @@ function Plugin:home_preview_menu()
     }
 end
 
+function Plugin:_schedule_reader_interaction_resume(target)
+    self._reader_interaction_resume_generation=(tonumber(self._reader_interaction_resume_generation) or 0)+1
+    local generation=self._reader_interaction_resume_generation
+    if self._reader_interaction_resume_task then
+        UIManager:unschedule(self._reader_interaction_resume_task)
+        self._reader_interaction_resume_task=nil
+    end
+    local task
+    task=function()
+        if self._reader_interaction_resume_task~=task
+            or generation~=self._reader_interaction_resume_generation then return end
+        local now=os.time()
+        local persisted=tonumber(U.read_file(tostring(self._reader_busy_path or ""),true) or 0) or 0
+        local deadline=math.max(tonumber(target) or 0,tonumber(self._reader_busy_until or 0) or 0,persisted)
+        if deadline>now then
+            UIManager:scheduleIn(math.max(.25,deadline-now+.15),task)
+            return
+        end
+        self._reader_interaction_resume_task=nil
+        if self.download_task then self.download_task:resume("reader_interaction") end
+    end
+    self._reader_interaction_resume_task=task
+    UIManager:scheduleIn(math.max(.25,(tonumber(target) or os.time())-os.time()+.15),task)
+end
+
 function Plugin:_mark_reader_busy(seconds)
     local path=tostring(self._reader_busy_path or "")
     if path=="" then return false end
-    local target=os.time()+math.max(1,tonumber(seconds) or 4)
-    if tonumber(self._reader_busy_until or 0)>=target-1 then return true end
+    local now=os.time()
+    local requested=now+math.max(1,tonumber(seconds) or 4)
+    local persisted=tonumber(U.read_file(path,true) or 0) or 0
+    local current=math.max(tonumber(self._reader_busy_until or 0) or 0,persisted)
+    local target=math.max(requested,current)
+    local wrote=true
+    if target>persisted then wrote=U.atomic_write(path,tostring(target),true)==true end
     self._reader_busy_until=target
-    return U.atomic_write(path,tostring(target),true)==true
+
+    if self.performance_mode and self.performance_mode:enabled() and self.download_task then
+        self.download_task:pause("reader_interaction")
+        self:_schedule_reader_interaction_resume(target)
+    end
+    return wrote
 end
 
 function Plugin:_reader_progress_percent()
@@ -12669,6 +12710,90 @@ function Plugin:display_settings_menu()
         {text="显示书架封面",checked_func=function() return self.store:preferences().shelf_covers~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("shelf_covers") end},
     }
 end
+function Plugin:_performance_mode_label()
+    local status=self.performance_mode:status()
+    return status.enabled and "轻量模式" or "标准模式"
+end
+
+function Plugin:_set_performance_mode(enabled)
+    self.performance_mode:set_enabled(enabled==true)
+    if enabled then
+        if self.ui and self.ui.document then self:_mark_reader_busy(3) end
+        self:info("轻量模式已开启。\n\n阅读操作会优先于后台下载；下载仍会继续，但会更保守地分批运行。")
+    else
+        if self.download_task then self.download_task:resume("reader_interaction") end
+        self:info("已恢复标准模式。")
+    end
+end
+
+function Plugin:_toggle_performance_auto_detect()
+    local status=self.performance_mode:status()
+    self.performance_mode:set_auto_detect(not status.auto_detect)
+    self:toast((not status.auto_detect) and "性能问题检测已开启" or "性能问题检测已关闭",2)
+end
+
+function Plugin:_record_performance(kind,elapsed_ms)
+    if not self.performance_mode then return end
+    local result=self.performance_mode:record(kind,elapsed_ms)
+    if result then self._performance_prompt_pending=result end
+end
+
+function Plugin:_show_performance_prompt()
+    local pending=self._performance_prompt_pending
+    if not pending or not self.performance_mode then return false end
+    self._performance_prompt_pending=nil
+    if self.performance_mode:enabled() then return false end
+    if self._performance_prompt_dialog then
+        pcall(UIManager.close,UIManager,self._performance_prompt_dialog)
+        self._performance_prompt_dialog=nil
+    end
+    local dialog
+    dialog=ButtonDialog:new{
+        title="检测到运行较慢\n\n觅阅检测到多次明显操作延迟。开启轻量模式后，会减少阅读操作与后台下载之间的竞争，并降低后台处理频率。",
+        title_align="center",
+        buttons={
+            {{text="开启轻量模式",callback=function()
+                UIManager:close(dialog); self._performance_prompt_dialog=nil
+                self:_set_performance_mode(true)
+            end}},
+            {{text="暂不开启",callback=function()
+                UIManager:close(dialog); self._performance_prompt_dialog=nil
+            end}},
+            {{text="不再提醒",callback=function()
+                UIManager:close(dialog); self._performance_prompt_dialog=nil
+                self.performance_mode:disable_reminders()
+                self:toast("已关闭性能问题提醒",2)
+            end}},
+        },
+    }
+    self._performance_prompt_dialog=dialog
+    UIManager:show(dialog)
+    return true
+end
+
+function Plugin:performance_settings_menu()
+    local status=self.performance_mode:status()
+    local memory_status=self.memory_mode:status()
+    local items={
+        {text="轻量模式",post_text=self:_performance_mode_label(),checked_func=function()
+            return self.performance_mode:enabled()
+        end,callback=function() self:_set_performance_mode(not self.performance_mode:enabled()) end},
+        {text="自动检测性能问题",post_text=status.reminders_disabled and "不再提醒" or nil,
+            checked_func=function() return self.performance_mode:status().auto_detect end,
+            keep_menu_open=true,callback=function() self:_toggle_performance_auto_detect() end},
+        {text="低内存保护",post_text=self:_memory_mode_label(),checked_func=function()
+            return (self.store:preferences().memory_mode or {}).enabled==true
+        end,callback=function() self:toggle_memory_mode() end},
+    }
+    if memory_status.enabled or memory_status.residual then
+        items[#items+1]={text="恢复缓存设置",callback=function() self:restore_memory_mode() end}
+    end
+    items[#items+1]={text="模式说明",callback=function()
+        self:info("轻量模式用于改善明显卡顿：阅读操作优先，后台下载更保守。\n\n低内存保护用于避免内存不足：会减少 KOReader 页面缓存，可能让 PDF、漫画和快速跳页稍慢。两个模式可以独立开启。")
+    end}
+    return items
+end
+
 function Plugin:_memory_mode_label()
     local status=self.memory_mode:status()
     if not status.available then return status.enabled and "配置异常" or "不可用" end
@@ -12680,16 +12805,16 @@ end
 function Plugin:_set_memory_mode(enabled)
     local ok,result_or_error=self.memory_mode:set_enabled(enabled)
     if not ok then
-        self:info("无法修改低内存模式：\n"..tostring(result_or_error))
+        self:info("无法修改低内存保护：\n"..tostring(result_or_error))
         return
     end
     local result=result_or_error or {}
     if enabled then
-        self:info("低内存模式已开启。\n\n完整退出并重新启动 KOReader 后生效。PDF、漫画和快速跳页可能稍慢。")
+        self:info("低内存保护已开启。\n\n完整退出并重新启动 KOReader 后生效。PDF、漫画和快速跳页可能稍慢。")
     elseif result.external_change then
-        self:info("低内存模式已关闭。\n\n检测到缓存设置已被其他配置修改，因此没有覆盖当前值。完整重启 KOReader 后生效。")
+        self:info("低内存保护已关闭。\n\n检测到缓存设置已被其他配置修改，因此没有覆盖当前值。完整重启 KOReader 后生效。")
     else
-        self:info("低内存模式已关闭，原有缓存设置已恢复。\n\n完整退出并重新启动 KOReader 后生效。")
+        self:info("低内存保护已关闭，原有缓存设置已恢复。\n\n完整退出并重新启动 KOReader 后生效。")
     end
 end
 
@@ -12702,7 +12827,7 @@ function Plugin:restore_memory_mode()
     end
     local text
     if status.enabled then
-        text="恢复开启低内存模式前的缓存设置？\n\n恢复后需要完整重启 KOReader。卸载觅阅前建议先执行恢复。"
+        text="恢复开启低内存保护前的缓存设置？\n\n恢复后需要完整重启 KOReader。卸载觅阅前建议先执行恢复。"
     else
         text="检测到外部或旧版本遗留的低内存设置。是否恢复缓存策略？\n\n无法确认它是否由觅阅写入；恢复后需要完整重启 KOReader。"
     end
@@ -12730,25 +12855,20 @@ function Plugin:toggle_memory_mode()
         return
     end
     UIManager:show(ConfirmBox:new{
-        text="低内存模式适合下载大书时容易闪退或卡死的设备。\n\n开启后会减少 KOReader 页面缓存，PDF、漫画和快速跳页可能稍慢。需要完整重启 KOReader 后生效。",
+        text="低内存保护适合下载大书时容易闪退或卡死的设备。\n\n开启后会减少 KOReader 页面缓存，PDF、漫画和快速跳页可能稍慢。需要完整重启 KOReader 后生效。",
         ok_text="开启",
         ok_callback=function() self:_set_memory_mode(true) end,
     })
 end
 
 function Plugin:download_settings_menu()
-    local memory_status=self.memory_mode:status()
     local policy=tostring(self.store:preferences().download_reader_policy or "ask")
     local policy_label=policy=="allow" and "允许后台下载" or (policy=="after_reading" and "退出阅读后下载" or "每次询问")
     local items={
         {text="阅读时下载策略",post_text=policy_label,sub_item_table_func=function() return self:download_reader_policy_menu() end},
         {text="下载关键进度提示",checked_func=function() return self.store:preferences().download_notice_enabled~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("download_notice_enabled") end},
         {text="下载完成提醒",checked_func=function() return self.store:preferences().download_complete_notice~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("download_complete_notice") end},
-        {text="低内存模式",post_text=self:_memory_mode_label(),checked_func=function() return (self.store:preferences().memory_mode or {}).enabled==true end,callback=function() self:toggle_memory_mode() end},
     }
-    if memory_status.enabled or memory_status.residual then
-        items[#items+1]={text="恢复缓存设置",callback=function() self:restore_memory_mode() end}
-    end
     items[#items+1]={text="下载目录",post_text=self:_download_dir_label(),callback=function() self:directory_dialog() end}
     items[#items+1]={text="下载管理与清理",callback=function() self:show_downloads() end}
     return items
@@ -12793,6 +12913,7 @@ function Plugin:settings_menu()
         {text="首页与书架",post_text="布局、来源与快捷面板",sub_item_table_func=function() return self:display_settings_menu() end},
         {text="时间与时区",post_text=TimeZone.label((self:_time_preferences())),sub_item_table_func=function() return self:time_display_settings_menu() end},
         {text="阅读界面",post_text="快捷面板与阅读状态",sub_item_table_func=function() return self:reader_quick_panel_settings_menu() end},
+        {text="性能与兼容性",post_text=self:_performance_mode_label(),sub_item_table_func=function() return self:performance_settings_menu() end},
         {text="评论与标注",post_text=self:_thought_display_label(),sub_item_table_func=function() return self:thought_font_settings_menu() end},
         {text="账号与同步",post_text=self:progress_sync_label(),sub_item_table_func=function() return self:account_sync_settings_menu() end},
         {text="下载与存储",post_text=self:_download_settings_summary(),sub_item_table_func=function() return self:download_settings_menu() end},
@@ -13194,9 +13315,9 @@ function Plugin:show_about()
     local memory_note=""
     local memory_status=self.memory_mode:status()
     if memory_status.enabled then
-        memory_note="\n\n低内存模式当前已开启。卸载觅阅前，请在“下载与存储”中恢复缓存设置。"
+        memory_note="\n\n低内存保护当前已开启。卸载觅阅前，请在“性能与兼容性”中恢复缓存设置。"
     elseif memory_status.residual then
-        memory_note="\n\n检测到外部或遗留的低内存设置，可在“下载与存储”中检查并恢复。"
+        memory_note="\n\n检测到外部或遗留的低内存设置，可在“性能与兼容性”中检查并恢复。"
     end
     self:info(Config.NAME.." "..self.version
         .."\n\n为 KOReader 提供微信读书书架、书籍下载、阅读同步与本地书籍管理。"
@@ -13412,7 +13533,11 @@ function Plugin:_finish_thought_popup(generation)
     self._thought_popup=nil
     self._thought_popup_busy=false
     self:_clear_thought_popup_marker()
+    if self.download_task then self.download_task:resume("thought_popup") end
     self:_mark_reader_busy(2)
+    if self._performance_prompt_pending then
+        UIManager:scheduleIn(.45,function() self:_show_performance_prompt() end)
+    end
     UIManager:scheduleIn(1.2,function() collectgarbage("step",48) end)
 end
 
@@ -13422,6 +13547,7 @@ function Plugin:_close_active_thought_popup(reason)
     self._thought_popup=nil
     self._thought_popup_busy=false
     self:_clear_thought_popup_marker()
+    if self.download_task then self.download_task:resume("thought_popup") end
     if popup and popup~=true then
         pcall(UIManager.close,UIManager,popup)
         logger.info("[MiuRead][ThoughtPopup] closed","reason=",tostring(reason or "forced"))
@@ -13433,7 +13559,7 @@ function Plugin:_open_thought_info(info,generation)
         self:_finish_thought_popup(generation)
         return
     end
-    local started=os.clock()
+    local started=monotonic_wall_time()
     local popup,notice
     local ok,unexpected=xpcall(function()
         self:_write_thought_popup_marker("lookup",info)
@@ -13464,6 +13590,7 @@ function Plugin:_open_thought_info(info,generation)
                 self:info("评论显示失败，窗口已安全关闭。当前阅读位置不会丢失。")
             end,
         }
+        local elapsed_ms=math.floor((monotonic_wall_time()-started)*1000+.5)
         logger.info("[MiuRead][ThoughtPopup] opened",
             "mode=","native_rounded_paged_swipe",
             "book=",tostring(info.book_id),"chapter=",tostring(info.chapter_uid),
@@ -13471,10 +13598,11 @@ function Plugin:_open_thought_info(info,generation)
             "source=",token and token.index_hit and "compact_index" or "chapter_cache",
             "cache=",token and token.cache_hit and "hit" or "miss",
             "native_cache=",native_cache_hit and "hit" or "miss",
-            "elapsed_ms=",tostring(math.floor((os.clock()-started)*1000+.5)))
+            "elapsed_ms=",tostring(elapsed_ms))
         if not popup then error("评论窗口未能加入界面") end
         self._thought_popup=popup
-        self:_write_thought_popup_marker("visible",info,{elapsed_ms=math.floor((os.clock()-started)*1000+.5)})
+        self:_write_thought_popup_marker("visible",info,{elapsed_ms=elapsed_ms})
+        self:_record_performance("thought_popup",elapsed_ms)
         if token and token.index_hit~=true then
             UIManager:scheduleIn(.2,function() self:_schedule_current_book_repair_check(nil,true) end)
         end
@@ -13501,6 +13629,7 @@ function Plugin:_show_thought_href(href)
     local generation=self._thought_popup_generation
     self._thought_popup_busy=true
     self:_write_thought_popup_marker("tap",info)
+    if self.download_task then self.download_task:pause("thought_popup") end
     self:_mark_reader_busy(30)
     -- Only write document metadata here when annotations really changed.
     -- Repeatedly opening comments must not force a storage flush every time.

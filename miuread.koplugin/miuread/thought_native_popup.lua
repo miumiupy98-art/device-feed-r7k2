@@ -519,6 +519,166 @@ function NativePopup:_fit_prefix(item, content, maximum_height, width, metrics, 
     return prefix, remainder, math.max(1, best_height or maximum_height)
 end
 
+function NativePopup:_paginate_next_page(width, maximum_height, metrics)
+    local comments = type(self.comments) == "table" and self.comments or {}
+    local state = self._pagination_state
+    if type(state) ~= "table" then
+        state = {comment_index = 1, item = nil, remaining_content = nil, continuation = false, done = false}
+        self._pagination_state = state
+    end
+    if state.done then return nil, nil, true end
+    if #comments == 0 then
+        state.done = true
+        return {}, 0, true
+    end
+
+    self._measurement_cache = {}
+    local page, used = {}, 0
+    local function add(piece, height)
+        local gap = #page > 0 and needs_comment_separator(page[#page], piece)
+            and metrics.comment_separator_height or 0
+        page[#page + 1] = piece
+        used = used + gap + height
+    end
+    local function clear_item(advance)
+        if advance then state.comment_index = (tonumber(state.comment_index) or 1) + 1 end
+        state.item = nil
+        state.remaining_content = nil
+        state.continuation = false
+    end
+
+    while true do
+        if not state.item then
+            local index = tonumber(state.comment_index) or 1
+            local raw = comments[index]
+            if not raw then
+                state.done = true
+                break
+            end
+            local item = {
+                author = clean(raw.author),
+                likes = tonumber(raw.likes or 0) or 0,
+                content = clean_body(raw.content),
+                comment_index = index,
+            }
+            if item.author == "" then item.author = "微信读书用户" end
+            if item.content == "" then
+                clear_item(true)
+            else
+                state.item = item
+                state.remaining_content = item.content
+                state.continuation = false
+            end
+        end
+
+        local item = state.item
+        if item then
+            local remaining_content = tostring(state.remaining_content or "")
+            if remaining_content == "" then
+                clear_item(true)
+            else
+                local probe_piece = {
+                    author = item.author,
+                    likes = item.likes,
+                    content = remaining_content,
+                    continuation = state.continuation == true,
+                    comment_index = item.comment_index,
+                }
+                local gap = #page > 0 and needs_comment_separator(page[#page], probe_piece)
+                    and metrics.comment_separator_height or 0
+                local available = math.max(1, maximum_height - used - gap)
+                local whole_height = self:_measure_piece(probe_piece, width, metrics)
+
+                if whole_height <= available then
+                    add(probe_piece, whole_height)
+                    clear_item(true)
+                else
+                    local prefix, remainder, piece_height = self:_fit_prefix(
+                        item, remaining_content, available, width, metrics,
+                        state.continuation == true
+                    )
+                    if prefix ~= "" and piece_height <= available then
+                        add({
+                            author = item.author,
+                            likes = item.likes,
+                            content = prefix,
+                            continuation = state.continuation == true,
+                            comment_index = item.comment_index,
+                        }, piece_height)
+                        state.remaining_content = remainder
+                        state.continuation = true
+                        if remainder == "" then clear_item(true) end
+                        break
+                    elseif #page > 0 then
+                        -- Leave the unconsumed comment for the next page rather
+                        -- than measuring later comments that cannot be shown yet.
+                        break
+                    else
+                        local forced_prefix, forced_remainder, forced_height = self:_fit_prefix(
+                            item, remaining_content, maximum_height, width, metrics,
+                            state.continuation == true
+                        )
+                        add({
+                            author = item.author,
+                            likes = item.likes,
+                            content = forced_prefix,
+                            continuation = state.continuation == true,
+                            comment_index = item.comment_index,
+                        }, math.min(maximum_height, forced_height))
+                        state.remaining_content = forced_remainder
+                        state.continuation = true
+                        if forced_remainder == "" then clear_item(true) end
+                        break
+                    end
+                end
+            end
+        end
+
+        if used >= maximum_height then break end
+        if state.done then break end
+    end
+
+    if not state.item and (tonumber(state.comment_index) or 1) > #comments then
+        state.done = true
+    end
+    self._measurement_cache = nil
+    if #page == 0 and state.done then return nil, nil, true end
+    return page, used, state.done == true
+end
+
+function NativePopup:_ensure_lazy_page(target)
+    target = math.max(1, tonumber(target) or 1)
+    local layout = self._pagination_layout
+    if type(layout) ~= "table" then return false end
+    self.pages = self.pages or {}
+    self.page_heights = self.page_heights or {}
+
+    while #self.pages < target and not self._pagination_complete do
+        local page, height, done = self:_paginate_next_page(
+            layout.width, layout.maximum_height, layout.metrics
+        )
+        if page then
+            self.pages[#self.pages + 1] = page
+            self.page_heights[#self.page_heights + 1] = tonumber(height) or 0
+        end
+        self._pagination_complete = done == true
+        if not page then break end
+    end
+
+    if #self.pages == 0 then
+        self.pages = {{}}
+        self.page_heights = {0}
+        self._pagination_complete = true
+    end
+    if self._pagination_complete and self._layout_cache_key_value then
+        layout_cache_put(self._layout_cache_key_value, {
+            pages = self.pages,
+            page_heights = self.page_heights,
+        })
+    end
+    return #self.pages >= target
+end
+
 function NativePopup:_paginate_comments(width, maximum_height, metrics)
     self._measurement_cache = {}
     local comments = type(self.comments) == "table" and self.comments or {}
@@ -726,6 +886,9 @@ end
 
 function NativePopup:_page_indicator_text()
     local count = #(self.pages or {})
+    if self._pagination_complete ~= true then
+        return tostring(math.max(1, tonumber(self.page_index) or 1)) .. " / …"
+    end
     if count <= 1 then return "" end
     return tostring(clamp(self.page_index, 1, count)) .. " / " .. tostring(count)
 end
@@ -735,7 +898,8 @@ function NativePopup:_build_page_indicator(width, metrics, height)
     if text == "" then return nil, 0, nil end
 
     local count = #(self.pages or {})
-    local current = clamp(self.page_index, 1, count)
+    local current = clamp(self.page_index, 1, math.max(1, count))
+    local has_next = self._pagination_complete ~= true or current < count
     local face = make_face(
         self.font_name, math.max(10, math.floor(metrics.meta_size * .92 + .5)), "smallinfofont"
     )
@@ -752,7 +916,7 @@ function NativePopup:_build_page_indicator(width, metrics, height)
     local right = TextWidget:new{
         text = "›",
         face = face,
-        fgcolor = current < count and Blitbuffer.COLOR_DARK_GRAY or INACTIVE_TEXT_COLOR,
+        fgcolor = has_next and Blitbuffer.COLOR_DARK_GRAY or INACTIVE_TEXT_COLOR,
     }
 
     local label_size = label:getSize()
@@ -814,17 +978,36 @@ function NativePopup:_build(reset_pages, anchor_comment)
     if reset_pages or not self.pages then
         local cache_key = self:_layout_cache_key(comment_w, maximum_comments_h, metrics)
         local cached = layout_cache_get(cache_key)
+        self._layout_cache_key_value = cache_key
+        self._pagination_layout = {
+            width = comment_w,
+            maximum_height = maximum_comments_h,
+            metrics = metrics,
+        }
         if cached then
             self.pages = cached.pages
             self.page_heights = cached.page_heights
+            self._pagination_state = nil
+            self._pagination_complete = true
             self._layout_cache_hit = true
-        else
+        elseif tonumber(anchor_comment) then
+            -- Font changes are explicit and infrequent. Preserve the current
+            -- comment anchor even if that requires one complete repagination.
             self.pages, self.page_heights = self:_paginate_comments(comment_w, maximum_comments_h, metrics)
+            self._pagination_state = nil
+            self._pagination_complete = true
             layout_cache_put(cache_key, {pages = self.pages, page_heights = self.page_heights})
             self._layout_cache_hit = false
+        else
+            -- Cold opens only calculate the page that can be displayed now.
+            -- Later pages are generated on demand when the user turns forward.
+            self.pages, self.page_heights = {}, {}
+            self._pagination_state = {comment_index = 1, item = nil, remaining_content = nil, continuation = false, done = false}
+            self._pagination_complete = false
+            self:_ensure_lazy_page(1)
+            self._layout_cache_hit = false
         end
-        self._layout_cache_key_value = cache_key
-        self.page_index = clamp(self.page_index, 1, #self.pages)
+        self.page_index = clamp(self.page_index, 1, math.max(1, #self.pages))
         if tonumber(anchor_comment) then
             for page_index, page in ipairs(self.pages or {}) do
                 local found = false
@@ -840,7 +1023,8 @@ function NativePopup:_build(reset_pages, anchor_comment)
         end
     end
 
-    local fixed_comments_h = #(self.pages or {}) > 1 and maximum_comments_h or nil
+    local fixed_comments_h = (self._pagination_complete ~= true or #(self.pages or {}) > 1)
+        and maximum_comments_h or nil
     local comment_group, comments_h = self:_build_comment_page(comment_w, metrics, fixed_comments_h)
     local guarded_comments = HorizontalGroup:new{
         HorizontalSpan:new{width = frame_guard},
@@ -1035,9 +1219,13 @@ end
 
 function NativePopup:_change_page(delta)
     if self.closing or self.paint_failed or self.page_changing then return true end
-    local pages = self.pages or {}
     local target = self.page_index + (tonumber(delta) or 0)
-    if target < 1 or target > #pages or target == self.page_index then return true end
+    if target < 1 or target == self.page_index then return true end
+    if target > #(self.pages or {}) and self._pagination_complete ~= true then
+        self:_ensure_lazy_page(target)
+    end
+    local pages = self.pages or {}
+    if target > #pages then return true end
 
     self.page_changing = true
     local previous_index = self.page_index
@@ -1192,6 +1380,9 @@ function NativePopup:_reopen(opts)
     self.page_index = 1
     self.pages = nil
     self.page_heights = nil
+    self._pagination_state = nil
+    self._pagination_layout = nil
+    self._pagination_complete = nil
     self.page_refresh_count = 0
     self._measurement_cache = nil
     self:init()

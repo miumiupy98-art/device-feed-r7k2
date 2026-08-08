@@ -742,6 +742,7 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
     clean_options.reader_active_path="/tmp/miuread-reader-active.flag"
     clean_options.reader_busy_path="/tmp/miuread-reader-busy.until"
     clean_options.pause_path=pause_path
+    clean_options.performance_mode_path=Config.LIGHTWEIGHT_MODE_FLAG
     local start_auth=self.store:auth()
     local start_account=type(start_auth.account)=="table" and start_auth.account or {}
     local auth_snapshot={
@@ -867,6 +868,12 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                 local downloader = Downloader:new(reader, api, annotations, store, http)
                 clean_options.cancelled = function()
                     return UChild.file_exists(cancel_path)
+                end
+                -- The parent and ReaderUI instances coordinate through a shared
+                -- pause marker. Read it in the child itself; otherwise only the
+                -- parent poller pauses while the download process keeps working.
+                clean_options.paused = function()
+                    return UChild.file_exists(pause_path)
                 end
                 http.cancelled = clean_options.cancelled
                 http.rate_limit_retries = 3
