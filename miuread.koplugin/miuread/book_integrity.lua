@@ -1,5 +1,6 @@
 local Digests=require("miuread.digests")
 local EpubInstaller=require("miuread.epub_installer")
+local DownloadDatabase=require("miuread.download_database")
 local U=require("miuread.util")
 
 local M={}
@@ -140,6 +141,95 @@ function M.position_from_maps(local_map,full_map,ratio,fallback)
     }
 end
 
+
+local function partial_options(manifest)
+    manifest=type(manifest)=="table" and manifest or {}
+    if type(manifest.repair_options)=="table" then
+        local options=U.copy(manifest.repair_options)
+        options.annotations=options.annotations==true
+        if options.images==nil then options.images=true end
+        return options
+    end
+    local key=tostring(manifest.option_key or "")
+    local options={
+        annotations=key:match("^notes%-")~=nil,
+        images=key:find("%-no%-images%-",1,false)==nil,
+    }
+    local entries={}
+    for _,entry in pairs(type(manifest.chapters)=="table" and manifest.chapters or {}) do
+        if type(entry)=="table" then entries[#entries+1]=entry end
+    end
+    table.sort(entries,function(a,b) return idx(a,0)<idx(b,0) end)
+    if key:find("%-range$",1,false) then
+        if #entries==0 then return nil,"章节范围断点缺少章节信息" end
+        options.range_start_index=idx(entries[1],1)
+        options.range_end_index=idx(entries[#entries],#entries)
+        options.range_start_title=entries[1].title
+        options.range_end_title=entries[#entries].title
+    elseif key:find("%-chapter%-",1,false) then
+        if #entries~=1 or uid(entries[1])=="" then return nil,"单章断点缺少章节信息" end
+        options.chapter_uid=uid(entries[1])
+    end
+    return options
+end
+
+local function partial_record(book,manifest,options)
+    if type(book)~="table" then return nil end
+    local key=tostring((manifest or {}).option_key or "")
+    local kind=key:match("^notes%-") and "notes" or "clean"
+    if options and options.chapter_uid then
+        local row=book.chapters and book.chapters[tostring(options.chapter_uid)]
+        return type(row)=="table" and row[kind] or nil
+    end
+    if key:find("%-range$",1,false) then
+        return book.variants and book.variants["range_"..kind] or nil
+    end
+    return book.variants and book.variants[kind] or nil
+end
+
+local function partial_manifest_pending(manifest, has_record)
+    if type(manifest)~="table" then return false end
+    if manifest.final_repair_required==true then return true end
+    if manifest.annotation_pending==true then return true end
+    for _,entry in pairs(type(manifest.chapters)=="table" and manifest.chapters or {}) do
+        if type(entry)=="table" and (entry.complete~=true or tostring(entry.error or "")~="") then return true end
+    end
+    -- A fully checkpointed cache without a generated record means the chapter
+    -- work completed but the final build/install did not. Keep it repairable.
+    return not has_record
+end
+
+function M.partial_repairs(store,book_id)
+    book_id=tostring(book_id or "")
+    local book=book_id~="" and store:book(book_id) or nil
+    local out={}
+    for _,root in ipairs(store:partial_cache_paths(book_id)) do
+        local manifest=DownloadDatabase.load_manifest(root)
+        if type(manifest)=="table" then
+            local key=tostring(manifest.option_key or "")
+            local kind=key:match("^notes%-") and "notes" or "clean"
+            local options,option_error=partial_options(manifest)
+            local record=partial_record(book,manifest,options)
+            if partial_manifest_pending(manifest,type(record)=="table" and record.file and U.file_exists(record.file)) then
+                local complete,failed,total=0,0,0
+                for _,entry in pairs(type(manifest.chapters)=="table" and manifest.chapters or {}) do
+                    if type(entry)=="table" then
+                        total=total+1
+                        if entry.complete==true and tostring(entry.error or "")=="" then complete=complete+1 else failed=failed+1 end
+                    end
+                end
+                out[#out+1]={
+                    root=root,manifest=manifest,options=options,option_error=option_error,
+                    kind=kind,label=(kind=="notes" and "划线与想法版" or "纯净版").." · 未完成缓存",
+                    complete=complete,failed=failed,total=total,updated_at=tonumber(manifest.updated_at or 0) or 0,
+                }
+            end
+        end
+    end
+    table.sort(out,function(a,b) return a.updated_at>b.updated_at end)
+    return out
+end
+
 function M.inspect(store,book_id,record)
     book_id=tostring(book_id or (record and record.book_id) or "")
     local book=book_id~="" and store:book(book_id) or nil
@@ -152,8 +242,15 @@ function M.inspect(store,book_id,record)
         repair_kind="none",
     }
     if type(record)~="table" then
-        out.repair_kind="missing_record"
-        out.error="没有找到已下载记录"
+        local partials=M.partial_repairs(store,book_id)
+        if #partials>0 then
+            out.repair_kind="partial"
+            out.partial_repairs=partials
+            out.error="存在可继续修复的未完成下载缓存"
+        else
+            out.repair_kind="missing_record"
+            out.error="没有找到已下载记录"
+        end
         return out
     end
     local file=tostring(record.file or "")

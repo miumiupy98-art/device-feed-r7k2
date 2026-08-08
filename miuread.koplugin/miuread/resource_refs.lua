@@ -145,7 +145,13 @@ function R.scan(chapters, css, assets)
 
     local referenced, missing = {}, {}
     local external, embedded = {}, 0
-    local function inspect(text, base_file, is_css)
+    local missing_chapters, external_chapters = {}, {}
+    local missing_details, external_details = {}, {}
+    local function chapter_uid(chapter)
+        return tostring(chapter and (chapter.uid or chapter.chapterUid or chapter.chapter_uid) or "")
+    end
+    local function inspect(text, base_file, is_css, chapter)
+        local uid = chapter_uid(chapter)
         for _, item in ipairs(R.collect(text, {css=is_css == true})) do
             local target, kind = R.resolve(base_file, item.value)
             if kind == "embedded" then
@@ -153,13 +159,29 @@ function R.scan(chapters, css, assets)
             elseif kind == "external" then
                 if item.kind == "image" or R.looks_like_image(item.value) then
                     external[#external + 1] = tostring(item.value)
+                    if uid ~= "" then external_chapters[uid] = true end
+                    if #external_details < 12 then
+                        external_details[#external_details + 1] = {
+                            uid=uid, title=chapter and chapter.title or nil,
+                            reference=tostring(item.value), base_file=base_file,
+                        }
+                    end
                 end
             elseif target then
                 local href = tostring(target):gsub("^OEBPS/", "")
                 local relevant = item.kind == "image" or asset_set[href] or R.looks_like_image(item.value)
                 if relevant then
                     referenced[href] = true
-                    if not asset_set[href] then missing[href] = true end
+                    if not asset_set[href] then
+                        missing[href] = true
+                        if uid ~= "" then missing_chapters[uid] = true end
+                        if #missing_details < 12 then
+                            missing_details[#missing_details + 1] = {
+                                uid=uid, title=chapter and chapter.title or nil,
+                                reference=tostring(item.value), href=href, base_file=base_file,
+                            }
+                        end
+                    end
                 end
             end
         end
@@ -168,15 +190,22 @@ function R.scan(chapters, css, assets)
     for index, chapter in ipairs(chapters or {}) do
         local raw, err = read_chapter(chapter)
         if type(raw) ~= "string" then return nil, "无法读取最终章节资源：" .. tostring(err or index) end
-        inspect(raw, string.format("OEBPS/text/chapter-%04d.xhtml", index), false)
+        inspect(raw, string.format("OEBPS/text/chapter-%04d.xhtml", index), false, chapter)
+        if tostring(chapter.style or "") ~= "" then
+            inspect(chapter.style, "OEBPS/style.css", true, chapter)
+        end
     end
-    inspect(css or "", "OEBPS/style.css", true)
+    inspect(css or "", "OEBPS/style.css", true, nil)
 
     return {
         referenced=referenced,
         missing=missing,
         external=external,
         embedded=embedded,
+        missing_chapters=missing_chapters,
+        external_chapters=external_chapters,
+        missing_details=missing_details,
+        external_details=external_details,
     }
 end
 
@@ -217,6 +246,10 @@ function R.prune(chapters, css, assets)
         pruned_samples=set_samples(pruned, 6),
         missing_samples=set_samples(scan.missing, 6),
         external_samples={},
+        missing_chapters=scan.missing_chapters or {},
+        external_chapters=scan.external_chapters or {},
+        missing_details=scan.missing_details or {},
+        external_details=scan.external_details or {},
     }
     for index=1,math.min(6,#scan.external) do stats.external_samples[index]=scan.external[index] end
     return kept, stats

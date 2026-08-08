@@ -6,16 +6,14 @@ local Http = require("miuread.http")
 local Library = require("miuread.library")
 local logger = require("logger")
 local lfs = require("libs/libkoreader-lfs")
-local bit = require("bit")
 
 local MP = {}
 MP.__index = MP
 
 local BASE = "https://weread.qq.com"
-local CACHE_SCHEMA = 2
+local CACHE_SCHEMA = 3
 local LIST_TTL = 6 * 60 * 60
 local ARTICLE_LIMIT = 100
-local B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
 local ARTICLE_CSS = [[
 html, body {
@@ -74,34 +72,6 @@ end
 local function has_readable_body(body)
     body = tostring(body or "")
     return #trim(plain(body)) >= 8 or body:lower():find("<img", 1, true) ~= nil
-end
-
-local function base64_encode(data)
-    local out = {}
-    local len = #data
-    for i = 1, len, 3 do
-        local a = data:byte(i)
-        local b = i + 1 <= len and data:byte(i + 1) or 0
-        local c = i + 2 <= len and data:byte(i + 2) or 0
-        local n = a * 65536 + b * 256 + c
-        local i1 = bit.rshift(n, 18) % 64 + 1
-        local i2 = bit.rshift(n, 12) % 64 + 1
-        out[#out + 1] = B64_CHARS:sub(i1, i1)
-        out[#out + 1] = B64_CHARS:sub(i2, i2)
-        if i + 1 <= len then
-            local i3 = bit.rshift(n, 6) % 64 + 1
-            out[#out + 1] = B64_CHARS:sub(i3, i3)
-        else
-            out[#out + 1] = "="
-        end
-        if i + 2 <= len then
-            local i4 = n % 64 + 1
-            out[#out + 1] = B64_CHARS:sub(i4, i4)
-        else
-            out[#out + 1] = "="
-        end
-    end
-    return table.concat(out)
 end
 
 local function parse_articles(data)
@@ -481,32 +451,87 @@ function MP:_fetch_raw_content(book_id, article)
     error(last_error or "文章正文为空")
 end
 
-function MP:_embed_images(body, enabled, progress)
-    if not enabled then return strip_mp_images(body), 0, 0 end
+local function mp_image_url(src)
+    src = tostring(src or "")
+    if not src:match("mmbiz%.qpic%.cn") and not src:match("mmbiz%.qlogo%.cn") then return nil end
+    return src:match("^//") and ("https:" .. src) or src
+end
+
+function MP:_localize_images(body, enabled, stage, progress, previous)
+    if not enabled then return strip_mp_images(body), 0, 0, {} end
     local total = 0
     tostring(body or ""):gsub('src=(["\'])(.-)%1', function(_, src)
-        if src:match("mmbiz%.qpic%.cn") or src:match("mmbiz%.qlogo%.cn") then total = total + 1 end
+        if mp_image_url(src) then total = total + 1 end
     end)
-    local index, failed = 0, 0
-    local output = tostring(body or ""):gsub('src=(["\'])(.-)%1', function(quote, src)
-        if not src:match("mmbiz%.qpic%.cn") and not src:match("mmbiz%.qlogo%.cn") then
-            return "src=" .. quote .. src .. quote
+    if total == 0 then return tostring(body or ""), 0, 0, {} end
+
+    local image_dir = tostring(stage) .. "/images"
+    U.mkdir(image_dir)
+    local reusable={}
+    if type(previous)=="table" and type(previous.image_sources)=="table" and previous.dir then
+        for _,item in ipairs(previous.image_sources) do
+            local source=tostring(type(item)=="table" and item.source or "")
+            local file=tostring(type(item)=="table" and item.file or "")
+            local full=file~="" and (tostring(previous.dir).."/"..file) or ""
+            if source~="" and full~="" and U.file_exists(full) then reusable[source]={file=file,full=full,mime=item.mime} end
         end
+    end
+    local index, failed = 0, 0
+    local cache, sources = {}, {}
+    local output = tostring(body or ""):gsub('src=(["\'])(.-)%1', function(quote, src)
+        local url = mp_image_url(src)
+        if not url then return "src=" .. quote .. src .. quote end
         index = index + 1
         if progress then progress(index, total, src) end
-        local url = src:match("^//") and ("https:" .. src) or src
+
+        local cached = cache[url]
+        if cached then
+            sources[#sources + 1] = {source=url, file=cached}
+            return "src=" .. quote .. cached .. quote
+        end
+
+        local old=reusable[url]
+        if old then
+            local ext=tostring(old.file or ""):match("(%.[%w]+)$") or ".bin"
+            local relative_path="images/"..string.format("%04d",index)..ext
+            local copied,copy_error=U.copy_file_stream(old.full,tostring(stage).."/"..relative_path)
+            if copied then
+                cache[url]=relative_path
+                sources[#sources+1]={source=url,file=relative_path,mime=old.mime,reused=true}
+                return "src="..quote..relative_path..quote
+            end
+            logger.warn("[MiuRead][MP] cached image reuse failed","index=",tostring(index),"error=",tostring(copy_error))
+        end
+
         local ok, data = pcall(self.http.download, self.http, url, {
-            auth=false, headers={Referer=BASE .. "/", Accept="image/avif,image/webp,image/*,*/*"}, retries=2,
+            auth=false,
+            headers={Referer=BASE .. "/", Accept="image/avif,image/webp,image/*,*/*"},
+            retries=3, timeout={12,30},
         })
         if not ok or type(data) ~= "string" or #data == 0 then
             failed = failed + 1
+            logger.warn("[MiuRead][MP] article image failed", "index=", tostring(index), "error=", ok and "empty" or tostring(data))
             return "src=" .. quote .. src .. quote
         end
-        local _, mime = Codec.media(data, url)
-        return "src=" .. quote .. "data:" .. tostring(mime or "application/octet-stream")
-            .. ";base64," .. base64_encode(data) .. quote
+
+        local ext, mime = Codec.media(data, url)
+        if not tostring(mime or ""):match("^image/") then
+            failed = failed + 1
+            logger.warn("[MiuRead][MP] article asset is not an image", "index=", tostring(index), "mime=", tostring(mime))
+            data = nil
+            collectgarbage("collect")
+            return "src=" .. quote .. src .. quote
+        end
+        local relative_path = "images/" .. string.format("%04d", index) .. tostring(ext or ".bin")
+        local wrote, write_error = U.atomic_write(tostring(stage) .. "/" .. relative_path, data, true)
+        data = nil
+        if not wrote then error("公众号图片缓存写入失败：" .. tostring(write_error or relative_path)) end
+        cache[url] = relative_path
+        sources[#sources + 1] = {source=url, file=relative_path, mime=mime}
+        collectgarbage("collect")
+        return "src=" .. quote .. relative_path .. quote
     end)
-    return output, total, failed
+    return output, total, failed, sources
 end
 
 function MP:fetch_article(book, article, options)
@@ -518,9 +543,12 @@ function MP:fetch_article(book, article, options)
     if not Protocol.is_mp_account(book_id) or article_id == "" then error("公众号文章标识缺失") end
 
     local cached = self:_load_article_record(book_id, article_id)
-    if cached and options.force ~= true and (options.images ~= true or cached.images_enabled == true) then
-        return cached
-    end
+    local cached_schema=tonumber(cached and cached.schema or 0) or 0
+    local cache_matches=options.images==true
+        and cached_schema>=CACHE_SCHEMA and cached and cached.images_enabled==true
+        and cached.images_complete~=false and tonumber(cached.failed_images or 0)==0
+        or (options.images~=true and cached and cached.images_enabled~=true)
+    if cached and options.force~=true and cache_matches then return cached end
 
     local root = self:_account_dir(book_id) .. "/articles"
     U.mkdir(root)
@@ -535,8 +563,9 @@ function MP:fetch_article(book, article, options)
         if not body or not has_readable_body(body) then error("文章正文为空或无法识别") end
         body = strip_mp_reader_font_styles(body)
         body = strip_blank_mp_blocks(body)
-        local image_count, failed_images
-        body, image_count, failed_images = self:_embed_images(body, options.images == true, options.progress)
+        local image_count, failed_images, image_sources
+        body, image_count, failed_images, image_sources = self:_localize_images(
+            body, options.images == true, stage, options.progress, cached)
         body = strip_blank_mp_blocks(body)
         if not has_readable_body(body) then error("文章正文处理后为空") end
 
@@ -546,8 +575,9 @@ function MP:fetch_article(book, article, options)
             .. U.xml(title) .. '</h1>' .. body .. '</body></html>'
         local wrote_html, html_error = U.atomic_write(stage .. "/article.html", wrapper, true)
         if not wrote_html then error("文章文件写入失败：" .. tostring(html_error or "")) end
-        -- Keep body.xhtml for old cache readers and future migrations. Images
-        -- are already embedded, so this file has no external asset dependency.
+        -- Keep body.xhtml for cache readers and future migrations. Article
+        -- images live beside the HTML and are loaded by relative file paths, so
+        -- large illustrated articles do not expand into a huge Base64 string.
         local wrote_body, body_error = U.atomic_write(stage .. "/body.xhtml", body, true)
         if not wrote_body then error("文章正文缓存写入失败：" .. tostring(body_error or "")) end
         local metadata = {
@@ -557,7 +587,8 @@ function MP:fetch_article(book, article, options)
             createTime=tonumber(article.createTime or 0) or 0,
             sourceUrl=article.sourceUrl, accountName=article.accountName,
             image_count=image_count, failed_images=failed_images,
-            images_enabled=options.images == true, updated_at=os.time(),
+            image_sources=image_sources, images_enabled=options.images == true,
+            images_complete=options.images ~= true or failed_images == 0, updated_at=os.time(),
         }
         local wrote_meta, meta_error = U.atomic_write(stage .. "/metadata.json", Json.encode(metadata), true)
         if not wrote_meta then error("文章缓存记录写入失败：" .. tostring(meta_error or "")) end

@@ -9780,6 +9780,8 @@ function Plugin:_finish_download_runtime(runtime,result)
         local rate_limited=Http.is_rate_limit_error(err)
         local network_failed=Http.is_network_error and Http.is_network_error(err)
         local content_pending=tostring(err):find("[MiuReadAnnotationPending]",1,true)~=nil
+        local image_missing=tostring(err):find("[MiuReadImageMissing]",1,true)~=nil
+            or tostring(err):find("[MiuReadImageExternal]",1,true)~=nil
         local validation_failed=tostring(err):find("EPUB 完整性验证失败",1,true)~=nil
         local wait_seconds=tonumber(tostring(err):match("wait_seconds=(%d+)"))
         if auth_required then self:_mark_auth_problem("download",err,true) end
@@ -9790,13 +9792,14 @@ function Plugin:_finish_download_runtime(runtime,result)
             percent=runtime.last_state and runtime.last_state.percent,seen=false,
             auth_required=auth_required or nil,
             error_kind=auth_required and "authentication" or (rate_limited and "rate_limit"
-                or (network_failed and "network" or (content_pending and "content_pending"
-                or (validation_failed and "validation" or nil)))),
+                or (network_failed and "network" or (image_missing and "image_missing"
+                or (content_pending and "content_pending" or (validation_failed and "validation" or nil))))),
             wait_seconds=rate_limited and wait_seconds or nil,
         },true)
         self:_update_open_shelf_download_status(b.bookId,
             auth_required and "等待重新登录" or (rate_limited and "请求受限 · 稍后继续"
-                or (network_failed and "等待网络 · 可继续" or "生成未完成")))
+                or (network_failed and "等待网络 · 可继续"
+                or (image_missing and "正文图片待修复 · 断点已保留" or "生成未完成"))))
         self:_notify_home_data_changed("content")
         local first
         if auth_required then
@@ -9805,6 +9808,8 @@ function Plugin:_finish_download_runtime(runtime,result)
             first="微信读书暂时限制了请求频率。插件已停止继续请求，正文和断点均已保留，请稍后继续下载。"
         elseif network_failed then
             first="网络连接暂时中断。已完成章节和下载断点均已保留，网络恢复后可继续下载。"
+        elseif image_missing then
+            first="书籍正文图片仍有缺失。已完成章节和下载断点均已保留，可在“修复书籍”中只补缺失内容；原文件没有被覆盖。"
         elseif content_pending then
             first="生成未完成，原文件和下载进度已保留。请稍后使用“生成／更新书籍”重试。"
         elseif validation_failed then
@@ -9814,12 +9819,13 @@ function Plugin:_finish_download_runtime(runtime,result)
         end
         if was_background then
             local toast_title=auth_required and "下载登录验证失败" or (rate_limited and "请求受限"
-                or (network_failed and "等待网络" or "觅阅"))
+                or (network_failed and "等待网络" or (image_missing and "书籍图片待修复" or "觅阅")))
             local toast_text=auth_required and "后台下载已暂停，重新扫码后自动继续"
                 or (rate_limited and "已停止继续请求，下载断点已保留"
                 or (network_failed and "下载断点已保留，网络恢复后可继续"
+                or (image_missing and "已完成内容和断点已保留，可用修复书籍继续"
                 or (content_pending and "生成未完成，原文件和进度已保留"
-                or (tostring(b.title or "未命名").."下载未完成，进度已保留"))))
+                or (tostring(b.title or "未命名").."下载未完成，进度已保留")))))
             self:status_toast(toast_title,toast_text,5)
         else self:info(first) end
         -- Any failed book pauses the single waiting task. The user decides whether
@@ -9976,6 +9982,7 @@ function Plugin:_download_status_label()
     if state.status=="completed" then return "后台下载 · 已完成" end
     if state.status=="failed" and state.auth_required==true then return "后台下载 · 等待重新登录" end
     if state.status=="failed" and state.error_kind=="network" then return "后台下载 · 等待网络，可继续" end
+    if state.status=="failed" and state.error_kind=="image_missing" then return "后台下载 · 正文图片待修复" end
     if state.status=="failed" then return "后台下载 · 未完成" end
     if state.status=="interrupted" then return "后台下载 · 可继续" end
     return "后台下载"
@@ -10148,6 +10155,7 @@ function Plugin:show_download_status()
     elseif state.status=="failed" and state.auth_required==true then lines[#lines+1]="等待重新登录"
     elseif state.status=="failed" and state.error_kind=="rate_limit" then lines[#lines+1]="请求频率受限，稍后可继续"
     elseif state.status=="failed" and state.error_kind=="network" then lines[#lines+1]="网络中断，断点已保留"
+    elseif state.status=="failed" and state.error_kind=="image_missing" then lines[#lines+1]="正文图片未完整，断点可修复"
     elseif state.status=="failed" then lines[#lines+1]="下载未完成"
     elseif state.status=="interrupted" then lines[#lines+1]="上次下载已中断"
     else lines[#lines+1]=tostring(state.status) end
@@ -10171,6 +10179,10 @@ function Plugin:show_download_status()
         end}}
     elseif state.status=="failed" and state.auth_required==true then
         buttons[#buttons+1]={{text="重新扫码登录",callback=function() UIManager:close(dialog); self.auth_flow:start() end}}
+    elseif state.status=="failed" and state.error_kind=="image_missing" and type(state.book)=="table" then
+        buttons[#buttons+1]={{text="修复书籍",callback=function()
+            UIManager:close(dialog); self:_repair_downloaded_book(state.book_id or state.book)
+        end}}
     elseif (state.status=="failed" or state.status=="interrupted") and type(state.book)=="table" then
         buttons[#buttons+1]={{text="继续下载",callback=function() UIManager:close(dialog); self:download(state.book,state.options or {},false) end}}
     end
@@ -10423,7 +10435,7 @@ function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
             content_type=b.content_type,updated_at=os.time()})
     end
     local prefs=self.store:preferences()
-    opt.images=prefs.images
+    if opt.images==nil then opt.images=prefs.images end
     opt.active_document_path=self:_current_document_path()
     local runtime={book=U.copy(b),options=U.copy(opt),last_state={stage="prepare",current=0,total=1,percent=0,chapter=b.title or ""},background=start_in_background==true,dialog=nil,started_at=os.time(),open_after=open_after==true,done=done,notified_milestones={}}
     self._download_runtime=runtime
@@ -11272,6 +11284,10 @@ function Plugin:downloaded_book_menu(book_ref)
             items[#items+1]={text="单章文件",post_text=tostring(chapter_count).." 个",callback=function() self:downloaded_chapters_menu(book_id) end}
         end
         if has_partial then
+            local repairable=#BookIntegrity.partial_repairs(self.store,book_id)
+            if repairable>0 then
+                items[#items+1]={text="修复未完成下载",post_text=tostring(repairable).." 个断点",callback=function() self:_repair_downloaded_book(book_id) end}
+            end
             items[#items+1]={text="清理未完成下载缓存",post_text="保留已生成 EPUB",callback=function() self:_confirm_clear_partial_cache(book_id,b.title) end}
         end
     end
@@ -12172,13 +12188,90 @@ function Plugin:_schedule_current_book_repair_check(current,urgent)
     return true
 end
 
+function Plugin:_repair_partial_download(book_id,repair,confirmed)
+    local id=tostring(book_id or "")
+    if id=="" or type(repair)~="table" then self:info("没有找到可继续修复的下载断点") return false end
+    self.store:reload()
+    local stored=self.store:book(id)
+    if not stored then self:info("这本书的下载记录已经不存在") return false end
+    if type(repair.options)~="table" then
+        self:info("这个旧下载断点缺少必要信息，无法安全地只补缺失内容。\n\n现有缓存没有删除，可以保留后重新下载。")
+        return false
+    end
+    local title=tostring(stored.title or "本书")
+    if confirmed~=true then
+        local progress=""
+        if tonumber(repair.total or 0)>0 then
+            progress="\n\n已完成 "..tostring(repair.complete or 0).." / "..tostring(repair.total).." 个章节"
+            if tonumber(repair.failed or 0)>0 then progress=progress.."，仍有 "..tostring(repair.failed).." 个章节待补" end
+        end
+        UIManager:show(ConfirmBox:new{
+            text="《"..title.."》存在未完成下载。"..progress
+                .."\n\n修复时会复用现有断点，只重新获取缺失内容；新文件验证成功前不会替换原文件。",
+            ok_text="开始修复",cancel_text="取消",
+            ok_callback=function() self:_repair_partial_download(id,repair,true) end,
+        })
+        return true
+    end
+    if self.download_task and self.download_task:busy() then
+        self:info("已有下载或修复任务正在进行，请完成后再试。")
+        return false
+    end
+    local book={bookId=id,title=stored.title,author=stored.author,cover=stored.cover}
+    local options=U.copy(repair.options)
+    options.repair_only=true
+    options.repair_source="partial_cache"
+    self:status_toast("修复书籍","正在复用断点并补全缺失内容",4)
+    return self:download(book,options,false,function(new_record)
+        self.store:reload()
+        if type(new_record)=="table" and new_record.pending_install==true then
+            self.store:save_session(id,{book_integrity_repaired_at=os.time(),book_integrity_pending_install=true})
+            self:info("修复内容已经生成。\n\n当前正在阅读这本书，新文件会在关闭本书后自动替换；原文件目前没有改变。")
+            self:_notify_home_data_changed("content")
+            return
+        end
+        local remaining=BookIntegrity.partial_repairs(self.store,id)
+        local same_pending=false
+        for _,row in ipairs(remaining) do
+            if tostring(row.root or "")==tostring(repair.root or "") then same_pending=true break end
+        end
+        if same_pending then
+            self.store:save_session(id,{book_integrity_error="partial_pending",book_integrity_checked_at=os.time()})
+            self:info("书籍仍有未完成内容。\n\n已完成章节和下载断点继续保留，下次使用“修复书籍”会从现有进度继续。")
+        else
+            self.store:save_session(id,{book_integrity_repaired_at=os.time(),book_integrity_error=false})
+            local reused=tonumber(repair.complete or 0) or 0
+            local suffix=reused>0 and ("\n\n已复用 "..tostring(reused).." 个已完成章节，没有重新下载整本书。") or ""
+            self:info("书籍修复完成。\n\n缺失内容已经补全，新文件通过检查后才替换原文件。"..suffix)
+        end
+        self:_notify_home_data_changed("content")
+    end,false)
+end
+
 function Plugin:_repair_downloaded_book(book_ref,confirmed)
     local id=tostring(type(book_ref)=="table" and (book_ref.bookId or book_ref.book_id) or book_ref or "")
     if id=="" then self:info("没有找到可修复的书籍") return false end
     self.store:reload()
     local stored=self.store:book(id)
+    if not stored then self:info("这本书还没有可修复的下载记录") return false end
+
+    local partials=BookIntegrity.partial_repairs(self.store,id)
+    if #partials==1 then return self:_repair_partial_download(id,partials[1],confirmed) end
+    if #partials>1 then
+        local rows={}
+        for _,candidate in ipairs(partials) do
+            local repair=candidate
+            local detail=tonumber(repair.total or 0)>0
+                and (tostring(repair.complete or 0).."/"..tostring(repair.total).." 章已完成") or "可继续修复"
+            rows[#rows+1]={text=repair.label or "未完成缓存",post_text=detail,
+                callback=function() self:_repair_partial_download(id,repair) end}
+        end
+        self:list("选择要修复的未完成下载",rows)
+        return true
+    end
+
     local record=self:_preferred_record(id)
-    if not stored or not record then self:info("这本书还没有可修复的已下载版本") return false end
+    if not record then self:info("这本书还没有可修复的已下载版本") return false end
     local report=BookIntegrity.inspect(self.store,id,record)
     if report.repair_kind=="none" then
         local session=self.store:session(id) or {}
@@ -12246,18 +12339,25 @@ function Plugin:scan_downloaded_books_for_integrity_repair()
     local rows={}
     for _,book in ipairs(self.store:all_books()) do
         local id=tostring(book.book_id or book.bookId or "")
-        local record=id~="" and self:_preferred_record(id) or nil
-        if record then
-            local report=BookIntegrity.inspect(self.store,id,record)
-            if report.repair_kind~="none" then
-                local book_id=id
-                local label=report.repair_kind=="annotations" and "批注待修复" or "书籍待修复"
-                rows[#rows+1]={text=tostring(book.title or record.title or id),post_text=label,
+        if id~="" then
+            local partials=BookIntegrity.partial_repairs(self.store,id)
+            local record=self:_preferred_record(id)
+            local book_id=id
+            if #partials>0 then
+                rows[#rows+1]={text=tostring(book.title or (record and record.title) or id),
+                    post_text=tostring(#partials).." 个未完成断点",
                     callback=function() self:_repair_downloaded_book(book_id) end}
+            elseif record then
+                local report=BookIntegrity.inspect(self.store,id,record)
+                if report.repair_kind~="none" then
+                    local label=report.repair_kind=="annotations" and "批注待修复" or "书籍待修复"
+                    rows[#rows+1]={text=tostring(book.title or record.title or id),post_text=label,
+                        callback=function() self:_repair_downloaded_book(book_id) end}
+                end
             end
         end
     end
-    if #rows==0 then self:info("检查完成，没有发现需要修复的已下载书籍。") return true end
+    if #rows==0 then self:info("检查完成，没有发现需要修复的已下载书籍或未完成下载。") return true end
     self:list("需要修复的书籍 · "..tostring(#rows).." 本",rows)
     return true
 end
