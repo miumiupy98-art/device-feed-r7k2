@@ -1,17 +1,17 @@
 {
-  "version": "4.2.0-beta.12",
-  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 4.2.0-beta.12 \u5185\u6d4b\u7248",
+  "version": "4.2.0-beta.13",
+  "name": "觅阅 · 微信读书助手 4.2.0-beta.13 内测版",
   "channel": "beta",
   "package_type": "full",
-  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.12/miuread-v4.2.0-beta.12-full.zip",
+  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.13/miuread-v4.2.0-beta.13-full.zip",
   "package_urls": [
-    "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.12/miuread-v4.2.0-beta.12-full.zip",
-    "https://ghfast.top/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.12/miuread-v4.2.0-beta.12-full.zip",
-    "https://gh-proxy.com/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.12/miuread-v4.2.0-beta.12-full.zip",
-    "https://ghproxy.net/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.12/miuread-v4.2.0-beta.12-full.zip"
+    "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.13/miuread-v4.2.0-beta.13-full.zip",
+    "https://ghfast.top/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.13/miuread-v4.2.0-beta.13-full.zip",
+    "https://gh-proxy.com/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.13/miuread-v4.2.0-beta.13-full.zip",
+    "https://ghproxy.net/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.13/miuread-v4.2.0-beta.13-full.zip"
   ],
-  "size": 531912,
-  "sha256": "aa32ac791937cbaee81e64817105c54093e12069a306e128b7b7433244370684",
-  "summary": "MiuRead v4.2.0-beta.12\n\u91cd\u505a: \u9605\u8bfb\u4e0b\u62c9\u83dc\u5355\u6539\u4e3a\u4e09\u7ec4\u8f7b\u91cf\u5165\u53e3, \u4e66\u7b7e\u5212\u7ebf\u60f3\u6cd5\u5206\u5f00\n\u4fee\u590d: \u5173\u95ed\u8bc4\u8bba\u540e\u5185\u90e8\u94fe\u63a5\u4e0d\u518d\u62a5\u9519, \u4e66\u5185\u641c\u7d22\u53ef\u6b63\u5e38\u4f7f\u7528\n\u7edf\u4e00: \u9605\u8bfb\u540c\u6b65\u548c\u8bca\u65ad\u6539\u7528\u89c5\u9605\u754c\u9762, \u5b57\u4f53\u8bbe\u7f6e\u7cbe\u7b80\u5e76\u65b0\u589e\u72ec\u7acb\u884c\u8ddd",
-  "notes": "MiuRead v4.2.0-beta.12\n\u91cd\u505a: \u9605\u8bfb\u4e0b\u62c9\u83dc\u5355\u6539\u4e3a\u4e09\u7ec4\u8f7b\u91cf\u5165\u53e3, \u4e66\u7b7e\u5212\u7ebf\u60f3\u6cd5\u5206\u5f00\n\u4fee\u590d: \u5173\u95ed\u8bc4\u8bba\u540e\u5185\u90e8\u94fe\u63a5\u4e0d\u518d\u62a5\u9519, \u4e66\u5185\u641c\u7d22\u53ef\u6b63\u5e38\u4f7f\u7528\n\u7edf\u4e00: \u9605\u8bfb\u540c\u6b65\u548c\u8bca\u65ad\u6539\u7528\u89c5\u9605\u754c\u9762, \u5b57\u4f53\u8bbe\u7f6e\u7cbe\u7b80\u5e76\u65b0\u589e\u72ec\u7acb\u884c\u8ddd"
+  "size": 531486,
+  "sha256": "8c2da3326312d2a7e99525cfcd3a5c58a8b2de816f24432ada03d8928e962a2e",
+  "summary": "MiuRead v4.2.0-beta.13\n重做: 阅读下拉工具栏改为秩序横条式，书名、章节与状态分层显示\n直达: 搜索、书签、划线、想法、评论、字体、行距、页面均在一级菜单直接操作\n显示: 前光与色温同时独立调节，并加入夜间模式、旋转、截图和全屏刷新快捷入口",
+  "notes": "MiuRead v4.2.0-beta.13\n重做: 阅读下拉工具栏改为秩序横条式，书名、章节与状态分层显示\n直达: 搜索、书签、划线、想法、评论、字体、行距、页面均在一级菜单直接操作\n显示: 前光与色温同时独立调节，并加入夜间模式、旋转、截图和全屏刷新快捷入口"
 }

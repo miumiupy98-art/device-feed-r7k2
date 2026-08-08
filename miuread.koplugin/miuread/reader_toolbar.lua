@@ -68,8 +68,28 @@ local function icon_box(icon, width, height, enabled, size)
     return Ui.icon(tostring(icon or ""), width, height, math.min(width, height, size or Skin.dp(22, 19, 30)), {
         icon_key = tostring(icon or ""),
         face = Skin.face("cfont", 17.2, 23.2, 14.4),
-        fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+        fgcolor = enabled ~= false and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
     })
+end
+
+local function circle_icon_button(icon, width, height, enabled)
+    local circle = math.min(Skin.dp(28, 24, 36), math.floor(height * .72), math.floor(width * .72))
+    local frame = Skin.frame(circle, circle, {
+        bordersize = Skin.line("thin"), padding = 0, radius = math.floor(circle / 2),
+        background = Blitbuffer.COLOR_WHITE,
+        color = enabled ~= false and Blitbuffer.COLOR_GRAY or (Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_GRAY),
+    }, icon_box(icon, circle, circle, enabled, math.floor(circle * .52)))
+    return CenterContainer:new{dimen = Geom:new{w = width, h = height}, frame}
+end
+
+local function dynamic_value(text, width, height, face, bold)
+    local widget = TextWidget:new{
+        text = tostring(text or ""),
+        face = face,
+        bold = bold == true,
+        fgcolor = Blitbuffer.COLOR_BLACK,
+    }
+    return widget, CenterContainer:new{dimen = Geom:new{w = width, h = height}, widget}
 end
 
 local SliderBar = InputContainer:extend{
@@ -80,6 +100,8 @@ local SliderBar = InputContainer:extend{
     track_w = 1,
     owner = nil,
     on_change = nil,
+    value_widget = nil,
+    value_suffix = "",
     last_refresh = 0,
 }
 function SliderBar:init()
@@ -102,7 +124,7 @@ function SliderBar:paintTo(bb, x, y)
     self.dimen.x, self.dimen.y = x, y
     self.slide_dimen.x, self.slide_dimen.y = x, y
     local track_h = math.max(1, Skin.line("medium"))
-    local marker = Skin.dp(8, 7, 11)
+    local marker = Skin.dp(9, 8, 12)
     local bar_y = y + math.floor((self.dimen.h - track_h) / 2)
     local ratio = self:_ratio()
     local fill_w = math.floor(self.track_w * ratio)
@@ -117,10 +139,13 @@ function SliderBar:_refresh(force)
     local now = os.clock()
     if not force and now - (tonumber(self.last_refresh) or 0) < interval then return end
     self.last_refresh = now
-    UIManager:setDirty(self.owner, function() return "ui", Skin.expand_region(self.dimen, Skin.dp(2, 2, 3)) end)
+    UIManager:setDirty(self.owner, function() return "ui", Skin.expand_region(self.owner.panel_dimen, Skin.dp(2, 2, 3)) end)
 end
 function SliderBar:setValue(value, force)
     self.value = math.max(self.min, math.min(self.max, tonumber(value) or self.value))
+    if self.value_widget and type(self.value_widget.setText) == "function" then
+        self.value_widget:setText(tostring(math.floor(self.value + .5)) .. tostring(self.value_suffix or ""))
+    end
     self:_refresh(force ~= false)
 end
 function SliderBar:_set_from_position(ges, force)
@@ -145,24 +170,44 @@ function SliderBar:onTapSlide(_, ges) return self:_set_from_position(ges, true) 
 function SliderBar:onPanSlide(_, ges) return self:_set_from_position(ges, false) end
 function SliderBar:handleEvent(event) return InputContainer.handleEvent(self, event) end
 
-local function action_item(entry, width, height, activate, hold_activate)
+local function status_item(entry, width, height, callback, hold_callback)
+    entry = type(entry) == "table" and entry or {}
     local enabled = entry.enabled ~= false
-    local icon_area_h = math.floor(height * .68)
-    local label_h = math.max(1, height - icon_area_h)
-    local circle = math.min(Skin.dp(39, 33, 52), math.floor(icon_area_h * .78), math.floor(width * .52))
-    local icon_size = math.max(Skin.dp(17, 15, 23), math.floor(circle * .52))
-    local circle_widget = Skin.frame(circle, circle, {
-        bordersize = Skin.line("thin"),
-        padding = 0,
-        radius = math.floor(circle / 2),
-        background = Blitbuffer.COLOR_WHITE,
-        color = enabled and Blitbuffer.COLOR_GRAY or (Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_GRAY),
-    }, icon_box(entry.icon_key or entry.icon, circle, circle, enabled, icon_size))
+    local icon_w = entry.icon and Skin.dp(26, 22, 34) or 0
+    local gap = entry.icon and Skin.dp(3, 2, 5) or 0
+    local text_w = math.max(1, width - icon_w - gap)
+    local content = HorizontalGroup:new{
+        align = "center",
+        entry.icon and icon_box(entry.icon, icon_w, height, enabled, Skin.dp(17, 15, 23)) or HorizontalSpan:new{width = 0},
+        entry.icon and HorizontalSpan:new{width = gap} or HorizontalSpan:new{width = 0},
+        Ui.textbox(tostring(entry.label or ""), text_w, height,
+            Skin.face("cfont", 8.9, 12.2, 7.6), {
+                alignment = "center", halign = "center",
+                bold = entry.bold == true or entry.alert == true,
+                fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+            }),
+    }
+    local tap = TapBox:new{
+        dimen = Geom:new{w = width, h = height},
+        enabled = enabled,
+        callback = callback,
+        hold_callback = hold_callback,
+    }
+    tap[1] = CenterContainer:new{dimen = Geom:new{w = width, h = height}, content}
+    return tap
+end
+
+local function plain_action_item(entry, width, height, activate, hold_activate)
+    entry = type(entry) == "table" and entry or {}
+    local enabled = entry.enabled ~= false
+    local icon_h = math.floor(height * .58)
+    local label_h = math.max(1, height - icon_h)
+    local icon_size = math.min(Skin.dp(25, 21, 32), math.floor(icon_h * .76))
     local content = VerticalGroup:new{
         align = "center",
-        CenterContainer:new{dimen = Geom:new{w = width, h = icon_area_h}, circle_widget},
-        centered_text(entry.label or entry.text, width, label_h,
-            Skin.face("smallinfofont", 7.8, 10.5, 6.6), {
+        icon_box(entry.icon or entry.icon_key, width, icon_h, enabled, icon_size),
+        centered_text(entry.label or "", width, label_h,
+            Skin.face("cfont", 8.4, 11.4, 7.2), {
                 bold = entry.active == true,
                 fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
             }),
@@ -170,10 +215,32 @@ local function action_item(entry, width, height, activate, hold_activate)
     local tap = TapBox:new{
         dimen = Geom:new{w = width, h = height},
         enabled = enabled,
-        callback = function() activate(entry.callback, entry.label or entry.key or "功能") end,
-        hold_callback = entry.hold_callback and function()
-            hold_activate(entry.hold_callback, entry.label or entry.key or "功能")
-        end or nil,
+        callback = function() activate(entry.callback, entry.label or "功能") end,
+        hold_callback = entry.hold_callback and function() hold_activate(entry.hold_callback, entry.label or "功能") end or nil,
+    }
+    tap[1] = CenterContainer:new{dimen = Geom:new{w = width, h = height}, content}
+    return tap
+end
+
+local function compact_action_item(entry, width, height, activate)
+    entry = type(entry) == "table" and entry or {}
+    local enabled = entry.enabled ~= false
+    local icon_w = Skin.dp(28, 24, 36)
+    local text_w = math.max(1, width - icon_w - Skin.dp(3, 2, 5))
+    local content = HorizontalGroup:new{
+        align = "center",
+        icon_box(entry.icon or entry.icon_key, icon_w, height, enabled, Skin.dp(18, 15, 23)),
+        HorizontalSpan:new{width = Skin.dp(3, 2, 5)},
+        Ui.textbox(tostring(entry.label or ""), text_w, height,
+            Skin.face("cfont", 8.2, 11.1, 7.0), {
+                alignment = "left", halign = "left", bold = entry.active == true,
+                fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+            }),
+    }
+    local tap = TapBox:new{
+        dimen = Geom:new{w = width, h = height},
+        enabled = enabled,
+        callback = function() activate(entry.callback, entry.label or "功能") end,
     }
     tap[1] = CenterContainer:new{dimen = Geom:new{w = width, h = height}, content}
     return tap
@@ -218,67 +285,94 @@ function Toolbar:_activate_hold(action, label)
     return self:_close(action)
 end
 
-function Toolbar:_header(root, header, x, y, width, title_h, status_h)
-    header = type(header) == "table" and header or {}
-    local side = Skin.dp(46, 39, 62)
-    local title_w = math.max(1, width - side * 2)
+function Toolbar:_inline(action, label, value_widget, suffix)
+    if self.closed or type(action) ~= "function" then return true end
+    local ok, result = pcall(action)
+    if not ok then
+        logger.warn("[MiuRead][ReaderToolbar] inline action failed", tostring(label or "unknown"), tostring(result))
+        return true
+    end
+    if result ~= false and value_widget and type(value_widget.setText) == "function" and result ~= nil then
+        value_widget:setText(tostring(result) .. tostring(suffix or ""))
+    end
+    UIManager:setDirty(self, function() return "ui", Skin.expand_region(self.panel_dimen, Skin.dp(2, 2, 3)) end)
+    return true
+end
 
-    local home = TapBox:new{
-        dimen = Geom:new{w = side, h = title_h},
-        enabled = type(header.home_callback) == "function",
-        callback = function() self:_activate(header.home_callback, "主页") end,
+function Toolbar:_divider(root, x, y, width, thickness)
+    root[#root + 1] = OffsetContainer:new{
+        x_off = x, y_off = y,
+        Skin.divider(width, (Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_GRAY), thickness),
     }
-    home[1] = icon_box("home", side, title_h, true, Skin.dp(20, 17, 27))
+end
 
-    local book = TapBox:new{
-        dimen = Geom:new{w = title_w, h = title_h},
+function Toolbar:_top_status_row(root, header, x, y, width, height)
+    header = type(header) == "table" and header or {}
+    local weights = {17, 24, 24, 14, 21}
+    local entries = {
+        {icon = "home", label = header.home_label or "首页", enabled = type(header.home_callback) == "function"},
+        {icon = "wifi", label = header.wifi_label or "Wi-Fi", enabled = type(header.wifi_callback) == "function", alert = header.wifi_alert == true},
+        {icon = "sync", label = header.sync_label or "同步", enabled = type(header.sync_callback) == "function", alert = header.sync_alert == true},
+        {icon = "battery", label = header.battery_label or "", enabled = true},
+        {icon = "more", label = header.more_label or "更多", enabled = type(header.more_callback) == "function"},
+    }
+    local callbacks = {
+        function() self:_activate(header.home_callback, "首页") end,
+        function() self:_activate(header.wifi_callback, "Wi-Fi") end,
+        function() self:_activate(header.sync_callback, "同步") end,
+        nil,
+        function() self:_activate(header.more_callback, "更多") end,
+    }
+    local holds = {
+        nil,
+        type(header.wifi_hold_callback) == "function" and function() self:_activate_hold(header.wifi_hold_callback, "Wi-Fi 设置") end or nil,
+        nil,nil,nil,
+    }
+    local used = 0
+    for index, entry in ipairs(entries) do
+        local w = index == #entries and (width - used) or math.floor(width * weights[index] / 100)
+        root[#root + 1] = OffsetContainer:new{
+            x_off = x + used, y_off = y,
+            status_item(entry, w, height, callbacks[index], holds[index]),
+        }
+        used = used + w
+    end
+end
+
+function Toolbar:_title_row(root, header, x, y, width, height)
+    header = type(header) == "table" and header or {}
+    local tap = TapBox:new{
+        dimen = Geom:new{w = width, h = height},
         enabled = type(header.book_callback) == "function",
         callback = function() self:_activate(header.book_callback, "当前书籍") end,
     }
-    book[1] = centered_text(header.title or "正在阅读", title_w, title_h,
-        Skin.face("cfont", 10.5, 14.2, 9), {bold = true})
-
-    local more = TapBox:new{
-        dimen = Geom:new{w = side, h = title_h},
-        enabled = type(header.more_callback) == "function",
-        callback = function() self:_activate(header.more_callback, "更多") end,
-    }
-    more[1] = icon_box("more", side, title_h, true, Skin.dp(19, 16, 25))
-
-    root[#root + 1] = OffsetContainer:new{
-        x_off = x, y_off = y,
-        HorizontalGroup:new{align = "center", home, book, more},
-    }
-    y = y + title_h
-
-    local half = math.floor(width / 2)
-    local wifi = TapBox:new{
-        dimen = Geom:new{w = half, h = status_h},
-        enabled = type(header.wifi_callback) == "function",
-        callback = function() self:_activate(header.wifi_callback, "Wi-Fi") end,
-        hold_callback = type(header.wifi_hold_callback) == "function" and function()
-            self:_activate_hold(header.wifi_hold_callback, "Wi-Fi 设置")
-        end or nil,
-    }
-    wifi[1] = Ui.textbox(tostring(header.status_left or ""), half, status_h,
-        Skin.face("smallinfofont", 7.2, 9.7, 6.1), {
-            alignment = "left",
-            fgcolor = header.status_left_alert and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_DARK_GRAY,
-            bold = header.status_left_alert == true,
-        })
-    local battery_w = width - half
-    local battery = Ui.textbox(tostring(header.status_right or ""), battery_w, status_h,
-        Skin.face("smallinfofont", 7.2, 9.7, 6.1), {
-            alignment = "right", halign = "right", fgcolor = Blitbuffer.COLOR_DARK_GRAY,
-        })
-    root[#root + 1] = OffsetContainer:new{
-        x_off = x, y_off = y,
-        HorizontalGroup:new{align = "center", wifi, battery},
-    }
-    return y + status_h
+    tap[1] = centered_text(header.title or "正在阅读", width, height,
+        Skin.face("cfont", 13.7, 18.0, 11.3), {bold = true})
+    root[#root + 1] = OffsetContainer:new{x_off = x, y_off = y, tap}
 end
 
-function Toolbar:_action_row(root, entries, x, y, width, height)
+function Toolbar:_chapter_row(root, header, x, y, width, height)
+    header = type(header) == "table" and header or {}
+    local left_w = math.floor(width * .66)
+    local right_w = width - left_w
+    local chapter = TapBox:new{
+        dimen = Geom:new{w = left_w, h = height},
+        enabled = type(header.chapter_callback) == "function",
+        callback = function() self:_activate(header.chapter_callback, "章节") end,
+    }
+    chapter[1] = Ui.textbox(tostring(header.chapter_label or "当前章节"), left_w, height,
+        Skin.face("cfont", 9.5, 12.8, 8.0), {alignment = "left", halign = "left", bold = true})
+    local progress = TapBox:new{
+        dimen = Geom:new{w = right_w, h = height},
+        enabled = type(header.progress_callback) == "function",
+        callback = function() self:_activate(header.progress_callback, "阅读进度") end,
+    }
+    progress[1] = Ui.textbox(tostring(header.progress_label or "") .. (header.progress_label and header.progress_label ~= "" and "  ›" or ""), right_w, height,
+        Skin.face("cfont", 9.3, 12.5, 7.8), {alignment = "right", halign = "right", bold = true})
+    root[#root + 1] = OffsetContainer:new{x_off = x, y_off = y, HorizontalGroup:new{align = "center", chapter, progress}}
+end
+
+function Toolbar:_content_row(root, entries, x, y, width, height)
     entries = type(entries) == "table" and entries or {}
     local count = math.max(1, #entries)
     local cell_w = math.floor(width / count)
@@ -287,43 +381,100 @@ function Toolbar:_action_row(root, entries, x, y, width, height)
         local actual_w = index == count and (x + width - cell_x) or cell_w
         root[#root + 1] = OffsetContainer:new{
             x_off = cell_x, y_off = y,
-            action_item(entry, actual_w, height,
+            plain_action_item(entry, actual_w, height,
                 function(action, label) self:_activate(action, label) end,
                 function(action, label) self:_activate_hold(action, label) end),
         }
     end
 end
 
-function Toolbar:_frontlight_row(root, setting, x, y, width, height)
-    if type(setting) ~= "table" then return end
-    local label_w = math.max(Skin.dp(78, 66, 104), math.floor(width * .23))
-    local control_w = math.max(1, width - label_w)
-    local slider_pad = Skin.dp(12, 10, 16)
-    local slider_w = math.max(1, control_w - slider_pad * 2)
-    local enabled = setting.enabled ~= false
+function Toolbar:_stepper(root, setting, x, y, width, height)
+    setting = type(setting) == "table" and setting or {}
+    local label_w = math.floor(width * .30)
+    local button_w = math.max(Skin.dp(34, 30, 44), math.floor(width * .16))
+    local value_w = math.max(1, width - label_w - button_w * 2)
+    local face = Skin.face("cfont", 9.0, 12.2, 7.6)
+    local value_widget, value_container = dynamic_value(setting.value or "", value_w, height, face, true)
 
     local label_tap = TapBox:new{
         dimen = Geom:new{w = label_w, h = height},
-        enabled = enabled and type(setting.on_toggle) == "function",
-        callback = function()
-            if type(setting.on_toggle) ~= "function" then return end
-            local ok, value = pcall(setting.on_toggle)
-            if not ok then
-                logger.warn("[MiuRead][ReaderToolbar] frontlight toggle failed", tostring(value))
-                return
-            end
-            if self._brightness_slider and tonumber(value) then self._brightness_slider:setValue(value, true) end
-            UIManager:setDirty(self, function() return "ui", self.panel_dimen end)
-        end,
+        enabled = type(setting.callback) == "function",
+        callback = function() self:_activate(setting.callback, setting.label or "设置") end,
     }
-    local value = math.floor((tonumber(setting.value) or tonumber(setting.min) or 0) + .5)
-    label_tap[1] = HorizontalGroup:new{
+    label_tap[1] = Ui.textbox(tostring(setting.label or ""), label_w, height, face, {alignment = "center", halign = "center", bold = true})
+
+    local minus = TapBox:new{
+        dimen = Geom:new{w = button_w, h = height},
+        enabled = type(setting.on_decrease) == "function",
+        callback = function() self:_inline(setting.on_decrease, tostring(setting.label or "") .. "-", value_widget) end,
+    }
+    minus[1] = circle_icon_button("minus", button_w, height, true)
+
+    local plus = TapBox:new{
+        dimen = Geom:new{w = button_w, h = height},
+        enabled = type(setting.on_increase) == "function",
+        callback = function() self:_inline(setting.on_increase, tostring(setting.label or "") .. "+", value_widget) end,
+    }
+    plus[1] = circle_icon_button("plus", button_w, height, true)
+
+    root[#root + 1] = OffsetContainer:new{
+        x_off = x, y_off = y,
+        HorizontalGroup:new{align = "center", label_tap, minus, value_container, plus},
+    }
+end
+
+function Toolbar:_typeset_row(root, typeset, x, y, width, height)
+    typeset = type(typeset) == "table" and typeset or {}
+    local page_w = math.floor(width * .22)
+    local left = width - page_w
+    local half = math.floor(left / 2)
+    self:_stepper(root, typeset.font or {}, x, y, half, height)
+    self:_stepper(root, typeset.spacing or {}, x + half, y, left - half, height)
+    local page = typeset.page or {}
+    local tap = TapBox:new{
+        dimen = Geom:new{w = page_w, h = height},
+        enabled = type(page.callback) == "function",
+        callback = function() self:_activate(page.callback, page.label or "页面") end,
+    }
+    local icon_w = Skin.dp(20, 17, 26)
+    tap[1] = CenterContainer:new{
+        dimen = Geom:new{w = page_w, h = height},
+        HorizontalGroup:new{
+            align = "center",
+            Ui.textbox(tostring(page.label or "页面"), math.max(1, page_w - icon_w), height,
+                Skin.face("cfont", 9.0, 12.2, 7.6), {alignment = "right", halign = "right", bold = true}),
+            icon_box("chevron-right", icon_w, height, true, Skin.dp(13, 11, 17)),
+        },
+    }
+    root[#root + 1] = OffsetContainer:new{x_off = x + left, y_off = y, tap}
+end
+
+function Toolbar:_light_row(root, setting, x, y, width, height)
+    if type(setting) ~= "table" then return end
+    local enabled = setting.enabled ~= false
+    local label_w = math.max(Skin.dp(112, 94, 146), math.floor(width * .22))
+    local button_w = Skin.dp(42, 36, 54)
+    local gap = Skin.dp(7, 6, 10)
+    local slider_w = math.max(1, width - label_w - button_w * 2 - gap * 2)
+    local icon_w = Skin.dp(29, 25, 37)
+    local value_text_w = Skin.dp(36, 31, 47)
+    local label_text_w = math.max(1, label_w - icon_w - value_text_w)
+    local value_widget = TextWidget:new{
+        text = tostring(math.floor((tonumber(setting.value) or 0) + .5)),
+        face = Skin.face("cfont", 8.8, 11.9, 7.4),
+        bold = true,
+        fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+    }
+    local label_content = HorizontalGroup:new{
         align = "center",
-        icon_box("frontlight", Skin.dp(25, 21, 34), height, enabled, Skin.dp(16, 14, 22)),
-        HorizontalSpan:new{width = Skin.dp(2, 2, 3)},
-        Ui.textbox("前光 " .. tostring(value), math.max(1, label_w - Skin.dp(27, 23, 37)), height,
-            Skin.face("smallinfofont", 7.7, 10.4, 6.5), {alignment = "left", bold = true}),
+        icon_box(setting.icon or "frontlight", icon_w, height, enabled, Skin.dp(18, 15, 24)),
+        Ui.textbox(tostring(setting.label or ""), label_text_w, height,
+            Skin.face("cfont", 8.7, 11.8, 7.3), {alignment = "left", halign = "left", bold = true}),
+        CenterContainer:new{dimen = Geom:new{w = value_text_w, h = height}, value_widget},
     }
+    local label = TapBox:new{dimen = Geom:new{w = label_w, h = height}, enabled = false}
+    label[1] = label_content
+
     local slider = SliderBar:new{
         dimen = Geom:new{w = slider_w, h = height},
         track_w = slider_w,
@@ -331,61 +482,94 @@ function Toolbar:_frontlight_row(root, setting, x, y, width, height)
         max = tonumber(setting.max) or 100,
         value = tonumber(setting.value) or 0,
         owner = self,
+        value_widget = value_widget,
         on_change = function(target)
-            local actual = target
-            if setting.on_set then
-                local ok, result = pcall(setting.on_set, target)
-                if not ok then
-                    logger.warn("[MiuRead][ReaderToolbar] frontlight change failed", tostring(result))
-                    return false
-                end
-                if result == false then return false end
-                if tonumber(result) then actual = tonumber(result) end
-            end
-            return actual
+            if type(setting.on_set) ~= "function" then return target end
+            local result = setting.on_set(target)
+            if result == false then return false end
+            return tonumber(result) or target
         end,
     }
-    self._brightness_slider = slider
+
+    local function adjust(callback, direction)
+        if type(callback) ~= "function" then return end
+        local ok, result = pcall(callback)
+        if not ok then
+            logger.warn("[MiuRead][ReaderToolbar] light step failed", tostring(direction), tostring(result))
+            return
+        end
+        if result ~= false then slider:setValue(tonumber(result) or slider.value, true) end
+    end
+
+    local minus = TapBox:new{
+        dimen = Geom:new{w = button_w, h = height}, enabled = enabled and type(setting.on_decrease) == "function",
+        callback = function() adjust(setting.on_decrease, "-") end,
+    }
+    minus[1] = circle_icon_button("minus", button_w, height, enabled)
+    local plus = TapBox:new{
+        dimen = Geom:new{w = button_w, h = height}, enabled = enabled and type(setting.on_increase) == "function",
+        callback = function() adjust(setting.on_increase, "+") end,
+    }
+    plus[1] = circle_icon_button("plus", button_w, height, enabled)
+
     root[#root + 1] = OffsetContainer:new{
         x_off = x, y_off = y,
         HorizontalGroup:new{
             align = "center",
-            label_tap,
-            HorizontalSpan:new{width = slider_pad},
+            label,
+            minus,
+            HorizontalSpan:new{width = gap},
             slider,
-            HorizontalSpan:new{width = slider_pad},
+            HorizontalSpan:new{width = gap},
+            plus,
         },
     }
+end
+
+function Toolbar:_device_row(root, entries, x, y, width, height)
+    entries = type(entries) == "table" and entries or {}
+    local count = math.max(1, #entries)
+    local cell_w = math.floor(width / count)
+    for index, entry in ipairs(entries) do
+        local cell_x = x + (index - 1) * cell_w
+        local actual_w = index == count and (x + width - cell_x) or cell_w
+        root[#root + 1] = OffsetContainer:new{
+            x_off = cell_x, y_off = y,
+            compact_action_item(entry, actual_w, height,
+                function(action, label) self:_activate(action, label) end),
+        }
+    end
 end
 
 function Toolbar:_build_content()
     local sw, sh = Screen:getWidth(), Screen:getHeight()
     local portrait = sw < sh
-    local side_pad = math.max(Skin.dp(14, 12, 23), math.floor(sw * .022))
+    local side_pad = math.max(Skin.dp(16, 13, 25), math.floor(sw * .025))
     local top_pad = Skin.dp(5, 4, 8)
-    local bottom_pad = Skin.dp(7, 6, 11)
-    local gap = Skin.dp(3, 2, 5)
+    local bottom_pad = Skin.dp(6, 5, 9)
     local content_w = math.max(1, sw - side_pad * 2)
-
-    local title_h = math.max(Skin.dp(33, 29, 44), math.floor(sh * (portrait and .031 or .044)))
-    local status_h = math.max(Skin.dp(20, 17, 27), math.floor(sh * (portrait and .018 or .026)))
-    local group_title_h = math.max(Skin.dp(18, 16, 24), math.floor(sh * (portrait and .017 or .024)))
-    local action_h = math.max(Skin.dp(61, 52, 79), math.floor(sh * (portrait and .057 or .075)))
-    local light_h = math.max(Skin.dp(34, 29, 44), math.floor(sh * (portrait and .031 or .044)))
     local divider_h = math.max(1, Skin.line("thin"))
 
-    local groups = type(self.opts.groups) == "table" and self.opts.groups or {}
-    local frontlight = type(self.opts.frontlight) == "table" and self.opts.frontlight or nil
-    local header = type(self.opts.header) == "table" and self.opts.header or {}
+    local status_h = math.max(Skin.dp(38, 33, 49), math.floor(sh * (portrait and .033 or .052)))
+    local title_h = math.max(Skin.dp(52, 44, 66), math.floor(sh * (portrait and .044 or .070)))
+    local chapter_h = math.max(Skin.dp(40, 34, 52), math.floor(sh * (portrait and .034 or .054)))
+    local content_h = math.max(Skin.dp(66, 56, 84), math.floor(sh * (portrait and .056 or .084)))
+    local typeset_h = math.max(Skin.dp(44, 38, 57), math.floor(sh * (portrait and .038 or .060)))
+    local light_h = math.max(Skin.dp(43, 37, 56), math.floor(sh * (portrait and .037 or .058)))
+    local device_h = math.max(Skin.dp(47, 40, 61), math.floor(sh * (portrait and .041 or .064)))
 
-    local panel_h = top_pad + title_h + status_h + gap + divider_h
-    for index, _ in ipairs(groups) do
-        panel_h = panel_h + group_title_h + action_h
-        if index < #groups then panel_h = panel_h + gap + divider_h + gap end
-    end
-    if frontlight then panel_h = panel_h + gap + divider_h + gap + light_h end
-    panel_h = panel_h + bottom_pad
-    panel_h = math.min(sh - Skin.dp(28, 24, 46), panel_h)
+    local header = type(self.opts.header) == "table" and self.opts.header or {}
+    local actions = type(self.opts.actions) == "table" and self.opts.actions or {}
+    local typeset = type(self.opts.typeset) == "table" and self.opts.typeset or {}
+    local frontlight = type(self.opts.frontlight) == "table" and self.opts.frontlight or nil
+    local warmth = type(self.opts.warmth) == "table" and self.opts.warmth or nil
+    local devices = type(self.opts.device_actions) == "table" and self.opts.device_actions or {}
+
+    local row_count = 5 + (frontlight and 1 or 0) + (warmth and 1 or 0) + (#devices > 0 and 1 or 0)
+    local panel_h = top_pad + status_h + title_h + chapter_h + content_h + typeset_h
+        + (frontlight and light_h or 0) + (warmth and light_h or 0) + (#devices > 0 and device_h or 0)
+        + divider_h * math.max(0, row_count - 1) + bottom_pad
+    panel_h = math.min(sh - Skin.dp(18, 15, 28), panel_h)
 
     self.dimen = Geom:new{x = 0, y = 0, w = sw, h = sh}
     self.panel_h = panel_h
@@ -401,35 +585,39 @@ function Toolbar:_build_content()
     }
 
     local y = top_pad
-    y = self:_header(root, header, side_pad, y, content_w, title_h, status_h)
-    y = y + gap
-    root[#root + 1] = OffsetContainer:new{x_off = side_pad, y_off = y, Skin.divider(content_w, (Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_GRAY), divider_h)}
-    y = y + divider_h
+    self:_top_status_row(root, header, side_pad, y, content_w, status_h)
+    y = y + status_h
+    self:_divider(root, side_pad, y, content_w, divider_h); y = y + divider_h
 
-    for index, group in ipairs(groups) do
-        root[#root + 1] = OffsetContainer:new{
-            x_off = side_pad, y_off = y,
-            Ui.textbox(tostring(group.title or ""), content_w, group_title_h,
-                Skin.face("smallinfofont", 7.2, 9.7, 6.1), {
-                    bold = true, alignment = "left", fgcolor = Blitbuffer.COLOR_DARK_GRAY,
-                }),
-        }
-        y = y + group_title_h
-        self:_action_row(root, group.actions or group.items, side_pad, y, content_w, action_h)
-        y = y + action_h
-        if index < #groups then
-            y = y + gap
-            root[#root + 1] = OffsetContainer:new{x_off = side_pad, y_off = y, Skin.divider(content_w, (Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_GRAY), divider_h)}
-            y = y + divider_h + gap
-        end
-    end
+    self:_title_row(root, header, side_pad, y, content_w, title_h)
+    y = y + title_h
+    self:_divider(root, side_pad, y, content_w, divider_h); y = y + divider_h
+
+    self:_chapter_row(root, header, side_pad, y, content_w, chapter_h)
+    y = y + chapter_h
+    self:_divider(root, side_pad, y, content_w, divider_h); y = y + divider_h
+
+    self:_content_row(root, actions, side_pad, y, content_w, content_h)
+    y = y + content_h
+    self:_divider(root, side_pad, y, content_w, divider_h); y = y + divider_h
+
+    self:_typeset_row(root, typeset, side_pad, y, content_w, typeset_h)
+    y = y + typeset_h
 
     if frontlight then
-        y = y + gap
-        root[#root + 1] = OffsetContainer:new{x_off = side_pad, y_off = y, Skin.divider(content_w, (Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_GRAY), divider_h)}
-        y = y + divider_h + gap
-        self:_frontlight_row(root, frontlight, side_pad, y, content_w, light_h)
+        self:_divider(root, side_pad, y, content_w, divider_h); y = y + divider_h
+        self:_light_row(root, frontlight, side_pad, y, content_w, light_h)
         y = y + light_h
+    end
+    if warmth then
+        self:_divider(root, side_pad, y, content_w, divider_h); y = y + divider_h
+        self:_light_row(root, warmth, side_pad, y, content_w, light_h)
+        y = y + light_h
+    end
+    if #devices > 0 then
+        self:_divider(root, side_pad, y, content_w, divider_h); y = y + divider_h
+        self:_device_row(root, devices, side_pad, y, content_w, device_h)
+        y = y + device_h
     end
 
     root[#root + 1] = OffsetContainer:new{

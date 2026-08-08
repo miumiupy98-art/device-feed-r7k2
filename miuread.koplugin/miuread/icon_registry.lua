@@ -48,6 +48,7 @@ local MAP = {
     ["⏻"] = "power", power = "power", quit = "power",
     ["↺"] = "restart", restart = "restart",
     rotate = "rotate", ["旋转"] = "rotate",
+    night = "night", warmth = "warmth", battery = "battery",
     ["full-refresh"] = "full-refresh",
     ["return"] = "return",
     ["ko-reader"] = "ko-reader", koreader = "ko-reader",

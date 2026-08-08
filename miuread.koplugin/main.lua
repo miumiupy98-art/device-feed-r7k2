@@ -7166,10 +7166,19 @@ end
 
 function Plugin:_reader_sync_summary()
     local label=tostring(self:progress_sync_label() or "")
-    if label:find("失败",1,true) then return "同步!",true end
-    if label:find("正在",1,true) or label:find("上传中",1,true) then return "同步⇅",false end
-    if label:find("未登录",1,true) or label:find("关闭",1,true) then return "同步○",false end
-    return "同步✓",false
+    if label:find("失败",1,true) or label:find("需要修复",1,true) or label:find("冲突",1,true) then
+        return label=="需要修复" and "同步需修复" or "同步失败",true
+    end
+    if label:find("正在",1,true) or label:find("上传中",1,true) or label:find("确认",1,true) then
+        return "同步中",false
+    end
+    if label:find("关闭",1,true) then return "同步关闭",false end
+    if label:find("未登录",1,true) then return "同步未登录",true end
+    if label:find("等待",1,true) or label:find("暂不处理",1,true) then return "同步待处理",false end
+    if label=="已同步" or label=="已上传并确认" or label=="已采用云端位置" or label=="使用本机位置" then
+        return "同步完成",false
+    end
+    return "同步已开启",false
 end
 
 function Plugin:_reader_battery_label()
@@ -7192,31 +7201,54 @@ function Plugin:_reader_toolbar_header(title)
     local wifi_label,wifi_alert=self:_reader_wifi_summary()
     local wifi_text=wifi_label
     if wifi_label=="Wi-Fi关" then wifi_text="Wi-Fi 已关闭"
-    elseif wifi_label=="Wi-Fi✓" then wifi_text="Wi-Fi 已连接"
-    elseif wifi_label=="Wi-Fi!" then wifi_text="Wi-Fi 未连接"
-    elseif wifi_label=="Wi-Fi" then wifi_text="Wi-Fi 状态未知" end
+    elseif wifi_label=="Wi-Fi✓" then wifi_text="Wi-Fi 已连"
+    elseif wifi_label=="Wi-Fi!" then wifi_text="Wi-Fi 未连"
+    elseif wifi_label=="Wi-Fi" then wifi_text="Wi-Fi 未知" end
 
+    local sync_text,sync_alert=self:_reader_sync_summary()
     local page=self:_reader_current_page()
-    local total=self.ui and self.ui.document and self.ui.document.info and tonumber(self.ui.document.info.number_of_pages) or nil
+    local total
+    local document=self.ui and self.ui.document or nil
+    if document and type(document.getPageCount)=="function" then
+        local ok,value=pcall(document.getPageCount,document)
+        if ok and tonumber(value) then total=tonumber(value) end
+    end
+    total=total or (document and document.info and tonumber(document.info.number_of_pages)) or nil
+
     local chapter=""
     local toc=self.ui and self.ui.toc or nil
     if toc and type(toc.getTocTitleByPage)=="function" and page then
         local ok,value=pcall(toc.getTocTitleByPage,toc,page)
         if ok and value then chapter=U.trim(tostring(value)) end
     end
-    local parts={tostring(title or "正在阅读")}
-    if chapter~="" then parts[#parts+1]=chapter end
-    if page and total and total>0 then parts[#parts+1]=tostring(math.floor(page+.5)).."/"..tostring(math.floor(total+.5)) end
+    if chapter=="" then chapter="当前章节" end
+
+    local progress_text=""
+    if page and total and total>0 then
+        progress_text=tostring(math.floor(page+.5)).." / "..tostring(math.floor(total+.5))
+    else
+        local percent=self:_reader_progress_percent()
+        progress_text=percent and (tostring(math.floor(percent+.5)).."%") or "阅读进度"
+    end
+
     local battery=self:_reader_battery_label()
     return {
-        title=table.concat(parts," · "),
+        title=tostring(title or "正在阅读"),
+        home_label="首页",
         home_callback=function() return self:return_to_miuread_home("reader surface") end,
         book_callback=function() return self:_show_reader_current_book_panel(function() self:show_reader_quick_panel() end) end,
-        more_callback=function() return self:show_reader_control_center("reading") end,
-        status_left=wifi_text,status_left_alert=wifi_alert,
+        wifi_label=wifi_text,wifi_alert=wifi_alert,
         wifi_callback=function() return self:_show_reader_wifi_quick_panel(function() self:show_reader_quick_panel() end) end,
         wifi_hold_callback=function() return self:_reader_wifi_settings(function() self:show_reader_quick_panel() end) end,
-        status_right=battery~="" and ("电量 "..battery) or "",
+        sync_label=sync_text,sync_alert=sync_alert,
+        sync_callback=function() return self:_show_reader_sync_panel(function() self:show_reader_quick_panel() end) end,
+        battery_label=battery,
+        more_label="更多",
+        more_callback=function() return self:show_reader_control_center("reading") end,
+        chapter_label=chapter,
+        chapter_callback=function() return self:_show_reader_toc(function() self:show_reader_quick_panel() end) end,
+        progress_label=progress_text,
+        progress_callback=function() return self:_show_reader_progress_control(function() self:show_reader_quick_panel() end) end,
     }
 end
 
@@ -8405,36 +8437,105 @@ function Plugin:show_reader_quick_panel()
     self:_mark_reader_busy(8)
     local title=self:_reader_toolbar_title()
     local definitions=self:_reader_quick_definitions()
-    local groups={
-        {title="阅读位置",actions={definitions.toc,definitions.progress,definitions.search,definitions.back}},
-        {title="阅读显示",actions={definitions.font,definitions.spacing,definitions.page,definitions.comments}},
-        {title="阅读记录",actions={definitions.bookmark,definitions.highlight,definitions.thought,definitions.sync}},
+
+    local actions={
+        definitions.search,
+        definitions.bookmark,
+        definitions.highlight,
+        definitions.thought,
+        definitions.comments,
     }
+
+    local typeset={
+        font={
+            label="字体",value=self:_reader_font_size_label(),
+            callback=function() self:_show_reader_font_panel(function() self:show_reader_quick_panel() end) end,
+            on_decrease=function()
+                if self:_reader_adjust_font_size(-1) then return self:_reader_font_size_label() end
+                return false
+            end,
+            on_increase=function()
+                if self:_reader_adjust_font_size(1) then return self:_reader_font_size_label() end
+                return false
+            end,
+        },
+        spacing={
+            label="行距",value=tostring(math.floor(self:_reader_line_spacing_value()+.5)).."%",
+            callback=function() self:_show_reader_spacing_panel(function() self:show_reader_quick_panel() end) end,
+            on_decrease=function()
+                if self:_reader_adjust_line_spacing(-5) then return tostring(math.floor(self:_reader_line_spacing_value()+.5)).."%" end
+                return false
+            end,
+            on_increase=function()
+                if self:_reader_adjust_line_spacing(5) then return tostring(math.floor(self:_reader_line_spacing_value()+.5)).."%" end
+                return false
+            end,
+        },
+        page={label="页面",callback=function() self:_show_reader_page_panel(function() self:show_reader_quick_panel() end) end},
+    }
+
     local frontlight
+    local warmth
     if Device:hasFrontlight() then
         local minimum,maximum=self:_reader_frontlight_bounds()
         frontlight={
-            min=minimum,max=maximum,value=self:_reader_frontlight_value() or minimum,
+            icon="frontlight",label="前光",min=minimum,max=maximum,value=self:_reader_frontlight_value() or minimum,
             on_set=function(value)
                 if not self:_reader_set_frontlight(value) then return false end
                 return self:_reader_frontlight_value() or value
             end,
-            on_toggle=function()
-                self:_reader_toggle_frontlight()
+            on_decrease=function()
+                if not self:_reader_adjust_frontlight(-1) then return false end
+                return self:_reader_frontlight_value() or minimum
+            end,
+            on_increase=function()
+                if not self:_reader_adjust_frontlight(1) then return false end
                 return self:_reader_frontlight_value() or minimum
             end,
         }
+        local state=self:_reader_warmth_state()
+        if state then
+            warmth={
+                icon="warmth",label="色温",min=state.min,max=state.max,value=state.value,
+                on_set=function(value)
+                    if not self:_reader_set_warmth(value) then return false end
+                    local current=self:_reader_warmth_state()
+                    return current and current.value or value
+                end,
+                on_decrease=function()
+                    if not self:_reader_adjust_warmth(-1) then return false end
+                    local current=self:_reader_warmth_state()
+                    return current and current.value or state.value
+                end,
+                on_increase=function()
+                    if not self:_reader_adjust_warmth(1) then return false end
+                    local current=self:_reader_warmth_state()
+                    return current and current.value or state.value
+                end,
+            }
+        end
     end
+
+    local device_actions={
+        {icon="night",label="夜间模式",active=self:_reader_night_enabled(),callback=function() self:_home_toggle_night() end},
+        {icon="rotate",label="旋转",callback=function() self:_home_rotate() end},
+        {icon="screenshot",label="截图",callback=function() ScreenshotMode.start(self) end},
+        {icon="full-refresh",label="全屏刷新",callback=function() self:_home_full_refresh(true) end},
+    }
+
     local panel,err=ReaderToolbar.show{
         header=self:_reader_toolbar_header(title),
-        groups=groups,
+        actions=actions,
+        typeset=typeset,
         frontlight=frontlight,
+        warmth=warmth,
+        device_actions=device_actions,
     }
     if not panel then
         logger.warn("[MiuRead][ReaderToolbar] unavailable",tostring(err or "unknown"))
         return false
     end
-    logger.info("[MiuRead][ReaderToolbar] opened grouped reader panel")
+    logger.info("[MiuRead][ReaderToolbar] opened ordered reader toolbar")
     return true
 end
 
