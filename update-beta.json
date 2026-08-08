@@ -1,17 +1,17 @@
 {
-  "version": "4.2.0-beta.5",
-  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 4.2.0-beta.5 \u5185\u6d4b\u7248",
+  "version": "4.2.0-beta.6",
+  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 4.2.0-beta.6 \u5185\u6d4b\u7248",
   "channel": "beta",
   "package_type": "full",
-  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.5/miuread-v4.2.0-beta.5-full.zip",
+  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.6/miuread-v4.2.0-beta.6-full.zip",
   "package_urls": [
-    "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.5/miuread-v4.2.0-beta.5-full.zip",
-    "https://ghfast.top/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.5/miuread-v4.2.0-beta.5-full.zip",
-    "https://gh-proxy.com/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.5/miuread-v4.2.0-beta.5-full.zip",
-    "https://ghproxy.net/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.5/miuread-v4.2.0-beta.5-full.zip"
+    "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.6/miuread-v4.2.0-beta.6-full.zip",
+    "https://ghfast.top/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.6/miuread-v4.2.0-beta.6-full.zip",
+    "https://gh-proxy.com/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.6/miuread-v4.2.0-beta.6-full.zip",
+    "https://ghproxy.net/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.2.0-beta.6/miuread-v4.2.0-beta.6-full.zip"
   ],
-  "size": 509135,
-  "sha256": "93a388a130b96a6344cfbcec043d601d14a05eebb0616c4fe6856bbec2a1135c",
-  "summary": "MiuRead v4.2.0-beta.5\n\u4fee\u590d: \u9605\u8bfb\u8fdb\u5ea6\u6309\u5b8c\u6574\u76ee\u5f55\u548c\u5f53\u524d\u7ae0\u8282\u6362\u7b97 \u5207\u4e66\u540e\u65e7\u540c\u6b65\u72b6\u6001\u4e0d\u4f1a\u5199\u56de\n\u4fee\u590d: \u540c\u6b65\u4fee\u590d\u589e\u52a0\u4e91\u7aef\u56de\u8bfb\u786e\u8ba4 \u672a\u786e\u8ba4\u7684\u4e0a\u4e0b\u6587\u4e0d\u4f1a\u4fdd\u5b58\n\u4f18\u5316: \u5df2\u751f\u6210\u4f46\u6279\u6ce8\u672a\u5b8c\u6574\u7684\u4e66\u53ef\u76f4\u63a5\u4fee\u590d \u4ec5\u8865\u7f3a\u5931\u5185\u5bb9\u5e76\u4fdd\u7559\u6b63\u6587",
-  "notes": "MiuRead v4.2.0-beta.5\n\u4fee\u590d: \u9605\u8bfb\u8fdb\u5ea6\u6309\u5b8c\u6574\u76ee\u5f55\u548c\u5f53\u524d\u7ae0\u8282\u6362\u7b97 \u5207\u4e66\u540e\u65e7\u540c\u6b65\u72b6\u6001\u4e0d\u4f1a\u5199\u56de\n\u4fee\u590d: \u540c\u6b65\u4fee\u590d\u589e\u52a0\u4e91\u7aef\u56de\u8bfb\u786e\u8ba4 \u672a\u786e\u8ba4\u7684\u4e0a\u4e0b\u6587\u4e0d\u4f1a\u4fdd\u5b58\n\u4f18\u5316: \u5df2\u751f\u6210\u4f46\u6279\u6ce8\u672a\u5b8c\u6574\u7684\u4e66\u53ef\u76f4\u63a5\u4fee\u590d \u4ec5\u8865\u7f3a\u5931\u5185\u5bb9\u5e76\u4fdd\u7559\u6b63\u6587"
+  "size": 513760,
+  "sha256": "cfdfe2aaefb607d207526b772777db868678fb6a7726f942c67b54c5b69ed86d",
+  "summary": "MiuRead v4.2.0-beta.6\n\u4fee\u590d: \u9605\u8bfb\u65f6\u540e\u53f0\u4e0b\u8f7d\u6682\u505c\u73b0\u5728\u4f1a\u771f\u6b63\u4f5c\u7528\u5230\u4e0b\u8f7d\u8fdb\u7a0b\n\u4f18\u5316: \u8bc4\u8bba\u7a97\u53e3\u9996\u5c4f\u4f18\u5148 \u540e\u7eed\u5206\u9875\u6309\u9700\u751f\u6210\n\u65b0\u589e: \u8f7b\u91cf\u6a21\u5f0f\u548c\u5361\u987f\u68c0\u6d4b \u4f4e\u5185\u5b58\u6a21\u5f0f\u66f4\u540d\u4e3a\u4f4e\u5185\u5b58\u4fdd\u62a4",
+  "notes": "MiuRead v4.2.0-beta.6\n\u4fee\u590d: \u9605\u8bfb\u65f6\u540e\u53f0\u4e0b\u8f7d\u6682\u505c\u73b0\u5728\u4f1a\u771f\u6b63\u4f5c\u7528\u5230\u4e0b\u8f7d\u8fdb\u7a0b\n\u4f18\u5316: \u8bc4\u8bba\u7a97\u53e3\u9996\u5c4f\u4f18\u5148 \u540e\u7eed\u5206\u9875\u6309\u9700\u751f\u6210\n\u65b0\u589e: \u8f7b\u91cf\u6a21\u5f0f\u548c\u5361\u987f\u68c0\u6d4b \u4f4e\u5185\u5b58\u6a21\u5f0f\u66f4\u540d\u4e3a\u4f4e\u5185\u5b58\u4fdd\u62a4"
 }
