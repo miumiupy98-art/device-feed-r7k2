@@ -658,6 +658,12 @@ end
 
 function Plugin:list(title,items,empty)
     if not items or #items==0 then self:info(empty or _("No items")); return end
+    -- When MiuRead home owns the foreground, keep MiuRead-origin lists inside
+    -- the MiuRead visual language. Native KOReader lists are still used in
+    -- ReaderUI/FileManager contexts and for genuinely native system pages.
+    if HomeView.is_shown() and not self:_active_reader_ui() then
+        return self:_show_standalone_menu(title,items)
+    end
     for _, item in ipairs(items) do
         if type(item)=="table" and (item.sub_item_table_func or item.sub_item_table) then
             return self:_show_standalone_menu(title,items)
@@ -970,6 +976,33 @@ function Plugin:on_auth_replacing(_old_auth,_new_auth)
 end
 
 function Plugin:show_account_status()
+    if HomeView.is_shown() and not self:_active_reader_ui() then
+        local auth=self.store:auth()
+        local health=self:_auth_health(); self:_recompute_auth_health(health)
+        local account=type(auth.account)=="table" and auth.account or {}
+        local name=U.trim(tostring(account.name or ""))
+        local rows={
+            {text="账号",post_text=name~="" and name or "—",enabled=false},
+            {text="基础登录",post_text=self:logged_in() and "正常" or "尚未登录",enabled=false},
+        }
+        if self:logged_in() then
+            local online_label=health.state=="ok" and "全部正常" or (health.state=="partial" and "部分暂时异常" or "等待实际使用验证")
+            rows[#rows+1]={text="在线功能",post_text=online_label,enabled=false}
+            for _,channel in ipairs(AUTH_CHANNEL_ORDER) do
+                rows[#rows+1]={text=AUTH_CHANNEL_LABELS[channel],post_text=account_channel_text((health.channels or {})[channel]),enabled=false}
+            end
+            rows[#rows+1]={text="最后检查",post_text=self:_relative_time(health.last_checked_at),enabled=false}
+            rows[#rows+1]={text="账号操作",separator=true,enabled=false}
+            rows[#rows+1]={text="重新检查状态",callback=function() self:check_account_status() end}
+            rows[#rows+1]={text="重新扫码登录",callback=function() self.auth_flow:start() end}
+            rows[#rows+1]={text="退出登录",callback=function() self:confirm_logout() end}
+        else
+            rows[#rows+1]={text="账号操作",separator=true,enabled=false}
+            rows[#rows+1]={text="扫码登录",callback=function() self.auth_flow:start() end}
+        end
+        return self:_show_miuread_menu("账号状态",rows,{page_size=7})
+    end
+
     local dialog
     local buttons={}
     if self:logged_in() then
@@ -985,6 +1018,7 @@ function Plugin:show_account_status()
     dialog=ButtonDialog:new{title=self:_account_details_text(),title_align="left",buttons=buttons}
     UIManager:show(dialog)
 end
+
 function Plugin:on_auth_success(name)
     self._auth_transitioning=false
     local health=self:_auth_health()
@@ -3518,23 +3552,14 @@ function Plugin:download_reader_policy_menu()
 end
 
 function Plugin:show_home_layout_dialog()
-    local dialog
     local home=self:_home_preferences()
-    local current=home.layout_style=="compact" and "紧凑布局" or "标准布局"
     local function choose(style)
-        if dialog then UIManager:close(dialog) end
         self:_set_home_layout(style)
     end
-    dialog=ButtonDialog:new{
-        title="页面布局 · 当前："..current,
-        title_align="center",
-        buttons={
-            {{text=(home.layout_style~="compact" and "✓ " or "").."标准布局",callback=function() choose("desk") end}},
-            {{text=(home.layout_style=="compact" and "✓ " or "").."紧凑布局",callback=function() choose("compact") end}},
-            {{text="关闭",callback=function() UIManager:close(dialog) end}},
-        },
-    }
-    UIManager:show(dialog)
+    return self:_show_standalone_menu("页面布局",{
+        {text="标准布局",radio=true,checked_func=function() return home.layout_style~="compact" end,callback=function() choose("desk") end},
+        {text="紧凑布局",radio=true,checked_func=function() return home.layout_style=="compact" end,callback=function() choose("compact") end},
+    })
 end
 
 function Plugin:_home_close_to_native(show_notice)
@@ -3578,9 +3603,115 @@ function Plugin:_home_leave_and_run(reason,callback)
     else UIManager:scheduleIn(.05,runner) end
 end
 
+function Plugin:_show_miuread_menu(title,items,options)
+    options=options or {}
+    items=type(items)=="table" and items or {}
+    if #items==0 then self:info("没有可用选项"); return nil end
+
+    local function build_rows()
+        local rows={}
+        for _,entry in ipairs(items) do
+            local source=entry
+            local enabled=source.enabled~=false
+            if type(source.enabled_func)=="function" then
+                local ok,value=pcall(source.enabled_func)
+                enabled=ok and value~=false
+            end
+            local label=""
+            if type(source.text_func)=="function" then
+                local ok,value=pcall(source.text_func)
+                label=ok and tostring(value or "") or ""
+            else
+                label=tostring(source.text or "")
+            end
+            local checked=false
+            if type(source.checked_func)=="function" then
+                local ok,value=pcall(source.checked_func)
+                checked=ok and value==true
+            end
+            if checked then label=(source.radio==true and "● " or "✓ ")..label end
+
+            local value=source.post_text
+            if type(value)=="function" then
+                local ok,result=pcall(value)
+                value=ok and result or ""
+            end
+            value=tostring(value or "")
+
+            local row={
+                label=label,
+                value=value,
+                detail=tostring(source.detail or ""),
+                enabled=enabled,
+                checked=checked,
+                bold=source.separator==true or source.heading==true,
+                arrow=false,
+            }
+            local icon_key=source.icon_key or source.icon
+            if icon_key and tostring(icon_key)~="" then row.icon=tostring(icon_key) end
+
+            if source.sub_item_table_func or source.sub_item_table then
+                row.arrow=true
+                row.callback=function()
+                    local child=source.sub_item_table
+                    if type(source.sub_item_table_func)=="function" then
+                        local ok,value=xpcall(source.sub_item_table_func,debug.traceback)
+                        if not ok then self:info("这个入口暂时无法打开。\n\n"..tostring(value)); return end
+                        child=value
+                    end
+                    local child_options=U.copy(options)
+                    child_options.on_back=function()
+                        self:_show_miuread_menu(title,items,options)
+                    end
+                    child_options.on_close=nil
+                    self:_show_miuread_menu(tostring(source.text or title),child,child_options)
+                end
+            elseif type(source.callback)=="function" then
+                row.arrow=source.keep_menu_open~=true
+                row.keep_open=source.keep_menu_open==true
+                row.callback=function(...)
+                    logger.info("[MiuRead][Menu] MiuRead item tapped",tostring(source.text or ""))
+                    local args={...}
+                    local ok,err=xpcall(function() return source.callback(unpack_args(args)) end,debug.traceback)
+                    if not ok then
+                        logger.warn("[MiuRead][Menu] MiuRead action failed",tostring(source.text or ""),tostring(err))
+                        self:info("这个入口暂时无法打开。\n\n"..tostring(err))
+                    end
+                end
+            end
+            rows[#rows+1]=row
+        end
+        return rows
+    end
+
+    local on_back=options.on_back or options.on_close
+    local on_home=options.on_home
+    if on_home==nil and HomeView.is_shown() then
+        on_home=function()
+            if HomeView.is_shown() then HomeView.raise(true) end
+        end
+    end
+    local dialog,err=ReaderListDialog.show{
+        title=tostring(title or "觅阅"),
+        subtitle=tostring(options.subtitle or ""),
+        items=build_rows,
+        page_size=tonumber(options.page_size) or 7,
+        on_back=on_back,
+        on_home=on_home,
+    }
+    if not dialog then
+        logger.warn("[MiuRead][Menu] custom list unavailable",tostring(err or "unknown"))
+    end
+    return dialog
+end
+
 function Plugin:_show_standalone_menu(title,items,options)
     options=options or {}
     items=type(items)=="table" and items or {}
+    if options.force_native~=true and options.native_input~=true
+        and HomeView.is_shown() and not self:_active_reader_ui() then
+        return self:_show_miuread_menu(title,items,options)
+    end
     if options.reader_context==true and type(options.on_home)=="function"
         and not (items[1] and items[1]._miuread_reader_home==true) then
         local navigable={{
@@ -3893,13 +4024,21 @@ function Plugin:_home_status_line()
     local ok_network,NetworkMgr=pcall(require,"ui/network/manager")
     if ok_network and NetworkMgr and type(NetworkMgr.isWifiOn)=="function" then
         local ok,value=pcall(NetworkMgr.isWifiOn,NetworkMgr)
-        if ok then parts[#parts+1]=value==true and "Wi-Fi" or "离线" end
+        if ok then
+            if value==true then
+                -- The first row should answer the useful question directly:
+                -- which network is connected, not merely whether Wi-Fi is on.
+                parts[#parts+1]=self:_reader_current_wifi_name(16) or "Wi-Fi"
+            else
+                parts[#parts+1]="离线"
+            end
+        end
     end
     local device=HomeData.device_state()
     if tonumber(device.battery) then
         parts[#parts+1]=tostring(math.floor(tonumber(device.battery)+.5)).."%"
     end
-    return table.concat(parts,"  ")
+    return table.concat(parts,"  ·  ")
 end
 
 function Plugin:_schedule_home_startup(delay)
@@ -4582,40 +4721,40 @@ function Plugin:_home_all_books_option_dialog()
     local source_labels={all="全部来源",account="微信书架",generated="已下载",["local"]="本地书籍",mp="公众号"}
     local status_labels={all="全部状态",reading="阅读中",unread="尚未开始",finished="已读完",downloaded="已下载",failed="异常"}
     local sort_labels={recent="最近阅读",added="最近加入",title="按书名",author="按作者"}
-    local dialog
-    local function choose(title,choices,key,labels)
-        local chooser
+
+    local function apply_choice(key,value)
+        state[key]=value
+        self:_home_close_full_shelf()
+        UIManager:scheduleIn(.05,function() self:show_home_all_books() end)
+    end
+    local function choice_rows(key,choices,labels)
         local rows={}
         for _,value in ipairs(choices) do
-            local selected=state[key]==value
-            rows[#rows+1]={{text=(selected and "● " or "")..labels[value],callback=function()
-                UIManager:close(chooser)
-                state[key]=value
-                self:_home_close_full_shelf()
-                UIManager:scheduleIn(.05,function() self:show_home_all_books() end)
-            end}}
+            local choice_value=value
+            rows[#rows+1]={
+                text=labels[choice_value],radio=true,checked_func=function() return state[key]==choice_value end,
+                callback=function() apply_choice(key,choice_value) end,
+            }
         end
-        rows[#rows+1]={{text="返回",callback=function() UIManager:close(chooser) end}}
-        chooser=ButtonDialog:new{title=title,title_align="center",buttons=rows}
-        UIManager:show(chooser)
+        return rows
     end
-    dialog=ButtonDialog:new{title="筛选与排序",title_align="center",buttons={
-        {{text="来源："..source_labels[state.source],callback=function()
-            UIManager:close(dialog); choose("选择来源",{"all","account","generated","local","mp"},"source",source_labels)
-        end}},
-        {{text="状态："..status_labels[state.status],callback=function()
-            UIManager:close(dialog); choose("选择阅读状态",{"all","reading","unread","finished","downloaded","failed"},"status",status_labels)
-        end}},
-        {{text="排序："..sort_labels[state.sort],callback=function()
-            UIManager:close(dialog); choose("选择排序",{"recent","added","title","author"},"sort",sort_labels)
-        end}},
-        {{text="恢复默认",callback=function()
-            UIManager:close(dialog); self._home_all_books_options={source="all",status="all",sort="recent"}
-            self:_home_close_full_shelf(); UIManager:scheduleIn(.05,function() self:show_home_all_books() end)
-        end}},
-        {{text="关闭",callback=function() UIManager:close(dialog) end}},
-    }}
-    UIManager:show(dialog)
+
+    return self:_show_standalone_menu("筛选与排序",{
+        {text="来源",post_text=source_labels[state.source],sub_item_table_func=function()
+            return choice_rows("source",{"all","account","generated","local","mp"},source_labels)
+        end},
+        {text="状态",post_text=status_labels[state.status],sub_item_table_func=function()
+            return choice_rows("status",{"all","reading","unread","finished","downloaded","failed"},status_labels)
+        end},
+        {text="排序",post_text=sort_labels[state.sort],sub_item_table_func=function()
+            return choice_rows("sort",{"recent","added","title","author"},sort_labels)
+        end},
+        {text="恢复默认",post_text="全部来源 · 全部状态 · 最近阅读",callback=function()
+            self._home_all_books_options={source="all",status="all",sort="recent"}
+            self:_home_close_full_shelf()
+            UIManager:scheduleIn(.05,function() self:show_home_all_books() end)
+        end},
+    })
 end
 
 function Plugin:show_home_all_books()
@@ -6565,7 +6704,7 @@ function Plugin:show_home_quick_panel(more_expanded)
         if ok then wifi_on=value==true end
     end
     local wifi_detail
-    local wifi_name=wifi_on==true and self:_reader_current_wifi_name(18) or nil
+    local wifi_name=wifi_on==true and self:_reader_current_wifi_name(11) or nil
     if wifi_on==nil then wifi_detail="状态未知"
     elseif wifi_on~=true then wifi_detail="已关闭"
     elseif wifi_name then wifi_detail=wifi_name
@@ -11882,6 +12021,17 @@ function Plugin:_clear_cover_cache()
 end
 function Plugin:show_download_cleanup_dialog()
     if self:_cache_action_blocked() then return end
+    if HomeView.is_shown() and not self:_active_reader_ui() then
+        return ActionSheet.show{
+            title="清理下载与缓存",
+            subtitle="只清理缓存和未完成文件，不删除书籍与阅读记录",
+            actions={
+                {icon="repair",label="清理下载断点与临时文件",detail="保留已完成书籍",callback=function() self:_clear_download_residue() end},
+                {icon="image",label="清理封面缓存",detail="下次进入书架时按需重新下载",callback=function() self:_clear_cover_cache() end},
+            },
+            footer_action={label="取消",callback=function() end},
+        }
+    end
     local dialog
     dialog=ButtonDialog:new{title="清理下载与缓存",title_align="center",buttons={
         {{text="清理下载断点与临时文件",callback=function() UIManager:close(dialog); self:_clear_download_residue() end}},
@@ -11921,6 +12071,10 @@ function Plugin:show_downloads(back_callback)
             local book_id=tostring(b.book_id)
             items[#items+1]={text=b.title or book_id,post_text=table.concat(labels," · "),callback=function() self:downloaded_book_menu(book_id) end}
         end
+    end
+    if HomeView.is_shown() and not self:_active_reader_ui() then
+        self._downloads_menu=nil
+        return self:_show_miuread_menu("下载管理",items,{on_back=back_callback,page_size=7})
     end
     local menu=Menu:new{title="下载管理",item_table=items,is_borderless=true,title_bar_fm_style=true}
     self._downloads_menu=menu
@@ -12030,6 +12184,10 @@ function Plugin:downloaded_book_menu(book_ref)
     end
     if #items==0 then self:toast("本书没有可管理的下载内容"); self:show_downloads(); return end
     if self._download_book_menu then pcall(function() UIManager:close(self._download_book_menu) end) end
+    if HomeView.is_shown() and not self:_active_reader_ui() then
+        self._download_book_menu=nil
+        return self:_show_miuread_menu(b.title or book_id,items,{on_back=function() self:show_downloads() end,page_size=7})
+    end
     local menu=Menu:new{title=b.title or book_id,item_table=items,is_borderless=true,title_bar_fm_style=true}
     self._download_book_menu=menu
     UIManager:show(menu)
@@ -12507,6 +12665,26 @@ function Plugin:show_sync_status(detail)
     elseif type(s.last_error)=="string" and (tonumber(s.consecutive_failures) or 0)>=1 then time_text="需要修复同步"
     elseif s.state=="uploading" then time_text="正在同步"
     else time_text="运行中" end
+
+    if HomeView.is_shown() and not self:_active_reader_ui() then
+        local rows={
+            {text="阅读时间",post_text=time_text,enabled=false},
+            {text="阅读进度",post_text=self:progress_sync_label(),enabled=false},
+            {text="当前位置",post_text=local_text,enabled=false},
+        }
+        if remote then rows[#rows+1]={text="云端位置",post_text=tostring(remote).."%",enabled=false} end
+        rows[#rows+1]={text="上次同步",post_text=self:_relative_time(s.last_upload),enabled=false}
+        if detail then
+            rows[#rows+1]={text="详细信息",separator=true,enabled=false}
+            rows[#rows+1]={text="后台服务版本",post_text=tostring(s.service_version or "—"),enabled=false}
+            if s.last_elapsed then rows[#rows+1]={text="上次提交时长",post_text=tostring(s.last_elapsed).." 秒",enabled=false} end
+            if s.last_stage then rows[#rows+1]={text="当前阶段",post_text=U.first_line(s.last_stage,80),enabled=false} end
+            if s.last_error then rows[#rows+1]={text="最近错误",post_text=U.first_line(s.last_error,80),enabled=false} end
+            if s.last_http_code then rows[#rows+1]={text="HTTP",post_text=tostring(s.last_http_code),enabled=false} end
+        end
+        return self:_show_miuread_menu("阅读同步状态",rows,{page_size=7})
+    end
+
     local lines={"阅读同步","","阅读时间："..time_text,"阅读进度："..self:progress_sync_label(),"当前位置："..local_text}
     if remote then lines[#lines+1]="云端位置："..remote.."%" end
     lines[#lines+1]="上次同步："..self:_relative_time(s.last_upload)

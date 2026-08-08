@@ -803,10 +803,13 @@ function HomeWidget:onHomeShelfSwipe(_,ges)
 end
 
 function HomeWidget:_build_header(children, m)
-    local menu_w = math.max(UiScale.dp(64, 58, 88), math.min(UiScale.dp(84, 68, 100), math.floor(m.content_w * .11)))
-    local title_w = math.max(UiScale.dp(78, 72, 108), math.min(UiScale.dp(108, 86, 126), math.floor(m.content_w * .14)))
-    local account_w = math.max(UiScale.dp(118, 108, 190), math.min(UiScale.dp(210, 150, 250), math.floor(m.content_w * .25)))
-    local gap = math.max(5, math.floor(m.content_w * .009))
+    -- Give the live status strip enough room for time + connected SSID + battery.
+    -- Account and menu remain easy to tap, but no longer consume a quarter of
+    -- the first row at the expense of the network name.
+    local menu_w = math.max(UiScale.dp(56, 50, 76), math.min(UiScale.dp(72, 62, 88), math.floor(m.content_w * .085)))
+    local title_w = math.max(UiScale.dp(76, 70, 102), math.min(UiScale.dp(102, 84, 118), math.floor(m.content_w * .125)))
+    local account_w = math.max(UiScale.dp(104, 94, 160), math.min(UiScale.dp(176, 132, 214), math.floor(m.content_w * .205)))
+    local gap = math.max(4, math.floor(m.content_w * .007))
     local status_w = math.max(1, m.content_w - title_w - account_w - menu_w - gap * 3)
     local header = HorizontalGroup:new{
         align = "center",
@@ -817,12 +820,12 @@ function HomeWidget:_build_header(children, m)
         }},
         HorizontalSpan:new{width = gap},
         tappable(status_w, m.header_h, Ui.textbox(tostring(self.opts.status_line or ""),
-            status_w, m.header_h, face("smallinfofont", 10, 14), {
+            status_w, m.header_h, face("smallinfofont", 10.6, 14.6), {
                 bold = true, alignment = "right", halign = "right", fgcolor = Blitbuffer.COLOR_BLACK,
             }), self.opts.on_quick_panel),
         HorizontalSpan:new{width = gap},
         tappable(account_w, m.header_h, Ui.textbox(tostring(self.opts.account_name or "账户"),
-            account_w, m.header_h, face("smallinfofont", 10, 14), {
+            account_w, m.header_h, face("smallinfofont", 10.2, 14.2), {
                 bold = true, alignment = "right", halign = "right", fgcolor = Blitbuffer.COLOR_BLACK,
             }), self.opts.on_account),
         HorizontalSpan:new{width = gap},

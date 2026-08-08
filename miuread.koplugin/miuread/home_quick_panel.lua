@@ -117,40 +117,40 @@ local function panel_button(entry, width, height, close_callback, compact)
     local detail = tostring(entry.detail or "")
     local icon = tostring(entry.icon_key or entry.icon or "")
     local enabled = entry.enabled ~= false
-    local pad = UiScale.dp(compact and 4 or 5, 3, 8)
+    local has_detail = detail ~= ""
+    local pad = UiScale.dp(compact and 3 or 4, 2, 6)
     local inner_w = math.max(1, width - pad * 2)
-    local gap_h = UiScale.dp(4, 3, 7)
-    local icon_slot_h = UiScale.dp(compact and 38 or 42, compact and 34 or 38, compact and 50 or 56)
-    local label_slot_h = UiScale.dp(compact and 25 or 27, compact and 22 or 24, compact and 33 or 36)
-    local detail_slot_h = UiScale.dp(compact and 21 or 23, compact and 19 or 21, compact and 28 or 31)
-    local icon_size = UiScale.dp(compact and 30 or 33, compact and 27 or 30, compact and 40 or 44)
+    local gap_h = UiScale.dp(3, 2, 5)
+    local icon_slot_h = UiScale.dp(compact and 34 or 38, compact and 30 or 34, compact and 44 or 50)
+    local label_slot_h = UiScale.dp(compact and 31 or 34, compact and 27 or 30, compact and 40 or 44)
+    local detail_slot_h = has_detail and UiScale.dp(compact and 20 or 22, compact and 18 or 20, compact and 26 or 29) or 0
+    local icon_size = UiScale.dp(compact and 27 or 30, compact and 24 or 27, compact and 35 or 39)
 
     local content = VerticalGroup:new{
         align = "center",
         Ui.icon(icon, inner_w, icon_slot_h, icon_size, {
             icon_key = icon,
             icon_path = entry.icon_path,
-            face = UiScale.iconFace("cfont", compact and 24 or 27, compact and 32 or 36, compact and 20 or 22),
+            face = UiScale.iconFace("cfont", compact and 22 or 25, compact and 29 or 33, compact and 18 or 20),
             fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
         }),
         VerticalSpan:new{height = gap_h},
         Ui.textbox(label, inner_w, label_slot_h,
-            face("smallinfofont", compact and 12.4 or 13.2, compact and 16.5 or 18), {
+            face("smallinfofont", compact and 11.6 or 12.3, compact and 14.8 or 16.0, compact and 10.1 or 10.7), {
                 bold = true, alignment = "center", halign = "center",
                 height_overflow_show_ellipsis = true,
                 fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
             }),
-        Ui.textbox(detail, inner_w, detail_slot_h,
-            face("smallinfofont", compact and 10.2 or 10.8, compact and 14 or 15), {
+    }
+    if has_detail then
+        content[#content + 1] = Ui.textbox(detail, inner_w, detail_slot_h,
+            face("smallinfofont", compact and 9.2 or 9.8, compact and 12.0 or 12.8, compact and 8.0 or 8.5), {
                 alignment = "center", halign = "center",
                 height_overflow_show_ellipsis = true,
                 fgcolor = enabled and Blitbuffer.COLOR_DARK_GRAY or Blitbuffer.COLOR_GRAY,
-            }),
-    }
+            })
+    end
 
-    -- Keep the entire third-column cell tappable, but do not draw a card
-    -- around every action. The pull-down panel should read as a control surface,
-    -- not as a wall of small boxed buttons.
     local surface = fixed_frame(width, height, {
         bordersize = 0,
         padding = pad,
@@ -222,21 +222,17 @@ function QuickPanelWidget:_build()
     local scale = UiScale.metrics()
     local sw, sh = scale.sw, scale.sh
     local margin = math.max(UiScale.dp(11, 9, 18), math.floor(scale.short * .018))
-    local gap = UiScale.dp(8, 6, 13)
+    local gap = UiScale.dp(6, 5, 10)
     local buttons = type(self.opts.buttons) == "table" and self.opts.buttons or {}
     local line = UiScale.line("thin")
 
-    -- Three fixed columns preserve spatial memory and give labels/icons enough
-    -- room on Kindle. Custom layouts simply add rows up to the existing 12-item
-    -- limit instead of shrinking everything back into six tiny columns.
-    local preferred_columns = 3
-    local min_button_w = UiScale.dp(132, 112, 176)
-    local possible_columns = math.max(1, math.floor((sw - margin * 2 + gap) / (min_button_w + gap)))
-    local columns = math.max(1, math.min(preferred_columns, possible_columns))
+    -- Keep the default six controls on one row. Custom layouts use the same
+    -- six-column grid, so 7–12 controls simply add a second row.
+    local columns = 6
     local rows = #buttons > 0 and math.ceil(math.min(#buttons, 12) / columns) or 0
 
     local title_h = UiScale.dp(52, 47, 70)
-    local button_h = UiScale.dp(104, 94, 136)
+    local button_h = UiScale.dp(98, 90, 128)
     local footer_h = (self.opts.on_customize or self.opts.on_tools) and UiScale.dp(48, 43, 64) or 0
     local status_h = (self.opts.status_text and self.opts.status_text ~= "") and UiScale.dp(34, 30, 46) or 0
 
