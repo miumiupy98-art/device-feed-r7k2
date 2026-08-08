@@ -60,6 +60,7 @@ local Cookies=require("miuread.cookies")
 local Thoughts=require("miuread.thoughts")
 local ThoughtNativePopup=require("miuread.thought_native_popup")
 local ReaderToolbar=require("miuread.reader_toolbar")
+local ReaderControlCenter=require("miuread.reader_control_center")
 local ReaderProgressDialog=require("miuread.reader_progress_dialog")
 local ReaderSettingsDialog=require("miuread.reader_settings_dialog")
 local ReaderTocDialog=require("miuread.reader_toc_dialog")
@@ -1126,27 +1127,37 @@ function Plugin:reader_menu()
     local current_path=self:_current_document_path()
     local mp_context=self.mp and self.mp:identify_path(current_path) or nil
     if mp_context then
-        return {
+        local desktop=self:_home_enabled()
+        local out={
             {text="返回文章列表",callback=self:safe("mp-back",function() self:open_mp_account_by_id(mp_context.bookId,mp_context.account_title) end)},
             {text="上一篇",callback=self:safe("mp-prev",function() self:open_mp_neighbor(-1) end)},
             {text="下一篇",callback=self:safe("mp-next",function() self:open_mp_neighbor(1) end)},
             {text="当前文章",sub_item_table_func=function() return self:current_mp_article_menu(mp_context) end},
-            {text=self:_download_menu_text(),callback=function() self:show_downloads() end},
-            {text="觅阅设置",sub_item_table_func=function() return self:settings_menu() end},
-            {text="KOReader 菜单",callback=function() self:_show_koreader_reader_menu() end},
         }
+        if desktop then out[#out+1]={text="全部阅读功能",callback=function() self:show_reader_control_center("reading") end} end
+        out[#out+1]={text=self:_download_menu_text(),callback=function() self:show_downloads() end}
+        out[#out+1]={text="觅阅设置",sub_item_table_func=function() return self:settings_menu() end}
+        if not desktop then out[#out+1]={text="KOReader 菜单",callback=function() self:_show_koreader_reader_menu() end} end
+        return out
     end
-    return {
-        {text=self:_home_enabled() and "退出阅读并返回觅阅主页" or "返回书架",callback=self:safe("shelf",function()
-            if self:_home_enabled() then self:return_to_miuread_home()
+    local desktop=self:_home_enabled()
+    local out={
+        {text=desktop and "退出阅读并返回觅阅主页" or "返回书架",callback=self:safe("shelf",function()
+            if desktop then self:return_to_miuread_home()
             else self:show_shelf(false,false,"account") end
         end)},
-        {text="当前书籍",sub_item_table_func=function() return self:current_book_menu() end},
-        {text=self:_sync_menu_text(),sub_item_table_func=function() return self:sync_menu() end},
-        {text=self:_download_menu_text(),callback=function() self:show_downloads() end},
-        {text="觅阅设置",sub_item_table_func=function() return self:settings_menu() end},
-        {text="KOReader 菜单",callback=function() self:_show_koreader_reader_menu() end},
     }
+    if desktop then
+        out[#out+1]={text="全部阅读功能",callback=function() self:show_reader_control_center("reading") end}
+    end
+    out[#out+1]={text="当前书籍",sub_item_table_func=function() return self:current_book_menu() end}
+    out[#out+1]={text=self:_sync_menu_text(),sub_item_table_func=function() return self:sync_menu() end}
+    out[#out+1]={text=self:_download_menu_text(),callback=function() self:show_downloads() end}
+    out[#out+1]={text="觅阅设置",sub_item_table_func=function() return self:settings_menu() end}
+    if not desktop then
+        out[#out+1]={text="KOReader 菜单",callback=function() self:_show_koreader_reader_menu() end}
+    end
+    return out
 end
 
 function Plugin:account_menu()
@@ -3385,15 +3396,15 @@ function Plugin:_reader_preferences()
     local changed=false
     if reader.enabled==nil then reader.enabled=true; changed=true end
     if reader.plugin_mode_enabled~=false then reader.plugin_mode_enabled=false; changed=true end
-    -- beta.10 keeps the reading surface completely clean while the panel is hidden.
-    -- Book/device status exists only inside the transient top control center.
+    -- beta.11 keeps the reading surface completely clean while the panel is hidden.
+    -- All reader controls live in the transient quick panel or the complete MiuRead menu.
     if reader.show_title~=false then reader.show_title=false; changed=true end
     if reader.show_status~=false then reader.show_status=false; changed=true end
     if reader.show_recent~=false then reader.show_recent=false; changed=true end
     if type(reader.recent_actions)~="table" or #reader.recent_actions>0 then reader.recent_actions={}; changed=true end
 
-    local fixed_order={"toc","progress","font","comments","search"}
-    local fixed_items={toc=true,progress=true,font=true,comments=true,search=true}
+    local fixed_order={"toc","progress","font","page","comments","search","bookmark","back","rotation","screenshot"}
+    local fixed_items={toc=true,progress=true,font=true,page=true,comments=true,search=true,bookmark=true,back=true,rotation=true,screenshot=true}
     local order_ok=type(reader.quick_order)=="table" and #reader.quick_order==#fixed_order
     if order_ok then
         for index,key in ipairs(fixed_order) do
@@ -3411,8 +3422,8 @@ function Plugin:_reader_preferences()
         end
         if count~=#fixed_order then items_ok=false end
     end
-    if tonumber(reader.quick_layout_version)~=9 or not order_ok or not items_ok then
-        reader.quick_layout_version=9
+    if tonumber(reader.quick_layout_version)~=10 or not order_ok or not items_ok then
+        reader.quick_layout_version=10
         reader.quick_order=U.copy(fixed_order)
         reader.quick_items=U.copy(fixed_items)
         changed=true
@@ -6888,18 +6899,6 @@ function Plugin:_show_reader_toc(back_callback)
     return false
 end
 
-function Plugin:_show_reader_typeset_menu(back_callback)
-    local ui=self.ui
-    if not (ui and type(ui.handleEvent)=="function") then
-        self:info("当前文档暂时无法打开 KOReader 高级排版")
-        return false
-    end
-    self:_mark_reader_busy(6)
-    return self:_reader_open_native_page("KOReader 高级排版",function()
-        ui:handleEvent(Event:new("ShowConfigMenu"))
-        return true
-    end,back_callback or function() self:_show_reader_font_panel() end)
-end
 function Plugin:_reader_line_spacing_value()
     local ui=self.ui
     local font=ui and ui.font or nil
@@ -6979,9 +6978,8 @@ function Plugin:_show_reader_font_face_menu(back_callback)
     return false
 end
 function Plugin:_show_reader_spacing_panel(back_callback)
-    local return_to_spacing=function() self:_show_reader_spacing_panel(back_callback) end
     ReaderSettingsDialog.show{
-        title="行距与页边距",
+        title="行距",
         subtitle=function() return "当前行距："..tostring(math.floor(self:_reader_line_spacing_value()+.5)).."%" end,
         hero=function()
             return {
@@ -6995,13 +6993,10 @@ function Plugin:_show_reader_spacing_panel(back_callback)
         sections=function()
             local current=math.floor(self:_reader_line_spacing_value()+.5)
             return {
-                {title="行距预设",rows={
+                {title="常用预设",rows={
                     {label="紧凑",value="100%",checked=current==100,keep_open=true,callback=function() self:_reader_set_line_spacing(100) end},
                     {label="标准",value="120%",checked=current==120,keep_open=true,callback=function() self:_reader_set_line_spacing(120) end},
                     {label="舒展",value="140%",checked=current==140,keep_open=true,callback=function() self:_reader_set_line_spacing(140) end},
-                }},
-                {title="页边距",rows={
-                    {label="页边距与复杂版式",value="KOReader 高级排版",value_bold=true,callback=function() self:_show_reader_typeset_menu(return_to_spacing) end},
                 }},
             }
         end,
@@ -7010,9 +7005,8 @@ function Plugin:_show_reader_spacing_panel(back_callback)
 end
 
 function Plugin:_show_reader_weight_panel(back_callback)
-    local return_to_weight=function() self:_show_reader_weight_panel(back_callback) end
     ReaderSettingsDialog.show{
-        title="字体粗细与对齐",
+        title="字体粗细",
         subtitle=function() return "当前粗细："..self:_reader_font_weight_label() end,
         hero=function()
             return {
@@ -7026,13 +7020,10 @@ function Plugin:_show_reader_weight_panel(back_callback)
         sections=function()
             local current=self:_reader_font_weight_value()
             return {
-                {title="粗细预设",rows={
+                {title="常用预设",rows={
                     {label="较细",value="-0.5",checked=math.abs(current+.5)<.01,keep_open=true,callback=function() self:_reader_set_font_weight(-.5) end},
                     {label="默认",value="0",checked=math.abs(current)<.01,keep_open=true,callback=function() self:_reader_set_font_weight(0) end},
                     {label="较粗",value="0.5",checked=math.abs(current-.5)<.01,keep_open=true,callback=function() self:_reader_set_font_weight(.5) end},
-                }},
-                {title="对齐与深入设置",rows={
-                    {label="段落对齐、字距与高级选项",value="KOReader 高级排版",value_bold=true,callback=function() self:_show_reader_typeset_menu(return_to_weight) end},
                 }},
             }
         end,
@@ -7349,7 +7340,7 @@ end
 function Plugin:_show_reader_font_panel(back_callback)
     local return_to_font=function() self:_show_reader_font_panel(back_callback) end
     ReaderSettingsDialog.show{
-        title="字体与排版",
+        title="字体",
         subtitle=function() return self:_reader_font_label().." · 字号 "..self:_reader_font_size_label() end,
         hero=function()
             return {
@@ -7362,13 +7353,14 @@ function Plugin:_show_reader_font_panel(back_callback)
         on_home=function() return self:return_to_miuread_home("reader surface") end,
         sections=function()
             return {
-                {title="快速排版",rows={
+                {title="常用",rows={
                     {label="正文字体",value=self:_reader_font_label(),callback=function() self:_show_reader_font_face_menu(return_to_font) end},
-                    {label="行距与页边距",value=tostring(math.floor(self:_reader_line_spacing_value()+.5)).."%",callback=function() self:_show_reader_spacing_panel(return_to_font) end},
-                    {label="字体粗细与对齐",value=self:_reader_font_weight_label(),callback=function() self:_show_reader_weight_panel(return_to_font) end},
+                    {label="行距",value=tostring(math.floor(self:_reader_line_spacing_value()+.5)).."%",callback=function() self:_show_reader_spacing_panel(return_to_font) end},
+                    {label="字体粗细",value=self:_reader_font_weight_label(),callback=function() self:_show_reader_weight_panel(return_to_font) end},
+                    {label="字间距与空格",value=self:_reader_word_spacing_label(),callback=function() self:_show_reader_word_spacing_panel(return_to_font) end},
                 }},
                 {title="高级",rows={
-                    {label="KOReader 高级排版",value="页边距、字距与复杂版式",value_bold=true,callback=function() self:_show_reader_typeset_menu(return_to_font) end},
+                    {label="高级排版",value="版式与渲染",value_bold=true,callback=function() self:_show_reader_advanced_typeset_panel(return_to_font) end},
                 }},
             }
         end,
@@ -7745,6 +7737,24 @@ function Plugin:_show_reader_page_display_panel(back_callback)
     return true
 end
 
+function Plugin:_show_reader_page_panel(back_callback)
+    local return_to_page=function() self:_show_reader_page_panel(back_callback) end
+    ReaderSettingsDialog.show{
+        title="页面",
+        subtitle="版面, 显示和刷新集中在这里",
+        on_back=back_callback or function() self:show_reader_quick_panel() end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        rows=function()
+            return {
+                {label="页边距",value=self:_reader_margin_label(),value_bold=true,callback=function() self:_show_reader_margin_panel(return_to_page) end},
+                {label="页面显示",value="状态栏与阅读信息",callback=function() self:_show_reader_page_display_panel(return_to_page) end},
+                {label="刷新与夜间",value=self:_reader_refresh_rate_label(),callback=function() self:_show_reader_refresh_panel(return_to_page) end},
+            }
+        end,
+    }
+    return true
+end
+
 function Plugin:_reader_recent_action_definitions()
     return {
         night={icon="☾",label="夜间模式",callback=function() self:_home_toggle_night() end},
@@ -7788,59 +7798,365 @@ function Plugin:_reader_recent_buttons()
     return buttons
 end
 
-function Plugin:show_reader_control_center(_)
-    -- beta.10 removes the nested More/category screen. Keep a compatibility
-    -- entry point for older callbacks and route it to the expanded top panel.
-    return self:show_reader_quick_panel(true)
+function Plugin:_reader_config_value(name)
+    local configurable=self.ui and self.ui.document and self.ui.document.configurable or nil
+    return configurable and configurable[name] or nil
 end
 
-function Plugin:_reader_panel_definitions(progress)
+function Plugin:_reader_emit_config(event,value,value2)
+    local ui=self.ui
+    if not (ui and type(ui.handleEvent)=="function") then return false end
+    self:_mark_reader_busy(5)
+    if value2~=nil then ui:handleEvent(Event:new(event,value,value2))
+    else ui:handleEvent(Event:new(event,value)) end
+    return true
+end
+
+function Plugin:_reader_default(name,fallback)
+    if G_defaults and type(G_defaults.readSetting)=="function" then
+        local ok,value=pcall(G_defaults.readSetting,G_defaults,name)
+        if ok and value~=nil then return value end
+    end
+    return fallback
+end
+
+function Plugin:_reader_margin_label()
+    local h=self:_reader_config_value("h_page_margins")
+    local t=tonumber(self:_reader_config_value("t_page_margin"))
+    local b=tonumber(self:_reader_config_value("b_page_margin"))
+    local left,right
+    if type(h)=="table" then left=tonumber(h[1]); right=tonumber(h[2]) end
+    if left and right and t and b then
+        return string.format("左右 %d/%d · 上下 %d/%d",left,right,t,b)
+    end
+    return "使用当前书籍设置"
+end
+
+function Plugin:_reader_apply_margin_preset(kind)
+    local presets={
+        compact={h=self:_reader_default("DCREREADER_CONFIG_H_MARGIN_SIZES_SMALL",{5,5}),t=self:_reader_default("DCREREADER_CONFIG_T_MARGIN_SIZES_SMALL",5),b=self:_reader_default("DCREREADER_CONFIG_B_MARGIN_SIZES_SMALL",5)},
+        standard={h=self:_reader_default("DCREREADER_CONFIG_H_MARGIN_SIZES_MEDIUM",{10,10}),t=self:_reader_default("DCREREADER_CONFIG_T_MARGIN_SIZES_LARGE",15),b=self:_reader_default("DCREREADER_CONFIG_B_MARGIN_SIZES_LARGE",15)},
+        wide={h=self:_reader_default("DCREREADER_CONFIG_H_MARGIN_SIZES_XX_LARGE",{30,30}),t=self:_reader_default("DCREREADER_CONFIG_T_MARGIN_SIZES_XX_LARGE",30),b=self:_reader_default("DCREREADER_CONFIG_B_MARGIN_SIZES_XX_LARGE",30)},
+    }
+    local preset=presets[kind] or presets.standard
+    self:_reader_emit_config("SetPageHorizMargins",preset.h)
+    self:_reader_emit_config("SetPageTopMargin",preset.t)
+    self:_reader_emit_config("SetPageBottomMargin",preset.b)
+    return true
+end
+
+function Plugin:_reader_adjust_horizontal_margin(delta)
+    local h=self:_reader_config_value("h_page_margins")
+    local left,right=10,10
+    if type(h)=="table" then left=tonumber(h[1]) or left; right=tonumber(h[2]) or right end
+    delta=tonumber(delta) or 0
+    return self:_reader_emit_config("SetPageHorizMargins",{math.max(0,math.min(140,left+delta)),math.max(0,math.min(140,right+delta))})
+end
+
+function Plugin:_reader_adjust_vertical_margin(delta)
+    local t=tonumber(self:_reader_config_value("t_page_margin")) or 15
+    local b=tonumber(self:_reader_config_value("b_page_margin")) or 15
+    delta=tonumber(delta) or 0
+    self:_reader_emit_config("SetPageTopMargin",math.max(0,math.min(140,t+delta)))
+    self:_reader_emit_config("SetPageBottomMargin",math.max(0,math.min(140,b+delta)))
+    return true
+end
+
+function Plugin:_show_reader_margin_panel(back_callback)
+    local return_here=function() self:_show_reader_margin_panel(back_callback) end
+    ReaderSettingsDialog.show{
+        title="页边距",
+        subtitle=function() return self:_reader_margin_label() end,
+        on_back=back_callback or function() self:show_reader_control_center("typeset") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        sections=function()
+            return {
+                {title="常用预设",rows={
+                    {label="紧凑",value="更多正文空间",keep_open=true,callback=function() self:_reader_apply_margin_preset("compact") end},
+                    {label="标准",value="推荐",value_bold=true,keep_open=true,callback=function() self:_reader_apply_margin_preset("standard") end},
+                    {label="宽松",value="更大留白",keep_open=true,callback=function() self:_reader_apply_margin_preset("wide") end},
+                }},
+                {title="精细调整",rows={
+                    {label="左右边距 -5",value="缩小",keep_open=true,callback=function() self:_reader_adjust_horizontal_margin(-5) end},
+                    {label="左右边距 +5",value="增大",keep_open=true,callback=function() self:_reader_adjust_horizontal_margin(5) end},
+                    {label="上下边距 -5",value="缩小",keep_open=true,callback=function() self:_reader_adjust_vertical_margin(-5) end},
+                    {label="上下边距 +5",value="增大",keep_open=true,callback=function() self:_reader_adjust_vertical_margin(5) end},
+                }},
+            }
+        end,
+    }
+    return true
+end
+
+function Plugin:_reader_word_spacing_value()
+    local value=self:_reader_config_value("word_spacing")
+    if type(value)=="table" then return tonumber(value[1]) or 100,tonumber(value[2]) or 75 end
+    return 100,75
+end
+
+function Plugin:_reader_word_spacing_label()
+    local scaling,reduction=self:_reader_word_spacing_value()
+    return tostring(math.floor(scaling+.5)).."% / "..tostring(math.floor(reduction+.5)).."%"
+end
+
+function Plugin:_reader_set_word_spacing(kind)
+    local presets={
+        small=self:_reader_default("DCREREADER_CONFIG_WORD_SPACING_SMALL",{90,75}),
+        medium=self:_reader_default("DCREREADER_CONFIG_WORD_SPACING_MEDIUM",{100,75}),
+        large=self:_reader_default("DCREREADER_CONFIG_WORD_SPACING_LARGE",{110,75}),
+    }
+    return self:_reader_emit_config("SetWordSpacing",presets[kind] or presets.medium)
+end
+
+function Plugin:_reader_adjust_cjk_width(delta)
+    local current=tonumber(self:_reader_config_value("cjk_width_scaling")) or 100
+    local target=math.max(100,math.min(150,current+(tonumber(delta) or 0)))
+    return self:_reader_emit_config("SetCJKWidthScaling",target)
+end
+
+function Plugin:_show_reader_word_spacing_panel(back_callback)
+    ReaderSettingsDialog.show{
+        title="字间距与空格",
+        subtitle=function() return "空格缩放/压缩 "..self:_reader_word_spacing_label() end,
+        on_back=back_callback or function() self:show_reader_control_center("typeset") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        sections=function()
+            local cjk=tonumber(self:_reader_config_value("cjk_width_scaling")) or 100
+            return {
+                {title="空格",rows={
+                    {label="紧凑",value="小",keep_open=true,callback=function() self:_reader_set_word_spacing("small") end},
+                    {label="标准",value="推荐",value_bold=true,keep_open=true,callback=function() self:_reader_set_word_spacing("medium") end},
+                    {label="宽松",value="大",keep_open=true,callback=function() self:_reader_set_word_spacing("large") end},
+                }},
+                {title="中文字符宽度",rows={
+                    {label="当前宽度",value=tostring(math.floor(cjk+.5)).."%",value_bold=true,arrow=false},
+                    {label="字符宽度 -5",value="缩小",keep_open=true,callback=function() self:_reader_adjust_cjk_width(-5) end},
+                    {label="字符宽度 +5",value="增大",keep_open=true,callback=function() self:_reader_adjust_cjk_width(5) end},
+                }},
+            }
+        end,
+    }
+    return true
+end
+
+function Plugin:_show_reader_refresh_panel(back_callback)
+    ReaderSettingsDialog.show{
+        title="刷新与显示",
+        subtitle="只保留阅读过程中真正需要的显示控制",
+        on_back=back_callback or function() self:show_reader_control_center("typeset") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        rows=function()
+            return {
+                {label="刷新频率",value=self:_reader_refresh_rate_label(),value_bold=true,keep_open=true,callback=function() self:_reader_cycle_refresh_rate() end},
+                {label="全屏刷新",value="立即执行",callback=function() self:_home_full_refresh() end},
+                {label="夜间模式",value=self:_reader_night_label(),keep_open=true,callback=function() self:_home_toggle_night() end},
+                {label="页面显示",value="状态栏与阅读信息",callback=function() self:_show_reader_page_display_panel(function() self:_show_reader_refresh_panel(back_callback) end) end},
+            }
+        end,
+    }
+    return true
+end
+
+function Plugin:_show_reader_advanced_typeset_panel(back_callback)
+    ReaderSettingsDialog.show{
+        title="高级排版",
+        subtitle="常用高级选项仍由觅阅直接提供, 不进入 KOReader 总菜单",
+        on_back=back_callback or function() self:show_reader_control_center("typeset") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        rows=function()
+            local mode=tonumber(self:_reader_config_value("block_rendering_mode")) or 2
+            local mode_labels={[0]="兼容",[1]="平面",[2]="书籍",[3]="网页"}
+            return {
+                {label="渲染模式",value=mode_labels[mode] or tostring(mode),value_bold=true,keep_open=true,callback=function()
+                    self:_reader_emit_config("SetBlockRenderingMode",(mode+1)%4)
+                end},
+                {label="字间距与空格",value=self:_reader_word_spacing_label(),callback=function() self:_show_reader_word_spacing_panel(function() self:_show_reader_advanced_typeset_panel(back_callback) end) end},
+                {label="页边距",value=self:_reader_margin_label(),callback=function() self:_show_reader_margin_panel(function() self:_show_reader_advanced_typeset_panel(back_callback) end) end},
+                {label="页面显示",value="状态栏、进度与刷新",callback=function() self:_show_reader_page_display_panel(function() self:_show_reader_advanced_typeset_panel(back_callback) end) end},
+            }
+        end,
+    }
+    return true
+end
+
+function Plugin:_show_reader_wifi_quick_panel(back_callback)
+    ReaderSettingsDialog.show{
+        title="Wi-Fi",
+        subtitle=function()
+            local label=self:_reader_wifi_summary()
+            return tostring(label)
+        end,
+        on_back=back_callback or function() self:show_reader_quick_panel() end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        rows=function()
+            local on=self:_reader_wifi_state()==true
+            return {
+                {label="Wi-Fi",value=on and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:_reader_wifi_toggle() end},
+                {label="选择网络",value="打开网络列表",callback=function() self:_reader_wifi_settings(back_callback or function() self:show_reader_quick_panel() end) end},
+            }
+        end,
+    }
+    return true
+end
+
+function Plugin:_show_reader_sync_quick_panel(back_callback)
+    ReaderSettingsDialog.show{
+        title="阅读同步",
+        subtitle=function() return "当前状态: "..tostring(self:progress_sync_label()) end,
+        on_back=back_callback or function() self:show_reader_quick_panel() end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        rows=function()
+            return {
+                {label="立即同步",value="上传当前进度",value_bold=true,keep_open=true,callback=function() self:upload_local_progress(true) end},
+                {label="同步详情",value=self:progress_sync_label(),callback=function() self:_show_reader_sync_panel(back_callback or function() self:show_reader_quick_panel() end) end},
+            }
+        end,
+    }
+    return true
+end
+
+function Plugin:_show_reader_gesture_panel(back_callback)
+    ReaderSettingsDialog.show{
+        title="手势与按键",
+        subtitle="桌面模式只接管顶部下滑阅读面板, 正文阅读手势继续交给阅读器",
+        on_back=back_callback or function() self:show_reader_control_center("device") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        rows=function()
+            return {
+                {label="顶部下滑",value="觅阅阅读快捷面板",arrow=false},
+                {label="向上滑动",value="收起快捷面板",arrow=false},
+                {label="正文区域",value="保持翻页与选词手势",arrow=false},
+                {label="阅读评论",value=self:_thoughts_enabled_label(),keep_open=true,callback=function() self:_toggle_thoughts_enabled() end},
+            }
+        end,
+    }
+    return true
+end
+
+function Plugin:_show_reader_device_compat_panel(back_callback)
+    ReaderSettingsDialog.show{
+        title="系统与兼容",
+        subtitle="日常阅读不需要进入 KOReader 原菜单",
+        on_back=back_callback or function() self:show_reader_control_center("device") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        rows=function()
+            return {
+                {label="KOReader 原生菜单",value="仅用于未覆盖功能与故障排查",callback=function()
+                    self:_show_koreader_reader_menu(function() self:_show_reader_device_compat_panel(back_callback) end)
+                end},
+                {label="觅阅阅读界面设置",value="评论与控制中心",callback=function()
+                    self:_show_standalone_menu("阅读界面",self:reader_quick_panel_settings_menu(),{native_input=true,reader_context=true,on_home=function() return self:return_to_miuread_home("reader surface") end,on_close=function() self:_show_reader_device_compat_panel(back_callback) end})
+                end},
+            }
+        end,
+    }
+    return true
+end
+
+function Plugin:_reader_control_categories()
+    local function back_to(key) return function() self:show_reader_control_center(key) end end
+    return {
+        {key="reading",label="阅读",sections={{items={
+            {icon="toc",label="目录",value="自动定位当前章节",callback=function() self:_show_reader_toc(back_to("reading")) end},
+            {icon="progress",label="阅读进度",value=(self:_reader_progress_percent() and (tostring(math.floor(self:_reader_progress_percent()+.5)).."%") or ""),callback=function() self:_show_reader_progress_control(back_to("reading")) end},
+            {icon="page-jump",label="页面跳转",value="精确跳到位置",callback=function() self:_show_reader_position_jump(back_to("reading")) end},
+            {icon="undo",label="返回上一位置",value="回到跳转前位置",callback=function() self:_reader_go_back_location() end},
+            {icon="bookmark",label="书签与划线",value="查看书签与标注",callback=function() self:_reader_show_bookmarks(back_to("reading")) end},
+            {icon="search",label="全文搜索",value="搜索当前书籍",callback=function() self:_reader_show_search(back_to("reading")) end},
+            {icon="history",label="阅读历史",value="查看跳转记录",callback=function() self:_reader_show_history(back_to("reading")) end},
+            {icon="bookmark",label="评论",value=self:_thoughts_enabled_label(),value_bold=true,callback=function() self:_show_reader_comment_settings(back_to("reading")) end},
+        }}}},
+        {key="typeset",label="排版",sections={{items={
+            {icon="font",label="字体与字号",value=self:_reader_font_label().." · "..self:_reader_font_size_label(),callback=function() self:_show_reader_font_panel(back_to("typeset")) end},
+            {icon="font",label="行距",value=tostring(math.floor(self:_reader_line_spacing_value()+.5)).."%",callback=function() self:_show_reader_spacing_panel(back_to("typeset")) end},
+            {icon="display",label="页边距",value=self:_reader_margin_label(),callback=function() self:_show_reader_margin_panel(back_to("typeset")) end},
+            {icon="font",label="字体粗细",value=self:_reader_font_weight_label(),callback=function() self:_show_reader_weight_panel(back_to("typeset")) end},
+            {icon="font",label="字间距与空格",value=self:_reader_word_spacing_label(),callback=function() self:_show_reader_word_spacing_panel(back_to("typeset")) end},
+            {icon="display",label="页面显示",value="状态栏与阅读信息",callback=function() self:_show_reader_page_display_panel(back_to("typeset")) end},
+            {icon="refresh",label="刷新与夜间",value=self:_reader_refresh_rate_label(),callback=function() self:_show_reader_refresh_panel(back_to("typeset")) end},
+            {icon="settings",label="高级排版",value="更多版式选项",callback=function() self:_show_reader_advanced_typeset_panel(back_to("typeset")) end},
+        }}}},
+        {key="book",label="书籍",sections={{items={
+            {icon="current-book",label="当前书籍",value="信息与本地状态",callback=function() self:_show_reader_current_book_panel(back_to("book")) end},
+            {icon="sync",label="阅读同步",value=self:progress_sync_label(),value_bold=true,callback=function() self:_show_reader_sync_panel(back_to("book")) end},
+            {icon="download",label="下载与生成",value="任务、失败重试与重新生成",callback=function() self:show_downloads(back_to("book")) end},
+            {icon="bookmark",label="评论数据",value="迁移与显示设置",callback=function()
+                self:_show_standalone_menu("评论数据",self:book_repair_settings_menu(),{native_input=true,reader_context=true,on_home=function() return self:return_to_miuread_home("reader surface") end,on_close=back_to("book")})
+            end},
+            {icon="repair",label="修复书籍",value="检查当前书籍",callback=function() self:repair_current_book() end},
+        }}}},
+        {key="device",label="设备",sections={{items={
+            {icon="frontlight",label="前光与色温",value=Device:hasFrontlight() and "直接调节" or "当前设备不支持",enabled=Device:hasFrontlight(),callback=function() self:_show_reader_frontlight_panel(back_to("device")) end},
+            {icon="wifi",label="Wi-Fi",value=(self:_reader_wifi_summary()),callback=function() self:_show_reader_wifi_quick_panel(back_to("device")) end},
+            {icon="rotate",label="屏幕方向",value=self:_reader_rotation_label(),callback=function() self:_home_rotate() end},
+            {icon="screenshot",label="截图",value="截取当前屏幕",callback=function() ScreenshotMode.start(self) end},
+            {icon="full-refresh",label="全屏刷新",value="清除残影",callback=function() self:_home_full_refresh() end},
+            {icon="sleep",label="休眠",value="立即休眠",enabled=Device:canSuspend(),callback=function() self:_home_sleep() end},
+            {icon="tools",label="手势与按键",value="阅读手势说明",callback=function() self:_show_reader_gesture_panel(back_to("device")) end},
+            {icon="settings",label="系统与兼容",value="高级与故障排查",callback=function() self:_show_reader_device_compat_panel(back_to("device")) end},
+        }}}},
+    }
+end
+
+function Plugin:show_reader_control_center(initial_category)
+    if not (self.ui and self.ui.document) then return false end
+    self:_mark_reader_busy(8)
+    local panel,err=ReaderControlCenter.show{
+        title="全部阅读功能",
+        categories=self:_reader_control_categories(),
+        initial_category=tostring(initial_category or "reading"),
+        on_back=function() self:show_reader_quick_panel() end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
+    }
+    if not panel then
+        logger.warn("[MiuRead][ReaderControlCenter] unavailable",tostring(err or "unknown"))
+        return false
+    end
+    return true
+end
+
+function Plugin:_reader_quick_definitions()
     local comment_on=self:_thoughts_enabled()
     return {
-        toc={key="toc",icon="toc",icon_key="toc",label="目录",callback=function() self:_show_reader_toc() end},
-        progress={key="progress",icon="progress",icon_key="progress",label="进度",callback=function() self:_show_reader_progress_control() end},
-        font={key="font",icon="font",icon_key="font",label="字体",callback=function() self:_show_reader_font_panel() end},
-        comments={key="comments",icon="bookmark",icon_key="bookmark",label=comment_on and "评论●" or "评论○",active=comment_on,callback=function()
+        toc={key="toc",icon="toc",label="目录",callback=function() self:_show_reader_toc(function() self:show_reader_quick_panel() end) end},
+        progress={key="progress",icon="progress",label="进度",callback=function() self:_show_reader_progress_control(function() self:show_reader_quick_panel() end) end},
+        font={key="font",icon="font",label="字体",callback=function() self:_show_reader_font_panel(function() self:show_reader_quick_panel() end) end},
+        page={key="page",icon="display",label="页面",callback=function() self:_show_reader_page_panel(function() self:show_reader_quick_panel() end) end},
+        comments={key="comments",icon="bookmark",label=comment_on and "评论●" or "评论○",active=comment_on,callback=function()
             self:_show_reader_comment_settings(function() self:show_reader_quick_panel() end)
         end,hold_callback=function()
             self:_toggle_thoughts_enabled()
             UIManager:scheduleIn(.05,function() self:show_reader_quick_panel() end)
         end},
-        search={key="search",icon="search",icon_key="search",label="搜索",callback=function()
-            return self:_reader_show_search(function() self:show_reader_quick_panel() end)
-        end},
+        search={key="search",icon="search",label="搜索",callback=function() self:_reader_show_search(function() self:show_reader_quick_panel() end) end},
+        bookmark={key="bookmark",icon="bookmark",label="书签",callback=function() self:_reader_show_bookmarks(function() self:show_reader_quick_panel() end) end},
+        back={key="back",icon="undo",label="返回",callback=function() self:_reader_go_back_location() end},
+        rotation={key="rotation",icon="rotate",label="旋转",callback=function() self:_home_rotate() end},
+        screenshot={key="screenshot",icon="screenshot",label="截图",callback=function() ScreenshotMode.start(self) end},
     }
 end
 
-function Plugin:_reader_tool_buttons()
+function Plugin:_reader_top_actions()
+    local wifi_label,wifi_alert=self:_reader_wifi_summary()
+    local sync_label,sync_alert=self:_reader_sync_summary()
     return {
-        {key="page",icon="display",icon_key="display",label="页面",callback=function()
-            return self:_show_reader_page_display_panel(function() self:show_reader_quick_panel(true) end)
-        end},
-        {key="rotation",icon="rotate",icon_key="rotate",label="旋转",callback=function() return self:_home_rotate() end},
-        {key="screenshot",icon="screenshot",icon_key="screenshot",label="截图",callback=function() return ScreenshotMode.start(self) end},
-        {key="book",icon="current-book",icon_key="current-book",label="书籍",callback=function()
-            return self:_show_reader_current_book_panel(function() self:show_reader_quick_panel(true) end)
-        end},
-        {key="koreader",icon="ko-reader",icon_key="ko-reader",label="KO",callback=function()
-            return self:_show_koreader_reader_menu(function() self:show_reader_quick_panel(true) end)
-        end},
+        {key="home",icon="home",label="主页",callback=function() return self:return_to_miuread_home("reader surface") end},
+        {key="wifi",icon="wifi",label=wifi_label,active=wifi_alert,callback=function() self:_show_reader_wifi_quick_panel(function() self:show_reader_quick_panel() end) end,hold_callback=function() self:_reader_wifi_settings(function() self:show_reader_quick_panel() end) end},
+        {key="sync",icon="sync",label=sync_label,active=sync_alert,callback=function() self:_show_reader_sync_quick_panel(function() self:show_reader_quick_panel() end) end,hold_callback=function() self:_show_reader_sync_panel(function() self:show_reader_quick_panel() end) end},
+        {key="all",icon="grid",label="全部",callback=function() self:show_reader_control_center("reading") end},
     }
 end
 
 function Plugin:show_reader_more_panel()
-    return self:show_reader_quick_panel(true)
+    return self:show_reader_control_center("reading")
 end
 
-function Plugin:show_reader_quick_panel(expanded)
+function Plugin:show_reader_quick_panel()
     if not (self.ui and self.ui.document) then return false end
     self:_mark_reader_busy(8)
-    local title=self:_reader_toolbar_title()
-    local definitions=self:_reader_panel_definitions()
-    local buttons={}
-    for _,key in ipairs({"toc","progress","font","comments","search"}) do
-        buttons[#buttons+1]=definitions[key]
-    end
+    local definitions=self:_reader_quick_definitions()
+    local primary={definitions.toc,definitions.progress,definitions.font,definitions.page,definitions.comments}
+    local secondary={definitions.search,definitions.bookmark,definitions.back,definitions.rotation,definitions.screenshot}
     local frontlight,warmth
     if Device:hasFrontlight() then
         local minimum,maximum=self:_reader_frontlight_bounds()
@@ -7868,27 +8184,24 @@ function Plugin:show_reader_quick_panel(expanded)
         end
     end
     local panel,err=ReaderToolbar.show{
-        header=self:_reader_toolbar_header(title),
-        refresh_status=function()
-            return {header=self:_reader_toolbar_header(title)}
-        end,
-        buttons=buttons,
+        top_actions=self:_reader_top_actions(),
+        primary_actions=primary,
+        secondary_actions=secondary,
         frontlight=frontlight,
         warmth=warmth,
-        tool_buttons=self:_reader_tool_buttons(),
-        expanded=expanded==true,
     }
     if not panel then
         logger.warn("[MiuRead][ReaderToolbar] unavailable",tostring(err or "unknown"))
         return false
     end
-    logger.info("[MiuRead][ReaderToolbar] opened top control center")
+    logger.info("[MiuRead][ReaderToolbar] opened fixed top reader panel")
     return true
 end
 
 function Plugin:_close_miuread_transients()
     HomeQuickPanel.close()
     ReaderToolbar.close()
+    ReaderControlCenter.close()
     ReaderProgressDialog.close()
     ReaderSettingsDialog.close()
     ReaderTocDialog.close()
@@ -13474,7 +13787,7 @@ function Plugin:onMiuReadReaderFont()
     return true
 end
 function Plugin:onMiuReadReaderTypeset()
-    self:_show_reader_typeset_menu()
+    self:_show_reader_advanced_typeset_panel()
     return true
 end
 function Plugin:onMiuReadReaderProgress()

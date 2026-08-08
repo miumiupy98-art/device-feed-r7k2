@@ -149,13 +149,9 @@ function Center:_section_widget(section, width, item_h)
     local items = type(section.items) == "table" and section.items or {}
     local height = math.max(item_h, #items * item_h)
     local layers = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
-    layers[#layers + 1] = Skin.frame(width, height, {
-        bordersize = Skin.line("thin"),
-        radius = Skin.radius(7, 5, 11),
-        background = Blitbuffer.COLOR_WHITE,
-        color = Blitbuffer.COLOR_DARK_GRAY,
-    }, Widget:new{dimen = Geom:new{w = 1, h = 1}})
-    local inset = math.max(Skin.line("thick"), Skin.dp(1, 1, 2))
+    -- Flat list: section hierarchy comes from spacing and hairlines rather than
+    -- nested rounded frames, which keeps the e-ink page lighter and clearer.
+    local inset = Skin.dp(4, 3, 6)
     for index = 1, #items - 1 do
         layers[#layers + 1] = OffsetContainer:new{
             x_off = inset,
@@ -216,11 +212,13 @@ end
 
 function Center:_sections_height(sections, section_title_h, item_h, gap)
     sections = type(sections) == "table" and sections or {}
-    if #sections == 0 then return section_title_h + item_h end
+    if #sections == 0 then return item_h end
     local total = 0
     for index, section in ipairs(sections) do
         local items = type(section.items) == "table" and section.items or {}
-        total = total + section_title_h + math.max(1, #items) * item_h
+        local title = tostring(section.title or "")
+        if title ~= "" then total = total + section_title_h end
+        total = total + math.max(1, #items) * item_h
         if index < #sections then total = total + gap end
     end
     return total
@@ -229,17 +227,16 @@ end
 function Center:_build_root()
     local sw, sh = Screen:getWidth(), Screen:getHeight()
     local portrait = sw < sh
-    local outer_margin = Skin.dp(10, 8, 18)
-    local top_inset = Skin.dp(3, 2, 5)
-    local pad = Skin.dp(11, 9, 17)
-    local gap = Skin.dp(7, 5, 10)
+    local outer_margin = Skin.dp(8, 6, 14)
+    local top_inset = 0
+    local pad = Skin.dp(14, 11, 21)
+    local gap = Skin.dp(9, 7, 13)
     local panel_w = sw - outer_margin * 2
     local content_w = panel_w - pad * 2
-    local header_h = math.max(Skin.dp(39, 34, 52), math.floor(sh * .039))
-    local tab_h = math.max(Skin.dp(36, 31, 47), math.floor(sh * .035))
-    local section_title_h = Skin.dp(25, 21, 33)
-    local item_h = math.max(Skin.dp(43, 37, 56), math.floor(sh * (portrait and .041 or .058)))
-    local handle_h = Skin.dp(18, 15, 25)
+    local header_h = math.max(Skin.dp(42, 36, 56), math.floor(sh * .041))
+    local tab_h = math.max(Skin.dp(38, 33, 50), math.floor(sh * .037))
+    local section_title_h = Skin.dp(28, 24, 37)
+    local item_h = math.max(Skin.dp(46, 40, 60), math.floor(sh * (portrait and .043 or .060)))
     local categories = self:_categories()
     local category = self:_selected_category()
     if category then self.selected_key = tostring(category.key or "") end
@@ -251,7 +248,7 @@ function Center:_build_root()
         body_h = math.max(body_h, self:_sections_height(candidate.sections, section_title_h, item_h, gap))
     end
     local tabs_h = #categories > 1 and tab_h or 0
-    local content_h = header_h + tabs_h + gap + body_h + handle_h
+    local content_h = header_h + tabs_h + gap + body_h
     local max_h = sh - top_inset - math.max(28, math.floor(sh * .052))
     self.panel_h = math.min(max_h, pad * 2 + content_h)
     self.dimen = Geom:new{x = 0, y = 0, w = sw, h = sh}
@@ -268,7 +265,15 @@ function Center:_build_root()
     root[#root + 1] = OffsetContainer:new{
         x_off = outer_margin,
         y_off = top_inset,
-        Skin.paper(panel_w, self.panel_h, {seed = 5, accent = false}, Widget:new{dimen = Geom:new{w = 1, h = 1}}),
+        Skin.frame(panel_w, self.panel_h, {
+            bordersize = 0, padding = 0, radius = 0,
+            background = Blitbuffer.COLOR_WHITE, color = Blitbuffer.COLOR_WHITE,
+        }, Widget:new{dimen = Geom:new{w = 1, h = 1}}),
+    }
+    root[#root + 1] = OffsetContainer:new{
+        x_off = outer_margin,
+        y_off = top_inset + self.panel_h - math.max(1, Skin.line("thin")),
+        LineWidget:new{background = Blitbuffer.COLOR_DARK_GRAY, dimen = Geom:new{w = panel_w, h = math.max(1, Skin.line("thin"))}},
     }
 
     local y = top_inset + pad
@@ -327,15 +332,18 @@ function Center:_build_root()
         }
     else
         for section_index, section in ipairs(sections) do
-            root[#root + 1] = OffsetContainer:new{
-                x_off = outer_margin + pad,
-                y_off = y,
-                Ui.textbox(tostring(section.title or ""), content_w, section_title_h,
-                    Skin.face("smallinfofont", 9.5, 12.6, 8.2), {
-                        bold = true, alignment = "left", fgcolor = Blitbuffer.COLOR_BLACK,
-                    }),
-            }
-            y = y + section_title_h
+            local section_title = tostring(section.title or "")
+            if section_title ~= "" then
+                root[#root + 1] = OffsetContainer:new{
+                    x_off = outer_margin + pad,
+                    y_off = y,
+                    Ui.textbox(section_title, content_w, section_title_h,
+                        Skin.face("smallinfofont", 9.5, 12.6, 8.2), {
+                            bold = true, alignment = "left", fgcolor = Blitbuffer.COLOR_BLACK,
+                        }),
+                }
+                y = y + section_title_h
+            end
             local section_widget, section_h = self:_section_widget(section, content_w, item_h)
             root[#root + 1] = OffsetContainer:new{x_off = outer_margin + pad, y_off = y, section_widget}
             y = y + section_h
@@ -343,15 +351,6 @@ function Center:_build_root()
         end
     end
 
-    local handle_w = Skin.dp(34, 28, 48)
-    root[#root + 1] = OffsetContainer:new{
-        x_off = outer_margin + math.floor((panel_w - handle_w) / 2),
-        y_off = top_inset + self.panel_h - math.floor(handle_h * .55),
-        LineWidget:new{
-            background = Blitbuffer.COLOR_DARK_GRAY,
-            dimen = Geom:new{w = handle_w, h = math.max(1, Skin.line("thin"))},
-        },
-    }
     return root
 end
 
