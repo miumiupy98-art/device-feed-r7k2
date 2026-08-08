@@ -390,6 +390,12 @@ local function build_payload(book_id, elapsed_seconds, book, progress_ratio)
         payload_fields_complete=tostring(payload.appId or "")~="" and tostring(payload.ps or "")~=""
             and tostring(payload.pc or "")~="" and tostring(payload.s or "")~="",
         position_source=position.source,
+        report_chapter_uid=position.chapter_uid,
+        report_chapter_idx=position.chapter_idx,
+        local_chapter_uid=book.local_chapter_uid,
+        local_chapter_idx=book.local_chapter_idx,
+        remote_chapter_uid=book.remote_chapter_uid,
+        remote_chapter_idx=book.remote_chapter_idx,
     }
     return payload, position, public
 end
@@ -414,7 +420,9 @@ local function attempt_report(client, book_id, elapsed_seconds, book, progress_r
     if read_report_accepted(result) then
         return true, result, nil, nil, position_or_error, payload_public, meta
     end
-    return false, result, result_summary(result), "server", position_or_error, payload_public, meta
+    local summary=result_summary(result)
+    local kind=Http.is_auth_error(summary) and "authentication" or "server"
+    return false, result, summary, kind, position_or_error, payload_public, meta
 end
 
 local BOOK_PATCH_KEYS = {

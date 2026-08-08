@@ -197,7 +197,11 @@ function Service.run(job)
         last_report_at = completed_at
 
         if ok and type(result) == "table" then
-            if type(result.legacy_context) == "table" then
+            -- Keep the daemon context transactional as well: a refreshed
+            -- context only becomes authoritative after WeRead accepts the
+            -- report. A rejected authentication request must not replace the
+            -- last known-good chapter mapping.
+            if result.accepted and type(result.legacy_context) == "table" then
                 book = U.copy(result.legacy_context)
                 if result.context_changed then write_context() end
             end

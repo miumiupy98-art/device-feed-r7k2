@@ -113,6 +113,7 @@ function Adapter.run(job)
         wr_ticket = job.wr_ticket or "",
         wr_wrpa = job.wr_wrpa or "",
         allow_renewal = job.allow_renewal == true,
+        force_context = job.force_context == true,
     }
     local result = Legacy.run(legacy_job)
     local context = merge(legacy_job.book, result.book_patch)

@@ -11748,26 +11748,34 @@ function Plugin:repair_current_sync()
     local r=self:_current_book_record()
     if not r or not r.book then self:info("请先打开一本觅阅下载的书籍。"); return false end
     local title=tostring(r.book.title or "当前书籍")
-    self:status_toast("修复阅读同步","正在重新识别《"..title.."》的章节信息",4)
+    self:status_toast("修复阅读同步","正在检查《"..title.."》的登录和章节同步状态",4)
     local started=self.sync:repair_current(function(ok,result)
         if ok then
             self._sync_repair_prompt_book=nil
-            self:status_toast("阅读同步已修复","当前进度已同步；阅读时间从现在重新开始同步",5)
+            self:status_toast("阅读同步已修复","当前进度已同步 阅读时间从现在重新开始同步",5)
         else
             local err=tostring(result or "未知错误")
-            if Http.is_auth_error(err) then
+            local record=self.sync:record()
+            local book_id=record and record.book and tostring(record.book.book_id or "") or ""
+            local session=book_id~="" and (self.store:session(book_id) or {}) or {}
+            local kind=tostring(session.sync_repair_kind or self.sync.last_error_kind or "")
+            if kind=="authentication" or Http.is_auth_error(err) then
                 local dialog
-                dialog=ButtonDialog:new{title="登录已失效",buttons={
+                dialog=ButtonDialog:new{title="微信读书登录已失效",buttons={
                     {{text="重新扫码登录",callback=function() UIManager:close(dialog); self.auth_flow:start() end}},
                     {{text="稍后",callback=function() UIManager:close(dialog) end}},
                 }}
                 UIManager:show(dialog)
+            elseif kind=="context" then
+                self:info("当前书籍同步修复失败\n\n登录状态正常 但无法可靠识别当前章节。\n\n已暂停这本书的阅读时间同步 其他书籍不受影响。")
+            elseif kind=="transport" then
+                self:info("阅读同步修复失败\n\n当前网络连接仍不可用。\n\n本次失败的阅读时间不会补传 可以稍后再次修复。")
             else
-                self:info("阅读同步修复失败\n\n"..U.first_line(err,240).."\n\n当前书籍可以继续阅读，本次失败的阅读时间不会补传。")
+                self:info("阅读同步修复失败\n\n微信读书未确认本次同步。\n\n本次失败的阅读时间不会补传 可以稍后再次修复。")
             end
         end
     end)
-    if not started then self:info("暂时无法启动同步修复，请稍后再试。") end
+    if not started then self:info("暂时无法启动同步修复 请稍后再试。") end
     return started
 end
 
