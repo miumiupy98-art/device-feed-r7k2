@@ -3388,153 +3388,32 @@ function Plugin:_reader_preferences()
     if reader.plugin_mode_enabled~=false then reader.plugin_mode_enabled=false; changed=true end
     if reader.show_title==nil then reader.show_title=true; changed=true end
     if reader.show_status==nil then reader.show_status=true; changed=true end
-    if reader.show_recent==nil then reader.show_recent=true; changed=true end
-    if type(reader.recent_actions)~="table" then reader.recent_actions={}; changed=true end
-    if type(reader.quick_items)~="table" then reader.quick_items={}; changed=true end
-    if type(reader.quick_order)~="table" then reader.quick_order={}; changed=true end
+    if reader.show_recent~=false then reader.show_recent=false; changed=true end
+    if type(reader.recent_actions)~="table" or #reader.recent_actions>0 then reader.recent_actions={}; changed=true end
 
-    local version=tonumber(reader.quick_layout_version) or 0
-    if version<4 then
-        local empty_items=next(reader.quick_items)==nil
-        local empty_order=#reader.quick_order==0
-        local legacy_default=quick_boolean_layout_matches(reader.quick_items,READER_QUICK_ITEM_LEGACY_DEFAULT,READER_QUICK_ITEM_LEGACY_ORDER)
-            and quick_order_matches(reader.quick_order,READER_QUICK_ITEM_LEGACY_ORDER)
-        local v2_default=quick_boolean_layout_matches(reader.quick_items,READER_QUICK_ITEM_V2_DEFAULT,READER_QUICK_ITEM_V2_ORDER)
-            and quick_order_matches(reader.quick_order,READER_QUICK_ITEM_V2_ORDER)
-        local v3_default=quick_boolean_layout_matches(reader.quick_items,READER_QUICK_ITEM_V3_DEFAULT,READER_QUICK_ITEM_V3_ORDER)
-            and quick_order_matches(reader.quick_order,READER_QUICK_ITEM_V3_ORDER)
-        if empty_items or empty_order or legacy_default or v2_default or v3_default then
-            reader.quick_items={}
-            for _,key in ipairs(READER_QUICK_ITEM_ORDER) do
-                reader.quick_items[key]=READER_QUICK_ITEM_DEFAULT[key]==true
-            end
-            reader.quick_order=U.copy(READER_QUICK_ITEM_ORDER)
-        else
-            -- Preserve genuinely customised layouts. New entries start hidden
-            -- so an update never displaces a user's chosen shortcuts.
-            reader.quick_items.more=nil
-            if reader.quick_items.all_functions==nil then reader.quick_items.all_functions=false end
-            if reader.quick_items.page_display==nil then reader.quick_items.page_display=false end
+    local fixed_order={"home","toc","progress","font","comments","more"}
+    local fixed_items={home=true,toc=true,progress=true,font=true,comments=true,more=true}
+    local order_ok=type(reader.quick_order)=="table" and #reader.quick_order==#fixed_order
+    if order_ok then
+        for index,key in ipairs(fixed_order) do
+            if reader.quick_order[index]~=key then order_ok=false; break end
         end
-        reader.quick_layout_version=4
-        changed=true
     end
-
-    if version<5 then
-        local former_home_default=true
-        local former_enabled={home=true,toc=true,progress=true,font=true,frontlight=true,sync=true}
-        for _,key in ipairs(READER_QUICK_ITEM_ORDER) do
-            if (reader.quick_items[key]==true)~=(former_enabled[key]==true) then
-                former_home_default=false
-                break
+    local items_ok=type(reader.quick_items)=="table"
+    if items_ok then
+        local count=0
+        for key,value in pairs(reader.quick_items) do
+            if value==true then
+                count=count+1
+                if fixed_items[key]~=true then items_ok=false; break end
             end
         end
-        if former_home_default then
-            reader.quick_items={}
-            for _,key in ipairs(READER_QUICK_ITEM_ORDER) do
-                reader.quick_items[key]=READER_QUICK_ITEM_DEFAULT[key]==true
-            end
-            reader.quick_order=U.copy(READER_QUICK_ITEM_ORDER)
-        end
-        reader.quick_layout_version=5
-        changed=true
+        if count~=#fixed_order then items_ok=false end
     end
-
-    if version<6 then
-        -- Every reader page now has a fixed Home control. Remove the old Home
-        -- tile so the configurable six-cell area remains useful.
-        if reader.quick_items.home~=nil then reader.quick_items.home=nil; changed=true end
-        local clean_order={}
-        for _,key in ipairs(reader.quick_order or {}) do
-            if key~="home" then clean_order[#clean_order+1]=key end
-        end
-        reader.quick_order=clean_order
-        reader.quick_layout_version=6
-        changed=true
-    end
-
-    if version<7 then
-        -- The footer already opens the complete reading control center. Use the
-        -- duplicated sixth tile for the frequently used comment font control.
-        local replacement={}
-        local seen_comment=false
-        for _,key in ipairs(reader.quick_order or {}) do
-            if key=="all_functions" then
-                if not seen_comment then replacement[#replacement+1]="comment_font"; seen_comment=true end
-            elseif key~="comment_font" then
-                replacement[#replacement+1]=key
-            elseif not seen_comment then
-                replacement[#replacement+1]=key; seen_comment=true
-            end
-        end
-        if not seen_comment then replacement[#replacement+1]="comment_font" end
-        reader.quick_order=replacement
-        if reader.quick_items.all_functions==true or reader.quick_items.comment_font==nil then
-            reader.quick_items.comment_font=true
-        end
-        reader.quick_items.all_functions=nil
-        reader.quick_layout_version=7
-        changed=true
-    end
-
-    for _,key in ipairs(READER_QUICK_ITEM_ORDER) do
-        if reader.quick_items[key]==nil then
-            reader.quick_items[key]=READER_QUICK_ITEM_DEFAULT[key]==true
-            changed=true
-        end
-    end
-    local seen,order={},{}
-    for _,key in ipairs(reader.quick_order) do
-        if READER_QUICK_ITEM_DEFAULT[key]~=nil and not seen[key] then
-            seen[key]=true
-            order[#order+1]=key
-        end
-    end
-    for _,key in ipairs(READER_QUICK_ITEM_ORDER) do
-        if not seen[key] then seen[key]=true; order[#order+1]=key end
-    end
-    if table.concat(order,"|")~=table.concat(reader.quick_order,"|") then reader.quick_order=order; changed=true end
-
-    if not Device:hasFrontlight() and reader.quick_items.frontlight==true then
-        reader.quick_items.frontlight=false
-        if reader.quick_items.page_display~=true then reader.quick_items.page_display=true end
-        changed=true
-    end
-
-    local enabled_count=0
-    for _,key in ipairs(READER_QUICK_ITEM_ORDER) do
-        if reader.quick_items[key]==true then enabled_count=enabled_count+1 end
-    end
-    if enabled_count>6 then
-        local kept=0
-        for _,key in ipairs(reader.quick_order) do
-            if reader.quick_items[key]==true then
-                kept=kept+1
-                if kept>6 then reader.quick_items[key]=false; changed=true end
-            end
-        end
-    elseif enabled_count<4 then
-        for _,key in ipairs({"toc","progress","font","frontlight","sync","comment_font","page_display"}) do
-            if (key~="frontlight" or Device:hasFrontlight()) and reader.quick_items[key]~=true then
-                reader.quick_items[key]=true
-                enabled_count=enabled_count+1
-                changed=true
-                if enabled_count>=4 then break end
-            end
-        end
-    end
-
-    local recent_seen,recent={},{}
-    for _,key in ipairs(reader.recent_actions) do
-        key=tostring(key or "")
-        if key~="" and not recent_seen[key] then
-            recent_seen[key]=true
-            recent[#recent+1]=key
-            if #recent>=6 then break end
-        end
-    end
-    if table.concat(recent,"|")~=table.concat(reader.recent_actions,"|") then
-        reader.recent_actions=recent
+    if tonumber(reader.quick_layout_version)~=8 or not order_ok or not items_ok then
+        reader.quick_layout_version=8
+        reader.quick_order=U.copy(fixed_order)
+        reader.quick_items=U.copy(fixed_items)
         changed=true
     end
 
@@ -3554,77 +3433,6 @@ function Plugin:_save_reader_preferences(reader,preferences)
     self.store:save_preferences(preferences)
 end
 
-function Plugin:_toggle_reader_quick_item(key)
-    local reader,preferences=self:_reader_preferences()
-    local current=reader.quick_items[key]==true
-    local count=0
-    for _,name in ipairs(READER_QUICK_ITEM_ORDER) do if reader.quick_items[name]==true then count=count+1 end end
-    if not current and count>=6 then self:toast("阅读面板最多显示六项",2); return false end
-    reader.quick_items[key]=not current
-    count=count+(current and -1 or 1)
-    if count<4 then reader.quick_items[key]=true; self:toast("阅读面板至少保留四项",2); return false end
-    self:_save_reader_preferences(reader,preferences)
-    return true
-end
-
-function Plugin:_move_reader_quick_item(key,delta)
-    local reader,preferences=self:_reader_preferences()
-    local order=reader.quick_order or {}
-    local index
-    for i,name in ipairs(order) do if name==key then index=i; break end end
-    if not index then return false end
-    local target=index+(tonumber(delta) or 0)
-    if target<1 or target>#order then return false end
-    order[index],order[target]=order[target],order[index]
-    reader.quick_order=order
-    self:_save_reader_preferences(reader,preferences)
-    return true
-end
-
-function Plugin:reader_quick_panel_order_menu()
-    local reader=self:_reader_preferences()
-    local rows={}
-    for index,key in ipairs(reader.quick_order or READER_QUICK_ITEM_ORDER) do
-        local item_key,item_index=key,index
-        rows[#rows+1]={text=READER_QUICK_LABELS[item_key] or item_key,post_text=tostring(item_index),sub_item_table_func=function()
-            local current=self:_reader_preferences().quick_order or READER_QUICK_ITEM_ORDER
-            local current_index
-            for i,name in ipairs(current) do if name==item_key then current_index=i; break end end
-            current_index=current_index or item_index
-            return {
-                {text="上移",enabled_func=function() return current_index>1 end,callback=function() self:_move_reader_quick_item(item_key,-1) end},
-                {text="下移",enabled_func=function() return current_index<#current end,callback=function() self:_move_reader_quick_item(item_key,1) end},
-            }
-        end}
-    end
-    return rows
-end
-
-function Plugin:reader_quick_panel_items_menu()
-    local rows={}
-    for _,key in ipairs(READER_QUICK_ITEM_ORDER) do
-        local item_key=key
-        rows[#rows+1]={text=READER_QUICK_LABELS[item_key] or item_key,checked_func=function()
-            return self:_reader_preferences().quick_items[item_key]==true
-        end,keep_menu_open=true,callback=function() self:_toggle_reader_quick_item(item_key) end}
-    end
-    rows[#rows+1]={text="调整顺序",sub_item_table_func=function() return self:reader_quick_panel_order_menu() end}
-    rows[#rows+1]={text="恢复推荐布局",callback=function()
-        local reader,preferences=self:_reader_preferences()
-        reader.quick_items={}
-        for _,key in ipairs(READER_QUICK_ITEM_ORDER) do reader.quick_items[key]=READER_QUICK_ITEM_DEFAULT[key]==true end
-        reader.quick_order=U.copy(READER_QUICK_ITEM_ORDER)
-        if type(Device.hasFrontlight)~="function" or not Device:hasFrontlight() then
-            reader.quick_items.frontlight=false
-            reader.quick_items.page_display=true
-        end
-        reader.quick_layout_version=7
-        self:_save_reader_preferences(reader,preferences)
-        self:toast("阅读面板已恢复推荐布局")
-    end}
-    return rows
-end
-
 function Plugin:reader_quick_panel_settings_menu()
     return {
         {text="启用觅阅阅读面板",checked_func=function() return self:_reader_preferences().enabled~=false end,keep_menu_open=true,callback=function()
@@ -3636,10 +3444,8 @@ function Plugin:reader_quick_panel_settings_menu()
         {text="显示阅读状态",checked_func=function() return self:_reader_preferences().show_status~=false end,keep_menu_open=true,callback=function()
             local reader,preferences=self:_reader_preferences(); reader.show_status=reader.show_status==false; self:_save_reader_preferences(reader,preferences)
         end},
-        {text="显示最近使用",checked_func=function() return self:_reader_preferences().show_recent~=false end,keep_menu_open=true,callback=function()
-            local reader,preferences=self:_reader_preferences(); reader.show_recent=reader.show_recent==false; self:_save_reader_preferences(reader,preferences)
-        end},
-        {text="快捷项目与顺序",post_text="最多六项",sub_item_table_func=function() return self:reader_quick_panel_items_menu() end},
+        {text="阅读评论",post_text=self:_thoughts_enabled_label(),checked_func=function() return self:_thoughts_enabled() end,keep_menu_open=true,callback=function() self:_toggle_thoughts_enabled() end},
+        {text="评论显示设置",post_text=self:_thought_font_size_label(),sub_item_table_func=function() return self:thought_font_settings_menu() end},
     }
 end
 
@@ -3976,20 +3782,88 @@ function Plugin:_reader_open_native_page(label,opener,return_callback)
     return true
 end
 
+function Plugin:_reader_wifi_state()
+    local ok_nm,NetworkMgr=pcall(require,"ui/network/manager")
+    if not ok_nm or not NetworkMgr or type(NetworkMgr.isWifiOn)~="function" then return nil end
+    local ok,value=pcall(NetworkMgr.isWifiOn,NetworkMgr)
+    if ok then return value==true end
+    return nil
+end
+
+function Plugin:_reader_wifi_toggle()
+    local ok_nm,NetworkMgr=pcall(require,"ui/network/manager")
+    if not ok_nm or not NetworkMgr then self:info("当前设备无法使用网络设置"); return false end
+    local on=self:_reader_wifi_state()==true
+    local ok=false
+    if on then
+        if type(NetworkMgr.toggleWifiOff)=="function" then ok=pcall(NetworkMgr.toggleWifiOff,NetworkMgr)
+        elseif type(NetworkMgr.turnOffWifi)=="function" then ok=pcall(NetworkMgr.turnOffWifi,NetworkMgr) end
+        if ok then self:toast("Wi-Fi 已关闭",1.5) end
+    else
+        if type(NetworkMgr.toggleWifiOn)=="function" then ok=pcall(NetworkMgr.toggleWifiOn,NetworkMgr)
+        elseif type(NetworkMgr.turnOnWifi)=="function" then ok=pcall(NetworkMgr.turnOnWifi,NetworkMgr) end
+        if ok then self:toast("正在开启 Wi-Fi",1.5) end
+    end
+    return ok==true
+end
+
 function Plugin:_reader_wifi_settings(back_callback)
     local ok_nm,NetworkMgr=pcall(require,"ui/network/manager")
     if not ok_nm or not NetworkMgr then self:info("当前设备无法使用网络设置"); return false end
-    return self:_reader_open_native_page("Wi-Fi",function()
+    local restored=false
+    local function restore_reader_menu()
+        if restored then return end
+        restored=true
+        if type(back_callback)=="function" then UIManager:scheduleIn(.12,back_callback) end
+    end
+    local function show_network_list()
+        if type(NetworkMgr.getNetworkList)=="function" then
+            local ok_list,networks=pcall(NetworkMgr.getNetworkList,NetworkMgr)
+            if ok_list and type(networks)=="table" then
+                local ok_widget,NetworkSetting=pcall(require,"ui/widget/networksetting")
+                if ok_widget and NetworkSetting and type(NetworkSetting.new)=="function" then
+                    local dialog=NetworkSetting:new{network_list=networks}
+                    local original_on_close=dialog.onCloseWidget
+                    dialog.onCloseWidget=function(widget)
+                        if type(original_on_close)=="function" then
+                            local ok_close,err=xpcall(function() original_on_close(widget) end,debug.traceback)
+                            if not ok_close then logger.warn("[MiuRead][Reader] network picker close failed",tostring(err)) end
+                        end
+                        restore_reader_menu()
+                    end
+                    UIManager:show(dialog)
+                    return true
+                end
+            end
+        end
         if type(NetworkMgr.toggleWifiOn)=="function" then
-            local ok=pcall(NetworkMgr.toggleWifiOn,NetworkMgr,nil,true,true)
+            local ok=pcall(NetworkMgr.toggleWifiOn,NetworkMgr,restore_reader_menu,true,true)
             if ok then return true end
         end
         if type(NetworkMgr.turnOnWifi)=="function" then
-            local ok=pcall(NetworkMgr.turnOnWifi,NetworkMgr)
+            local ok=pcall(NetworkMgr.turnOnWifi,NetworkMgr,restore_reader_menu,true)
             if ok then return true end
         end
         return false
-    end,back_callback or function() self:show_reader_control_center("device") end)
+    end
+    if self:_reader_wifi_state()==true then
+        if show_network_list() then return true end
+    elseif type(NetworkMgr.toggleWifiOn)=="function" then
+        -- KOReader's long-press flag enables Wi-Fi and keeps the network list
+        -- visible. Restore the MiuRead reader panel only after that picker closes.
+        local ok=pcall(NetworkMgr.toggleWifiOn,NetworkMgr,restore_reader_menu,true,true)
+        if ok then return true end
+    elseif type(NetworkMgr.turnOnWifi)=="function" then
+        local ok=pcall(NetworkMgr.turnOnWifi,NetworkMgr,function()
+            UIManager:scheduleIn(.1,function()
+                if not show_network_list() then restore_reader_menu() end
+            end)
+        end,true)
+        if ok then return true end
+    end
+    self:info("Wi-Fi 网络列表暂时无法打开")
+    restore_reader_menu()
+    return false
 end
 
 function Plugin:_home_status_line()
@@ -7157,6 +7031,40 @@ function Plugin:_show_reader_weight_panel(back_callback)
     return true
 end
 
+function Plugin:_thoughts_enabled()
+    return (self.store:preferences().thoughts or {}).enabled~=false
+end
+
+function Plugin:_set_thoughts_enabled(enabled)
+    enabled=enabled~=false
+    local p=self.store:preferences(); p.thoughts=p.thoughts or {}
+    if (p.thoughts.enabled~=false)==enabled then return true end
+    p.thoughts.enabled=enabled
+    self.store:save_preferences(p)
+    if enabled then
+        local current=self.sync and self.sync.current or nil
+        local record=current and current.record or {}
+        local variant=tostring(current and (current.variant or record.variant) or "")
+        if current and (record.annotation_requested==true or variant:find("notes",1,true)) then
+            self:_setup_thought_tap()
+        end
+        self:toast("阅读评论已开启",1.5)
+    else
+        self:_close_active_thought_popup("comments disabled")
+        self:_teardown_thought_tap()
+        self:toast("阅读评论已关闭, 划线和评论数据不会删除",2)
+    end
+    return true
+end
+
+function Plugin:_toggle_thoughts_enabled()
+    return self:_set_thoughts_enabled(not self:_thoughts_enabled())
+end
+
+function Plugin:_thoughts_enabled_label()
+    return self:_thoughts_enabled() and "已开启" or "已关闭"
+end
+
 function Plugin:_thought_font_size_label()
     local level=tostring((self.store:preferences().thoughts or {}).font or "standard")
     local labels={small="小（18）",standard="标准（22）",large="大（26）",xlarge="特大（30）"}
@@ -7196,6 +7104,7 @@ function Plugin:_show_reader_comment_settings(back_callback)
     ReaderSettingsDialog.show{
         title="评论显示",
         subtitle=function()
+            if not self:_thoughts_enabled() then return "阅读评论已关闭, 划线与本地评论数据仍保留" end
             local prefs=self.store:preferences().thoughts or {}
             return (prefs.follow_body_font==true and "字体跟随正文" or self:_thought_font_face_label(prefs)).." · "..self:_thought_font_size_label()
         end,
@@ -7206,6 +7115,7 @@ function Plugin:_show_reader_comment_settings(back_callback)
             local follow=prefs.follow_body_font==true
             local level=tostring(prefs.font or "standard")
             return {
+                {label="阅读评论",value=self:_thoughts_enabled_label(),value_bold=true,keep_open=true,callback=function() self:_toggle_thoughts_enabled() end},
                 {label="评论字体跟随正文",value=follow and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:_toggle_thought_follow_body_font() end},
                 {label="固定字体",value=self:_thought_font_face_label(prefs),enabled=not follow,callback=function()
                     self:_show_standalone_menu("评论字体",self:thought_font_face_menu(),{native_input=true,reader_context=true,on_home=function() return self:return_to_miuread_home("reader surface") end,on_close=return_to_comments})
@@ -7252,20 +7162,7 @@ function Plugin:_reader_toolbar_title()
     return tostring(title),status,progress,percent
 end
 
-function Plugin:_reader_record_recent_action(key)
-    key=tostring(key or "")
-    if key=="" or key=="home" or key=="toc" or key=="progress" or key=="font" or key=="sync" or key=="comment_font" then return false end
-    local reader,preferences=self:_reader_preferences()
-    local recent={key}
-    for _,name in ipairs(reader.recent_actions or {}) do
-        name=tostring(name or "")
-        if name~="" and name~=key then recent[#recent+1]=name end
-        if #recent>=6 then break end
-    end
-    reader.recent_actions=recent
-    self:_save_reader_preferences(reader,preferences)
-    return true
-end
+function Plugin:_reader_record_recent_action() return false end
 
 function Plugin:_reader_night_enabled()
     local enabled=false
@@ -7851,85 +7748,43 @@ end
 function Plugin:_reader_control_categories()
     local function back_to(category) return function() self:show_reader_control_center(category) end end
     local reading={
-        {title="阅读导航",items={
-            self:_reader_control_item("toc","目录","☰",function() return self:_show_reader_toc(back_to("reading")) end),
-            self:_reader_control_item("progress","阅读进度","◴",function() return self:_show_reader_progress_control(back_to("reading")) end),
+        {title="阅读工具",items={
             self:_reader_control_item("position","页面跳转","→",function() return self:_show_reader_position_jump(back_to("reading")) end),
             self:_reader_control_item("back_location","返回上一位置","↶",function() return self:_reader_go_back_location() end,{arrow=false}),
-            self:_reader_control_item("bookmark","书签","▯",function() return self:_reader_show_bookmarks(back_to("reading")) end),
+            self:_reader_control_item("search","全文搜索","⌕",function() return self:_reader_show_search(back_to("reading")) end),
+            self:_reader_control_item("bookmark","书签与标注","▯",function() return self:_reader_show_bookmarks(back_to("reading")) end),
             self:_reader_control_item("history","阅读历史","◷",function() return self:_reader_show_history(back_to("reading")) end),
         }},
-        {title="书籍",items={
-            self:_reader_control_item("current_book","当前书籍","□",function() return self:_show_reader_current_book_panel(back_to("reading")) end),
-            self:_reader_control_item("home",self:_home_enabled() and "返回觅阅主页" or "打开觅阅书架","⌂",function()
-                if self:_home_enabled() then return self:return_to_miuread_home() end
-                return self:show_shelf(false,false,"account")
-            end),
+    }
+    local display={
+        {title="显示与排版",items={
+            self:_reader_control_item("page_display","页面显示","▤",function() return self:_show_reader_page_display_panel(back_to("display")) end),
+            self:_reader_control_item("comments","评论设置","✎",function() return self:_show_reader_comment_settings(back_to("display")) end,{value=self:_thoughts_enabled_label()}),
+            self:_reader_control_item("refresh_rate","刷新频率","↻",function() return self:_reader_cycle_refresh_rate() end,{value=self:_reader_refresh_rate_label(),arrow=false}),
+            self:_reader_control_item("night","夜间模式","☾",function() return self:_home_toggle_night() end,{value=self:_reader_night_label(),arrow=false}),
+            self:_reader_control_item("typeset","KOReader 高级排版","⋯",function() return self:_show_reader_typeset_menu(back_to("display")) end),
         }},
     }
-    local layout={
-        {title="快速排版",items={
-            self:_reader_control_item("font","字体与字号","Aa",function() return self:_show_reader_font_panel(back_to("layout")) end),
-            self:_reader_control_item("spacing","行距与页边距","≡",function() return self:_show_reader_spacing_panel(back_to("layout")) end,{value=tostring(math.floor(self:_reader_line_spacing_value()+.5)).."%"}),
-            self:_reader_control_item("weight","字体粗细与对齐","T",function() return self:_show_reader_weight_panel(back_to("layout")) end,{value=self:_reader_font_weight_label()}),
-            self:_reader_control_item("comments","评论显示","✎",function() return self:_show_reader_comment_settings(back_to("layout")) end),
-        }},
-        {title="显示与高级",items={
-            self:_reader_control_item("page_display","页面显示","▤",function() return self:_show_reader_page_display_panel(back_to("layout")) end),
-            self:_reader_control_item("typeset","KOReader 高级排版","⋯",function() return self:_show_reader_typeset_menu(back_to("layout")) end),
+    local book={
+        {title="书籍与同步",items={
+            self:_reader_control_item("sync","阅读同步","⇅",function() return self:_show_reader_sync_panel(back_to("book")) end),
+            self:_reader_control_item("current_book","当前书籍","□",function() return self:_show_reader_current_book_panel(back_to("book")) end),
+            self:_reader_control_item("downloads","下载管理","⇩",function() return self:show_downloads(back_to("book")) end),
         }},
     }
-    local display_items={
-        self:_reader_control_item("page_display","页面显示","▤",function() return self:_show_reader_page_display_panel(back_to("display")) end),
-        self:_reader_control_item("refresh_rate","刷新频率","↻",function() return self:_reader_cycle_refresh_rate() end,{value=self:_reader_refresh_rate_label(),arrow=false}),
-        self:_reader_control_item("night","夜间模式","☾",function() return self:_home_toggle_night() end,{value=self:_reader_night_label(),arrow=false}),
-        self:_reader_control_item("rotation","屏幕方向","↻",function() return self:_home_rotate() end,{value=self:_reader_rotation_label(),arrow=false}),
+    local system_items={
         self:_reader_control_item("full_refresh","全屏刷新","◉",function() return self:_home_full_refresh() end,{arrow=false}),
+        self:_reader_control_item("koreader_menu","KOReader 高级菜单","☰",function() return self:_show_koreader_reader_menu(back_to("system")) end),
     }
-    if Device:hasFrontlight() then
-        table.insert(display_items,2,self:_reader_control_item("frontlight","前光与色温","☼",function() return self:_show_reader_frontlight_panel(back_to("display")) end,{value=tostring(math.floor((self:_reader_frontlight_value() or 0)+.5))}))
-    end
-    local display={{title="页面与屏幕",items=display_items}}
-    local tools={
-        {title="阅读工具",items={
-            self:_reader_control_item("search","全文搜索","⌕",function() return self:_reader_show_search(back_to("tools")) end),
-            self:_reader_control_item("bookmark","书签与标注","▯",function() return self:_reader_show_bookmarks(back_to("tools")) end),
-            self:_reader_control_item("history","跳转历史","◷",function() return self:_reader_show_history(back_to("tools")) end),
-            self:_reader_control_item("comments","评论显示","✎",function() return self:_show_reader_comment_settings(back_to("tools")) end),
-        }},
-        {title="觅阅工具",items={
-            self:_reader_control_item("sync","阅读同步","⇅",function() return self:_show_reader_sync_panel(back_to("tools")) end),
-            self:_reader_control_item("current_book","当前书籍","□",function() return self:_show_reader_current_book_panel(back_to("tools")) end),
-            self:_reader_control_item("downloads","下载管理","⇩",function() return self:show_downloads(back_to("tools")) end),
-        }},
-    }
-    local device_items={
-        self:_reader_control_item("wifi","Wi-Fi","wifi",function() return self:_reader_wifi_settings(back_to("device")) end),
-        self:_reader_control_item("rotation","屏幕方向","↻",function() return self:_home_rotate() end,{value=self:_reader_rotation_label(),arrow=false}),
-        self:_reader_control_item("full_refresh","全屏刷新","◉",function() return self:_home_full_refresh() end,{arrow=false}),
-    }
-    if Device:hasFrontlight() then
-        device_items[#device_items+1]=self:_reader_control_item("frontlight","前光","☼",function() return self:_show_reader_frontlight_panel(back_to("device")) end,{value=tostring(math.floor((self:_reader_frontlight_value() or 0)+.5))})
-    end
     if Device:canSuspend() then
-        device_items[#device_items+1]=self:_reader_control_item("sleep","休眠","◐",function() return self:_home_sleep() end,{arrow=false})
+        system_items[#system_items+1]=self:_reader_control_item("sleep","休眠","◐",function() return self:_home_sleep() end,{arrow=false})
     end
-    local device={
-        {title="设备",items=device_items},
-        {title="系统与高级",items={
-            self:_reader_control_item("koreader_menu","KOReader 高级菜单","☰",function() return self:_show_koreader_reader_menu(back_to("device")) end),
-            self:_reader_control_item("home",self:_home_enabled() and "返回觅阅主页" or "觅阅书架","⌂",function()
-                if self:_home_enabled() then return self:return_to_miuread_home() end
-                return self:show_shelf(false,false,"account")
-            end),
-        }},
-    }
+    local system={{title="系统",items=system_items}}
     return {
         {key="reading",label="阅读",sections=reading},
-        {key="layout",label="排版",sections=layout},
         {key="display",label="显示",sections=display},
-        {key="tools",label="工具",sections=tools},
-        {key="device",label="设备",sections=device},
+        {key="book",label="书籍",sections=book},
+        {key="system",label="系统",sections=system},
     }
 end
 
@@ -7937,7 +7792,7 @@ function Plugin:show_reader_control_center(initial_category)
     if not (self.ui and self.ui.document) then return false end
     self:_mark_reader_busy(8)
     local center,err=ReaderControlCenter.show{
-        title="全部阅读功能",
+        title="更多",
         initial_category=initial_category or "reading",
         categories=self:_reader_control_categories(),
         on_back=function() self:show_reader_quick_panel() end,
@@ -7955,61 +7810,83 @@ function Plugin:show_reader_more_panel()
 end
 
 function Plugin:_reader_panel_definitions(progress)
-    local home_label=self:_home_enabled() and "返回主页" or "觅阅书架"
+    local home_label=self:_home_enabled() and "主页" or "书架"
     return {
-        toc={key="toc",icon="☰",label="目录",detail="章节导航",callback=function() self:_show_reader_toc() end},
-        progress={key="progress",icon="◴",label="阅读进度",detail=progress,callback=function() self:_show_reader_progress_control() end},
-        font={key="font",icon="Aa",label="字体排版",detail="字号 "..self:_reader_font_size_label(),callback=function() self:_show_reader_font_panel() end},
-        frontlight={key="frontlight",icon="☼",label="前光",detail=Device:hasFrontlight() and "亮度与色温" or "设备不支持",enabled=Device:hasFrontlight(),callback=function() self:_show_reader_frontlight_panel() end},
-        sync={key="sync",icon="⇅",label="阅读同步",detail=self:progress_sync_label(),callback=function() self:_show_reader_sync_panel() end},
-        comment_font={key="comment_font",icon="A✎",label="评论显示",detail=self:_thought_font_size_label(),callback=function()
+        home={key="home",icon="home",icon_key="home",label=home_label,detail="",callback=function()
+            if self:_home_enabled() then return self:return_to_miuread_home() end
+            return self:show_shelf(false,false,"account")
+        end},
+        toc={key="toc",icon="toc",icon_key="toc",label="目录",detail="",callback=function() self:_show_reader_toc() end},
+        progress={key="progress",icon="progress",icon_key="progress",label="进度",detail=progress or "",callback=function() self:_show_reader_progress_control() end},
+        font={key="font",icon="font",icon_key="font",label="字体",detail=self:_reader_font_size_label(),callback=function() self:_show_reader_font_panel() end},
+        comments={key="comments",icon="bookmark",icon_key="bookmark",label="评论",detail=self:_thoughts_enabled() and "开" or "关",callback=function()
+            self:_toggle_thoughts_enabled()
+        end,hold_callback=function()
             self:_show_reader_comment_settings(function() self:show_reader_quick_panel() end)
         end},
-        page_display={key="page_display",icon="▤",label="页面显示",detail="状态栏与刷新",callback=function() self:_show_reader_page_display_panel() end},
-        home={key="home",icon="⌂",label=home_label,detail=self:_home_enabled() and "退出阅读" or "打开书架",callback=function()
-            if self:_home_enabled() then self:return_to_miuread_home() else self:show_shelf(false,false,"account") end
+        more={key="more",icon="more",icon_key="more",label="更多",detail="",callback=function() self:show_reader_more_panel() end},
+    }
+end
+
+function Plugin:_reader_device_buttons()
+    local wifi_state=self:_reader_wifi_state()
+    local wifi_label=wifi_state==true and "Wi-Fi 开" or (wifi_state==false and "Wi-Fi 关" or "Wi-Fi")
+    return {
+        {key="wifi",icon="wifi",icon_key="wifi",label=wifi_label,callback=function() return self:_reader_wifi_toggle() end,hold_callback=function()
+            return self:_reader_wifi_settings(function() self:show_reader_quick_panel() end)
         end},
-        typeset={key="typeset",icon="⋯",label="高级排版",detail="KOReader",callback=function() self:_show_reader_typeset_menu(function() self:show_reader_quick_panel() end) end},
-        current_book={key="current_book",icon="□",label="当前书籍",detail=self:_current_book_record() and "详情与修复" or "文件未识别",callback=function() self:_show_reader_current_book_panel(function() self:show_reader_quick_panel() end) end},
-        downloads={key="downloads",icon="⇩",label="下载管理",detail=self:_download_status_label(),callback=function() self:show_downloads(function() self:show_reader_quick_panel() end) end},
-        full_refresh={key="full_refresh",icon="↻",label="全屏刷新",detail="清除残影",callback=function() self:_home_full_refresh() end},
-        koreader_menu={key="koreader_menu",icon="☰",label="KOReader 高级菜单",detail="兼容入口",callback=function() self:_show_koreader_reader_menu(function() self:show_reader_quick_panel() end) end},
-        sleep={key="sleep",icon="◐",label="休眠",detail="设备休眠",enabled=Device:canSuspend(),callback=function() self:_home_sleep() end},
+        {key="rotation",icon="rotate",icon_key="rotate",label="旋转",callback=function() return self:_home_rotate() end},
+        {key="screenshot",icon="screenshot",icon_key="screenshot",label="截图",callback=function() return ScreenshotMode.start(self) end},
+        {key="sync",icon="sync",icon_key="sync",label="同步",callback=function() return self:_show_reader_sync_panel(function() self:show_reader_quick_panel() end) end},
+        {key="koreader",icon="ko-reader",icon_key="ko-reader",label="KOReader",callback=function()
+            return self:_show_koreader_reader_menu(function() self:show_reader_quick_panel() end)
+        end},
     }
 end
 
 function Plugin:show_reader_quick_panel()
     if not (self.ui and self.ui.document) then return false end
     self:_mark_reader_busy(8)
-    local title,status,progress,percent=self:_reader_toolbar_title()
+    local title,status,progress=self:_reader_toolbar_title()
     local reader=self:_reader_preferences()
     local definitions=self:_reader_panel_definitions(progress)
     local buttons={}
-    for _,key in ipairs(reader.quick_order or READER_QUICK_ITEM_ORDER) do
-        local source=definitions[key]
-        if reader.quick_items[key]==true and source then
-            local item_key=key
-            local item={}
-            for name,value in pairs(source) do item[name]=value end
-            local callback=source.callback
-            item.callback=function()
-                self:_reader_record_recent_action(item_key)
-                return callback()
-            end
-            buttons[#buttons+1]=item
+    for _,key in ipairs({"home","toc","progress","font","comments","more"}) do
+        buttons[#buttons+1]=definitions[key]
+    end
+    local frontlight,warmth
+    if Device:hasFrontlight() then
+        local minimum,maximum=self:_reader_frontlight_bounds()
+        frontlight={
+            label="前光",min=minimum,max=maximum,value=self:_reader_frontlight_value() or minimum,
+            on_set=function(value)
+                if not self:_reader_set_frontlight(value) then return false end
+                return self:_reader_frontlight_value() or value
+            end,
+            on_toggle=function()
+                self:_reader_toggle_frontlight()
+                return self:_reader_frontlight_value() or minimum
+            end,
+        }
+        local state=self:_reader_warmth_state()
+        if state then
+            warmth={
+                label="色温",icon="☾",min=state.min,max=state.max,value=state.value,
+                on_set=function(value)
+                    if not self:_reader_set_warmth(value) then return false end
+                    local current=self:_reader_warmth_state()
+                    return current and current.value or value
+                end,
+            }
         end
-        if #buttons>=6 then break end
     end
     local panel,err=ReaderToolbar.show{
-        title=reader.show_title~=false and title or "阅读快捷面板",
+        title=reader.show_title~=false and title or "阅读",
         subtitle=reader.show_status~=false and status or "",
-        progress_percent=percent,
-        columns=3,
         buttons=buttons,
-        recent_title="最近使用",
-        recent_buttons=self:_reader_recent_buttons(),
-        footer_action={label="全部阅读功能  ›",callback=function() self:show_reader_control_center("reading") end},
-        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        frontlight=frontlight,
+        warmth=warmth,
+        device_buttons=self:_reader_device_buttons(),
     }
     if not panel then
         logger.warn("[MiuRead][ReaderToolbar] unavailable",tostring(err or "unknown"))
@@ -12661,7 +12538,7 @@ end
 
 
 function Plugin:_thought_display_label()
-    return "轻量列表 · 点击翻页"
+    return self:_thoughts_enabled() and ("已开启 · "..self:_thought_font_size_label()) or "已关闭"
 end
 
 function Plugin:_toggle_home_network_metadata()
@@ -13156,6 +13033,7 @@ end
 function Plugin:thought_font_settings_menu()
     local prefs=self.store:preferences().thoughts or {}
     return {
+        {text="阅读评论",post_text=self:_thoughts_enabled_label(),checked_func=function() return self:_thoughts_enabled() end,keep_menu_open=true,callback=function() self:_toggle_thoughts_enabled() end},
         {text="评论字体跟随正文",checked_func=function()
             return (self.store:preferences().thoughts or {}).follow_body_font==true
         end,keep_menu_open=true,callback=function()
@@ -13849,6 +13727,7 @@ function Plugin:_open_thought_info(info,generation)
 end
 
 function Plugin:_show_thought_href(href)
+    if not self:_thoughts_enabled() then return false end
     local info=Thoughts.parse_href(href); if not info then return false end
     if self._thought_popup_busy or self._thought_popup then return true end
     local runtime=self._download_runtime
@@ -13880,6 +13759,7 @@ function Plugin:_on_thought_tap(ges)
     return self:_show_thought_href(href)
 end
 function Plugin:_setup_thought_tap()
+    if not self:_thoughts_enabled() then return end
     if self._thought_tap_setup or not self.ui or not self.ui.registerTouchZones then return end
     local ok,Device=pcall(require,"device"); if ok and Device.isTouchDevice and not Device:isTouchDevice() then return end
     self.ui:registerTouchZones({{id="miuread_thought_popup",ges="tap",screen_zone={ratio_x=0,ratio_y=0,ratio_w=1,ratio_h=1},overrides={"tap_link"},handler=function(ges) return self:_on_thought_tap(ges) end}})
@@ -13892,7 +13772,7 @@ function Plugin:on_sync_record_ready(current)
         local book_id,path=tostring(current.book.book_id),current.path
         local record=current.record or {}
         local variant=tostring(current.variant or record.variant or "")
-        if record.annotation_requested==true or variant:find("notes",1,true) then
+        if self:_thoughts_enabled() and (record.annotation_requested==true or variant:find("notes",1,true)) then
             self:_setup_thought_tap()
         end
         UIManager:scheduleIn(1.0,function()
