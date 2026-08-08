@@ -117,42 +117,44 @@ local function panel_button(entry, width, height, close_callback, compact)
     local detail = tostring(entry.detail or "")
     local icon = tostring(entry.icon_key or entry.icon or "")
     local enabled = entry.enabled ~= false
-    local pad = UiScale.dp(compact and 3 or 4, 2, 7)
+    local pad = UiScale.dp(compact and 4 or 5, 3, 8)
     local inner_w = math.max(1, width - pad * 2)
-    local gap_h = UiScale.dp(2, 1, 4)
-    local icon_slot_h = UiScale.dp(compact and 27 or 31, compact and 24 or 27, compact and 37 or 43)
-    local label_slot_h = UiScale.dp(compact and 20 or 22, compact and 18 or 20, compact and 27 or 31)
-    -- Always reserve the detail slot. Buttons without a subtitle keep the same
-    -- icon and title axes as buttons that do have one.
-    local detail_slot_h = UiScale.dp(compact and 16 or 18, compact and 14 or 16, compact and 22 or 25)
-    local icon_size = UiScale.dp(compact and 22 or 25, compact and 20 or 22, compact and 30 or 34)
+    local gap_h = UiScale.dp(4, 3, 7)
+    local icon_slot_h = UiScale.dp(compact and 38 or 42, compact and 34 or 38, compact and 50 or 56)
+    local label_slot_h = UiScale.dp(compact and 25 or 27, compact and 22 or 24, compact and 33 or 36)
+    local detail_slot_h = UiScale.dp(compact and 21 or 23, compact and 19 or 21, compact and 28 or 31)
+    local icon_size = UiScale.dp(compact and 30 or 33, compact and 27 or 30, compact and 40 or 44)
 
     local content = VerticalGroup:new{
         align = "center",
         Ui.icon(icon, inner_w, icon_slot_h, icon_size, {
             icon_key = icon,
             icon_path = entry.icon_path,
-            face = UiScale.iconFace("cfont", compact and 18 or 21, compact and 24 or 29, compact and 15 or 17),
+            face = UiScale.iconFace("cfont", compact and 24 or 27, compact and 32 or 36, compact and 20 or 22),
             fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
         }),
         VerticalSpan:new{height = gap_h},
         Ui.textbox(label, inner_w, label_slot_h,
-            face("smallinfofont", compact and 9.2 or 10.5, compact and 13 or 15), {
+            face("smallinfofont", compact and 12.4 or 13.2, compact and 16.5 or 18), {
                 bold = true, alignment = "center", halign = "center",
+                height_overflow_show_ellipsis = true,
                 fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
             }),
-        Ui.textbox(detail, inner_w, detail_slot_h, face("smallinfofont", 8.2, 11.5), {
-            alignment = "center", halign = "center",
-            fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
-        }),
+        Ui.textbox(detail, inner_w, detail_slot_h,
+            face("smallinfofont", compact and 10.2 or 10.8, compact and 14 or 15), {
+                alignment = "center", halign = "center",
+                height_overflow_show_ellipsis = true,
+                fgcolor = enabled and Blitbuffer.COLOR_DARK_GRAY or Blitbuffer.COLOR_GRAY,
+            }),
     }
 
-    local card = fixed_frame(width, height, {
-        bordersize = UiScale.line("thin"),
+    -- Keep the entire third-column cell tappable, but do not draw a card
+    -- around every action. The pull-down panel should read as a control surface,
+    -- not as a wall of small boxed buttons.
+    local surface = fixed_frame(width, height, {
+        bordersize = 0,
         padding = pad,
-        radius = UiScale.radius(6, 4, 10),
         background = Blitbuffer.COLOR_WHITE,
-        color = enabled and Blitbuffer.COLOR_GRAY or (Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_GRAY),
     }, CenterContainer:new{dimen = Geom:new{w = inner_w, h = math.max(1, height - pad * 2)}, content})
 
     local function run_action(action, anchor)
@@ -169,7 +171,7 @@ local function panel_button(entry, width, height, close_callback, compact)
         end
     end
 
-    return tappable(width, height, card,
+    return tappable(width, height, surface,
         function(anchor) run_action(entry.callback, anchor) end,
         type(entry.hold_callback) == "function"
             and function(anchor) run_action(entry.hold_callback, anchor) end
@@ -219,30 +221,31 @@ end
 function QuickPanelWidget:_build()
     local scale = UiScale.metrics()
     local sw, sh = scale.sw, scale.sh
-    local margin = math.max(UiScale.dp(10, 9, 18), math.floor(scale.short * .018))
-    local gap = UiScale.dp(7, 5, 12)
+    local margin = math.max(UiScale.dp(11, 9, 18), math.floor(scale.short * .018))
+    local gap = UiScale.dp(8, 6, 13)
     local buttons = type(self.opts.buttons) == "table" and self.opts.buttons or {}
     local line = UiScale.line("thin")
 
-    -- Six columns are the visual contract for the home pull-down panel. On a
-    -- genuinely narrower screen we still fall back instead of clipping.
-    local preferred_columns = 6
-    local min_button_w = UiScale.dp(72, 64, 104)
+    -- Three fixed columns preserve spatial memory and give labels/icons enough
+    -- room on Kindle. Custom layouts simply add rows up to the existing 12-item
+    -- limit instead of shrinking everything back into six tiny columns.
+    local preferred_columns = 3
+    local min_button_w = UiScale.dp(132, 112, 176)
     local possible_columns = math.max(1, math.floor((sw - margin * 2 + gap) / (min_button_w + gap)))
     local columns = math.max(1, math.min(preferred_columns, possible_columns))
     local rows = #buttons > 0 and math.ceil(math.min(#buttons, 12) / columns) or 0
 
-    local title_h = UiScale.dp(48, 44, 66)
-    local button_h = UiScale.dp(82, 74, 108)
-    local tools_h = self.opts.on_tools and UiScale.dp(46, 41, 62) or 0
-    local status_h = (self.opts.status_text and self.opts.status_text ~= "") and UiScale.dp(30, 27, 42) or 0
+    local title_h = UiScale.dp(52, 47, 70)
+    local button_h = UiScale.dp(104, 94, 136)
+    local footer_h = (self.opts.on_customize or self.opts.on_tools) and UiScale.dp(48, 43, 64) or 0
+    local status_h = (self.opts.status_text and self.opts.status_text ~= "") and UiScale.dp(34, 30, 46) or 0
 
     self.panel_h = margin * 2 + title_h + line + gap * 2
     if rows > 0 then
         self.panel_h = self.panel_h + rows * button_h + math.max(0, rows - 1) * gap + gap
     end
     if status_h > 0 then self.panel_h = self.panel_h + status_h + gap end
-    if tools_h > 0 then self.panel_h = self.panel_h + tools_h end
+    if footer_h > 0 then self.panel_h = self.panel_h + line + gap + footer_h end
     self.panel_h = math.min(sh - margin, self.panel_h)
 
     self.dimen = Geom:new{x = 0, y = 0, w = sw, h = sh}
@@ -255,56 +258,29 @@ function QuickPanelWidget:_build()
     local children = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
     self:_add(children, 0, 0, fixed_frame(sw, self.panel_h, {background = Blitbuffer.COLOR_WHITE}))
 
-    local customize_w = self.opts.on_customize and UiScale.dp(72, 66, 94) or 0
-    local close_w = UiScale.dp(62, 58, 82)
-    local time_w = UiScale.dp(92, 82, 122)
-    local controls_gap_count = (customize_w > 0 and 3 or 2)
-    local state_w = math.max(1, sw - margin * 2 - time_w - customize_w - close_w - gap * controls_gap_count)
-    local wifi_w = math.floor(state_w * .62)
-    local battery_w = math.max(1, state_w - wifi_w)
+    local close_w = UiScale.dp(92, 80, 120)
+    local battery_w = UiScale.dp(98, 84, 126)
+    local time_w = math.max(1, sw - margin * 2 - close_w - battery_w - gap * 2)
 
     local title_row = HorizontalGroup:new{
         align = "center",
         LeftContainer:new{dimen = Geom:new{w = time_w, h = title_h},
             Ui.text(tostring(self.opts.time_text or os.date("%H:%M")), time_w, title_h,
-                face("cfont", 18.5, 26), {bold = true, halign = "left"})},
+                face("cfont", 20.5, 28.5), {bold = true, halign = "left"})},
         HorizontalSpan:new{width = gap},
-        Ui.text(tostring(self.opts.wifi_text or "Wi-Fi"), wifi_w, title_h,
-            face("smallinfofont", 10.2, 14.5), {bold = true}),
-        Ui.text(tostring(self.opts.battery_text or ""), battery_w, title_h,
-            face("smallinfofont", 10.2, 14.5), {bold = true}),
+        Ui.text("电量 "..tostring(self.opts.battery_text or "未知"), battery_w, title_h,
+            face("smallinfofont", 11.8, 16), {bold = true}),
         HorizontalSpan:new{width = gap},
+        tappable(close_w, title_h,
+            fixed_frame(close_w, title_h, {bordersize = 0, background = Blitbuffer.COLOR_WHITE},
+                Ui.text("收起 ↑", close_w, title_h, face("smallinfofont", 11.8, 16), {bold = true})),
+            function() self:_close() end),
     }
-
-    if customize_w > 0 then
-        title_row[#title_row + 1] = tappable(customize_w, title_h, fixed_frame(customize_w, math.max(1, title_h - gap), {
-            bordersize = line,
-            radius = UiScale.radius(5, 4, 9),
-            background = Blitbuffer.COLOR_WHITE,
-            color = Blitbuffer.COLOR_GRAY,
-        }, Ui.text("自定义", customize_w - UiScale.dp(8, 6, 12), math.max(1, title_h - gap),
-            face("smallinfofont", 10, 14), {bold = true})), function()
-            self:_close(function()
-                if self.opts.on_customize then self.opts.on_customize() end
-            end)
-        end)
-        title_row[#title_row + 1] = HorizontalSpan:new{width = gap}
-    end
-
-    title_row[#title_row + 1] = tappable(close_w, title_h, fixed_frame(close_w, math.max(1, title_h - gap), {
-        bordersize = line,
-        radius = UiScale.radius(5, 4, 9),
-        background = Blitbuffer.COLOR_WHITE,
-        color = Blitbuffer.COLOR_GRAY,
-    }, Ui.text("收起", close_w - UiScale.dp(8, 6, 12), math.max(1, title_h - gap),
-        face("smallinfofont", 10, 14), {bold = true})), function()
-        self:_close()
-    end)
     self:_add(children, margin, margin, title_row)
 
     local y = margin + title_h + gap
     self:_add(children, margin, y, LineWidget:new{
-        background = Blitbuffer.COLOR_GRAY,
+        background = Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_GRAY,
         dimen = Geom:new{w = sw - margin * 2, h = line},
     })
     y = y + line + gap
@@ -322,37 +298,51 @@ function QuickPanelWidget:_build()
     end
 
     if status_h > 0 and y + status_h <= self.panel_h then
-        self:_add(children, margin, y, fixed_frame(sw - margin * 2, status_h, {
-            bordersize = line,
-            padding = UiScale.dp(3, 2, 5),
-            radius = UiScale.radius(4, 3, 8),
-            background = Blitbuffer.COLOR_WHITE,
-            color = Blitbuffer.COLOR_GRAY,
-        }, Ui.textbox(tostring(self.opts.status_text or ""),
-            sw - margin * 2 - UiScale.dp(12, 10, 18), status_h - UiScale.dp(6, 4, 10),
-            face("smallinfofont", 9.2, 13), {alignment = "left", fgcolor = Blitbuffer.COLOR_BLACK})))
+        -- Status/notice is intentionally text-first, not another boxed card.
+        self:_add(children, margin, y, Ui.textbox(tostring(self.opts.status_text or ""),
+            sw - margin * 2, status_h,
+            face("smallinfofont", 10.8, 15), {
+                bold = true, alignment = "left", halign = "left",
+                height_overflow_show_ellipsis = true,
+                fgcolor = Blitbuffer.COLOR_BLACK,
+            }))
         y = y + status_h + gap
     end
 
-    if tools_h > 0 and y + tools_h <= self.panel_h then
-        local arrow_w = UiScale.dp(42, 36, 52)
-        local tools = tappable(sw - margin * 2, tools_h, fixed_frame(sw - margin * 2, tools_h, {
-            bordersize = line,
-            padding = UiScale.dp(4, 3, 7),
-            radius = UiScale.radius(6, 4, 10),
-            background = Blitbuffer.COLOR_WHITE,
-            color = Blitbuffer.COLOR_GRAY,
-        }, HorizontalGroup:new{
-            align = "center",
-            Ui.text("工具与维护", sw - margin * 2 - arrow_w - UiScale.dp(16, 12, 22), tools_h,
-                face("cfont", 13.2, 18.5), {bold = true, halign = "left"}),
-            Ui.text("›", arrow_w, tools_h, face("cfont", 18, 24), {bold = true}),
-        }), function()
-            self:_close(function()
-                if self.opts.on_tools then self.opts.on_tools() end
-            end)
-        end)
-        self:_add(children, margin, y, tools)
+    if footer_h > 0 and y + line + gap + footer_h <= self.panel_h then
+        self:_add(children, margin, y, LineWidget:new{
+            background = Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_GRAY,
+            dimen = Geom:new{w = sw - margin * 2, h = line},
+        })
+        y = y + line + gap
+
+        local available_w = sw - margin * 2
+        local has_customize = type(self.opts.on_customize) == "function"
+        local has_tools = type(self.opts.on_tools) == "function"
+        local count = (has_customize and 1 or 0) + (has_tools and 1 or 0)
+        local footer_gap = count > 1 and UiScale.dp(18, 14, 26) or 0
+        local item_w = count > 0 and math.floor((available_w - footer_gap * math.max(0, count - 1)) / count) or available_w
+        local x = margin
+
+        if has_customize then
+            local customize = tappable(item_w, footer_h,
+                fixed_frame(item_w, footer_h, {bordersize = 0, background = Blitbuffer.COLOR_WHITE},
+                    Ui.text("自定义", item_w, footer_h, face("cfont", 13.2, 18), {bold = true})),
+                function()
+                    self:_close(function() self.opts.on_customize() end)
+                end)
+            self:_add(children, x, y, customize)
+            x = x + item_w + footer_gap
+        end
+        if has_tools then
+            local tools = tappable(item_w, footer_h,
+                fixed_frame(item_w, footer_h, {bordersize = 0, background = Blitbuffer.COLOR_WHITE},
+                    Ui.text("工具与维护  ›", item_w, footer_h, face("cfont", 13.2, 18), {bold = true})),
+                function()
+                    self:_close(function() self.opts.on_tools() end)
+                end)
+            self:_add(children, x, y, tools)
+        end
     end
 
     self:_add(children, 0, self.panel_h - UiScale.line("thick"), LineWidget:new{

@@ -103,7 +103,9 @@ local HOME_QUICK_ITEM_LEGACY_DEFAULT={wifi=true,frontlight=true,refresh_shelf=tr
 local HOME_ACTION_ITEM_ORDER={"refresh","search","downloads","sync","frontlight","miuread_settings","all_books","history","file_manager","screenshot"}
 local HOME_ACTION_ITEM_DEFAULT={refresh=true,search=true,downloads=true,sync=true,frontlight=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false}
 local HOME_PANEL_ITEM_ORDER={"wifi","rotate","screenshot","koreader_settings","return_koreader","quit","frontlight","sync","miuread_settings","downloads","restart","sleep","full_refresh"}
-local HOME_PANEL_ITEM_DEFAULT={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=true,frontlight=false,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=false,full_refresh=false}
+local HOME_PANEL_ITEM_V1_DEFAULT={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=true,frontlight=false,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=false,full_refresh=false}
+local HOME_PANEL_ITEM_DEFAULT={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=false,frontlight=false,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=true,full_refresh=false}
+local HOME_PANEL_LAYOUT_VERSION=2
 local READER_QUICK_ITEM_LEGACY_ORDER={"home","toc","progress","font","typeset","sync","current_book","downloads","full_refresh","koreader_menu","sleep","more"}
 local READER_QUICK_ITEM_LEGACY_DEFAULT={home=true,toc=true,progress=true,font=true,typeset=true,sync=true,current_book=true,downloads=false,full_refresh=false,koreader_menu=false,sleep=false,more=true}
 local READER_QUICK_ITEM_V2_ORDER={"home","toc","progress","font","sync","more","typeset","current_book","downloads","full_refresh","koreader_menu","sleep"}
@@ -2021,6 +2023,19 @@ function Plugin:_home_preferences()
     end
     normalize_quick_group("action_items","action_order","action_layout_version",1,HOME_ACTION_ITEM_ORDER,HOME_ACTION_ITEM_DEFAULT)
     normalize_quick_group("panel_items","panel_order","panel_layout_version",1,HOME_PANEL_ITEM_ORDER,HOME_PANEL_ITEM_DEFAULT)
+    -- Pull-down layout v2 changes only the recommended layout: sleep replaces
+    -- the low-frequency Exit KOReader slot. Preserve genuinely customized
+    -- layouts instead of resetting them during migration.
+    if (tonumber(home.panel_layout_version) or 0)<HOME_PANEL_LAYOUT_VERSION then
+        local old_recommended=quick_boolean_layout_matches(home.panel_items,HOME_PANEL_ITEM_V1_DEFAULT,HOME_PANEL_ITEM_ORDER)
+            and quick_order_matches(home.panel_order,HOME_PANEL_ITEM_ORDER)
+        if old_recommended then
+            home.panel_items.quit=false
+            home.panel_items.sleep=Device:canSuspend()==true
+        end
+        home.panel_layout_version=HOME_PANEL_LAYOUT_VERSION
+        changed=true
+    end
     -- Unsupported hardware controls disappear instead of leaving dead slots.
     if not Device:hasFrontlight() then
         if home.action_items.frontlight==true then home.action_items.frontlight=false; changed=true end
@@ -3331,7 +3346,7 @@ function Plugin:_home_group_settings_menu(group)
         home[items_key]={}
         for _,key in ipairs(order) do home[items_key][key]=defaults[key]==true end
         home[order_key]=U.copy(order)
-        home[version_key]=1
+        home[version_key]=is_action and 1 or HOME_PANEL_LAYOUT_VERSION
         self:_save_home_preferences(home,preferences)
         if HomeView.is_shown() then self:_refresh_home_view(nil,"content") end
         self:toast("已恢复推荐布局")
@@ -3361,7 +3376,7 @@ function Plugin:_home_restore_all_quick_defaults()
     home.panel_items={}
     for _,key in ipairs(HOME_PANEL_ITEM_ORDER) do home.panel_items[key]=HOME_PANEL_ITEM_DEFAULT[key]==true end
     home.panel_order=U.copy(HOME_PANEL_ITEM_ORDER)
-    home.panel_layout_version=1
+    home.panel_layout_version=HOME_PANEL_LAYOUT_VERSION
     if not Device:hasFrontlight() then
         home.action_items.frontlight=false
         home.panel_items.frontlight=false
@@ -6477,6 +6492,53 @@ function Plugin:_home_sleep()
     return false
 end
 
+function Plugin:_home_device_power_busy(action_label)
+    action_label=tostring(action_label or "执行此操作")
+    if (self.download_task and self.download_task:busy()) or self._download_runtime~=nil then
+        self:info("当前下载任务尚未完成，暂不"..action_label.."。\n\n请等待任务结束，或先在下载管理中取消任务。")
+        return true
+    end
+    if self.cache_cleanup_task and self.cache_cleanup_task:busy() then
+        self:info("缓存任务尚未完成，暂不"..action_label.."。")
+        return true
+    end
+    return false
+end
+
+function Plugin:_home_reboot_device()
+    if type(Device.canReboot)~="function" or not Device:canReboot() then
+        self:info("当前设备不支持由 KOReader 重启设备")
+        return false
+    end
+    if self:_home_device_power_busy("重启设备") then return false end
+    UIManager:show(ConfirmBox:new{
+        text="重启整个设备？\n\n这会重新启动 Kindle，而不是只重启 KOReader。",
+        ok_text="重启设备",
+        cancel_text="取消",
+        ok_callback=function()
+            UIManager:broadcastEvent(Event:new("RequestReboot"))
+        end,
+    })
+    return true
+end
+
+function Plugin:_home_poweroff_device()
+    if type(Device.canPowerOff)~="function" or not Device:canPowerOff() then
+        self:info("当前设备不支持由 KOReader 关机")
+        return false
+    end
+    if self:_home_device_power_busy("关机") then return false end
+    UIManager:show(ConfirmBox:new{
+        text="关闭整个设备？\n\n日常使用建议优先使用休眠。",
+        ok_text="关机",
+        cancel_text="取消",
+        ok_callback=function()
+            UIManager:broadcastEvent(Event:new("RequestPowerOff"))
+        end,
+    })
+    return true
+end
+
 function Plugin:_home_preview_books(rows,hero,limit)
     local out,seen={},{}
     local hero_key=self:_home_book_key(hero)
@@ -6505,7 +6567,15 @@ function Plugin:show_home_quick_panel(more_expanded)
     local wifi_detail
     if wifi_on==nil then wifi_detail="状态未知"
     elseif wifi_on~=true then wifi_detail="已关闭"
-    elseif state.online==true then wifi_detail="已连接"
+    elseif state.online==true then
+        local ssid
+        if NetworkMgr and type(NetworkMgr.getCurrentNetwork)=="function" then
+            local ok_current,current=pcall(NetworkMgr.getCurrentNetwork,NetworkMgr)
+            if ok_current and type(current)=="table" then
+                ssid=U.trim(tostring(current.ssid or current.name or ""))
+            end
+        end
+        wifi_detail=ssid and ssid~="" and U.utf8_truncate(ssid,18,"…") or "已连接"
     else wifi_detail="未连接" end
 
     local download_detail=""
@@ -6520,11 +6590,11 @@ function Plugin:show_home_quick_panel(more_expanded)
             callback=function() self:_home_wifi_toggle() end,
             hold_callback=function() self:_home_wifi_settings() end
         },
-        rotate={icon="↻",icon_key="rotate",label="旋转",detail="",callback=function() self:_home_rotate() end},
+        rotate={icon="↻",icon_key="rotate",label="旋转屏幕",detail="",callback=function() self:_home_rotate() end},
         screenshot={icon="▣",icon_key="screenshot",label="截图",detail="",callback=function(anchor) ScreenshotMode.start(self,anchor) end},
-        koreader_settings={icon="⚙",icon_key="ko-reader",label="KOReader",detail="",callback=function() self:_show_native_koreader_menu() end},
-        return_koreader={icon="←",icon_key="return",label="返回",detail="",callback=function() self:_home_close_to_native(true) end},
-        quit={icon="⏻",icon_key="power",label="退出",detail="",callback=function() self:_quit_koreader() end},
+        koreader_settings={icon="⚙",icon_key="ko-reader",label="KOReader 设置",detail="",callback=function() self:_show_native_koreader_menu() end},
+        return_koreader={icon="←",icon_key="return",label="返回 KOReader",detail="",callback=function() self:_home_close_to_native(true) end},
+        quit={icon="⏻",icon_key="power",label="退出 KOReader",detail="",callback=function() self:_quit_koreader() end},
         sync={icon="⇅",icon_key="sync",label="阅读同步",detail=(self:progress_sync_label()=="上传失败" and "上传失败" or ""),callback=function() self:_show_standalone_menu("阅读同步",self:sync_menu()) end},
         miuread_settings={icon="⚙",icon_key="settings",label="觅阅设置",detail="",callback=function() self:_show_standalone_menu("觅阅设置",self:settings_menu()) end},
         downloads={icon="⇩",icon_key="download",label="下载管理",detail=download_detail,callback=function() self:show_downloads() end},
@@ -6559,7 +6629,19 @@ function Plugin:show_home_quick_panel(more_expanded)
             self.store:reload(); self.store:prune_missing_files(); self:_show_miuread_home_now(false,true,true,"full")
         end},
         {text="清理缓存",callback=function() self:show_download_cleanup_dialog() end},
-        {text="重启 KOReader",callback=function() self:_restart_koreader() end},
+        {text="系统操作",post_text="退出 / 重启 / 关机",sub_item_table_func=function()
+            local system_items={
+                {text="退出 KOReader",callback=function() self:_quit_koreader() end},
+                {text="重启 KOReader",callback=function() self:_restart_koreader() end},
+            }
+            if type(Device.canReboot)=="function" and Device:canReboot() then
+                system_items[#system_items+1]={text="重启设备",callback=function() self:_home_reboot_device() end}
+            end
+            if type(Device.canPowerOff)=="function" and Device:canPowerOff() then
+                system_items[#system_items+1]={text="关机",callback=function() self:_home_poweroff_device() end}
+            end
+            return system_items
+        end},
     }
 
     local battery=tonumber(state.battery) and (tostring(math.floor(state.battery+.5)).."%") or "未知"
@@ -6573,7 +6655,6 @@ function Plugin:show_home_quick_panel(more_expanded)
     end
     local panel,err=HomeQuickPanel.show{
         time_text=os.date("%H:%M"),
-        wifi_text="Wi-Fi "..wifi_detail,
         battery_text=battery,
         status_text=status_text,
         buttons=buttons,
