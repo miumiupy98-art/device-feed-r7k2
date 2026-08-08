@@ -123,7 +123,9 @@ local function panel_button(entry, width, height, close_callback, compact)
     local gap_h = UiScale.dp(3, 2, 5)
     local icon_slot_h = UiScale.dp(compact and 34 or 38, compact and 30 or 34, compact and 44 or 50)
     local label_slot_h = UiScale.dp(compact and 31 or 34, compact and 27 or 30, compact and 40 or 44)
-    local detail_slot_h = has_detail and UiScale.dp(compact and 20 or 22, compact and 18 or 20, compact and 26 or 29) or 0
+    -- Reserve the same third line in every cell. Without this, Wi-Fi (which
+    -- has an SSID detail) becomes taller and its icon is vertically shifted.
+    local detail_slot_h = UiScale.dp(compact and 20 or 22, compact and 18 or 20, compact and 26 or 29)
     local icon_size = UiScale.dp(compact and 27 or 30, compact and 24 or 27, compact and 35 or 39)
 
     local content = VerticalGroup:new{
@@ -142,14 +144,12 @@ local function panel_button(entry, width, height, close_callback, compact)
                 fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
             }),
     }
-    if has_detail then
-        content[#content + 1] = Ui.textbox(detail, inner_w, detail_slot_h,
-            face("smallinfofont", compact and 9.2 or 9.8, compact and 12.0 or 12.8, compact and 8.0 or 8.5), {
-                alignment = "center", halign = "center",
-                height_overflow_show_ellipsis = true,
-                fgcolor = enabled and Blitbuffer.COLOR_DARK_GRAY or Blitbuffer.COLOR_GRAY,
-            })
-    end
+    content[#content + 1] = Ui.textbox(has_detail and detail or " ", inner_w, detail_slot_h,
+        face("smallinfofont", compact and 9.2 or 9.8, compact and 12.0 or 12.8, compact and 8.0 or 8.5), {
+            alignment = "center", halign = "center",
+            height_overflow_show_ellipsis = true,
+            fgcolor = enabled and Blitbuffer.COLOR_DARK_GRAY or Blitbuffer.COLOR_GRAY,
+        })
 
     local surface = fixed_frame(width, height, {
         bordersize = 0,

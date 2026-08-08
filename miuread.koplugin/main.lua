@@ -4026,19 +4026,22 @@ function Plugin:_home_status_line()
         local ok,value=pcall(NetworkMgr.isWifiOn,NetworkMgr)
         if ok then
             if value==true then
-                -- The first row should answer the useful question directly:
-                -- which network is connected, not merely whether Wi-Fi is on.
-                parts[#parts+1]=self:_reader_current_wifi_name(16) or "Wi-Fi"
+                -- Keep the home header concise: time + the connected SSID.
+                parts[#parts+1]=self:_reader_current_wifi_name(18) or "Wi-Fi"
             else
                 parts[#parts+1]="离线"
             end
         end
     end
+    return table.concat(parts,"  ·  ")
+end
+
+function Plugin:_home_battery_text()
     local device=HomeData.device_state()
     if tonumber(device.battery) then
-        parts[#parts+1]=tostring(math.floor(tonumber(device.battery)+.5)).."%"
+        return tostring(math.floor(tonumber(device.battery)+.5)).."%"
     end
-    return table.concat(parts,"  ·  ")
+    return "--%"
 end
 
 function Plugin:_schedule_home_startup(delay)
@@ -6723,10 +6726,10 @@ function Plugin:show_home_quick_panel(more_expanded)
             callback=function() self:_home_wifi_toggle() end,
             hold_callback=function() self:_home_wifi_settings() end
         },
-        rotate={icon="↻",icon_key="rotate",label="旋转屏幕",detail="",callback=function() self:_home_rotate() end},
+        rotate={icon="↻",icon_key="rotate",label="旋转",detail="",callback=function() self:_home_rotate() end},
         screenshot={icon="▣",icon_key="screenshot",label="截图",detail="",callback=function(anchor) ScreenshotMode.start(self,anchor) end},
-        koreader_settings={icon="⚙",icon_key="ko-reader",label="KOReader 设置",detail="",callback=function() self:_show_native_koreader_menu() end},
-        return_koreader={icon="←",icon_key="return",label="返回 KOReader",detail="",callback=function() self:_home_close_to_native(true) end},
+        koreader_settings={icon="⚙",icon_key="ko-reader",label="KO设置",detail="",callback=function() self:_show_native_koreader_menu() end},
+        return_koreader={icon="←",icon_key="return",label="返回KO",detail="",callback=function() self:_home_close_to_native(true) end},
         quit={icon="⏻",icon_key="power",label="退出 KOReader",detail="",callback=function() self:_quit_koreader() end},
         sync={icon="⇅",icon_key="sync",label="阅读同步",detail=(self:progress_sync_label()=="上传失败" and "上传失败" or ""),callback=function() self:_show_standalone_menu("阅读同步",self:sync_menu()) end},
         miuread_settings={icon="⚙",icon_key="settings",label="觅阅设置",detail="",callback=function() self:_show_standalone_menu("觅阅设置",self:settings_menu()) end},
@@ -9400,6 +9403,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     local view,err=HomeView.show({
         title="觅阅",
         status_line=self:_home_status_line(),
+        battery_text=self:_home_battery_text(),
         account_name=self:_home_account_name(),
         layout_style=home.layout_style,
         display_size=home.display_size,

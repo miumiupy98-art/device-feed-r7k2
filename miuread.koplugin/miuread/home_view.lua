@@ -803,35 +803,36 @@ function HomeWidget:onHomeShelfSwipe(_,ges)
 end
 
 function HomeWidget:_build_header(children, m)
-    -- Give the live status strip enough room for time + connected SSID + battery.
-    -- Account and menu remain easy to tap, but no longer consume a quarter of
-    -- the first row at the expense of the network name.
-    local menu_w = math.max(UiScale.dp(56, 50, 76), math.min(UiScale.dp(72, 62, 88), math.floor(m.content_w * .085)))
-    local title_w = math.max(UiScale.dp(76, 70, 102), math.min(UiScale.dp(102, 84, 118), math.floor(m.content_w * .125)))
-    local account_w = math.max(UiScale.dp(104, 94, 160), math.min(UiScale.dp(176, 132, 214), math.floor(m.content_w * .205)))
-    local gap = math.max(4, math.floor(m.content_w * .007))
-    local status_w = math.max(1, m.content_w - title_w - account_w - menu_w - gap * 3)
+    -- The first row now has four stable zones: brand, time/network, battery, More.
+    -- Account information remains available from MiuRead settings instead of
+    -- competing with live device status in the narrow home header.
+    local gap = math.max(UiScale.dp(5, 4, 8), math.floor(m.content_w * .006))
+    local title_w = math.max(UiScale.dp(88, 78, 112), math.floor(m.content_w * .155))
+    local battery_w = math.max(UiScale.dp(72, 64, 94), math.floor(m.content_w * .115))
+    local menu_w = math.max(UiScale.dp(74, 66, 96), math.floor(m.content_w * .115))
+    local status_w = math.max(1, m.content_w - title_w - battery_w - menu_w - gap * 3)
     local header = HorizontalGroup:new{
         align = "center",
         LeftContainer:new{dimen = Geom:new{w = title_w, h = m.header_h}, TextWidget:new{
             text = self.opts.title or "觅阅",
-            face = face("cfont", 16, 20),
+            face = face("cfont", 16.8, 21),
             bold = true,
         }},
         HorizontalSpan:new{width = gap},
         tappable(status_w, m.header_h, Ui.textbox(tostring(self.opts.status_line or ""),
-            status_w, m.header_h, face("smallinfofont", 10.6, 14.6), {
-                bold = true, alignment = "right", halign = "right", fgcolor = Blitbuffer.COLOR_BLACK,
+            status_w, m.header_h, face("smallinfofont", 10.8, 14.8), {
+                bold = true, alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_BLACK,
+                height_overflow_show_ellipsis = true,
             }), self.opts.on_quick_panel),
         HorizontalSpan:new{width = gap},
-        tappable(account_w, m.header_h, Ui.textbox(tostring(self.opts.account_name or "账户"),
-            account_w, m.header_h, face("smallinfofont", 10.2, 14.2), {
-                bold = true, alignment = "right", halign = "right", fgcolor = Blitbuffer.COLOR_BLACK,
-            }), self.opts.on_account),
+        Ui.textbox(tostring(self.opts.battery_text or "--%"), battery_w, m.header_h,
+            face("smallinfofont", 10.8, 14.8), {
+                bold = true, alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_BLACK,
+            }),
         HorizontalSpan:new{width = gap},
-        tappable(menu_w, math.max(UiScale.dp(34, 32, 44), m.header_h - UiScale.dp(4, 3, 8)),
-            Ui.icon("more", menu_w, math.max(UiScale.dp(34, 32, 44), m.header_h - UiScale.dp(4, 3, 8)),
-                UiScale.dp(22, 19, 30), {face = UiScale.iconFace("cfont", 16, 22, 13)}), function()
+        tappable(menu_w, m.header_h,
+            fixed_frame(menu_w, m.header_h, {bordersize = 0, background = Blitbuffer.COLOR_WHITE},
+                Ui.text("更多", menu_w, m.header_h, face("smallinfofont", 10.8, 14.8), {bold = true})), function()
             logger.info("[MiuRead][Home] quick panel tapped")
             if self.opts and self.opts.on_quick_panel then self.opts.on_quick_panel()
             elseif self.opts and self.opts.on_menu then self.opts.on_menu() end
