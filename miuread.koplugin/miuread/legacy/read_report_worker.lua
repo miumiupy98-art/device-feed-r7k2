@@ -85,7 +85,24 @@ local function chapter_index(chapter, fallback)
 end
 
 local function chapter_words(chapter)
-    return math.max(1, tonumber(chapter and (chapter.wordCount or chapter.word_count) or 0) or 0)
+    if Content.is_structural_chapter(chapter) then return 0 end
+    return math.max(0, tonumber(chapter and (chapter.wordCount or chapter.word_count) or 0) or 0)
+end
+
+local function trusted_words(book, chapter)
+    local words = chapter_words(chapter)
+    if words > 0 then return words end
+    local uid = tostring(chapter_uid(chapter) or "")
+    if uid ~= "" and uid == tostring(book.local_chapter_uid or "") then
+        return math.max(0, tonumber(book.local_chapter_word_count or 0) or 0)
+    end
+    if uid ~= "" and uid == tostring(book.source_chapter_uid or "") then
+        return math.max(0, tonumber(book.source_chapter_word_count or 0) or 0)
+    end
+    if uid ~= "" and uid == tostring(book.chapter_uid or "") then
+        return math.max(0, tonumber(book.chapter_word_count or 0) or 0)
+    end
+    return 0
 end
 
 local function standalone_position(book, ratio)
@@ -95,7 +112,7 @@ local function standalone_position(book, ratio)
 
     local total, before, selected = 0, 0, nil
     for _, chapter in ipairs(chapters) do
-        local words = chapter_words(chapter)
+        local words = trusted_words(book, chapter)
         if not selected and tostring(chapter_uid(chapter) or "") == source_uid then
             selected = chapter
         elseif not selected then
@@ -105,7 +122,7 @@ local function standalone_position(book, ratio)
     end
     if not selected or total <= 0 then return nil, "standalone chapter not found in full catalog" end
 
-    local words = chapter_words(selected)
+    local words = trusted_words(book, selected)
     local offset = math.max(0, math.min(words, math.floor(words * ratio + 0.5)))
     local whole_ratio = (before + offset) / total
     return {
@@ -161,34 +178,54 @@ end
 
 local function select_context_chapter(book)
     local chapters = type(book.chapters) == "table" and book.chapters or {}
-    local selected
 
-    local preferred_uid = book.source_is_standalone and book.source_chapter_uid or book.chapter_uid
-    if preferred_uid ~= nil then
+    local function by_uid(uid)
+        uid = tostring(uid or "")
+        if uid == "" then return nil end
         for _, chapter in ipairs(chapters) do
-            if tostring(chapter_uid(chapter) or "") == tostring(preferred_uid) then
-                selected = chapter
-                break
+            if tostring(chapter_uid(chapter) or "") == uid
+                and not Content.is_structural_chapter(chapter) then
+                return chapter
             end
         end
     end
 
-    if not selected and #chapters > 0 then
-        local ratio = normalize_progress_ratio(book.progress) or 0
-        local total = 0
-        for _, chapter in ipairs(chapters) do total = total + chapter_words(chapter) end
-        local target, before = ratio * total, 0
+    -- Prefer the chapter MiuRead can prove is currently open. An exact UID
+    -- remains usable even when WeRead reports wordCount=0/missing.
+    local selected = by_uid(book.local_chapter_uid)
+        or by_uid(book.source_is_standalone and book.source_chapter_uid or nil)
+        or by_uid(book.chapter_uid)
+        or by_uid(book.remote_chapter_uid)
+    if selected then return selected end
+
+    local wanted_idx = tonumber(book.local_chapter_idx or book.source_chapter_index or book.chapter_idx or book.remote_chapter_idx)
+    if wanted_idx ~= nil then
         for index, chapter in ipairs(chapters) do
-            local words = chapter_words(chapter)
-            if target <= before + words or index == #chapters then
-                selected = chapter
-                break
+            local idx = chapter_index(chapter, index)
+            if (idx == wanted_idx or index == wanted_idx or index - 1 == wanted_idx)
+                and not Content.is_structural_chapter(chapter) then
+                return chapter
             end
-            before = before + words
         end
     end
 
-    return selected or Content.first_readable_chapter(chapters)
+    -- Ratio fallback uses only chapters with trustworthy positive length. It
+    -- must never choose a zero-length structural/random chapter just to report.
+    local ratio = normalize_progress_ratio(book.progress) or 0
+    local total = 0
+    for _, chapter in ipairs(chapters) do total = total + trusted_words(book, chapter) end
+    if total > 0 then
+        local target, before = ratio * total, 0
+        for _, chapter in ipairs(chapters) do
+            local words = trusted_words(book, chapter)
+            if words > 0 then
+                if target <= before + words then return chapter end
+                before = before + words
+            end
+        end
+    end
+
+    return Content.first_readable_chapter(chapters)
 end
 
 local function refresh_context(client, book_id, book, force)
@@ -236,10 +273,8 @@ local function refresh_context(client, book_id, book, force)
             book.remote_chapter_uid = remote_uid or book.chapter_uid
             book.remote_chapter_idx = remote_idx or tonumber(book.chapter_idx) or 0
             book.remote_chapter_offset = remote_offset or tonumber(book.chapter_offset) or 0
-            book.progress = book.remote_progress
-            book.chapter_uid = book.remote_chapter_uid
-            book.chapter_idx = book.remote_chapter_idx
-            book.chapter_offset = book.remote_chapter_offset
+            -- Keep remote position as a fallback only. The currently open
+            -- local chapter must remain the primary repair/sync identity.
             book.remote_progress_loaded = true
         end
     end
@@ -249,10 +284,9 @@ local function refresh_context(client, book_id, book, force)
         error("no readable chapter found for report context")
     end
 
-    book.chapter_uid = selected.chapterUid or book.chapter_uid
-    book.chapter_idx = tonumber(selected.chapterIdx) or tonumber(book.chapter_idx) or 0
-    book.chapter_word_count = tonumber(selected.wordCount)
-        or tonumber(book.chapter_word_count) or 0
+    book.chapter_uid = chapter_uid(selected) or book.chapter_uid
+    book.chapter_idx = chapter_index(selected, book.chapter_idx)
+    book.chapter_word_count = trusted_words(book, selected)
     book.app_id = book.app_id or WeRead.web_app_id()
     book.read_context_updated_at = now
     book.read_context_ready = book.psvts ~= nil and tostring(book.psvts) ~= ""
@@ -285,48 +319,50 @@ local function estimate_position(book, progress_ratio)
         return nil, map_error
     end
 
-    local chapter
-    local within_chapter = 0
-    if #chapters > 0 then
-        local total = 0
-        for _, item in ipairs(chapters) do total = total + chapter_words(item) end
-        local target, before = ratio * total, 0
-        for index, item in ipairs(chapters) do
-            local words = chapter_words(item)
-            if target <= before + words or index == #chapters then
-                chapter = item
-                within_chapter = math.max(0, math.min(1, (target - before) / words))
-                break
-            end
-            before = before + words
+    local function by_uid(uid)
+        uid=tostring(uid or "")
+        if uid=="" then return nil end
+        for _,item in ipairs(chapters) do
+            if tostring(chapter_uid(item) or "")==uid and not Content.is_structural_chapter(item) then return item end
         end
     end
 
-    if not chapter and book.chapter_uid ~= nil then
-        for _, item in ipairs(chapters) do
-            if tostring(item.chapterUid or "") == tostring(book.chapter_uid) then
-                chapter = item
-                break
+    -- The local open-book mapping is the safest source and must win over a
+    -- ratio guess, especially when WeRead reports zero/missing word counts.
+    local chapter=by_uid(book.local_chapter_uid) or by_uid(book.chapter_uid)
+    if chapter then
+        local words=trusted_words(book,chapter)
+        local offset=tonumber(book.local_chapter_offset or book.chapter_offset) or 0
+        if words>0 then offset=math.max(0,math.min(words,offset)) else offset=math.max(0,offset) end
+        return {
+            chapter_uid=chapter_uid(chapter),
+            chapter_idx=chapter_index(chapter,book.local_chapter_idx or book.chapter_idx),
+            chapter_offset=offset,
+            progress=math.floor(ratio*100+0.5),
+            source="trusted_local_chapter",
+        }
+    end
+
+    local total=0
+    for _,item in ipairs(chapters) do total=total+trusted_words(book,item) end
+    if total<=0 then return nil,"no safe chapter length available for report position" end
+    local target,before=ratio*total,0
+    for _,item in ipairs(chapters) do
+        local words=trusted_words(book,item)
+        if words>0 then
+            if target<=before+words then
+                return {
+                    chapter_uid=chapter_uid(item),
+                    chapter_idx=chapter_index(item,0),
+                    chapter_offset=math.max(0,math.min(words,math.floor(target-before))),
+                    progress=math.floor(ratio*100+0.5),
+                    source="catalog_ratio",
+                }
             end
+            before=before+words
         end
     end
-
-    local chapter_uid = chapter and (chapter.chapterUid or chapter.uid or chapter.chapter_uid) or book.chapter_uid or 0
-    local chapter_idx = tonumber(chapter and (chapter.chapterIdx or chapter.index or chapter.chapter_idx))
-        or tonumber(book.chapter_idx) or 0
-    local word_count = tonumber(chapter and (chapter.wordCount or chapter.word_count))
-        or tonumber(book.chapter_word_count) or 0
-    local chapter_offset = tonumber(book.chapter_offset) or 0
-    if word_count > 0 then
-        chapter_offset = math.floor(within_chapter * word_count)
-    end
-
-    return {
-        chapter_uid = chapter_uid,
-        chapter_idx = chapter_idx,
-        chapter_offset = chapter_offset,
-        progress = math.floor(ratio * 100 + 0.5),
-    }
+    return nil,"no safe chapter found for report position"
 end
 
 local function build_payload(book_id, elapsed_seconds, book, progress_ratio)
@@ -457,7 +493,7 @@ function Worker.run(job)
     end
 
     local context_ok, context_or_error, initial_context_changed = pcall(function()
-        return refresh_context(client, book_id, book, false)
+        return refresh_context(client, book_id, book, job.force_context == true)
     end)
     if not context_ok then
         local message=tostring(context_or_error)
@@ -475,125 +511,28 @@ function Worker.run(job)
     local accepted, result, first_error, first_kind, first_position, first_public, first_meta = attempt_report(
         client, book_id, elapsed_seconds, book, progress_ratio
     )
-    local latest_public,latest_meta=first_public,first_meta
     if accepted then
         return finish(settings, book, {
             ok = true,
             result = confirmation(result),
-            path = "initial",
+            path = job.force_context == true and "manual_repair" or "initial",
             position = first_position,
-            payload_public = latest_public,
-            meta = latest_meta,
-        }, context_changed)
-    end
-    if first_kind == "transport" then
-        return finish(settings, book, {
-            ok = false,
-            error = first_error,
-            error_kind = "transport",
-            payload_public = latest_public,
-            meta = latest_meta,
+            payload_public = first_public,
+            meta = first_meta,
         }, context_changed)
     end
 
-    local first_failure = first_error
-    local retry_kind
-    local refresh_ok, refreshed_or_error, refreshed_changed = pcall(function()
-        return refresh_context(client, book_id, book, true)
-    end)
-    if refresh_ok then
-        book = refreshed_or_error
-        context_changed = context_changed or refreshed_changed == true
-        local retry_accepted, retry_result, retry_error, kind, retry_position, retry_public, retry_meta = attempt_report(
-            client, book_id, elapsed_seconds, book, progress_ratio
-        )
-        retry_kind=kind
-        latest_public=retry_public or latest_public
-        latest_meta=retry_meta or latest_meta
-        if retry_accepted then
-            return finish(settings, book, {
-                ok = true,
-                result = confirmation(retry_result),
-                path = "context_refresh",
-                position = retry_position,
-                payload_public = latest_public,
-                meta = latest_meta,
-            }, context_changed)
-        end
-        first_failure = "initial=" .. tostring(first_failure)
-            .. "; refreshed=" .. tostring(retry_error)
-    else
-        first_failure = tostring(first_failure)
-            .. "; context_refresh=" .. tostring(refreshed_or_error)
-    end
-
-    if job.allow_renewal ~= true then
-        return finish(settings, book, {
-            ok = false,
-            error = first_failure,
-            error_kind = (first_kind == "authentication" or retry_kind == "authentication")
-                and "authentication" or "server",
-            payload_public = latest_public,
-            meta = latest_meta,
-        }, context_changed)
-    end
-
-    local renew_ok, renew_result = pcall(function()
-        return client:renew_cookie()
-    end)
-    if not renew_ok or not read_report_accepted(renew_result) then
-        local renewal_error = renew_ok and result_summary(renew_result) or tostring(renew_result)
-        return finish(settings, book, {
-            ok = false,
-            error = first_failure .. "; renewal=" .. renewal_error,
-            error_kind = "authentication",
-            renewal_attempted = true,
-            payload_public = latest_public,
-            meta = latest_meta,
-        }, context_changed)
-    end
-
-    local final_context_ok, final_book_or_error, final_context_changed = pcall(function()
-        return refresh_context(client, book_id, book, true)
-    end)
-    if not final_context_ok then
-        return finish(settings, book, {
-            ok = false,
-            error = first_failure .. "; final_context=" .. tostring(final_book_or_error),
-            error_kind = "context",
-            renewal_attempted = true,
-            payload_public = latest_public,
-            meta = latest_meta,
-        }, context_changed)
-    end
-    book = final_book_or_error
-    context_changed = context_changed or final_context_changed == true
-
-    local final_accepted, final_result, final_error, final_kind, final_position, final_public, final_meta = attempt_report(
-        client, book_id, elapsed_seconds, book, progress_ratio
-    )
-    latest_public=final_public or latest_public
-    latest_meta=final_meta or latest_meta
-    if final_accepted then
-        return finish(settings, book, {
-            ok = true,
-            result = confirmation(final_result),
-            path = "cookie_renewal",
-            renewal_attempted = true,
-            position = final_position,
-            payload_public = latest_public,
-            meta = latest_meta,
-        }, context_changed)
-    end
-
+    -- beta.3: do not silently refresh/retry/renew in the worker. The caller
+    -- surfaces a Repair Sync action immediately, preventing long retry chains
+    -- and repeated unofficial requests after a book-specific failure.
     return finish(settings, book, {
         ok = false,
-        error = first_failure .. "; final=" .. tostring(final_error),
-        error_kind = final_kind or "server",
-        renewal_attempted = true,
-        payload_public = latest_public,
-        meta = latest_meta,
+        error = first_error,
+        error_kind = first_kind or "server",
+        payload_public = first_public,
+        meta = first_meta,
     }, context_changed)
+
 end
 
 return Worker

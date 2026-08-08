@@ -7286,6 +7286,7 @@ function Plugin:_show_reader_sync_panel(back_callback)
                 }},
                 {title="立即操作",rows={
                     {icon="⇧",label="上传当前阅读进度",value="执行",value_bold=true,keep_open=true,callback=function() self:upload_local_progress(true) end},
+                    {icon="↻",label="修复当前书籍同步",value="执行",value_bold=true,keep_open=true,callback=function() self:repair_current_sync() end},
                     {icon="⇩",label="读取云端阅读进度",value="执行",value_bold=true,keep_open=true,callback=function() self:manual_sync() end},
                     {icon="◉",label="同步诊断",value="进入",callback=function()
                         self:_show_standalone_menu("同步诊断",self:sync_diagnostics_menu(),{native_input=true,reader_context=true,on_home=function() return self:return_to_miuread_home("reader surface") end,on_close=return_to_sync})
@@ -11257,6 +11258,7 @@ function Plugin:progress_sync_label()
     if prefs.progress_enabled==false then return "已关闭" end
     local r=self.sync:record()
     local session=r and self.store:session(r.book.book_id) or {}
+    if session and session.sync_repair_required==true then return "需要修复" end
     local state=session and session.progress_sync_state or nil
     local labels={checking="正在检查",retrying="正在重试",mapping_pending="等待章节换算",aligned="已同步",local_selected="使用本机位置",local_uploaded="已上传并确认",uploading="正在上传",verifying_upload="正在确认",upload_failed="上传失败",upload_unconfirmed="云端未确认",source_conflict="云端来源冲突",remote_selected="已采用云端位置",different="等待选择",deferred="本次暂不处理",remote_unavailable="等待重新检查",remote_jump_unconfirmed="跳转待确认"}
     return labels[state] or "已开启"
@@ -11311,6 +11313,7 @@ function Plugin:sync_diagnostics_menu()
                     "progress_sync_state","progress_sync_message","progress_upload_state","progress_upload_error",
                     "consecutive_failures"
                 }) do session[key]=nil end
+                -- Failed remote reading time is intentionally not queued for later replay.
                 session.pending_report_seconds=0
                 sessions[id]=session
                 self.store:set("sessions",sessions)
@@ -11337,6 +11340,7 @@ function Plugin:sync_menu()
         {text="自动同步阅读时间",checked_func=function() return self.store:preferences().sync.time_enabled==true end,keep_menu_open=true,callback=function() self:toggle_time_sync() end},
         {text="同步成功提醒",checked_func=function() return self:_sync_success_notice_enabled() end,keep_menu_open=true,callback=function() self:toggle_sync_success_notice() end},
         {text="立即上传当前进度",callback=function() self:upload_local_progress(true) end},
+        {text="修复当前书籍同步",callback=function() self:repair_current_sync() end},
         {text="重新读取云端进度",callback=function() self:manual_sync() end},
         {text="同步诊断",sub_item_table_func=function() return self:sync_diagnostics_menu() end},
     }
@@ -11546,6 +11550,12 @@ function Plugin:upload_local_progress(manual,callback)
         return false
     end
     local id=tostring(r.book.book_id)
+    local session=self.store:session(id) or {}
+    if session.sync_repair_required==true then
+        if manual then self:_show_sync_repair_prompt(session.sync_repair_error,session.sync_repair_kind,id) end
+        if callback then callback(false,session.sync_repair_error or "当前书籍需要修复同步") end
+        return false
+    end
     local target=math.floor((tonumber(position.progress) or 0)+.5)
     self.sync:begin_progress_sync("主动上传本机阅读进度")
     self:_save_progress_state(id,"uploading","正在上传本机阅读进度",target,nil)
@@ -11554,7 +11564,7 @@ function Plugin:upload_local_progress(manual,callback)
         if not ok then
             self:_save_progress_state(id,"upload_failed","阅读进度上传失败",target,nil)
             self.sync:end_progress_sync("阅读进度上传失败")
-            if manual then self:info("阅读进度上传失败\n\n"..tostring(result or "未知错误")) end
+            if manual then self:_show_sync_repair_prompt(result,"context",id) end
             if callback then callback(false,result) end
             return
         end
@@ -11711,8 +11721,9 @@ function Plugin:show_sync_status(detail)
     if not s.time_enabled then time_text="已关闭"
     elseif not s.record or s.state=="stopped" then time_text="未运行"
     elseif s.state=="verification_required" or s.state=="fetching_remote" or s.state=="progress_sync" then time_text="等待位置确认"
-    elseif s.state=="paused" then time_text="暂时失败，稍后重新计时"
-    elseif type(s.last_error)=="string" and (tonumber(s.consecutive_failures) or 0)>=2 then time_text="暂时失败，稍后重试"
+    elseif s.state=="repair_required" then time_text="需要修复同步"
+    elseif s.state=="paused" then time_text="已暂停"
+    elseif type(s.last_error)=="string" and (tonumber(s.consecutive_failures) or 0)>=1 then time_text="需要修复同步"
     elseif s.state=="uploading" then time_text="正在同步"
     else time_text="运行中" end
     local lines={"阅读同步","","阅读时间："..time_text,"阅读进度："..self:progress_sync_label(),"当前位置："..local_text}
@@ -11731,6 +11742,59 @@ function Plugin:show_sync_status(detail)
         if s.last_path then lines[#lines+1]="上传路径："..tostring(s.last_path) end
     end
     self:info(table.concat(lines,"\n"))
+end
+
+function Plugin:repair_current_sync()
+    local r=self:_current_book_record()
+    if not r or not r.book then self:info("请先打开一本觅阅下载的书籍。"); return false end
+    local title=tostring(r.book.title or "当前书籍")
+    self:status_toast("修复阅读同步","正在重新识别《"..title.."》的章节信息",4)
+    local started=self.sync:repair_current(function(ok,result)
+        if ok then
+            self._sync_repair_prompt_book=nil
+            self:status_toast("阅读同步已修复","当前进度已同步；阅读时间从现在重新开始同步",5)
+        else
+            local err=tostring(result or "未知错误")
+            if Http.is_auth_error(err) then
+                local dialog
+                dialog=ButtonDialog:new{title="登录已失效",buttons={
+                    {{text="重新扫码登录",callback=function() UIManager:close(dialog); self.auth_flow:start() end}},
+                    {{text="稍后",callback=function() UIManager:close(dialog) end}},
+                }}
+                UIManager:show(dialog)
+            else
+                self:info("阅读同步修复失败\n\n"..U.first_line(err,240).."\n\n当前书籍可以继续阅读，本次失败的阅读时间不会补传。")
+            end
+        end
+    end)
+    if not started then self:info("暂时无法启动同步修复，请稍后再试。") end
+    return started
+end
+
+function Plugin:_show_sync_repair_prompt(err,kind,book_id)
+    local r=self:_current_book_record()
+    local current_id=r and r.book and tostring(r.book.book_id or "") or ""
+    book_id=tostring(book_id or current_id)
+    if book_id=="" or (current_id~="" and book_id~=current_id) then return end
+    if self._sync_repair_prompt_book==book_id then return end
+    self._sync_repair_prompt_book=book_id
+    local title=tostring(r and r.book and r.book.title or "当前书籍")
+    local detail=(tostring(kind or "")=="context")
+        and "当前书籍的章节同步信息无法可靠识别。"
+        or ((tostring(kind or "")=="authentication") and "当前登录或同步状态已失效。" or "本次阅读同步未成功。")
+    local dialog
+    local function close()
+        self._sync_repair_prompt_book=nil
+        if dialog then UIManager:close(dialog) end
+    end
+    dialog=ConfirmBox:new{
+        text="《"..title.."》阅读同步失败\n\n"..detail
+            .."\n\n本次失败的阅读时间不会补传。其他书籍不受影响。",
+        ok_text="修复同步", cancel_text="稍后",
+        ok_callback=function() close(); self:repair_current_sync() end,
+        cancel_callback=close,
+    }
+    UIManager:show(dialog)
 end
 
 function Plugin:on_auth_required(channel,err)
@@ -11782,13 +11846,9 @@ function Plugin:on_read_report_interval_success(status)
         self:_show_auto_sync_success("阅读时间已上传")
     end
 end
-function Plugin:on_read_report_failure(err)
-    if Http.is_auth_error(err) then
-        self:_mark_auth_problem("read_report",err,false)
-        self:status_toast("阅读同步","登录验证暂时失败，本次时间不补传；稍后重新计时",5)
-        return
-    end
-    self:status_toast("阅读同步","连续同步失败，本次时间不补传；稍后重试",5)
+function Plugin:on_read_report_failure(err,kind,book_id)
+    if Http.is_auth_error(err) then self:_mark_auth_problem("read_report",err,false) end
+    self:_show_sync_repair_prompt(err,kind,book_id)
 end
 function Plugin:_current_book_record()
     self.store:reload()

@@ -26,20 +26,39 @@ function Content.normalize_chapters(payload, book_id)
     return {}
 end
 
+local function truthy(value)
+    return value == true or value == 1 or value == "1" or value == "true"
+end
+
+function Content.chapter_uid(chapter)
+    return chapter and (chapter.chapterUid or chapter.uid or chapter.chapter_uid)
+end
+
+function Content.is_structural_chapter(chapter)
+    if type(chapter) ~= "table" then return true end
+    local title = tostring(chapter.title or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if title == "封面" then return true end
+    if truthy(chapter.isCover) or truthy(chapter.cover) then return true end
+    local kind = tostring(chapter.chapterType or chapter.type or ""):lower()
+    if kind == "cover" then return true end
+    return Content.chapter_uid(chapter) == nil
+end
+
+function Content.is_readable_chapter(chapter)
+    if Content.is_structural_chapter(chapter) then return false end
+    return (tonumber(chapter.wordCount or chapter.word_count or 0) or 0) > 0
+end
+
 function Content.first_readable_chapter(chapters)
     for _, chapter in ipairs(chapters or {}) do
-        if tonumber(chapter.wordCount or 0) > 0 and tostring(chapter.title or "") ~= "封面" then
-            return chapter
-        end
+        if Content.is_readable_chapter(chapter) then return chapter end
     end
 end
 
 function Content.readable_chapters(chapters)
     local out = {}
     for _, chapter in ipairs(chapters or {}) do
-        if tonumber(chapter.wordCount or 0) > 0 and tostring(chapter.title or "") ~= "封面" then
-            out[#out + 1] = chapter
-        end
+        if Content.is_readable_chapter(chapter) then out[#out + 1] = chapter end
     end
     return out
 end
@@ -66,7 +85,11 @@ function Content.fetch_catalog(client, book)
     local catalog = client:post_json("https://weread.qq.com/web/book/chapterInfos", {
         bookIds = { tostring(book_id) },
     }, { referer = reader_url })
-    local chapters = Content.readable_chapters(Content.normalize_chapters(catalog, book_id))
+    -- Keep the complete catalog. Some WeRead books expose real text chapters
+    -- with a missing/zero wordCount; dropping them here makes that book
+    -- permanently impossible to repair. Selection is performed later using
+    -- trusted local/remote chapter identities.
+    local chapters = Content.normalize_chapters(catalog, book_id)
     book.chapters = chapters
     return chapters
 end

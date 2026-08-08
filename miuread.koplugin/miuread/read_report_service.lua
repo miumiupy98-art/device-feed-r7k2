@@ -150,7 +150,7 @@ function Service.run(job)
     local last_report_at = 0
     local last_flush_seq = 0
     local consecutive_failures = 0
-    local recovery_probe = false
+    local blocked = false
 
     local function write_service_status(value, source_job)
         value=type(value)=="table" and value or {}
@@ -175,14 +175,9 @@ function Service.run(job)
 
     local function run_report(control, elapsed, final_flush, reason)
         local interval = math.max(10, tonumber(current_job.interval) or 30)
-        -- Keep each request within one normal reporting interval. After a
-        -- failure, the next accepted request is a zero-second recovery probe;
-        -- normal timing restarts from that successful probe.
-        if recovery_probe then
-            elapsed = 0
-        else
-            elapsed = math.max(1, math.min(interval, math.floor(tonumber(elapsed) or interval)))
-        end
+        -- Keep every request within one normal reporting interval. Failed
+        -- intervals are never accumulated or replayed later.
+        elapsed = math.max(1, math.min(interval, math.floor(tonumber(elapsed) or interval)))
         sequence = sequence + 1
         local report_job = {
             book_id = tostring(current_job.book_id or ""),
@@ -215,18 +210,17 @@ function Service.run(job)
             local delay = 0
             if result.accepted then
                 consecutive_failures = 0
-                recovery_probe = false
+                blocked = false
             else
                 consecutive_failures = consecutive_failures + 1
-                recovery_probe = true
-                delay=retry_delay(kind,consecutive_failures,interval)
+                blocked = true
             end
             out.generation = generation
             out.seq = sequence
             out.state = result.accepted and "waiting" or "error"
             out.error_kind = kind or result.error_kind
-            out.paused = false
-            out.retry_delay = delay
+            out.paused = blocked
+            out.retry_delay = 0
             out.consecutive_failures = consecutive_failures
             out.attempted_at = attempted_at
             out.completed_at = completed_at
@@ -234,20 +228,19 @@ function Service.run(job)
             out.carry_elapsed = 0
             out.carry_consumed = false
             out.pending_elapsed = 0
-            out.recovery_probe = elapsed == 0
+            out.recovery_probe = false
             out.final_flush = final_flush == true
             out.flush_reason = reason
-            out.next_due = final_flush and 0 or (completed_at + (delay>0 and delay or interval))
+            out.next_due = (final_flush or blocked) and 0 or (completed_at + interval)
             out.book_id = tostring(current_job.book_id or "")
             write_service_status(out)
             return out.next_due
         end
 
         consecutive_failures = consecutive_failures + 1
-        recovery_probe = true
+        blocked = true
         local kind=classify_error(nil,result)
-        local delay=retry_delay(kind,consecutive_failures,interval)
-        local due = final_flush and 0 or (completed_at + delay)
+        local due = 0
         write_service_status({
             generation = generation,
             seq = sequence,
@@ -255,7 +248,7 @@ function Service.run(job)
             accepted = false,
             error = tostring(result or "read report service failed"),
             error_kind = kind,
-            retry_delay = delay,
+            retry_delay = 0,
             consecutive_failures = consecutive_failures,
             attempted_at = attempted_at,
             completed_at = completed_at,
@@ -263,7 +256,7 @@ function Service.run(job)
             carry_elapsed = 0,
             carry_consumed = false,
             pending_elapsed = 0,
-            recovery_probe = elapsed == 0,
+            recovery_probe = false,
             final_flush = final_flush == true,
             flush_reason = reason,
             next_due = due,
@@ -296,7 +289,7 @@ function Service.run(job)
                 last_flush_seq = 0
                 last_control_state = nil
                 consecutive_failures = 0
-                recovery_probe = false
+                blocked = false
                 if tostring(loaded.action or "")=="reset_auth" then
                     book={}
                     auth={}
@@ -380,7 +373,7 @@ function Service.run(job)
                         book_id = tostring(current_job.book_id or ""),
                     })
                 end
-            elseif active then
+            elseif active and not blocked then
                 local now = os.time()
                 local interval = math.max(10, tonumber(current_job.interval) or 30)
                 local idle_timeout = math.max(interval, tonumber(current_job.idle_timeout) or 600)
