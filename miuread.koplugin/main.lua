@@ -348,6 +348,11 @@ function Plugin:init()
     self._home_quick_panel_last_open=0
     self._home_quick_panel_opening=false
     self._reader_quick_panel_pending=false
+    self._reader_toolbar_state_cache={session=0,page=nil,total=nil,chapter="",updated_at=0}
+    self._reader_toolbar_state_task=nil
+    self._reader_toolbar_header_perf=nil
+    self._reader_toolbar_options_perf=nil
+    self._mode_intro_generation=0
     self._thought_popup_marker_path=self.store.temp_dir.."/thought-popup.pending.json"
     self._thought_popup_last_crash_path=self.store.data_dir.."/thought-popup-last-crash.json"
     local pending_popup=U.read_file(self._thought_popup_marker_path,true)
@@ -556,12 +561,14 @@ function Plugin:init()
         UIManager:scheduleIn(.8,function() if not self:_current_document_path() then self:_install_pending_downloads(false) end end)
         UIManager:scheduleIn(1.4,function() self:_show_auth_notice() end)
         UIManager:scheduleIn(5.0,function() self:maybe_auto_check_update(false) end)
-        if self:_mode_intro_needed() then
-            -- New users and users who have just entered another mode see one
-            -- concise explanation before Desktop Home is revealed.
-            UIManager:scheduleIn(.55,function() self:_show_mode_intro() end)
-        elseif self:_home_enabled() and not HOME_SESSION_SUPPRESSED then
+        -- Mode guidance is never a startup gate. Reveal the selected runtime
+        -- surface first, then show guidance only when a fresh install or an
+        -- explicit user-requested mode switch armed it.
+        if self:_home_enabled() and not HOME_SESSION_SUPPRESSED then
             self:_schedule_home_startup(.65)
+        end
+        if self:_mode_intro_needed() then
+            self:_schedule_mode_intro_after_surface(.85)
         end
     end
 end
@@ -2267,18 +2274,49 @@ function Plugin:_mode_intro_preferences()
     return preferences.mode_intro,preferences
 end
 
+function Plugin:_mode_intro_pending_mode()
+    local intro=self:_mode_intro_preferences()
+    local mode=tostring(intro.pending_mode or "")
+    if mode~="desktop" and mode~="plugin" then return "" end
+    return mode
+end
+
 function Plugin:_mode_intro_needed()
     if self._reader_context then return false end
     if not self:_notice_enabled("mode_environment") then return false end
-    local intro=self:_mode_intro_preferences()
-    local mode=self:_home_enabled() and "desktop" or "plugin"
-    return tostring(intro.last_confirmed_mode or "")~=mode
+    local pending=self:_mode_intro_pending_mode()
+    local runtime=self:_home_enabled() and "desktop" or "plugin"
+    return pending~="" and pending==runtime
+end
+
+function Plugin:_set_mode_intro_pending(mode,reason)
+    mode=tostring(mode or "")
+    if mode~="desktop" and mode~="plugin" then return false end
+    local intro,preferences=self:_mode_intro_preferences()
+    intro.pending_mode=mode
+    intro.pending_reason=tostring(reason or "user_switch")
+    intro.pending_at=os.time()
+    self.store:save_preferences(preferences)
+    return true
+end
+
+function Plugin:_clear_mode_intro_pending()
+    local intro,preferences=self:_mode_intro_preferences()
+    if tostring(intro.pending_mode or "")=="" and tostring(intro.pending_reason or "")=="" then return false end
+    intro.pending_mode=""
+    intro.pending_reason=""
+    intro.pending_at=0
+    self.store:save_preferences(preferences)
+    return true
 end
 
 function Plugin:_ack_mode_intro()
     local intro,preferences=self:_mode_intro_preferences()
     intro.last_confirmed_mode=self:_home_enabled() and "desktop" or "plugin"
     intro.confirmed_at=os.time()
+    intro.pending_mode=""
+    intro.pending_reason=""
+    intro.pending_at=0
     self.store:save_preferences(preferences)
 end
 
@@ -2308,12 +2346,17 @@ end
 
 function Plugin:_set_home_mode(use_miuread_home)
     local enabled=use_miuread_home==true
+    local target_mode=enabled and "desktop" or "plugin"
     local home,preferences=self:_home_preferences()
     local configured=home.enabled~=false
     if configured==enabled then
         if self:_home_enabled()==enabled then
+            self:_clear_mode_intro_pending()
             self:toast(enabled and "当前已是觅阅桌面模式" or "当前已是插件模式",2)
         else
+            if self:_notice_enabled("mode_environment") and self:_mode_intro_pending_mode()~=target_mode then
+                self:_set_mode_intro_pending(target_mode,"user_switch")
+            end
             self:toast(enabled and "已设置重启后使用觅阅桌面" or "已设置重启后使用插件模式",2)
         end
         return false
@@ -2322,8 +2365,14 @@ function Plugin:_set_home_mode(use_miuread_home)
     home.layout_version=23
     self:_save_home_preferences(home,preferences)
     if self:_home_enabled()==enabled then
+        self:_clear_mode_intro_pending()
         self:toast("已取消待切换模式，当前继续使用"..self:_runtime_mode_label(),3)
         return true
+    end
+    if self:_notice_enabled("mode_environment") then
+        self:_set_mode_intro_pending(target_mode,"user_switch")
+    else
+        self:_clear_mode_intro_pending()
     end
     return self:_show_mode_restart_notice(enabled)
 end
@@ -2332,27 +2381,56 @@ function Plugin:_request_home_mode(enabled)
     return self:_set_home_mode(enabled==true)
 end
 
-function Plugin:_show_mode_intro()
-    if self._reader_context then return false end
-    local desktop=self:_home_enabled()
-    if not self:_mode_intro_needed() then
-        if desktop and not HOME_SESSION_SUPPRESSED and not HomeView.is_shown() then self:_schedule_home_startup(.10) end
-        return false
+function Plugin:_schedule_mode_intro_after_surface(delay)
+    if not self:_mode_intro_needed() then return false end
+    self._mode_intro_generation=(tonumber(self._mode_intro_generation) or 0)+1
+    local generation=self._mode_intro_generation
+    local attempts=0
+    local function attempt()
+        if generation~=self._mode_intro_generation or not self:_mode_intro_needed() then return end
+        if HOME_EXITING or UIManager._exit_code~=nil then return end
+        if HOME_SESSION.suspended==true or self._miuread_suspended==true then
+            UIManager:scheduleIn(.35,attempt)
+            return
+        end
+        attempts=attempts+1
+        local ready=false
+        if self:_home_enabled() then
+            ready=HomeView.is_shown() and not self:_active_reader_ui()
+        else
+            local navigation=self:_navigation_state()
+            ready=not self:_active_reader_ui() and not self:_current_document_path()
+                and navigation~="opening_reader" and navigation~="closing_reader"
+                and navigation~="reader" and navigation~="suspended" and navigation~="exiting"
+            if ready then
+                local ok,FileManager=pcall(require,"apps/filemanager/filemanager")
+                if ok and FileManager then ready=FileManager.instance~=nil end
+            end
+        end
+        if ready then
+            UIManager:scheduleIn(.18,function()
+                if generation==self._mode_intro_generation and self:_mode_intro_needed() then self:_show_mode_intro() end
+            end)
+            return
+        end
+        if attempts<50 then UIManager:scheduleIn(.15,attempt) end
     end
+    UIManager:scheduleIn(tonumber(delay) or .8,attempt)
+    return true
+end
+
+function Plugin:_show_mode_intro()
+    if self._reader_context or not self:_mode_intro_needed() then return false end
+    local desktop=self:_home_enabled()
     local dialog
     if desktop then
         dialog=ButtonDialog:new{
             title="当前使用：觅阅桌面\n\n觅阅桌面会提供完整主页、书架和阅读快捷界面，并接管 KOReader 的部分主页、菜单、手势和返回操作。\n\n如果同时启用了其他美化 UI 或美化补丁，可能造成卡顿、闪烁、菜单异常、手势失效或返回异常。\n\n建议先禁用或删除其他美化 UI 和相关补丁。需要保留 KOReader 原界面或其他美化 UI 时，可改用插件模式。",
             title_align="center",
             buttons={
-                {{text="继续使用觅阅桌面",callback=function()
-                    UIManager:close(dialog); self:_ack_mode_intro()
-                    if not HOME_SESSION_SUPPRESSED and not HomeView.is_shown() then self:_schedule_home_startup(.10) end
-                end}},
-                {{text="改用插件模式",callback=function()
-                    UIManager:close(dialog); self:_ack_mode_intro()
-                    if not HOME_SESSION_SUPPRESSED and not HomeView.is_shown() then self:_schedule_home_startup(.10) end
-                    self:_request_home_mode(false)
+                {{text="继续使用觅阅桌面",callback=function() UIManager:close(dialog); self:_ack_mode_intro() end}},
+                {{text="切换到插件模式",callback=function()
+                    UIManager:close(dialog); self:_ack_mode_intro(); self:_request_home_mode(false)
                 end}},
             },
         }
@@ -7027,22 +7105,108 @@ function Plugin:_schedule_reader_interaction_resume(target)
     UIManager:scheduleIn(math.max(.25,(tonumber(target) or os.time())-os.time()+.15),task)
 end
 
-function Plugin:_mark_reader_busy(seconds)
+function Plugin:_mark_reader_busy(seconds,share_report)
     local path=tostring(self._reader_busy_path or "")
     if path=="" then return false end
     local now=os.time()
     local target=math.max(now+math.max(1,tonumber(seconds) or 4),tonumber(self._reader_busy_until or 0) or 0)
     self._reader_busy_until=target
     local active_download=(self.download_task and self.download_task:busy()) or self._download_runtime~=nil
-    -- /tmp is also consumed by the lightweight read-report subprocess. Keep a
-    -- short shared deadline there for all reader interactions, not only while
-    -- downloading, so new interval uploads can yield to visible gestures.
-    local wrote=U.atomic_write(path,tostring(target),true)==true
+    local wrote=true
+    -- Keep page turns memory-only in the normal case. The shared /tmp marker is
+    -- written only when a visible panel gesture specifically asks the report
+    -- subprocess to yield, or while a download is already competing for I/O.
+    if active_download or share_report==true then wrote=U.atomic_write(path,tostring(target),true)==true end
     if active_download and self.performance_mode and self.performance_mode:enabled() and self.download_task then
         self.download_task:pause("reader_interaction")
         self:_schedule_reader_interaction_resume(target)
     end
     return wrote
+end
+
+function Plugin:_reader_toolbar_cache()
+    local session=tonumber(HOME_SESSION.reader_session_generation or 0) or 0
+    local cache=self._reader_toolbar_state_cache
+    if type(cache)~="table" or tonumber(cache.session or -1)~=session then
+        cache={session=session,page=nil,total=nil,chapter="",updated_at=0}
+        self._reader_toolbar_state_cache=cache
+    end
+    return cache
+end
+
+function Plugin:_reset_reader_toolbar_state_cache()
+    if self._reader_toolbar_state_task then
+        UIManager:unschedule(self._reader_toolbar_state_task)
+        self._reader_toolbar_state_task=nil
+    end
+    self._reader_toolbar_state_cache={
+        session=tonumber(HOME_SESSION.reader_session_generation or 0) or 0,
+        page=nil,total=nil,chapter="",updated_at=0,
+    }
+end
+
+function Plugin:_refresh_reader_toolbar_state_cache(page)
+    if not (self.ui and self.ui.document) then return false end
+    local started=os.clock()
+    local cache=self:_reader_toolbar_cache()
+    local current=tonumber(page)
+    if not current then current=self:_reader_current_page() end
+    if current then cache.page=current end
+
+    if not tonumber(cache.total) or tonumber(cache.total)<=0 then
+        local document=self.ui.document
+        local total
+        if type(document.getPageCount)=="function" then
+            local ok,value=pcall(document.getPageCount,document)
+            if ok then total=tonumber(value) end
+        end
+        total=total or (document.info and tonumber(document.info.number_of_pages)) or nil
+        if total and total>0 then cache.total=total end
+    end
+
+    local chapter_started=os.clock()
+    if current then
+        local toc=self.ui and self.ui.toc or nil
+        local chapter=""
+        if toc and type(toc.getTocTitleByPage)=="function" then
+            local ok,value=pcall(toc.getTocTitleByPage,toc,current)
+            if ok and value then chapter=U.trim(tostring(value)) end
+        end
+        if chapter~="" then cache.chapter=chapter elseif tostring(cache.chapter or "")=="" then cache.chapter="当前章节" end
+    end
+    cache.updated_at=os.time()
+    local chapter_ms=math.floor((os.clock()-chapter_started)*1000+.5)
+    local total_ms=math.floor((os.clock()-started)*1000+.5)
+    if total_ms>=20 or chapter_ms>=15 then
+        logger.info("[MiuRead][ReaderToolbarState] refreshed",
+            "page=",tostring(cache.page or ""),"chapter_ms=",tostring(chapter_ms),"total_ms=",tostring(total_ms))
+    end
+    return true
+end
+
+function Plugin:_schedule_reader_toolbar_state_refresh(page,delay)
+    if self._reader_toolbar_state_task then UIManager:unschedule(self._reader_toolbar_state_task) end
+    local session=tonumber(HOME_SESSION.reader_session_generation or 0) or 0
+    local requested=tonumber(page)
+    local task
+    task=function()
+        if self._reader_toolbar_state_task~=task then return end
+        self._reader_toolbar_state_task=nil
+        if self.ui and self.ui.document and not reader_close_active()
+            and tonumber(HOME_SESSION.reader_session_generation or 0)==session then
+            self:_refresh_reader_toolbar_state_cache(requested)
+        end
+    end
+    self._reader_toolbar_state_task=task
+    UIManager:scheduleIn(tonumber(delay) or .05,task)
+    return true
+end
+
+function Plugin:_reader_toolbar_cached_percent()
+    local cache=self:_reader_toolbar_cache()
+    local page,total=tonumber(cache.page),tonumber(cache.total)
+    if page and total and total>0 then return math.max(0,math.min(100,page/total*100)) end
+    return nil
 end
 
 function Plugin:_reader_progress_percent()
@@ -7502,7 +7666,7 @@ function Plugin:_reader_toolbar_title()
         local path=self:_current_document_path()
         title=path and path:match("([^/]+)$") or "正在阅读"
     end
-    local percent=self:_reader_progress_percent()
+    local percent=self:_reader_toolbar_cached_percent()
     local progress=percent and (tostring(math.floor(percent+.5)).."%") or "位置未知"
     local status=progress.." · "..tostring(self:progress_sync_label())
     return tostring(title),status,progress,percent
@@ -7553,39 +7717,37 @@ function Plugin:_reader_battery_label()
 end
 
 function Plugin:_reader_toolbar_header(title)
+    local started=os.clock()
+    local device_started=os.clock()
     local wifi_label,wifi_alert=self:_reader_wifi_summary()
     local wifi_text=wifi_label
     if wifi_label=="Wi-Fi关" then wifi_text="已关闭"
     elseif wifi_label=="Wi-Fi!" then wifi_text="未连接"
     elseif wifi_label=="Wi-Fi" then wifi_text="状态未知" end
+    local battery=self:_reader_battery_label()
+    local device_ms=math.floor((os.clock()-device_started)*1000+.5)
 
+    local state_started=os.clock()
     local sync_text,sync_alert=self:_reader_sync_summary()
-    local page=self:_reader_current_page()
-    local total
-    local document=self.ui and self.ui.document or nil
-    if document and type(document.getPageCount)=="function" then
-        local ok,value=pcall(document.getPageCount,document)
-        if ok and tonumber(value) then total=tonumber(value) end
-    end
-    total=total or (document and document.info and tonumber(document.info.number_of_pages)) or nil
-
-    local chapter=""
-    local toc=self.ui and self.ui.toc or nil
-    if toc and type(toc.getTocTitleByPage)=="function" and page then
-        local ok,value=pcall(toc.getTocTitleByPage,toc,page)
-        if ok and value then chapter=U.trim(tostring(value)) end
-    end
+    local cache=self:_reader_toolbar_cache()
+    local page,total=tonumber(cache.page),tonumber(cache.total)
+    local chapter=U.trim(tostring(cache.chapter or ""))
     if chapter=="" then chapter="当前章节" end
-
     local progress_text=""
     if page and total and total>0 then
         progress_text=tostring(math.floor(page+.5)).." / "..tostring(math.floor(total+.5))
     else
-        local percent=self:_reader_progress_percent()
+        local percent=self:_reader_toolbar_cached_percent()
         progress_text=percent and (tostring(math.floor(percent+.5)).."%") or "阅读进度"
     end
-
-    local battery=self:_reader_battery_label()
+    local state_ms=math.floor((os.clock()-state_started)*1000+.5)
+    self._reader_toolbar_header_perf={
+        device_ms=device_ms,
+        state_ms=state_ms,
+        chapter_cached=chapter~="当前章节" or tostring(cache.chapter or "")~="",
+        cache_age=math.max(0,os.time()-(tonumber(cache.updated_at) or os.time())),
+        total_ms=math.floor((os.clock()-started)*1000+.5),
+    }
     return {
         title=tostring(title or "正在阅读"),
         home_label="首页",
@@ -8788,7 +8950,11 @@ end
 
 function Plugin:_reader_quick_panel_options()
     if not (self.ui and self.ui.document) then return nil end
+    local started=os.clock()
+    local title_started=os.clock()
     local title=self:_reader_toolbar_title()
+    local title_ms=math.floor((os.clock()-title_started)*1000+.5)
+    local header=self:_reader_toolbar_header(title)
     local definitions=self:_reader_quick_definitions()
 
     local actions={
@@ -8876,8 +9042,12 @@ function Plugin:_reader_quick_panel_options()
         {icon="full-refresh",label="全屏刷新",callback=function() self:_home_full_refresh(true) end},
     }
 
+    self._reader_toolbar_options_perf={
+        title_ms=title_ms,
+        options_ms=math.floor((os.clock()-started)*1000+.5),
+    }
     return {
-        header=self:_reader_toolbar_header(title),
+        header=header,
         actions=actions,
         typeset=typeset,
         frontlight=frontlight,
@@ -8889,24 +9059,35 @@ end
 function Plugin:_show_reader_quick_panel_now()
     if not (self.ui and self.ui.document) then return false end
     local started=os.clock()
-    self:_mark_reader_busy(3)
+    self:_mark_reader_busy(2)
     local options=self:_reader_quick_panel_options()
+    local options_done=os.clock()
     if not options then return false end
     local panel,err=ReaderToolbar.show(options)
+    local shown=os.clock()
     if not panel then
         logger.warn("[MiuRead][ReaderToolbar] unavailable",tostring(err or "unknown"))
         return false
     end
-    logger.info("[MiuRead][ReaderToolbar] opened ordered reader toolbar",
-        "total_ms=",tostring(math.floor((os.clock()-started)*1000+.5)))
+    local header_perf=self._reader_toolbar_header_perf or {}
+    local options_perf=self._reader_toolbar_options_perf or {}
+    logger.info("[MiuRead][ReaderToolbarPerf]",
+        "title_ms=",tostring(options_perf.title_ms or 0),
+        "device_ms=",tostring(header_perf.device_ms or 0),
+        "state_ms=",tostring(header_perf.state_ms or 0),
+        "options_ms=",tostring(math.floor((options_done-started)*1000+.5)),
+        "show_ms=",tostring(math.floor((shown-options_done)*1000+.5)),
+        "cache_age_s=",tostring(header_perf.cache_age or 0),
+        "chapter_cached=",tostring(header_perf.chapter_cached==true),
+        "total_ms=",tostring(math.floor((shown-started)*1000+.5)))
     return true
 end
 
 function Plugin:show_reader_quick_panel()
     if not (self.ui and self.ui.document) then return false end
-    -- Publish the foreground-interaction window before the next-tick build so
-    -- reporting/download workers do not start new work against this gesture.
-    self:_mark_reader_busy(3)
+    -- Only the visible downward-swipe path publishes a short shared busy marker
+    -- for the read-report subprocess. Page turns themselves stay memory-only.
+    self:_mark_reader_busy(2,true)
     if self._reader_quick_panel_pending==true then return true end
     self._reader_quick_panel_pending=true
     UIManager:nextTick(function()
@@ -14937,23 +15118,10 @@ function Plugin:onReaderReady()
             logger.info("[MiuRead][ThoughtPopup] local tap ready before cloud sync")
         end
     end)
-    -- Prebuild the static toolbar shortly after the first page becomes usable.
-    -- This keeps the first downward swipe close to later cache-hit opens while
-    -- leaving cloud/network work for a later window.
-    UIManager:scheduleIn(.12,function()
-        if self.ui and self.ui.document
-            and tonumber(HOME_SESSION.reader_session_generation or 0)==ready_session
-            and not reader_close_active() and self._reader_quick_panel_pending~=true then
-            local started=os.clock()
-            local options=self:_reader_quick_panel_options()
-            if options then
-                local _,reused=ReaderToolbar.prepare(options)
-                logger.info("[MiuRead][ReaderToolbar] prepared",
-                    "cache_hit=",tostring(reused==true),
-                    "ms=",tostring(math.floor((os.clock()-started)*1000+.5)))
-            end
-        end
-    end)
+    -- Prime only lightweight page/chapter data. No toolbar widget survives a
+    -- close or page turn; every visible panel is created fresh and destroyed.
+    self:_reset_reader_toolbar_state_cache()
+    self:_schedule_reader_toolbar_state_refresh(nil,.06)
     self:_teardown_thought_tap()
     self._progress_prompted_book_id=nil
     self._progress_check_running=false
@@ -14976,7 +15144,7 @@ function Plugin:onReaderReady()
     -- Let KOReader paint the first page and restore input before identity and
     -- cloud-progress work begins. Local comment taps are already installed by
     -- the next-tick block above, so this does not delay reading interaction.
-    UIManager:scheduleIn(.85,task)
+    UIManager:scheduleIn(.60,task)
     UIManager:scheduleIn(1.8,function()
         if self.ui and self.ui.document and not reader_close_active() then HomeData.quick_device_state(true) end
     end)
@@ -15016,7 +15184,8 @@ function Plugin:onSetDimensions()
                     self._reader_dimension_width,self._reader_dimension_height=sw,sh
                     self._reader_dimension_rotation=rotation
                     if changed then
-                        ReaderToolbar.reset()
+                        self:_reset_reader_toolbar_state_cache()
+                        self:_schedule_reader_toolbar_state_refresh(nil,.08)
                         self:_install_reader_menu_bridge()
                         self:_install_reader_quick_panel_zone()
                         UIManager:setDirty("all","full")
@@ -15033,7 +15202,11 @@ end
 function Plugin:onScreenResize() return self:onSetDimensions() end
 function Plugin:onRotation() return self:onSetDimensions() end
 function Plugin:onPageUpdate(page)
-    self:_mark_reader_busy(3)
+    self:_mark_reader_busy(2)
+    local cache=self:_reader_toolbar_cache()
+    local current=tonumber(page)
+    if current then cache.page=current end
+    self:_schedule_reader_toolbar_state_refresh(current,.12)
     self.sync:on_page(page)
 end
 function Plugin:onAnnotationsModified()
