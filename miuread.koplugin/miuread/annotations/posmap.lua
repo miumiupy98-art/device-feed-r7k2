@@ -155,66 +155,6 @@ local function findAllNorm(norm_text, norm_byte_map, norm_map, needle)
     return hits
 end
 
---- 命中消歧：hits 为原 text_runes 下标；context 用 rune 切片 + 去空白比较。
-local function pickHit(hits, map, needle, context_before, context_after)
-    if #hits == 0 then
-        return nil
-    end
-    if #hits == 1 then
-        return hits[1]
-    end
-
-    context_before = context_before or ""
-    context_after = context_after or ""
-    if context_before == "" and context_after == "" then
-        return nil, "ambiguous"
-    end
-
-    local runes = map.text_runes
-    local nclean_runes = Runes.toRunes(needle:gsub("%s", ""):gsub("%*", ""))
-    local needle_clean = #nclean_runes
-    local scored = {}
-    for _, rune_i in ipairs(hits) do
-        local before = {}
-        for k = math.max(1, rune_i - #context_before), rune_i - 1 do
-            local r = runes[k]
-            if not r:match("%s") and r ~= "*" then
-                before[#before + 1] = r
-            end
-        end
-        local after = {}
-        for k = rune_i + needle_clean, math.min(#runes, rune_i + needle_clean + #context_after - 1) do
-            local r = runes[k]
-            if not r:match("%s") and r ~= "*" then
-                after[#after + 1] = r
-            end
-        end
-        local ok = true
-        if context_before ~= "" then
-            local cb = table.concat(before)
-            local expect_b = context_before:gsub("%s", ""):gsub("%*", "")
-            if cb:sub(-#expect_b) ~= expect_b then
-                ok = false
-            end
-        end
-        if ok and context_after ~= "" then
-            local ca = table.concat(after)
-            local expect_a = context_after:gsub("%s", ""):gsub("%*", "")
-            if ca:sub(1, #expect_a) ~= expect_a then
-                ok = false
-            end
-        end
-        if ok then
-            scored[#scored + 1] = rune_i
-        end
-    end
-
-    if #scored == 1 then
-        return scored[1]
-    end
-    return nil, "ambiguous"
-end
-
 --- 删除所有空白字符（用于空白不敏感比较）。
 local function stripWS(s)
     return (s:gsub("%s", ""))
@@ -257,7 +197,8 @@ local function resolveHitToSpan(map, rune_i, mark_text)
     if consumed ~= #nclean then
         return nil
     end
-    -- 终点含区间内被跳过的尾部空白 rune
+    -- 终点含区间内被跳过的尾部空白 rune，与 Android 边界吸附前的
+    -- 当前 MiuRead 语义保持一致；最终上传仍会做反向正文校验。
     local text_end_pos = last_consumed + 1
     while text_end_pos <= #map.text_runes and map.text_runes[text_end_pos]:match("%s") do
         text_end_pos = text_end_pos + 1
@@ -267,6 +208,71 @@ local function resolveHitToSpan(map, rune_i, mark_text)
         return nil
     end
     return text_start, text_end_pos
+end
+
+--- 命中消歧：hits 为原 text_runes 下标；context 用真实候选 span 两侧文本比较。
+-- 旧实现用“去空白后的 needle 长度”估算 context_after 起点；当选区内部
+-- 存在换行、多个空格或 wr-star 时，后文可能从选区内部开始。这里先对每个
+-- candidate 调 resolveHitToSpan，得到真实 end_pos 后再比较上下文。
+local function pickHit(hits, map, needle, context_before, context_after)
+    if #hits == 0 then
+        return nil
+    end
+    if #hits == 1 then
+        return hits[1]
+    end
+
+    context_before = context_before or ""
+    context_after = context_after or ""
+    if context_before == "" and context_after == "" then
+        return nil, "ambiguous"
+    end
+
+    local runes = map.text_runes
+    local expect_b = context_before:gsub("%s", ""):gsub("%*", "")
+    local expect_a = context_after:gsub("%s", ""):gsub("%*", "")
+    local before_need = #Runes.toRunes(expect_b)
+    local after_need = #Runes.toRunes(expect_a)
+    local scored = {}
+
+    for _, rune_i in ipairs(hits) do
+        local _, text_end_pos = resolveHitToSpan(map, rune_i, needle)
+        if text_end_pos then
+            local before = {}
+            local seen = 0
+            local k = rune_i - 1
+            while k >= 1 and seen < before_need do
+                local r = runes[k]
+                if not r:match("%s") and r ~= "*" then
+                    table.insert(before, 1, r)
+                    seen = seen + 1
+                end
+                k = k - 1
+            end
+
+            local after = {}
+            seen = 0
+            k = text_end_pos
+            while k <= #runes and seen < after_need do
+                local r = runes[k]
+                if not r:match("%s") and r ~= "*" then
+                    after[#after + 1] = r
+                    seen = seen + 1
+                end
+                k = k + 1
+            end
+
+            local ok = true
+            if expect_b ~= "" and table.concat(before) ~= expect_b then ok = false end
+            if ok and expect_a ~= "" and table.concat(after) ~= expect_a then ok = false end
+            if ok then scored[#scored + 1] = rune_i end
+        end
+    end
+
+    if #scored == 1 then
+        return scored[1]
+    end
+    return nil, "ambiguous"
 end
 
 --- 用 markText（+ 可选前后文）在坐标 HTML 上定位，返回上传可用的 range。

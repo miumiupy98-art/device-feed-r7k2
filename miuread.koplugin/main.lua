@@ -7915,9 +7915,7 @@ function Plugin:_show_reader_menu_table(title,source,back_callback)
 end
 
 function Plugin:_reader_annotation_type(item)
-    if type(item)~="table" then return nil end
-    if item.drawer then return item.note and "thought" or "highlight" end
-    return "bookmark"
+    return LocalAnnotationDatabase.annotation_kind(item)
 end
 
 function Plugin:_reader_annotation_xpointer(item)
@@ -7941,6 +7939,74 @@ function Plugin:_reader_annotation_page(item)
         if ok and tonumber(value) then return math.floor(tonumber(value)+.5) end
     end
     return nil
+end
+
+local function annotation_doc_text(doc, first_xp, last_xp)
+    if not (doc and type(doc.getTextFromXPointers)=="function") then return "" end
+    if type(first_xp)~="string" or first_xp=="" or type(last_xp)~="string" or last_xp=="" then return "" end
+    local ok,text=pcall(doc.getTextFromXPointers,doc,first_xp,last_xp,false)
+    if not ok then return "" end
+    if type(text)=="table" then text=text.text or text[1] end
+    return tostring(text or "")
+end
+
+function Plugin:_reader_annotation_selection_context(item,kind)
+    if type(item)~="table" or (kind~="highlight" and kind~="thought") then
+        return "", "", ""
+    end
+    local doc=self.ui and self.ui.document or nil
+    local pos0=type(item.pos0)=="string" and item.pos0 or (type(item.start)=="string" and item.start or nil)
+    local pos1=type(item.pos1)=="string" and item.pos1 or (type(item["end"])=="string" and item["end"] or nil)
+    local selected=U.trim(tostring(item.text or item.notes or ""))
+
+    -- Prefer the actual CREngine selection over the list label. This preserves
+    -- the text the XPointer really covers when KOReader normalized the display.
+    if doc and pos0 and pos1 then
+        local extracted=U.trim(annotation_doc_text(doc,pos0,pos1))
+        if extracted~="" then selected=extracted end
+    end
+
+    local before,after="",""
+    if not (doc and pos0 and pos1) then return selected,before,after end
+
+    -- Context is captured only for a manual sync. It is intentionally bounded:
+    -- enough to distinguish repeated quotes without doing heavy work while the
+    -- user is creating the annotation.
+    local before_xp=pos0
+    if type(doc.getPrevVisibleWordStart)=="function" then
+        for _=1,12 do
+            local ok,next_xp=pcall(doc.getPrevVisibleWordStart,doc,before_xp)
+            if not ok or type(next_xp)~="string" or next_xp=="" or next_xp==before_xp then break end
+            before_xp=next_xp
+        end
+    elseif type(doc.getPrevVisibleChar)=="function" then
+        for _=1,48 do
+            local ok,next_xp=pcall(doc.getPrevVisibleChar,doc,before_xp)
+            if not ok or type(next_xp)~="string" or next_xp=="" or next_xp==before_xp then break end
+            before_xp=next_xp
+        end
+    end
+    local raw_before=annotation_doc_text(doc,before_xp,pos0)
+    local before_len=U.utf8_len(raw_before)
+    if before_len>0 then before=U.utf8_sub(raw_before,math.max(1,before_len-63),before_len) end
+
+    local after_xp=pos1
+    if type(doc.getNextVisibleWordEnd)=="function" then
+        for _=1,12 do
+            local ok,next_xp=pcall(doc.getNextVisibleWordEnd,doc,after_xp)
+            if not ok or type(next_xp)~="string" or next_xp=="" or next_xp==after_xp then break end
+            after_xp=next_xp
+        end
+    elseif type(doc.getNextVisibleChar)=="function" then
+        for _=1,48 do
+            local ok,next_xp=pcall(doc.getNextVisibleChar,doc,after_xp)
+            if not ok or type(next_xp)~="string" or next_xp=="" or next_xp==after_xp then break end
+            after_xp=next_xp
+        end
+    end
+    local raw_after=annotation_doc_text(doc,pos1,after_xp)
+    if raw_after~="" then after=U.utf8_sub(raw_after,1,64) end
+    return selected,before,after
 end
 
 function Plugin:_reader_bookmark_anchor_text(item)
@@ -15334,8 +15400,21 @@ function Plugin:show_local_annotation_sync_status()
         "待同步："..tostring(summary.pending or 0),
         "待删除："..tostring(summary.delete_pending or 0),
         "定位失败："..tostring(summary.locate_failed or 0),
+        "元数据失败："..tostring(summary.metadata_failed or 0),
         "结果未知："..tostring(summary.unknown or 0),
     }
+    local failures=LocalAnnotationDatabase.failures(self.store,book_id,5)
+    if type(failures)=="table" and #failures>0 then
+        lines[#lines+1]=""
+        lines[#lines+1]="最近失败："
+        local kind_label={bookmark="书签",highlight="划线",thought="想法"}
+        for _,failure in ipairs(failures) do
+            lines[#lines+1]=string.format("- %s [%s] %s",
+                kind_label[failure.kind] or tostring(failure.kind or "批注"),
+                tostring(failure.stage or failure.state or "unknown"),
+                U.utf8_truncate(tostring(failure.error or ""),72,""))
+        end
+    end
     self:info(table.concat(lines,"\n"))
     return true
 end
@@ -15381,12 +15460,27 @@ function Plugin:sync_local_annotations_now()
             "已删除："..tostring(result.deleted or 0),
             "云端已存在："..tostring(result.reconciled or 0),
             "定位失败："..tostring(result.locate_failed or 0),
+            "元数据失败："..tostring(result.metadata_failed or 0),
             "结果未知："..tostring(result.unknown or 0),
         }
-        if tonumber(result.failed or 0)>0 then lines[#lines+1]="其他待处理："..tostring(result.failed or 0) end
+        if tonumber(result.failed or 0)>0 then lines[#lines+1]="待处理合计："..tostring(result.failed or 0) end
         if type(result.errors)=="table" and #result.errors>0 then
             lines[#lines+1]=""
-            lines[#lines+1]="未上传的记录会继续保留在本地，不会猜测错误位置。"
+            lines[#lines+1]="未上传："
+            local kind_label={bookmark="书签",highlight="划线",thought="想法"}
+            for index,item in ipairs(result.errors) do
+                if index>6 then break end
+                if type(item)=="table" then
+                    lines[#lines+1]=string.format("- %s [%s] %s",
+                        kind_label[item.kind] or tostring(item.kind or "批注"),
+                        tostring(item.stage or "unknown"),
+                        U.utf8_truncate(tostring(item.error or ""),72,""))
+                else
+                    lines[#lines+1]="- "..U.utf8_truncate(tostring(item),88,"")
+                end
+            end
+            lines[#lines+1]=""
+            lines[#lines+1]="以上记录仍保留在本地，没有猜测错误位置。"
         end
         self:info(table.concat(lines,"\n"))
     end,180)
@@ -15398,22 +15492,43 @@ function Plugin:_local_annotation_chapter_context(item,current,kind,reason)
     if type(current)~="table" then return {} end
     local record=type(current.record)=="table" and current.record or {}
     local book=type(current.book)=="table" and current.book or {}
+    local manual=reason=="manual_sync"
+    local selected,before,after="","",""
+    if manual and (kind=="highlight" or kind=="thought") then
+        selected,before,after=self:_reader_annotation_selection_context(item,kind)
+    end
+    local anchor=(kind=="bookmark" and manual) and self:_reader_bookmark_anchor_text(item) or ""
+
     local standalone_uid=tostring(record.chapter_uid or "")
     if standalone_uid~="" then
         return {
             chapter_uid=standalone_uid,
             chapter_idx=tonumber((record.chapter_map or {})[1] and (record.chapter_map or {})[1].index) or 1,
-            anchor_text=(kind=="bookmark" and reason=="manual_sync") and self:_reader_bookmark_anchor_text(item) or "",
+            selected_text=selected, context_before=before, context_after=after,
+            anchor_text=anchor,
         }
     end
+
     local chapter_map=type(record.chapter_map)=="table" and record.chapter_map
         or (type(book.catalog)=="table" and book.catalog or {})
-    if #chapter_map==0 then return {} end
-    local page=self:_reader_annotation_page(item)
+    if #chapter_map==0 then
+        return {selected_text=selected,context_before=before,context_after=after,anchor_text=anchor}
+    end
+
     local toc=self.ui and self.ui.toc or nil
     local toc_index
     if toc and type(toc.fillToc)=="function" then pcall(toc.fillToc,toc) end
-    if page and toc and type(toc.getTocIndexByPage)=="function" then
+
+    -- Prefer the annotation XPointer: for rolling documents it identifies the
+    -- real spine position more precisely than an estimated rendered page.
+    local xp=self:_reader_annotation_xpointer(item)
+    if xp and toc and type(toc.getTocIndexByPage)=="function" then
+        local ok,value=pcall(toc.getTocIndexByPage,toc,xp)
+        if ok then toc_index=tonumber(value) end
+    end
+
+    local page=self:_reader_annotation_page(item)
+    if not toc_index and page and toc and type(toc.getTocIndexByPage)=="function" then
         local ok,value=pcall(toc.getTocIndexByPage,toc,page)
         if ok then toc_index=tonumber(value) end
     end
@@ -15425,14 +15540,15 @@ function Plugin:_local_annotation_chapter_context(item,current,kind,reason)
             if p and p<=page and p>=best then best=p; toc_index=index end
         end
     end
+
     local index=math.max(1,math.min(#chapter_map,math.floor(tonumber(toc_index) or 1)))
     local chapter=chapter_map[index] or {}
     local uid=tostring(chapter.uid or chapter.chapterUid or chapter.chapter_uid or "")
-    if uid=="" then return {} end
     return {
         chapter_uid=uid,
         chapter_idx=tonumber(chapter.index) or index,
-        anchor_text=(kind=="bookmark" and reason=="manual_sync") and self:_reader_bookmark_anchor_text(item) or "",
+        selected_text=selected, context_before=before, context_after=after,
+        anchor_text=anchor,
     }
 end
 
