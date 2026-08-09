@@ -6,20 +6,16 @@ local function append(rows,items)
 end
 
 function M.sync(plugin)
-    return {
-        {text="同步状态",callback=function() plugin:show_sync_status(false) end},
-        {text="自动同步阅读进度",checked_func=function() return plugin.store:preferences().sync.progress_enabled~=false end,keep_menu_open=true,callback=function() plugin:toggle_progress_sync() end},
-        {text="自动同步阅读时间",checked_func=function() return plugin.store:preferences().sync.time_enabled==true end,keep_menu_open=true,callback=function() plugin:toggle_time_sync() end},
-        {text="同步成功提醒",checked_func=function() return plugin:_sync_success_notice_enabled() end,keep_menu_open=true,callback=function() plugin:toggle_sync_success_notice() end},
-        {text="立即上传当前进度",callback=function() plugin:upload_local_progress(true) end},
-        {text="高级同步",sub_item_table_func=function()
-            return {
-                {text="修复当前书籍同步",callback=function() plugin:repair_current_sync() end},
-                {text="重新读取云端进度",callback=function() plugin:manual_sync() end},
-                {text="同步诊断",sub_item_table_func=function() return plugin:sync_diagnostics_menu() end},
-            }
-        end},
+    local rows={
+        {text="同步状态",post_text=plugin:_home_sync_status_label(),callback=function() plugin:show_sync_status(false) end},
+        {text="同步待处理内容",post_text="进度 时间 划线 想法",callback=function() plugin:_sync_home_pending() end},
     }
+    append(rows,plugin:sync_settings_menu())
+    if plugin:_current_book_record() then
+        rows[#rows+1]={text="修复当前书籍同步",callback=function() plugin:repair_current_sync() end}
+        rows[#rows+1]={text="重新读取当前书籍云端进度",callback=function() plugin:manual_sync() end}
+    end
+    return rows
 end
 
 function M.account_sync(plugin)
@@ -73,7 +69,7 @@ end
 function M.comments(plugin)
     local rows={}
     append(rows,plugin:thought_font_settings_menu())
-    append(rows,M.annotation_sync(plugin))
+    rows[#rows+1]={text="本地划线与想法",post_text="显示与本地数据",enabled=false}
     rows[#rows+1]={text="评论数据管理",sub_item_table_func=function() return M.comment_data(plugin) end}
     return rows
 end

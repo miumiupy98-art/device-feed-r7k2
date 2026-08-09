@@ -489,6 +489,114 @@ function LocalAnnotationDatabase.summary(store, book_id)
     return result
 end
 
+local FAILURE_STATES = {
+    locate_failed=true, metadata_failed=true, coord_failed=true,
+    unknown=true, delete_unknown=true,
+}
+
+local function database_paths(store)
+    local root = tostring(store and store.cache_books_dir or "")
+    local out = {}
+    if root == "" or lfs.attributes(root, "mode") ~= "directory" then return out end
+    local ok, iter, state, var = pcall(lfs.dir, root)
+    if not ok or not iter then return out end
+    while true do
+        local name = iter(state, var)
+        var = name
+        if not name then break end
+        if name ~= "." and name ~= ".." then
+            local path = root .. "/" .. name .. "/" .. LocalAnnotationDatabase.FILE_NAME
+            if lfs.attributes(path, "mode") == "file" then out[#out + 1] = path end
+        end
+    end
+    return out
+end
+
+-- Aggregate pending local mutations across every generated book. The home
+-- screen uses this instead of pretending there is a "current book" while no
+-- reader is open.
+function LocalAnnotationDatabase.global_summary(store)
+    local out = {pending=0, failed=0, delete_pending=0, bookmark=0, highlight=0, thought=0, books=0}
+    for _, path in ipairs(database_paths(store)) do
+        local ok_conn, conn = pcall(SQLiteStore.open, path, true)
+        if ok_conn and conn then
+            local ok = pcall(function()
+                local statement = conn:prepare([[
+                    SELECT kind, sync_state, COUNT(*) FROM local_annotations
+                     WHERE sync_state IN
+                        ('local_only','locate_failed','metadata_failed','coord_failed','unknown','delete_pending','delete_unknown')
+                     GROUP BY kind, sync_state
+                ]])
+                local touched = false
+                while true do
+                    local row = statement:step()
+                    if not row then break end
+                    local kind, state_name = tostring(row[1] or ""), tostring(row[2] or "")
+                    local count = tonumber(row[3] or 0) or 0
+                    if count > 0 then touched = true end
+                    out.pending = out.pending + count
+                    if out[kind] ~= nil then out[kind] = out[kind] + count end
+                    if state_name == "delete_pending" or state_name == "delete_unknown" then
+                        out.delete_pending = out.delete_pending + count
+                    end
+                    if FAILURE_STATES[state_name] then out.failed = out.failed + count end
+                end
+                statement:close()
+                if touched then out.books = out.books + 1 end
+            end)
+            pcall(conn.close, conn)
+            if not ok then -- ignore one damaged cache DB; the rest remain usable
+            end
+        end
+    end
+    return out
+end
+
+function LocalAnnotationDatabase.pending_books(store, limit)
+    limit = math.max(1, tonumber(limit) or 100)
+    local by_book, order = {}, {}
+    for _, path in ipairs(database_paths(store)) do
+        local ok_conn, conn = pcall(SQLiteStore.open, path, true)
+        if ok_conn and conn then
+            pcall(function()
+                local statement = conn:prepare([[
+                    SELECT book_id, kind, sync_state, COUNT(*) FROM local_annotations
+                     WHERE sync_state IN
+                        ('local_only','locate_failed','metadata_failed','coord_failed','unknown','delete_pending','delete_unknown')
+                     GROUP BY book_id, kind, sync_state
+                ]])
+                while true do
+                    local row = statement:step()
+                    if not row then break end
+                    local book_id = tostring(row[1] or "")
+                    local kind, state_name = tostring(row[2] or ""), tostring(row[3] or "")
+                    local count = tonumber(row[4] or 0) or 0
+                    if book_id ~= "" and count > 0 then
+                        local item = by_book[book_id]
+                        if not item then
+                            item = {book_id=book_id, pending=0, failed=0, bookmark=0, highlight=0, thought=0}
+                            by_book[book_id] = item
+                            order[#order + 1] = item
+                        end
+                        item.pending = item.pending + count
+                        if item[kind] ~= nil then item[kind] = item[kind] + count end
+                        if FAILURE_STATES[state_name] then item.failed = item.failed + count end
+                    end
+                end
+                statement:close()
+            end)
+            pcall(conn.close, conn)
+        end
+    end
+    table.sort(order, function(a, b)
+        if a.failed ~= b.failed then return a.failed > b.failed end
+        if a.pending ~= b.pending then return a.pending > b.pending end
+        return a.book_id < b.book_id
+    end)
+    while #order > limit do table.remove(order) end
+    return order
+end
+
 function LocalAnnotationDatabase.failures(store, book_id, limit)
     if not LocalAnnotationDatabase.exists(store, book_id) then return {} end
     local conn = open(store, book_id, false)

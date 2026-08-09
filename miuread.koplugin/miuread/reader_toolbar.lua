@@ -316,25 +316,24 @@ function Toolbar:_top_status_row(root, header, x, y, width, height)
     -- labels sit next to each other instead of being visually separated by a
     -- full-width text box. "More" is text-only: the old three-dot icon merely
     -- duplicated the label and consumed useful width.
-    local weights = {15, 31, 24, 14, 16}
+    local weights = {31, 24, 14, 15, 16}
     local entries = {
-        {icon = "home", label = header.home_label or "首页", enabled = type(header.home_callback) == "function", bold = true},
         {icon = "wifi", label = header.wifi_label or "Wi-Fi", enabled = type(header.wifi_callback) == "function", alert = header.wifi_alert == true, bold = true},
         {icon = "sync", label = header.sync_label or "同步", enabled = type(header.sync_callback) == "function", alert = header.sync_alert == true, bold = true},
         {icon = "battery", label = header.battery_label or "", enabled = true, bold = true},
+        {icon = "home", label = header.home_label or "首页", enabled = type(header.home_callback) == "function", bold = true},
         {label = header.more_label or "更多", enabled = type(header.more_callback) == "function", text_align = "center", bold = true},
     }
     local callbacks = {
-        function() self:_activate(header.home_callback, "首页") end,
         function() self:_activate(header.wifi_callback, "Wi-Fi") end,
         function() self:_activate(header.sync_callback, "同步") end,
         nil,
+        function() self:_activate(header.home_callback, "首页") end,
         function() self:_activate(header.more_callback, "更多") end,
     }
     local holds = {
-        nil,
         type(header.wifi_hold_callback) == "function" and function() self:_activate_hold(header.wifi_hold_callback, "Wi-Fi 设置") end or nil,
-        nil,nil,nil,
+        nil,nil,nil,nil,
     }
     local used = 0
     for index, entry in ipairs(entries) do

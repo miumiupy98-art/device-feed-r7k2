@@ -279,6 +279,47 @@ function SheetWidget:_footer(action, width, height)
     return tap
 end
 
+function SheetWidget:_footer_group(actions, width, height)
+    actions = type(actions) == "table" and actions or {}
+    local visible = {}
+    for _, action in ipairs(actions) do
+        if type(action) == "table" and action.hidden ~= true then
+            visible[#visible + 1] = action
+            if #visible >= 3 then break end
+        end
+    end
+    if #visible == 0 then return nil end
+    local gap = UiScale.dp(4, 3, 6)
+    local cell_w = math.floor((width - gap * (#visible - 1)) / #visible)
+    local group = HorizontalGroup:new{align = "center"}
+    for index, action in ipairs(visible) do
+        local enabled = action.enabled ~= false
+        local label = tostring(action.label or action.text or "更多")
+        local layers = OverlapGroup:new{dimen = Geom:new{w = cell_w, h = height}, allow_mirroring = false}
+        layers[#layers + 1] = TextBoxWidget:new{
+            text = label,
+            face = UiScale.face("cfont", 9.3, 13.3, 8.2),
+            bold = true,
+            width = cell_w,
+            height = height,
+            height_adjust = false,
+            height_overflow_show_ellipsis = true,
+            alignment = "center",
+            fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+        }
+        local tap = TapBox:new{
+            dimen = Geom:new{w = cell_w, h = height},
+            callback = function()
+                if enabled then self:_close(action.callback) end
+            end,
+        }
+        tap[1] = layers
+        group[#group + 1] = tap
+        if index < #visible then group[#group + 1] = HorizontalSpan:new{width = gap} end
+    end
+    return group
+end
+
 local function normalized_anchor(anchor)
     if type(anchor) ~= "table" then return nil end
     local x, y = tonumber(anchor.x), tonumber(anchor.y)
@@ -327,13 +368,16 @@ function SheetWidget:_build()
     local subtitle_h = has_subtitle and UiScale.dp(21, 19, 29) or 0
     local card_h = UiScale.dp(58, 53, 79)
     local footer_action = type(self.opts.footer_action) == "table" and self.opts.footer_action or nil
-    local footer_h = footer_action and UiScale.dp(39, 35, 52) or 0
+    local footer_actions = type(self.opts.footer_actions) == "table" and self.opts.footer_actions or nil
+    local has_footer_actions = footer_actions and #footer_actions > 0
+    local footer_h = (footer_action or has_footer_actions) and UiScale.dp(39, 35, 52) or 0
     local show_close = self.opts.show_close == true
     if show_close and count < MAX_PRIMARY_ACTIONS then
         actions[#actions + 1] = {icon = "×", label = tostring(self.opts.close_label or "关闭"), close_only = true}
         count = #actions
     end
     local columns = count <= 1 and 1 or 2
+    local wide_last = self.opts.wide_last == true and columns == 2 and count % 2 == 1
     local rows = math.max(1, math.ceil(count / columns))
     local card_w = columns == 1 and inner_w or math.floor((inner_w - gap) / 2)
     local header_h = title_h + subtitle_h
@@ -375,22 +419,32 @@ function SheetWidget:_build()
     local index = 1
     for row = 1, rows do
         local row_group = HorizontalGroup:new{align = "center"}
-        for col = 1, columns do
+        if wide_last and row == rows then
             local action = actions[index]
-            if action then
-                row_group[#row_group + 1] = self:_card(action, card_w, card_h, index * 3 + row)
-            else
-                row_group[#row_group + 1] = Widget:new{dimen = Geom:new{w = card_w, h = card_h}}
-            end
-            if col < columns then row_group[#row_group + 1] = HorizontalSpan:new{width = gap} end
+            if action then row_group[#row_group + 1] = self:_card(action, inner_w, card_h, index * 3 + row) end
             index = index + 1
+        else
+            for col = 1, columns do
+                local action = actions[index]
+                if action then
+                    row_group[#row_group + 1] = self:_card(action, card_w, card_h, index * 3 + row)
+                else
+                    row_group[#row_group + 1] = Widget:new{dimen = Geom:new{w = card_w, h = card_h}}
+                end
+                if col < columns then row_group[#row_group + 1] = HorizontalSpan:new{width = gap} end
+                index = index + 1
+            end
         end
         list[#list + 1] = row_group
         if row < rows then list[#list + 1] = VerticalSpan:new{height = gap} end
     end
     if footer_h > 0 then
         list[#list + 1] = VerticalSpan:new{height = gap}
-        list[#list + 1] = self:_footer(footer_action, inner_w, footer_h)
+        if has_footer_actions then
+            list[#list + 1] = self:_footer_group(footer_actions, inner_w, footer_h)
+        else
+            list[#list + 1] = self:_footer(footer_action, inner_w, footer_h)
+        end
     end
 
     local panel = fixed_frame(panel_w, panel_h, {
@@ -525,21 +579,44 @@ local function show_fallback(opts, reason)
             end,
         }}
     end
-    local footer = type(opts.footer_action) == "table" and opts.footer_action or nil
-    if footer then
-        buttons[#buttons + 1] = {{
-            text = tostring(footer.label or footer.text or "更多操作"),
-            enabled = footer.enabled ~= false,
-            callback = function()
-                UIManager:close(dialog)
-                if footer.enabled ~= false and footer.callback then
-                    UIManager:scheduleIn(.04, function()
-                        local ok, err = pcall(footer.callback)
-                        if not ok then logger.warn("[MiuRead][ActionSheet] fallback footer failed", tostring(err)) end
-                    end)
-                end
-            end,
-        }}
+    local footer_actions = type(opts.footer_actions) == "table" and opts.footer_actions or nil
+    if footer_actions and #footer_actions > 0 then
+        local row = {}
+        for _, footer in ipairs(footer_actions) do
+            if type(footer) == "table" and footer.hidden ~= true and #row < 3 then
+                row[#row + 1] = {
+                    text = tostring(footer.label or footer.text or "更多"),
+                    enabled = footer.enabled ~= false,
+                    callback = function()
+                        UIManager:close(dialog)
+                        if footer.enabled ~= false and footer.callback then
+                            UIManager:scheduleIn(.04, function()
+                                local ok, err = pcall(footer.callback)
+                                if not ok then logger.warn("[MiuRead][ActionSheet] fallback footer failed", tostring(err)) end
+                            end)
+                        end
+                    end,
+                }
+            end
+        end
+        if #row > 0 then buttons[#buttons + 1] = row end
+    else
+        local footer = type(opts.footer_action) == "table" and opts.footer_action or nil
+        if footer then
+            buttons[#buttons + 1] = {{
+                text = tostring(footer.label or footer.text or "更多操作"),
+                enabled = footer.enabled ~= false,
+                callback = function()
+                    UIManager:close(dialog)
+                    if footer.enabled ~= false and footer.callback then
+                        UIManager:scheduleIn(.04, function()
+                            local ok, err = pcall(footer.callback)
+                            if not ok then logger.warn("[MiuRead][ActionSheet] fallback footer failed", tostring(err)) end
+                        end)
+                    end
+                end,
+            }}
+        end
     end
     buttons[#buttons + 1] = {{text = "关闭", callback = function() UIManager:close(dialog) end}}
     local title = tostring(opts.title or "操作")

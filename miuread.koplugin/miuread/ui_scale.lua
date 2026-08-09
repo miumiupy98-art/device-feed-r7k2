@@ -1,10 +1,12 @@
 local Device = require("device")
 local Font = require("ui/font")
+local ThoughtFaceFactory
 
 local Screen = Device.screen
 local UiScale = {}
 
 local display_mode = "standard"
+local ui_font_name = nil
 local MODE_FACTORS = {
     compact = {font = 1.08, icon = 1.04, spacing = .96},
     -- The previous standard setting was still too small on 300 ppi Kindles.
@@ -29,6 +31,29 @@ end
 
 function UiScale.getDisplayMode()
     return display_mode
+end
+
+function UiScale.setFontName(name)
+    name = type(name) == "string" and name:match("^%s*(.-)%s*$") or ""
+    ui_font_name = name ~= "" and name or nil
+end
+
+function UiScale.getFontName()
+    return ui_font_name
+end
+
+local function text_face(name, size)
+    if ui_font_name then
+        if not ThoughtFaceFactory then
+            local ok, module = pcall(require, "miuread.thought_face_factory")
+            if ok then ThoughtFaceFactory = module end
+        end
+        if ThoughtFaceFactory then
+            local ok, face = pcall(ThoughtFaceFactory.getFace, ThoughtFaceFactory, ui_font_name, size, name)
+            if ok and face then return face end
+        end
+    end
+    return Font:getFace(name, size)
 end
 
 function UiScale.metrics()
@@ -93,7 +118,8 @@ function UiScale.face(name, nominal, maximum, minimum)
     -- maximum is a visual cap in the old call sites. Scale it with the same
     -- comfort factor, otherwise a larger requested mode gets clipped early.
     local cap = math.max(floor_size, (tonumber(maximum) or adjusted) * m.ratio * factors.font * orientation_factor)
-    return Font:getFace(name, math.max(1, math.floor(clamp(adjusted, floor_size, cap) + .5)))
+    local size = math.max(1, math.floor(clamp(adjusted, floor_size, cap) + .5))
+    return text_face(name, size)
 end
 
 function UiScale.iconFace(name, nominal, maximum, minimum)

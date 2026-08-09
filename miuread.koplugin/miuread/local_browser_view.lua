@@ -82,12 +82,31 @@ local function image_widget(path, width, height)
     return nil
 end
 
-local function book_placeholder(width, height, title)
-    local mark = U.utf8_sub(tostring(title or "书"), 1, 1)
+local function book_placeholder(width, height, title, author)
+    title = U.trim(tostring(title or "未命名"))
+    author = U.trim(tostring(author or ""))
+    if title == "" then title = "未命名" end
+    local pad = UiScale.dp(3, 2, 5)
+    local content_w = math.max(1, width - pad * 2)
+    local content_h = math.max(1, height - pad * 2)
+    local title_h = math.max(1, math.floor(content_h * (author ~= "" and .60 or .80)))
+    local body = VerticalGroup:new{align = "center", TextBoxWidget:new{
+        text = U.utf8_truncate(title, 24, "…"), face = face("cfont", 10.8, 15.5), bold = true,
+        width = math.max(1, content_w - UiScale.dp(4, 3, 7)), height = title_h,
+        height_adjust = false, height_overflow_show_ellipsis = true, alignment = "center",
+    }}
+    if author ~= "" then
+        body[#body + 1] = TextBoxWidget:new{
+            text = U.utf8_truncate(author, 18, "…"), face = face("smallinfofont", 7.8, 10.8),
+            width = math.max(1, content_w - UiScale.dp(4, 3, 7)), height = math.max(1, content_h - title_h),
+            height_adjust = false, height_overflow_show_ellipsis = true, alignment = "center",
+            fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+        }
+    end
     return fixed_frame(width, height, {
         bordersize = UiScale.line("thin"), radius = UiScale.radius(7, 5, 12),
-        background = Blitbuffer.COLOR_WHITE, color = Blitbuffer.COLOR_GRAY,
-    }, TextWidget:new{text = mark ~= "" and mark or "书", face = face("cfont", 18, 24), bold = true})
+        padding = pad, background = Blitbuffer.COLOR_WHITE, color = Blitbuffer.COLOR_GRAY,
+    }, body)
 end
 
 local function folder_card(folder, width, height, callback)
@@ -123,7 +142,7 @@ local function book_card(book, width, height, callback, hold_callback)
     local gap = UiScale.dp(3, 2, 5)
     local cover_h = math.max(UiScale.dp(112, 94, 180), height - title_h - gap)
     local cover_w = math.max(UiScale.dp(74, 62, 122), math.min(math.floor(width * .92), math.floor(cover_h * .715)))
-    local cover = image_widget(book.cover_path, cover_w, cover_h) or book_placeholder(cover_w, cover_h, book.title)
+    local cover = image_widget(book.cover_path, cover_w, cover_h) or book_placeholder(cover_w, cover_h, book.title, book.author)
     local body = VerticalGroup:new{
         align = "center", cover, VerticalSpan:new{height = gap},
         TextBoxWidget:new{
@@ -137,7 +156,7 @@ end
 
 local LocalBrowserWidget = InputContainer:extend{
     name = "miuread_local_browser", _miuread_transient = true,
-    covers_fullscreen = true, opts = nil, page = 1, pages = 1,
+    covers_fullscreen = true, opts = nil, page = 1, pages = 1, view_mode = "folders",
     _closed = false, _miu_closed = false,
 }
 
@@ -145,10 +164,11 @@ function LocalBrowserWidget:_metrics()
     local m = UiScale.metrics()
     local margin = math.max(UiScale.dp(9, 8, 17), math.floor(math.min(m.sw, m.sh) * .012))
     local header_h = UiScale.dp(54, 48, 74)
+    local tab_h = UiScale.dp(38, 34, 52)
     local footer_h = UiScale.dp(45, 40, 62)
     local gap = UiScale.dp(6, 5, 10)
     local rows = m.portrait and 3 or 2
-    return m, margin, header_h, footer_h, gap, rows
+    return m, margin, header_h, tab_h, footer_h, gap, rows
 end
 
 function LocalBrowserWidget:_close()
@@ -168,13 +188,26 @@ end
 
 function LocalBrowserWidget:_entries()
     local entries = {}
-    for _, folder in ipairs((self.opts and self.opts.folders) or {}) do
-        entries[#entries + 1] = {kind = "folder", value = folder, weight = 2}
-    end
-    for _, book in ipairs((self.opts and self.opts.books) or {}) do
-        entries[#entries + 1] = {kind = "book", value = book, weight = 1}
+    if self.view_mode == "folders" then
+        for _, folder in ipairs((self.opts and self.opts.folders) or {}) do
+            entries[#entries + 1] = {kind = "folder", value = folder, weight = 2}
+        end
+    else
+        for _, book in ipairs((self.opts and self.opts.books) or {}) do
+            entries[#entries + 1] = {kind = "book", value = book, weight = 1}
+        end
     end
     return entries
+end
+
+function LocalBrowserWidget:_set_view_mode(mode)
+    mode = mode == "books" and "books" or "folders"
+    if mode == self.view_mode then return true end
+    self.view_mode = mode
+    self.page = 1
+    self:_build()
+    UIManager:setDirty(self, "full")
+    return true
 end
 
 function LocalBrowserWidget:_page_map(capacity)
@@ -195,7 +228,7 @@ function LocalBrowserWidget:_add(group, x, y, child)
 end
 
 function LocalBrowserWidget:_build()
-    local m, margin, header_h, footer_h, gap, rows = self:_metrics()
+    local m, margin, header_h, tab_h, footer_h, gap, rows = self:_metrics()
     local sw, sh = m.sw, m.sh
     self._last_screen_w, self._last_screen_h = sw, sh
     self._last_rotation = Screen.getRotationMode and Screen:getRotationMode() or nil
@@ -233,7 +266,34 @@ function LocalBrowserWidget:_build()
         dimen = Geom:new{w = sw - margin * 2, h = UiScale.line("thin")},
     })
 
-    local grid_y = margin + header_h + UiScale.line("thin") + gap
+    local folder_count = #((self.opts and self.opts.folders) or {})
+    local book_count = #((self.opts and self.opts.books) or {})
+    if self.view_mode == "folders" and folder_count == 0 and book_count > 0 then self.view_mode = "books" end
+    if self.view_mode == "books" and book_count == 0 and folder_count > 0 then self.view_mode = "folders" end
+    local tab_w = math.floor(inner_w / 2)
+    local function tab(label, mode, width)
+        local selected = self.view_mode == mode
+        local layers_tab = OverlapGroup:new{dimen = Geom:new{w = width, h = tab_h}, allow_mirroring = false}
+        layers_tab[#layers_tab + 1] = Ui.textbox(label, width, tab_h, face("cfont", 10.8, 15.2), {
+            bold = selected, alignment = "center", halign = "center", valign = "center",
+            fgcolor = selected and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_DARK_GRAY,
+        })
+        if selected then
+            local line_w = math.max(UiScale.dp(38, 32, 58), math.floor(width * .28))
+            layers_tab[#layers_tab + 1] = OffsetContainer:new{
+                x_off = math.floor((width - line_w) / 2), y_off = tab_h - UiScale.line("thick"),
+                LineWidget:new{background = Blitbuffer.COLOR_BLACK, dimen = Geom:new{w = line_w, h = UiScale.line("thick")}},
+            }
+        end
+        return tappable(width, tab_h, layers_tab, function() self:_set_view_mode(mode) end)
+    end
+    local tabs = HorizontalGroup:new{align = "center",
+        tab("文件夹 " .. tostring(folder_count), "folders", tab_w),
+        tab("书籍 " .. tostring(book_count), "books", inner_w - tab_w),
+    }
+    self:_add(layers, margin, margin + header_h + UiScale.line("thin"), tabs)
+
+    local grid_y = margin + header_h + UiScale.line("thin") + tab_h + gap
     local grid_h = math.max(1, sh - grid_y - footer_h - margin)
     local col_gap = UiScale.dp(4, 3, 7)
     local row_gap = UiScale.dp(5, 4, 9)
@@ -260,7 +320,8 @@ function LocalBrowserWidget:_build()
     end
 
     if #(pages[self.page] or {}) == 0 then
-        self:_add(layers, margin, grid_y, Ui.textbox(tostring(self.opts and self.opts.empty_text or "这个文件夹里没有可显示的书籍"),
+        local empty_label = self.view_mode == "folders" and "这个位置没有子文件夹" or tostring(self.opts and self.opts.empty_text or "这个文件夹里没有可显示的书籍")
+        self:_add(layers, margin, grid_y, Ui.textbox(empty_label,
             inner_w, grid_h, face("smallinfofont", 11, 15), {
                 bold = true, alignment = "center", halign = "center", valign = "center",
             }))
@@ -291,6 +352,9 @@ function LocalBrowserWidget:_change_page(delta)
 end
 function LocalBrowserWidget:init()
     self.page = tonumber(self.opts and self.opts.page) or 1
+    local folders = (self.opts and self.opts.folders) or {}
+    local books = (self.opts and self.opts.books) or {}
+    self.view_mode = #folders > 0 and "folders" or "books"
     if Device:hasKeys() then
         self.key_events = self.key_events or {}
         if Device.input and Device.input.group and Device.input.group.Back then self.key_events.Back = {{Device.input.group.Back}} end
@@ -307,6 +371,9 @@ function LocalBrowserWidget:updateData(snapshot)
     if self._miu_closed then return false end
     self.opts.folders = snapshot.folders or {}
     self.opts.books = snapshot.books or {}
+    if self.view_mode == "folders" and #self.opts.folders == 0 and #self.opts.books > 0 then self.view_mode = "books" end
+    if self.view_mode == "books" and #self.opts.books == 0 and #self.opts.folders > 0 then self.view_mode = "folders" end
+    self.page = 1
     self.opts.empty_text = snapshot.error and ("无法读取文件夹\n" .. tostring(snapshot.error)) or self.opts.empty_text
     self:_build(); UIManager:setDirty(self, "full"); return true
 end

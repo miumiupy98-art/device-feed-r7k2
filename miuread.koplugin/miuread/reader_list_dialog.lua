@@ -139,7 +139,7 @@ function Dialog:_row_widget(item, width, height)
     text_layers[#text_layers + 1] = OffsetContainer:new{
         x_off = 0, y_off = 0,
         Ui.textbox(tostring(item.label or item.text or ""), text_w, label_h,
-            Skin.face("cfont", detail ~= "" and 10.2 or 10.7, detail ~= "" and 13.8 or 14.5, detail ~= "" and 8.8 or 9.2), {
+            Skin.face("cfont", detail ~= "" and 11.1 or 11.6, detail ~= "" and 14.9 or 15.6, detail ~= "" and 9.4 or 9.9), {
                 bold = item.bold == true or item.checked == true,
                 alignment = "left",
                 fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
@@ -148,7 +148,7 @@ function Dialog:_row_widget(item, width, height)
     if detail ~= "" then
         text_layers[#text_layers + 1] = OffsetContainer:new{
             x_off = 0, y_off = label_h,
-            Ui.textbox(detail, text_w, detail_h, Skin.face("smallinfofont", 8.2, 10.9, 7.0), {
+            Ui.textbox(detail, text_w, detail_h, Skin.face("smallinfofont", 9.0, 11.9, 7.7), {
                 alignment = "left",
                 fgcolor = enabled and Blitbuffer.COLOR_DARK_GRAY or Blitbuffer.COLOR_GRAY,
             }),
@@ -167,7 +167,7 @@ function Dialog:_row_widget(item, width, height)
     row[#row + 1] = text_layers
     if value_w > 0 then
         row[#row + 1] = HorizontalSpan:new{width = gap}
-        row[#row + 1] = Ui.textbox(value, value_w, height - pad * 2, Skin.face("smallinfofont", 8.7, 11.6, 7.4), {
+        row[#row + 1] = Ui.textbox(value, value_w, height - pad * 2, Skin.face("smallinfofont", 9.5, 12.6, 8.1), {
             bold = item.value_bold == true or item.checked == true,
             alignment = "right", halign = "right",
             fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
@@ -193,7 +193,7 @@ function Dialog:_tab_widget(category, width, height, selected)
     local key = tostring(category.key or "")
     local layers = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
     layers[#layers + 1] = Ui.textbox(tostring(category.label or key), width, height,
-        Skin.face("cfont", 10.2, 13.8, 8.8), {
+        Skin.face("cfont", 11.0, 14.8, 9.4), {
             bold = selected, alignment = "center", halign = "center",
             fgcolor = selected and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_DARK_GRAY,
         })
@@ -241,7 +241,7 @@ function Dialog:_build_content()
     self.selected_key = tostring(selected and selected.key or "all")
     local tab_h = #categories > 1 and math.max(Skin.dp(37, 32, 49), math.floor(sh * .036)) or 0
     local pager_h_default = Skin.dp(34, 29, 45)
-    local row_h = math.max(Skin.dp(62, 53, 82), math.floor(sh * (portrait and .058 or .082)))
+    local row_h = math.max(Skin.dp(64, 55, 86), math.floor(sh * (portrait and .060 or .084)))
     local page_size = self:_page_size()
     local items = self:_items(selected)
     local pages = math.max(1, math.ceil(#items / page_size))
@@ -326,7 +326,7 @@ function Dialog:_build_content()
     if #items == 0 then
         root[#root + 1] = OffsetContainer:new{x_off = outer + pad, y_off = y,
             Ui.textbox(tostring(selected and selected.empty_text or self.opts.empty_text or "当前没有内容"), content_w, row_h,
-                Skin.face("cfont", 10.2, 13.8, 8.8), {alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_DARK_GRAY})}
+                Skin.face("cfont", 11.0, 14.8, 9.4), {alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_DARK_GRAY})}
         y = y + row_h
     else
         for index = first, last do

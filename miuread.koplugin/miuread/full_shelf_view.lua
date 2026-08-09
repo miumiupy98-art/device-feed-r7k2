@@ -137,24 +137,50 @@ local function image_widget(path, width, height)
     return rounded
 end
 
-local function placeholder(width, height, title)
-    local mark = U.utf8_sub(tostring(title or "书"), 1, 1)
+local function placeholder(width, height, title, author)
+    title = U.trim(tostring(title or "未命名"))
+    author = U.trim(tostring(author or ""))
+    if title == "" then title = "未命名" end
+    local pad = UiScale.dp(3, 2, 5)
+    local content_w = math.max(1, width - pad * 2)
+    local content_h = math.max(1, height - pad * 2)
+    local title_h = math.max(1, math.floor(content_h * (author ~= "" and .60 or .80)))
+    local body = VerticalGroup:new{align = "center", TextBoxWidget:new{
+        text = U.utf8_truncate(title, 24, "…"), face = face("cfont", 10.8, 15.5), bold = true,
+        width = math.max(1, content_w - UiScale.dp(4, 3, 7)), height = title_h,
+        height_adjust = false, height_overflow_show_ellipsis = true, alignment = "center",
+    }}
+    if author ~= "" then
+        body[#body + 1] = TextBoxWidget:new{
+            text = U.utf8_truncate(author, 18, "…"), face = face("smallinfofont", 7.8, 10.8),
+            width = math.max(1, content_w - UiScale.dp(4, 3, 7)), height = math.max(1, content_h - title_h),
+            height_adjust = false, height_overflow_show_ellipsis = true, alignment = "center",
+            fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+        }
+    end
     return fixed_frame(width, height, {
-        bordersize = UiScale.line("thin"),
-        radius = UiScale.radius(7, 5, 12),
-        background = Blitbuffer.COLOR_WHITE,
-        color = Blitbuffer.COLOR_GRAY,
-    }, TextWidget:new{text = mark ~= "" and mark or "书", face = face("cfont", 18, 24), bold = true})
+        bordersize = UiScale.line("thin"), radius = UiScale.radius(7, 5, 12),
+        padding = pad, background = Blitbuffer.COLOR_WHITE, color = Blitbuffer.COLOR_GRAY,
+    }, body)
 end
 
-local function light_badge(text, width, height)
-    return fixed_frame(width, height, {
-        bordersize = UiScale.line("thin"),
-        radius = UiScale.radius(5, 4, 8),
-        padding = UiScale.dp(1, 1, 2),
-        background = Blitbuffer.COLOR_WHITE,
-        color = Blitbuffer.COLOR_GRAY,
-    }, TextWidget:new{text = text, face = face("smallinfofont", 8.7, 12.5), bold = true})
+local function outlined_badge(text, width, height)
+    local layer = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
+    local radius = math.max(2, UiScale.dp(2, 2, 3))
+    local offsets = {
+        {-radius,0},{radius,0},{0,-radius},{0,radius},
+        {-radius,-radius},{-radius,radius},{radius,-radius},{radius,radius},
+    }
+    for _, off in ipairs(offsets) do
+        layer[#layer + 1] = OffsetContainer:new{x_off = off[1], y_off = off[2],
+            CenterContainer:new{dimen = Geom:new{w = width, h = height}, TextWidget:new{
+                text = text, face = face("smallinfofont", 9.0, 13), bold = true, fgcolor = Blitbuffer.COLOR_WHITE,
+            }}}
+    end
+    layer[#layer + 1] = CenterContainer:new{dimen = Geom:new{w = width, h = height}, TextWidget:new{
+        text = text, face = face("smallinfofont", 9.0, 13), bold = true, fgcolor = Blitbuffer.COLOR_BLACK,
+    }}
+    return layer
 end
 
 local function book_card(book, width, height, on_select, on_hold)
@@ -162,7 +188,7 @@ local function book_card(book, width, height, on_select, on_hold)
     local gap = UiScale.dp(3, 2, 5)
     local cover_h = math.max(UiScale.dp(116, 98, 190), height - title_h - gap)
     local cover_w = math.max(UiScale.dp(76, 65, 126), math.min(math.floor(width * .92), math.floor(cover_h * .715)))
-    local cover = image_widget(book.cover_path, cover_w, cover_h) or placeholder(cover_w, cover_h, book.title)
+    local cover = image_widget(book.cover_path, cover_w, cover_h) or placeholder(cover_w, cover_h, book.title, book.author)
     local layer = OverlapGroup:new{dimen = Geom:new{w = cover_w, h = cover_h}, allow_mirroring = false}
     layer[#layer + 1] = cover
 
@@ -175,7 +201,7 @@ local function book_card(book, width, height, on_select, on_hold)
     if downloaded then
         local badge = UiScale.dp(20, 18, 28)
         local inset = UiScale.dp(3, 2, 5)
-        layer[#layer + 1] = OffsetContainer:new{x_off = inset, y_off = inset, light_badge("✓", badge, badge)}
+        layer[#layer + 1] = OffsetContainer:new{x_off = inset, y_off = inset, outlined_badge("✓", badge, badge)}
     end
     if progress > 0 then
         local text = progress >= 100 and "已读" or tostring(math.floor(progress + .5)) .. "%"
@@ -185,7 +211,7 @@ local function book_card(book, width, height, on_select, on_hold)
         layer[#layer + 1] = OffsetContainer:new{
             x_off = math.max(0, cover_w - badge_w - inset),
             y_off = inset,
-            light_badge(text, badge_w, badge_h),
+            outlined_badge(text, badge_w, badge_h),
         }
     end
 
@@ -296,13 +322,22 @@ function GridShelfWidget:_build()
             }),
     }
     if self.opts.show_actions then
-        header[#header + 1] = tappable(action_w, header_h,
-            Ui.icon("search", action_w, header_h, UiScale.dp(19, 17, 27), {
+        local left_label=tostring(self.opts.left_action_label or "")
+        local right_label=tostring(self.opts.right_action_label or "筛选")
+        local left_child
+        if left_label=="" or left_label=="搜索" then
+            left_child=Ui.icon("search", action_w, header_h, UiScale.dp(19, 17, 27), {
                 face = UiScale.iconFace("cfont", 17, 24),
-            }), self.opts.on_left_action)
+            })
+        else
+            left_child=Ui.text(left_label, action_w, header_h, face("smallinfofont", 9.6, 13.5), {
+                bold=true, halign="center", valign="center",
+            })
+        end
+        header[#header + 1] = tappable(action_w, header_h, left_child, self.opts.on_left_action)
         header[#header + 1] = HorizontalSpan:new{width = action_gap}
         header[#header + 1] = tappable(action_w, header_h,
-            Ui.text("筛选", action_w, header_h, face("smallinfofont", 10, 14), {
+            Ui.text(right_label, action_w, header_h, face("smallinfofont", 9.6, 13.5), {
                 bold = true, halign = "center", valign = "center",
             }), self.opts.on_right_action)
     end

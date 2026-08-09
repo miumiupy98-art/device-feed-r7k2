@@ -76,6 +76,18 @@ local function should_skip_dir(name, full, root)
     return false
 end
 
+local function should_skip_file(name)
+    local lower=tostring(name or ""):lower()
+    -- Hidden files created by macOS/Linux/Kindle support tools are never books
+    -- even when their suffix looks like a supported reader format.
+    if lower:sub(1,1)=="." then return true end
+    if lower:sub(1,2)=="._" then return true end
+    if lower:sub(-1)=="~" then return true end
+    if lower:match("%.part$") or lower:match("%.tmp$") or lower:match("%.download$")
+        or lower:match("%.crdownload$") then return true end
+    return false
+end
+
 
 local function normalized_path(path)
     return tostring(path or ""):gsub("\\","/"):gsub("/+","/"):lower()
@@ -127,7 +139,7 @@ function LocalLibrary.scan(root, options)
                 local attr=lfs.attributes(full)
                 if attr and attr.mode=="directory" then
                     if not should_skip_dir(name,full,root) then walk(full,depth+1) end
-                elseif attr and attr.mode=="file" and LocalLibrary.is_supported(full) then
+                elseif attr and attr.mode=="file" and not should_skip_file(name) and LocalLibrary.is_supported(full) then
                     local title=title_from_path(full)
                     if options.include_dictionaries==true or not LocalLibrary.is_likely_dictionary(full,title) then
                     rows[#rows+1]={
@@ -199,7 +211,7 @@ function DirectoryScan:_accept(name)
             }
             self.seen=self.seen+1
         end
-    elseif attr and attr.mode=="file" and LocalLibrary.is_supported(full) then
+    elseif attr and attr.mode=="file" and not should_skip_file(name) and LocalLibrary.is_supported(full) then
         local title=title_from_path(full)
         if self.options.include_dictionaries==true or not LocalLibrary.is_likely_dictionary(full,title) then
             self.books[#self.books+1]={

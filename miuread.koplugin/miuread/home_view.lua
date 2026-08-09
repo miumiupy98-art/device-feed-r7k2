@@ -182,14 +182,40 @@ local function image_widget(path, width, height, ink_boost)
     return nil
 end
 
-local function placeholder(width, height, title)
-    local mark = U.utf8_sub(tostring(title or "书"):gsub("^%s+", ""), 1, 1)
-    if mark == "" then mark = "书" end
+local function placeholder(width, height, title, author)
+    title = U.trim(tostring(title or "未命名"))
+    author = U.trim(tostring(author or ""))
+    if title == "" then title = "未命名" end
+    local pad = UiScale.dp(3, 2, 5)
+    local content_w = math.max(1, width - pad * 2)
+    local content_h = math.max(1, height - pad * 2)
+    local title_h = math.max(1, math.floor(content_h * (author ~= "" and .58 or .78)))
+    local author_h = math.max(1, content_h - title_h)
+    local body = VerticalGroup:new{
+        align = "center",
+        TextBoxWidget:new{
+            text = U.utf8_truncate(title, 24, "…"),
+            face = face("cfont", 10.8, 15.5), bold = true,
+            width = math.max(1, content_w - UiScale.dp(4, 3, 7)), height = title_h,
+            height_adjust = false, height_overflow_show_ellipsis = true, alignment = "center",
+        },
+    }
+    if author ~= "" then
+        body[#body + 1] = TextBoxWidget:new{
+            text = U.utf8_truncate(author, 18, "…"),
+            face = face("smallinfofont", 7.8, 10.8),
+            width = math.max(1, content_w - UiScale.dp(4, 3, 7)), height = author_h,
+            height_adjust = false, height_overflow_show_ellipsis = true, alignment = "center",
+            fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+        }
+    end
     return fixed_frame(width, height, {
         bordersize = UiScale.line("thin"),
         radius = UiScale.radius(6, 4, 12),
+        padding = pad,
         background = Blitbuffer.COLOR_WHITE,
-    }, TextWidget:new{text = mark, face = face("cfont", 18, 22), bold = true})
+        color = Blitbuffer.COLOR_GRAY,
+    }, body)
 end
 
 local function solid_bar(width, height, color)
@@ -274,7 +300,7 @@ local function hero_card(book, width, height, callback, compact, hold_callback)
         math.floor(inner_h * .82)
     ))
     local cover_h = math.max(UiScale.dp(108, 92, 155), math.min(inner_h, math.floor(cover_w / .68)))
-    local cover = image_widget(book.home_cover_path or book.cover_path, cover_w, cover_h, .05) or placeholder(cover_w, cover_h, book.title)
+    local cover = image_widget(book.home_cover_path or book.cover_path, cover_w, cover_h, .05) or placeholder(cover_w, cover_h, book.title, book.author)
     local gap = math.max(UiScale.dp(9, 7, 14), math.floor(width * .014))
     local text_w = math.max(1, inner_w - cover_w - gap)
     local heading_h = UiScale.dp(22, 20, 30)
@@ -450,7 +476,11 @@ end
 
 local function outlined_badge_text(text, width, height, badge_face)
     local layer = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
-    local offsets = {{-1,0},{1,0},{0,-1},{0,1}}
+    local radius = math.max(2, UiScale.dp(2, 2, 3))
+    local offsets = {
+        {-radius,0},{radius,0},{0,-radius},{0,radius},
+        {-radius,-radius},{-radius,radius},{radius,-radius},{radius,radius},
+    }
     for _, off in ipairs(offsets) do
         layer[#layer + 1] = OffsetContainer:new{
             x_off = off[1], y_off = off[2],
@@ -477,7 +507,7 @@ local function shelf_book_card(book, width, height, callback, hold_callback)
         or book.downloaded == true or tostring(book.shelf_section or "") == "generated"
         or (book.file and tostring(book.file) ~= "" and U.file_exists(tostring(book.file)))
     local reading_badge = ""
-    if progress >= 100 then reading_badge = "100%"
+    if progress >= 100 then reading_badge = "已读"
     elseif progress > 0 then reading_badge = tostring(math.floor(progress + .5)) .. "%" end
 
     local download_active = book.download_active == true
@@ -500,7 +530,7 @@ local function shelf_book_card(book, width, height, callback, hold_callback)
     local extra_gaps = (status_h > 0 and 1 or 0) + (download_h > 0 and 1 or 0)
     local cover_h = math.max(UiScale.dp(78, 64, 108), height - title_h - extra_h - vgap * (1 + extra_gaps))
     local cover_w = math.max(UiScale.dp(54, 46, 78), math.min(math.floor(inner_w * .995), math.floor(cover_h * .715)))
-    local cover = image_widget(book.home_cover_path or book.cover_path, cover_w, cover_h, .06) or placeholder(cover_w, cover_h, book.title)
+    local cover = image_widget(book.home_cover_path or book.cover_path, cover_w, cover_h, .06) or placeholder(cover_w, cover_h, book.title, book.author)
 
     local cover_layer = OverlapGroup:new{dimen = Geom:new{w = cover_w, h = cover_h}, allow_mirroring = false}
     cover_layer[#cover_layer + 1] = cover
