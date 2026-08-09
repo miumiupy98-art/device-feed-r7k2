@@ -1,17 +1,17 @@
 {
-  "version": "4.3.0-beta.6",
-  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 4.3.0-beta.6 \u5185\u6d4b\u7248",
+  "version": "4.3.0-beta.7",
+  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 4.3.0-beta.7 \u5185\u6d4b\u7248",
   "channel": "beta",
   "package_type": "full",
-  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.6/miuread-v4.3.0-beta.6-full.zip",
+  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.7/miuread-v4.3.0-beta.7-full.zip",
   "package_urls": [
-    "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.6/miuread-v4.3.0-beta.6-full.zip",
-    "https://ghfast.top/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.6/miuread-v4.3.0-beta.6-full.zip",
-    "https://gh-proxy.com/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.6/miuread-v4.3.0-beta.6-full.zip",
-    "https://ghproxy.net/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.6/miuread-v4.3.0-beta.6-full.zip"
+    "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.7/miuread-v4.3.0-beta.7-full.zip",
+    "https://ghfast.top/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.7/miuread-v4.3.0-beta.7-full.zip",
+    "https://gh-proxy.com/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.7/miuread-v4.3.0-beta.7-full.zip",
+    "https://ghproxy.net/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.7/miuread-v4.3.0-beta.7-full.zip"
   ],
-  "size": 574320,
-  "sha256": "1e700fb576dab6150138ed9f2d5a1e62223097db0c90a2439de0c1fb20b66c25",
-  "summary": "\u672c\u5730\u6279\u6ce8 \u652f\u6301\u4e66\u7b7e \u5212\u7ebf \u60f3\u6cd5\u624b\u52a8\u4e91\u540c\u6b65\n\u5750\u6807 \u7edf\u4e00 Range Runes PosMap \u5b9a\u4f4d\u548c\u6821\u9a8c\n\u540c\u6b65 \u652f\u6301\u53bb\u91cd bookmarkId \u4fdd\u5b58\u53ca\u4e66\u7b7e\u5212\u7ebf\u4e91\u7aef\u5220\u9664\n\u5b89\u5168 \u5931\u8d25\u4e0d\u8bef\u4f20 \u7f51\u7edc\u7ed3\u679c\u672a\u77e5\u4e0d\u91cd\u590d\u63d0\u4ea4",
-  "notes": "\u672c\u5730\u6279\u6ce8 \u652f\u6301\u4e66\u7b7e \u5212\u7ebf \u60f3\u6cd5\u624b\u52a8\u4e91\u540c\u6b65\n\u5750\u6807 \u7edf\u4e00 Range Runes PosMap \u5b9a\u4f4d\u548c\u6821\u9a8c\n\u540c\u6b65 \u652f\u6301\u53bb\u91cd bookmarkId \u4fdd\u5b58\u53ca\u4e66\u7b7e\u5212\u7ebf\u4e91\u7aef\u5220\u9664\n\u5b89\u5168 \u5931\u8d25\u4e0d\u8bef\u4f20 \u7f51\u7edc\u7ed3\u679c\u672a\u77e5\u4e0d\u91cd\u590d\u63d0\u4ea4"
+  "size": 578077,
+  "sha256": "d3eb49ae2d809bc3ba5f67352906f20145d571d67f7434e82e2165818f3539ab",
+  "summary": "\u6279\u6ce8 \u4fee\u590d\u672c\u5730\u5212\u7ebf\u4e0e\u60f3\u6cd5\u5206\u7c7b\u5e76\u8865\u5168\u4e0a\u4e0b\u6587\u5b9a\u4f4d\n\u5750\u6807 \u4e0a\u4f20\u7edf\u4e00\u8d70 PosMap Bridge \u5e76\u9a8c\u8bc1\u7ae0\u8282\u4e0e range\n\u540c\u6b65 \u589e\u52a0\u76f8\u90bb\u7ae0\u8282\u6821\u9a8c\u548c\u5206\u9636\u6bb5\u5931\u8d25\u539f\u56e0\n\u5b89\u5168 \u5b9a\u4f4d\u4e0d\u552f\u4e00\u6216\u6821\u9a8c\u5931\u8d25\u65f6\u7ee7\u7eed\u53ea\u4fdd\u7559\u672c\u5730",
+  "notes": "\u6279\u6ce8 \u4fee\u590d\u672c\u5730\u5212\u7ebf\u4e0e\u60f3\u6cd5\u5206\u7c7b\u5e76\u8865\u5168\u4e0a\u4e0b\u6587\u5b9a\u4f4d\n\u5750\u6807 \u4e0a\u4f20\u7edf\u4e00\u8d70 PosMap Bridge \u5e76\u9a8c\u8bc1\u7ae0\u8282\u4e0e range\n\u540c\u6b65 \u589e\u52a0\u76f8\u90bb\u7ae0\u8282\u6821\u9a8c\u548c\u5206\u9636\u6bb5\u5931\u8d25\u539f\u56e0\n\u5b89\u5168 \u5b9a\u4f4d\u4e0d\u552f\u4e00\u6216\u6821\u9a8c\u5931\u8d25\u65f6\u7ee7\u7eed\u53ea\u4fdd\u7559\u672c\u5730"
 }
