@@ -197,12 +197,10 @@ local function resolveHitToSpan(map, rune_i, mark_text)
     if consumed ~= #nclean then
         return nil
     end
-    -- 终点含区间内被跳过的尾部空白 rune，与 Android 边界吸附前的
-    -- 当前 MiuRead 语义保持一致；最终上传仍会做反向正文校验。
+    -- 半开区间必须停在最后一个实际消费字符之后。
+    -- 不再吞掉选区末尾之后的段间换行/缩进空白；否则段尾“开球。”这类
+    -- 选区会被扩大到下一段之前，生成过长的服务端 range。
     local text_end_pos = last_consumed + 1
-    while text_end_pos <= #map.text_runes and map.text_runes[text_end_pos]:match("%s") do
-        text_end_pos = text_end_pos + 1
-    end
     local got = table.concat(map.text_runes, "", text_start, text_end_pos - 1)
     if stripWS(got):gsub("%*", "") ~= stripWS(mark_text):gsub("%*", "") then
         return nil

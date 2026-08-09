@@ -13,6 +13,9 @@ local Config = require("miuread.config")
 local AnnotationSync = {}
 AnnotationSync.__index = AnnotationSync
 
+local COORD_VERSION = 2
+local COORD_SOURCE = "raw_xhtml"
+
 local function scalar(value)
     local kind = type(value)
     if kind == "string" or kind == "number" or kind == "boolean" then return tostring(value) end
@@ -234,6 +237,80 @@ local function official_anchor_rows(store, book_id, chapter_uid_value)
     return out
 end
 
+
+local function distributed_anchor_rows(rows, max_count)
+    rows = type(rows) == "table" and rows or {}
+    max_count = math.max(1, math.floor(tonumber(max_count) or 8))
+    if #rows <= max_count then return rows end
+    local out, seen = {}, {}
+    for i = 0, max_count - 1 do
+        local pos = math.floor((i * (#rows - 1)) / (max_count - 1) + 0.5) + 1
+        if not seen[pos] and rows[pos] then
+            seen[pos] = true
+            out[#out + 1] = rows[pos]
+        end
+    end
+    return out
+end
+
+--- Use existing WeRead range+abstract pairs as an external coordinate-basis check.
+-- Some review groups use an abstract that is only a subquote of the shared range,
+-- so beta.11 samples anchors across the chapter and uses a conservative match ratio
+-- instead of demanding every historical group be byte-identical.
+function AnnotationSync:_verify_coordinate_basis(book_id, chapter_ctx)
+    if type(chapter_ctx) ~= "table" or type(chapter_ctx.map) ~= "table" then
+        return {status="mismatch", checked=0, matched=0, total=0, error="coord_map_missing"}
+    end
+    if type(chapter_ctx.coord_verification) == "table" then
+        return chapter_ctx.coord_verification
+    end
+
+    local anchors = official_anchor_rows(self.store, book_id, chapter_ctx.chapter_uid)
+    local sampled = distributed_anchor_rows(anchors, 8)
+    local checked, matched = 0, 0
+    for _, anchor in ipairs(sampled) do
+        local expected = clean_text(anchor.abstract)
+        if expected ~= "" and tostring(anchor.range or "") ~= "" then
+            local resolved = Coord.resolveRangeOnMap(chapter_ctx.map, tostring(anchor.range))
+            if resolved and clean_text(resolved.text) ~= "" then
+                checked = checked + 1
+                if clean_text(resolved.text) == expected then matched = matched + 1 end
+            end
+        end
+    end
+
+    local result = {
+        status="local_verified",
+        checked=checked,
+        matched=matched,
+        total=#anchors,
+        source=COORD_SOURCE,
+        version=COORD_VERSION,
+    }
+    if checked >= 3 then
+        local ratio = matched / checked
+        result.ratio = ratio
+        if matched >= 3 and ratio >= 0.60 then
+            result.status = "official_verified"
+        else
+            result.status = "mismatch"
+            result.error = string.format("official_anchor_mismatch:%d/%d", matched, checked)
+        end
+    elseif #anchors > 0 then
+        result.note = "official_anchors_inconclusive"
+    else
+        result.note = "no_official_anchors"
+    end
+
+    chapter_ctx.coord_verification = result
+    logger.info("[MiuRead][AnnotationSync] coordinate basis",
+        "book=", tostring(book_id), "chapter=", tostring(chapter_ctx.chapter_uid or ""),
+        "source=", COORD_SOURCE, "version=", tostring(COORD_VERSION),
+        "status=", tostring(result.status), "anchors=", tostring(result.total),
+        "checked=", tostring(result.checked), "matched=", tostring(result.matched))
+    return result
+end
+
 local function diagnostic_local_row(row, located, locate_error, locate_stage)
     return {
         local_id=tostring(row.local_id or ""), kind=tostring(row.kind or ""),
@@ -245,6 +322,11 @@ local function diagnostic_local_row(row, located, locate_error, locate_stage)
         chapter_uid=tostring(row.chapter_uid or ""), chapter_idx=tonumber(row.chapter_idx),
         locate_ok=located ~= nil, locate_stage=tostring(locate_stage or ""),
         locate_error=tostring(locate_error or ""),
+        coord_version=located and tonumber(located.coord_version) or tonumber(row.coord_version or 0) or 0,
+        coord_source=located and tostring(located.coord_source or "") or tostring(row.coord_source or ""),
+        coord_verify=located and tostring(located.coord_verify or "") or tostring(row.coord_verify or ""),
+        anchor_checked=located and tonumber(located.anchor_checked or 0) or 0,
+        anchor_matched=located and tonumber(located.anchor_matched or 0) or 0,
     }
 end
 
@@ -280,7 +362,7 @@ function AnnotationSync:_save_coordinate_diagnostics(book_id, chapters)
             if not ok then logger.warn("[MiuRead][AnnotationCoordDiag] coord write failed", "chapter=", uid, "error=", tostring(err)) end
         end
         local payload = {
-            format="miuread-annotation-coordinate-diagnostic-v1",
+            format="miuread-annotation-coordinate-diagnostic-v2",
             version=Config.VERSION,
             generated_at=os.time(),
             book_id=tostring(book_id or ""),
@@ -296,9 +378,9 @@ function AnnotationSync:_save_coordinate_diagnostics(book_id, chapters)
             official_anchors=official_anchor_rows(self.store, book_id, uid),
             notes={
                 "raw.xhtml is the complete decrypted chapter before MiuRead body extraction or image rewriting.",
-                "coord.xhtml is the exact coordinate candidate currently used by MiuRead.",
+                "coord.xhtml is the exact coordinate source currently used by MiuRead; beta.11 keeps the full XHTML.",
                 "official_anchors are existing WeRead ranges from thoughts.sqlite3 and are the external reference.",
-                "Cloud annotation writes are paused in this diagnostic build.",
+                "A diagnostic export never performs cloud annotation writes.",
             },
         }
         local ok_json, encoded = pcall(Json.encode, payload)
@@ -330,11 +412,11 @@ function AnnotationSync:_save_coordinate_diagnostics(book_id, chapters)
         exported = exported + 1
     end
     local bundle_readme = table.concat({
-        "MiuRead beta.10 coordinate diagnostic bundle",
+        "MiuRead beta.11 coordinate diagnostic bundle",
         "Upload this annotation-coordinate-diagnostics folder to AI.",
         "Included when available: thoughts.sqlite3, local_annotations.sqlite3, generated.epub.",
         "Each chapter folder contains raw.xhtml, coord.xhtml and range-debug.json.",
-        "Cloud annotation writes are paused in this diagnostic build.",
+        "Diagnostic export does not perform cloud annotation writes.",
         "bookId=" .. tostring(book_id or ""),
         "thoughts_copy=" .. tostring(copied.thoughts == true),
         "local_annotations_copy=" .. tostring(copied.local_annotations == true),
@@ -441,7 +523,7 @@ function AnnotationSync:_locate(row, chapter_ctx)
         local mark_text = visible_slice(map, text_start, 140)
         if mark_text == "" then return nil, "bookmark_preview_empty" end
         return {range=point, mark_text=mark_text, html_start=html_start,
-            text_start=text_start, point=true}
+            text_start=text_start, point=true, coord_version=COORD_VERSION, coord_source=COORD_SOURCE}
     end
 
     local mark_text = U.trim(tostring(row.selected_text or ""))
@@ -459,7 +541,7 @@ function AnnotationSync:_locate(row, chapter_ctx)
     -- Upload the text re-extracted from coord_html, not the injected KOReader
     -- selection. This keeps markText/abstract free of local display markers.
     return {range=range_key, mark_text=resolved.text, html_start=html_start,
-        html_end_pos=html_end_pos, point=false}
+        html_end_pos=html_end_pos, point=false, coord_version=COORD_VERSION, coord_source=COORD_SOURCE}
 end
 
 local function can_try_neighbour(error_code)
@@ -583,9 +665,11 @@ function AnnotationSync:sync_book(book, record, options)
         rows, rows_error = LocalDB.pending(self.store, book_id, options.limit or 200)
     end
     if not rows then return {ok=false, error=rows_error} end
+    local summary = LocalDB.summary(self.store, book_id) or {}
     local result = {ok=true,total=#rows,synced=0,deleted=0,failed=0,locate_failed=0,
-        metadata_failed=0,unknown=0,skipped=0,reconciled=0,errors={}, diagnostic_only=diagnostic_only,
-        diagnostic_exported=0, diagnostic_root=diagnostic_root(self.store, book_id)}
+        metadata_failed=0,coord_failed=0,unknown=0,skipped=0,reconciled=0,errors={}, diagnostic_only=diagnostic_only,
+        diagnostic_exported=0, diagnostic_root=diagnostic_root(self.store, book_id),
+        legacy_synced=tonumber(summary.legacy_synced or 0) or 0}
     if #rows == 0 then return result end
 
     local need_bookmarks, need_reviews = false, false
@@ -618,6 +702,7 @@ function AnnotationSync:sync_book(book, record, options)
         result.failed = result.failed + 1
         if state == "locate_failed" then result.locate_failed = result.locate_failed + 1 end
         if state == "metadata_failed" then result.metadata_failed = result.metadata_failed + 1 end
+        if state == "coord_failed" then result.coord_failed = result.coord_failed + 1 end
         if state == "unknown" or state == "delete_unknown" then result.unknown = result.unknown + 1 end
         if #result.errors < 12 then
             result.errors[#result.errors + 1] = {
@@ -660,16 +745,24 @@ function AnnotationSync:sync_book(book, record, options)
                 }
                 diagnostic_chapters[uid] = diag
             end
-            diag.local_annotations[#diag.local_annotations + 1] =
-                diagnostic_local_row(row, located, locate_error, locate_stage)
             if located then
+                local verification = self:_verify_coordinate_basis(book_id, chapter_ctx)
+                located.coord_verify = tostring(verification.status or "local_verified")
+                located.anchor_checked = tonumber(verification.checked or 0) or 0
+                located.anchor_matched = tonumber(verification.matched or 0) or 0
+                diag.local_annotations[#diag.local_annotations + 1] =
+                    diagnostic_local_row(row, located, locate_error, locate_stage)
                 stage_log(row, "diagnostic", true, "range=" .. tostring(located.range or ""))
                 logger.info("[MiuRead][AnnotationCoordDiag] range",
                     "book=", tostring(book_id), "chapter=", tostring(uid),
                     "local=", tostring(row.local_id or ""), "kind=", tostring(row.kind or ""),
                     "stored=", tostring(row.range_key or ""), "calculated=", tostring(located.range or ""),
+                    "coord=", tostring(verification.status or ""),
+                    "anchors=", tostring(verification.matched or 0) .. "/" .. tostring(verification.checked or 0),
                     "text=", U.utf8_truncate(tostring(row.selected_text or row.text or ""), 48, "…"))
             else
+                diag.local_annotations[#diag.local_annotations + 1] =
+                    diagnostic_local_row(row, located, locate_error, locate_stage)
                 result.failed = result.failed + 1
                 if #result.errors < 12 then
                     result.errors[#result.errors + 1] = {kind=tostring(row.kind or ""),
@@ -727,80 +820,104 @@ function AnnotationSync:sync_book(book, record, options)
             else
                 row.chapter_uid = tostring(chapter_ctx.chapter_uid or chapter_uid(chapter_ctx.chapter) or row.chapter_uid or "")
                 row.chapter_idx = tonumber(chapter_ctx.chapter_idx or chapter_idx(chapter_ctx.chapter) or row.chapter_idx)
-                stage_log(row, "verify", true, located.range)
-                LocalDB.mark_state(self.store, book_id, row.local_id, "local_only", {
-                    range_key=located.range, book_version=version,
-                    chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
-                    last_stage="verify", last_error="", last_attempt_at=os.time(),
-                })
-                row.range_key = located.range
-
-                if cloud_rows then
-                    if is_review then
-                        match, matched_id = find_review_match(cloud_rows, located.range, row.note, row.remote_id)
-                    else
-                        match, matched_id = find_bookmark_match(cloud_rows, located.range, expected_type, row.remote_id)
-                    end
-                end
-                if match then
-                    local rid = matched_id or (is_review and review_remote_id(match) or bookmark_remote_id(match))
-                    LocalDB.mark_synced(self.store, book_id, row.local_id, rid, located.range, version, {
+                local verification = self:_verify_coordinate_basis(book_id, chapter_ctx)
+                located.coord_verify = tostring(verification.status or "local_verified")
+                located.anchor_checked = tonumber(verification.checked or 0) or 0
+                located.anchor_matched = tonumber(verification.matched or 0) or 0
+                if verification.status == "mismatch" then
+                    remember_error(row, "coord_failed", verification.error or "coord_basis_mismatch", "coord_basis", {
+                        range_key=located.range, book_version=version,
                         chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
+                        coord_version=COORD_VERSION, coord_source=COORD_SOURCE, coord_verify="mismatch",
                     })
-                    result.synced = result.synced + 1
-                    result.reconciled = result.reconciled + 1
-                    stage_log(row, "reconcile", true, "existing_remote")
                 else
-                    -- A brand-new local record has never been POSTed by MiuRead, so a
-                    -- temporary failure to read the cloud list must not block its first
-                    -- upload forever. We still use the list for de-duplication whenever
-                    -- it is available. Only `unknown` records require reconciliation
-                    -- before another POST, because their previous write may have reached
-                    -- the server despite a lost response.
-                    if not cloud_rows then
-                        stage_log(row, "reconcile", true,
-                            "preflight_unavailable_first_post:" .. tostring(cloud_error or "unknown"))
+                    stage_log(row, "verify", true, string.format("%s coord=%s anchors=%d/%d",
+                        tostring(located.range), tostring(verification.status),
+                        tonumber(verification.matched or 0) or 0, tonumber(verification.checked or 0) or 0))
+                    LocalDB.mark_state(self.store, book_id, row.local_id, "local_only", {
+                        range_key=located.range, book_version=version,
+                        chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
+                        coord_version=COORD_VERSION, coord_source=COORD_SOURCE, coord_verify=verification.status,
+                        last_stage="verify", last_error="", last_attempt_at=os.time(),
+                    })
+                    row.range_key = located.range
+                    row.coord_version = COORD_VERSION
+                    row.coord_source = COORD_SOURCE
+                    row.coord_verify = verification.status
+
+                    if cloud_rows then
+                        if is_review then
+                            match, matched_id = find_review_match(cloud_rows, located.range, row.note, row.remote_id)
+                        else
+                            match, matched_id = find_bookmark_match(cloud_rows, located.range, expected_type, row.remote_id)
+                        end
                     end
-                    local payload = is_review
-                        and self:_review_payload(row, located, version, prefs)
-                        or self:_bookmark_payload(row, located, version, prefs)
-                    local payload_ok, payload_error = validate_payload(row, payload)
-                    if not payload_ok then
-                        remember_error(row, "metadata_failed", payload_error, "payload", {
-                            range_key=located.range, book_version=version,
+                    if match then
+                        local rid = matched_id or (is_review and review_remote_id(match) or bookmark_remote_id(match))
+                        LocalDB.mark_synced(self.store, book_id, row.local_id, rid, located.range, version, {
                             chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
+                            coord_version=COORD_VERSION, coord_source=COORD_SOURCE, coord_verify=verification.status,
                         })
+                        result.synced = result.synced + 1
+                        result.reconciled = result.reconciled + 1
+                        stage_log(row, "reconcile", true, "existing_remote")
                     else
-                        stage_log(row, "post", true, is_review and "review/add" or "book/addBookmark")
-                        local ok, value = pcall(is_review and self.api.add_review or self.api.add_bookmark,
-                            self.api, payload)
-                        if ok then
-                            local remote_id = is_review
-                                and find_id(value, {"reviewId", "reviewID"})
-                                or find_id(value, {"bookmarkId", "bookmarkID"})
-                            if not is_review and remote_id == "" then
-                                remember_error(row, "unknown", "服务器未返回 bookmarkId", "post", {
-                                    range_key=located.range, book_version=version,
-                                    chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
-                                })
-                            else
-                                LocalDB.mark_synced(self.store, book_id, row.local_id,
-                                    remote_id, located.range, version, {
-                                        chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
-                                    })
-                                result.synced = result.synced + 1
-                                stage_log(row, "post", true, remote_id ~= "" and "remote_id_saved" or "review_saved")
-                            end
-                        elseif Http.is_network_error(value) then
-                            remember_error(row, "unknown", value, "post", {
+                        -- A brand-new local record has never been POSTed by MiuRead, so a
+                        -- temporary failure to read the cloud list must not block its first
+                        -- upload forever. We still use the list for de-duplication whenever
+                        -- it is available. Only `unknown` records require reconciliation
+                        -- before another POST, because their previous write may have reached
+                        -- the server despite a lost response.
+                        if not cloud_rows then
+                            stage_log(row, "reconcile", true,
+                                "preflight_unavailable_first_post:" .. tostring(cloud_error or "unknown"))
+                        end
+                        local payload = is_review
+                            and self:_review_payload(row, located, version, prefs)
+                            or self:_bookmark_payload(row, located, version, prefs)
+                        local payload_ok, payload_error = validate_payload(row, payload)
+                        if not payload_ok then
+                            remember_error(row, "metadata_failed", payload_error, "payload", {
                                 range_key=located.range, book_version=version,
                                 chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
+                                coord_version=COORD_VERSION, coord_source=COORD_SOURCE, coord_verify=verification.status,
                             })
                         else
-                            remember_error(row, "local_only", value, "post", {
-                                range_key=located.range, book_version=version,
-                                chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
-                            })
+                            stage_log(row, "post", true, is_review and "review/add" or "book/addBookmark")
+                            local ok, value = pcall(is_review and self.api.add_review or self.api.add_bookmark,
+                                self.api, payload)
+                            if ok then
+                                local remote_id = is_review
+                                    and find_id(value, {"reviewId", "reviewID"})
+                                    or find_id(value, {"bookmarkId", "bookmarkID"})
+                                if not is_review and remote_id == "" then
+                                    remember_error(row, "unknown", "服务器未返回 bookmarkId", "post", {
+                                        range_key=located.range, book_version=version,
+                                        chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
+                                        coord_version=COORD_VERSION, coord_source=COORD_SOURCE, coord_verify=verification.status,
+                                    })
+                                else
+                                    LocalDB.mark_synced(self.store, book_id, row.local_id,
+                                        remote_id, located.range, version, {
+                                            chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
+                                            coord_version=COORD_VERSION, coord_source=COORD_SOURCE, coord_verify=verification.status,
+                                        })
+                                    result.synced = result.synced + 1
+                                    stage_log(row, "post", true, remote_id ~= "" and "remote_id_saved" or "review_saved")
+                                end
+                            elseif Http.is_network_error(value) then
+                                remember_error(row, "unknown", value, "post", {
+                                    range_key=located.range, book_version=version,
+                                    chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
+                                    coord_version=COORD_VERSION, coord_source=COORD_SOURCE, coord_verify=verification.status,
+                                })
+                            else
+                                remember_error(row, "local_only", value, "post", {
+                                    range_key=located.range, book_version=version,
+                                    chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
+                                    coord_version=COORD_VERSION, coord_source=COORD_SOURCE, coord_verify=verification.status,
+                                })
+                            end
                         end
                     end
                 end
@@ -820,6 +937,8 @@ function AnnotationSync:sync_book(book, record, options)
         "book=",book_id,"total=",tostring(result.total),"synced=",tostring(result.synced),
         "deleted=",tostring(result.deleted),"locate_failed=",tostring(result.locate_failed),
         "metadata_failed=",tostring(result.metadata_failed),
+        "coord_failed=",tostring(result.coord_failed),
+        "legacy_synced=",tostring(result.legacy_synced),
         "unknown=",tostring(result.unknown),"failed=",tostring(result.failed))
     return result
 end

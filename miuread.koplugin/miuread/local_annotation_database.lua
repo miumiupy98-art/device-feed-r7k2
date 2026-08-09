@@ -4,7 +4,7 @@ local lfs = require("libs/libkoreader-lfs")
 
 local LocalAnnotationDatabase = {}
 
-LocalAnnotationDatabase.SCHEMA_VERSION = 3
+LocalAnnotationDatabase.SCHEMA_VERSION = 4
 LocalAnnotationDatabase.FILE_NAME = "local_annotations.sqlite3"
 
 local function database_path(store, book_id)
@@ -45,6 +45,9 @@ local function initialize(conn)
             last_stage TEXT NOT NULL DEFAULT '',
             last_error TEXT NOT NULL DEFAULT '',
             last_attempt_at INTEGER NOT NULL DEFAULT 0,
+            coord_version INTEGER NOT NULL DEFAULT 0,
+            coord_source TEXT NOT NULL DEFAULT '',
+            coord_verify TEXT NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL DEFAULT 0
         );
@@ -60,6 +63,9 @@ local function initialize(conn)
     safe_alter(conn, "ALTER TABLE local_annotations ADD COLUMN last_stage TEXT NOT NULL DEFAULT '';")
     safe_alter(conn, "ALTER TABLE local_annotations ADD COLUMN last_error TEXT NOT NULL DEFAULT '';")
     safe_alter(conn, "ALTER TABLE local_annotations ADD COLUMN last_attempt_at INTEGER NOT NULL DEFAULT 0;")
+    safe_alter(conn, "ALTER TABLE local_annotations ADD COLUMN coord_version INTEGER NOT NULL DEFAULT 0;")
+    safe_alter(conn, "ALTER TABLE local_annotations ADD COLUMN coord_source TEXT NOT NULL DEFAULT '';")
+    safe_alter(conn, "ALTER TABLE local_annotations ADD COLUMN coord_verify TEXT NOT NULL DEFAULT '';")
 
     if previous > 0 and previous < LocalAnnotationDatabase.SCHEMA_VERSION then
         -- beta.6 may have marked records as locate_failed before context-aware
@@ -259,7 +265,7 @@ function LocalAnnotationDatabase.snapshot(store, book_id, annotations, source_pa
             conn:exec([[
                 DELETE FROM local_annotations
                  WHERE present = 0 AND remote_id = ''
-                   AND sync_state IN ('local_only','locate_failed','metadata_failed');
+                   AND sync_state IN ('local_only','locate_failed','metadata_failed','coord_failed');
             ]])
             -- Anything already known/possibly known by the server is retained until
             -- the cloud side is confirmed gone.
@@ -282,7 +288,7 @@ local SELECT_COLUMNS = [[
     selected_text, context_before, context_after, anchor_text, note,
     datetime, drawer, source_path, present, sync_state, range_key,
     remote_id, chapter_uid, chapter_idx, book_version, last_stage, last_error,
-    last_attempt_at, created_at, updated_at
+    last_attempt_at, coord_version, coord_source, coord_verify, created_at, updated_at
 ]]
 
 local function row_from_sql(row)
@@ -300,7 +306,9 @@ local function row_from_sql(row)
         chapter_uid=tostring(row[21] or ""), chapter_idx=tonumber(row[22]),
         book_version=tonumber(row[23] or 0) or 0, last_stage=tostring(row[24] or ""),
         last_error=tostring(row[25] or ""), last_attempt_at=tonumber(row[26] or 0) or 0,
-        created_at=tonumber(row[27] or 0) or 0, updated_at=tonumber(row[28] or 0) or 0,
+        coord_version=tonumber(row[27] or 0) or 0, coord_source=tostring(row[28] or ""),
+        coord_verify=tostring(row[29] or ""), created_at=tonumber(row[30] or 0) or 0,
+        updated_at=tonumber(row[31] or 0) or 0,
     }
 end
 
@@ -335,7 +343,7 @@ function LocalAnnotationDatabase.pending(store, book_id, limit)
         local statement = conn:prepare("SELECT " .. SELECT_COLUMNS .. [[
             FROM local_annotations
             WHERE book_id = ? AND sync_state IN
-                ('local_only','locate_failed','metadata_failed','unknown','delete_pending','delete_unknown')
+                ('local_only','locate_failed','metadata_failed','coord_failed','unknown','delete_pending','delete_unknown')
             ORDER BY updated_at ASC LIMIT ?
         ]])
         statement:bind(tostring(book_id or ""), math.max(1, tonumber(limit) or 200))
@@ -362,6 +370,9 @@ local function update_state(store, book_id, local_id, state, fields)
                    book_version = CASE WHEN ? IS NULL THEN book_version ELSE ? END,
                    chapter_uid = CASE WHEN ? IS NULL THEN chapter_uid ELSE ? END,
                    chapter_idx = CASE WHEN ? IS NULL THEN chapter_idx ELSE ? END,
+                   coord_version = CASE WHEN ? IS NULL THEN coord_version ELSE ? END,
+                   coord_source = CASE WHEN ? IS NULL THEN coord_source ELSE ? END,
+                   coord_verify = CASE WHEN ? IS NULL THEN coord_verify ELSE ? END,
                    last_stage = ?, last_error = ?, last_attempt_at = ?, updated_at = ?
              WHERE local_id = ?
         ]])
@@ -370,6 +381,9 @@ local function update_state(store, book_id, local_id, state, fields)
         local version = fields.book_version
         local chapter_uid = fields.chapter_uid
         local chapter_idx = fields.chapter_idx
+        local coord_version = fields.coord_version
+        local coord_source = fields.coord_source
+        local coord_verify = fields.coord_verify
         local now = os.time()
         statement:bind(
             tostring(state or "local_only"),
@@ -377,6 +391,9 @@ local function update_state(store, book_id, local_id, state, fields)
             version, version,
             chapter_uid, chapter_uid,
             chapter_idx, chapter_idx,
+            coord_version, coord_version,
+            coord_source, coord_source,
+            coord_verify, coord_verify,
             tostring(fields.last_stage or ""), tostring(fields.last_error or ""),
             tonumber(fields.last_attempt_at) or now, now,
             tostring(local_id or "")
@@ -418,12 +435,14 @@ end
 function LocalAnnotationDatabase.summary(store, book_id)
     if not LocalAnnotationDatabase.exists(store, book_id) then
         return {total=0, bookmark=0, highlight=0, thought=0, pending=0, synced=0,
-            delete_pending=0, locate_failed=0, metadata_failed=0, unknown=0}
+            delete_pending=0, locate_failed=0, metadata_failed=0, coord_failed=0,
+            unknown=0, legacy_synced=0}
     end
     local conn = open(store, book_id, false)
     local ok, result = xpcall(function()
         local out = {total=0, bookmark=0, highlight=0, thought=0, pending=0, synced=0,
-            delete_pending=0, locate_failed=0, metadata_failed=0, unknown=0}
+            delete_pending=0, locate_failed=0, metadata_failed=0, coord_failed=0,
+            unknown=0, legacy_synced=0}
         local statement = conn:prepare([[
             SELECT kind, sync_state, COUNT(*) FROM local_annotations
              WHERE book_id = ? AND (present = 1 OR sync_state IN ('delete_pending','delete_unknown'))
@@ -445,6 +464,8 @@ function LocalAnnotationDatabase.summary(store, book_id)
                 out.locate_failed = out.locate_failed + count; out.pending = out.pending + count
             elseif state == "metadata_failed" then
                 out.metadata_failed = out.metadata_failed + count; out.pending = out.pending + count
+            elseif state == "coord_failed" then
+                out.coord_failed = out.coord_failed + count; out.pending = out.pending + count
             elseif state == "unknown" then
                 out.unknown = out.unknown + count; out.pending = out.pending + count
             else
@@ -452,6 +473,15 @@ function LocalAnnotationDatabase.summary(store, book_id)
             end
         end
         statement:close()
+        local legacy = conn:prepare([[
+            SELECT COUNT(*) FROM local_annotations
+             WHERE book_id = ? AND present = 1 AND sync_state = 'synced'
+               AND COALESCE(coord_version, 0) < 2
+        ]])
+        legacy:bind(tostring(book_id or ""))
+        local legacy_row = legacy:step()
+        out.legacy_synced = legacy_row and (tonumber(legacy_row[1] or 0) or 0) or 0
+        legacy:close()
         return out
     end, debug.traceback)
     pcall(conn.close, conn)

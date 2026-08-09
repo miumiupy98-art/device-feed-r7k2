@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.3.0-beta.10",
+    VERSION = "4.3.0-beta.11",
     SCHEMA = 105,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -48,10 +48,10 @@ local C = {
 
     -- Online features are verified by their real request. Renewal is recovery,
     -- never a prerequisite. Diagnostics never include account secrets.
-    -- beta.10 is a coordinate-diagnostics build. Cloud annotation writes are
-    -- deliberately paused until raw decrypted XHTML is aligned against real
-    -- WeRead ranges. Manual annotation action exports safe diagnostic files.
-    ANNOTATION_COORD_DIAGNOSTIC_ONLY = true,
+    -- beta.11 restores explicit/manual cloud annotation writes after moving the
+    -- coordinate basis to complete decrypted XHTML. Diagnostic export remains
+    -- available separately and never performs cloud writes.
+    ANNOTATION_COORD_DIAGNOSTIC_ONLY = false,
 
     AUTH_NOTICE_FAILURE_THRESHOLD = 2,
     DOWNLOAD_AUTO_RESTARTS = 2,

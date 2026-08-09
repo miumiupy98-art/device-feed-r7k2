@@ -2,23 +2,23 @@
 MiuRead 批注坐标统一入口。
 
 这里故意把“坐标 HTML 的来源”与 PosMap/Range 分开：
-- 当前版本以章节解码完成、资源改写/批注/脚注注入之前的 body 作为 coord_html。
-- 不做空白折叠、实体展开或资源 URL 改写，避免人为改变服务端字符坐标。
-- 如果后续拿到与官方 Android 完全一致的 normalizeMarkup，只需要替换
-  `fromDownloadedXhtml`，PosMap/Range 和调用方无需再改。
+- 章节解码完成后的完整 XHTML（仅去 UTF-8 BOM）就是 coord_html。
+- 不裁剪 body，不折叠空白，不改写实体/资源 URL，避免改变服务端字符坐标。
+- 2026-08 真机诊断已用微信读书现有 range 对齐：完整 raw XHTML 与服务端坐标一致；
+  body-inner 会丢失 head/body 前缀并造成整体前移。
 --]]--
 
-local Codec = require("miuread.codec")
 local PosMap = require("miuread.annotations.posmap")
 local Range = require("miuread.annotations.range")
 local Runes = require("miuread.annotations.runes")
 
 local Coord = {}
 
---- 章节解码结果 -> 坐标 HTML。
--- 当前兼容规则：取 body 内容并剥离 UTF-8 BOM；绝不修改正文空白/实体。
+--- 章节解码结果 -> 服务端坐标 HTML。
+-- 关键约束：保留完整 XHTML，只剥离 UTF-8 BOM。
+-- 不能使用 Codec.body()，否则每章都会丢失长度不固定的 XML/head/body 前缀。
 function Coord.fromDownloadedXhtml(xhtml)
-    return Runes.stripLeadingBOM(Codec.body(xhtml))
+    return Runes.stripLeadingBOM(tostring(xhtml or ""))
 end
 
 function Coord.build(coord_html)

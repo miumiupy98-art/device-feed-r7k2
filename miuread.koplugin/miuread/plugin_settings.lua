@@ -55,7 +55,7 @@ end
 function M.annotation_sync(plugin)
     if plugin:annotation_sync_diagnostic_only() then
         return {
-            {text="批注坐标诊断（beta.10）",post_text="云端写入已暂停",enabled=false},
+            {text="批注坐标诊断（beta.11）",post_text="云端写入已暂停",enabled=false},
             {text="诊断方式",post_text="打开书籍后在阅读页“批注”中生成",enabled=false},
             {text="导出内容",post_text="raw.xhtml · coord.xhtml · range-debug.json",enabled=false},
         }
@@ -69,6 +69,8 @@ function M.annotation_sync(plugin)
             callback=function() plugin:toggle_annotation_sync() end,
         },
         {text="同步方式",post_text="手动 · 当前书籍在阅读页操作",enabled=false},
+        {text="坐标保护",post_text="raw XHTML · 双向校验 · 官方锚点",enabled=false},
+        {text="坐标诊断",post_text="打开书籍后在阅读页“批注”中导出",enabled=false},
         {text="新想法可见范围",post_text=plugin:annotation_sync_visibility_label(),sub_item_table_func=function() return plugin:annotation_sync_visibility_menu() end},
     }
 end

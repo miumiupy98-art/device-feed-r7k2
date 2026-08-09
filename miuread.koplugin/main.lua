@@ -8152,14 +8152,16 @@ function Plugin:_show_reader_annotation_panel(back_callback)
     local summary=book_id~="" and LocalAnnotationDatabase.summary(self.store,book_id) or nil
     summary=type(summary)=="table" and summary or {
         total=0,bookmark=0,highlight=0,thought=0,pending=0,synced=0,
-        delete_pending=0,locate_failed=0,metadata_failed=0,unknown=0,
+        delete_pending=0,locate_failed=0,metadata_failed=0,coord_failed=0,unknown=0,legacy_synced=0,
     }
     local title=current and current.book and U.trim(tostring(current.book.title or "")) or ""
     if title=="" then title="当前书籍" end
     local function return_to_panel() self:_show_reader_annotation_panel(back_callback) end
     local enabled=self:annotation_sync_enabled()
     local pending=tonumber(summary.pending or 0) or 0
-    local failed=(tonumber(summary.locate_failed or 0) or 0)+(tonumber(summary.metadata_failed or 0) or 0)+(tonumber(summary.unknown or 0) or 0)
+    local failed=(tonumber(summary.locate_failed or 0) or 0)+(tonumber(summary.metadata_failed or 0) or 0)
+        +(tonumber(summary.coord_failed or 0) or 0)+(tonumber(summary.unknown or 0) or 0)
+    local legacy_synced=tonumber(summary.legacy_synced or 0) or 0
     ReaderSettingsDialog.show{
         title="批注",
         subtitle=U.utf8_truncate(title,42,"…").." · 书签 划线 想法统一管理",
@@ -8173,7 +8175,7 @@ function Plugin:_show_reader_annotation_panel(back_callback)
                     {icon="highlight",label="划线",value=tostring(summary.highlight or 0),callback=function() self:_show_reader_records("highlight",return_to_panel) end},
                     {icon="thought",label="想法",value=tostring(summary.thought or 0),callback=function() self:_show_reader_records("thought",return_to_panel) end},
                 }},
-                self:annotation_sync_diagnostic_only() and {title="批注坐标诊断 · beta.10",rows={
+                self:annotation_sync_diagnostic_only() and {title="批注坐标诊断 · beta.11",rows={
                     {icon="warning",label="云端批注写入",value="已暂停 · 防止错误 range",value_bold=true,enabled=false},
                     {icon="diagnostics",label="生成本书坐标诊断",value="导出 raw / coord / range",value_bold=true,callback=function()
                         self:sync_local_annotations_now()
@@ -8186,7 +8188,13 @@ function Plugin:_show_reader_annotation_panel(back_callback)
                         if self:annotation_sync_enabled() then self:sync_local_annotations_now()
                         else self:_enable_annotation_sync_and_sync_current() end
                     end},
-                    {label="同步状态",value=string.format("已同步 %d · 失败 %d",tonumber(summary.synced or 0) or 0,failed),callback=function() self:show_local_annotation_sync_status() end},
+                    {label="同步状态",value=legacy_synced>0
+                        and string.format("已同步 %d · 旧坐标 %d",tonumber(summary.synced or 0) or 0,legacy_synced)
+                        or string.format("已同步 %d · 失败 %d",tonumber(summary.synced or 0) or 0,failed),
+                        callback=function() self:show_local_annotation_sync_status() end},
+                    {icon="diagnostics",label="坐标诊断",value="导出 raw / coord / range",callback=function()
+                        self:sync_local_annotations_now(true)
+                    end},
                     {label="新想法可见范围",value=self:annotation_sync_visibility_label(),callback=function()
                         self:_show_reader_menu_table("新想法可见范围",self:annotation_sync_visibility_menu(),return_to_panel)
                     end},
@@ -15502,7 +15510,9 @@ function Plugin:show_local_annotation_sync_status()
         "待删除："..tostring(summary.delete_pending or 0),
         "定位失败："..tostring(summary.locate_failed or 0),
         "元数据失败："..tostring(summary.metadata_failed or 0),
+        "坐标校验失败："..tostring(summary.coord_failed or 0),
         "结果未知："..tostring(summary.unknown or 0),
+        "旧坐标已同步："..tostring(summary.legacy_synced or 0),
     }
     local failures=LocalAnnotationDatabase.failures(self.store,book_id,5)
     if type(failures)=="table" and #failures>0 then
@@ -15520,9 +15530,9 @@ function Plugin:show_local_annotation_sync_status()
     return true
 end
 
-function Plugin:sync_local_annotations_now()
+function Plugin:sync_local_annotations_now(force_diagnostic)
     local annotation_enabled=self:annotation_sync_enabled()
-    local diagnostic_only=self:annotation_sync_diagnostic_only()
+    local diagnostic_only=force_diagnostic==true or self:annotation_sync_diagnostic_only()
     logger.info("[MiuRead][AnnotationSync] manual sync requested",
         "enabled=",tostring(annotation_enabled), diagnostic_only and "mode=coordinate_diagnostic" or "mode=manual")
     if not diagnostic_only and not annotation_enabled then
@@ -15585,7 +15595,9 @@ function Plugin:sync_local_annotations_now()
             "云端已存在："..tostring(result.reconciled or 0),
             "定位失败："..tostring(result.locate_failed or 0),
             "元数据失败："..tostring(result.metadata_failed or 0),
+            "坐标校验失败："..tostring(result.coord_failed or 0),
             "结果未知："..tostring(result.unknown or 0),
+            "旧坐标已同步："..tostring(result.legacy_synced or 0).."（不会自动重传）",
         }
         if tonumber(result.failed or 0)>0 then lines[#lines+1]="待处理合计："..tostring(result.failed or 0) end
         if type(result.errors)=="table" and #result.errors>0 then
