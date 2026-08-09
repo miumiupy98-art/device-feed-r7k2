@@ -157,8 +157,10 @@ local function chapter_uid(chapter)
 end
 
 local function chapter_idx(chapter, fallback)
+    -- chapterIdx is the WeRead protocol field. `index` may be a local/EPUB
+    -- ordinal, so only use it as a last-resort fallback.
     return tonumber(type(chapter) == "table" and
-        (chapter.index or chapter.chapterIdx or chapter.chapter_idx) or nil) or tonumber(fallback)
+        (chapter.chapterIdx or chapter.chapter_idx or chapter.index) or nil) or tonumber(fallback)
 end
 
 local function chapter_source(book, record)
@@ -1000,7 +1002,7 @@ function AnnotationSync:sync_book(book, record, options)
                             or self:_bookmark_payload(row, located, write_version or 0, prefs)
                         if not is_review then
                             stage_log(row, "payload", true, string.format(
-                                "book/addBookmark type=%d style=%d color=%s chapterIdx=%d bookVersion=%d markText=plain chars=%d",
+                                "book/addBookmark type=%d style=%d color=%s chapterIdx=%d bookVersion=%d markText=plain_to_base64 chars=%d",
                                 tonumber(payload.type) or -1, tonumber(payload.style) or -1,
                                 payload.colorStyle==nil and "none" or tostring(tonumber(payload.colorStyle) or 0),
                                 tonumber(payload.chapterIdx) or -1, tonumber(payload.bookVersion) or 0,

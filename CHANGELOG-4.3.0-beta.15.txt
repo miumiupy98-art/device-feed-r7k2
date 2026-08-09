@@ -1,0 +1,4 @@
+修复 addBookmark 最终请求使用 Base64 UTF8 markText
+协议 同步层保留明文仅在 API 写入前编码
+章节 优先使用微信读书 chapterIdx 避免本地索引
+安全 保留真实 bookVersion 坐标校验和失败待同步

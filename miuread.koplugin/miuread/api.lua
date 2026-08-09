@@ -1,6 +1,7 @@
 local Protocol = require("miuread.protocol")
 local U = require("miuread.util")
 local Http = require("miuread.http")
+local Codec = require("miuread.codec")
 local logger = require("logger")
 
 local Api = {}
@@ -299,8 +300,23 @@ end
 
 function Api:add_bookmark(payload)
     payload = type(payload) == "table" and payload or {}
-    return self:_web_annotation_write("/web/book/addBookmark", payload,
-        payload.bookId or payload.bookid, payload.chapterUid or payload.chapteruid)
+    -- ADD_BOOKMARK receives plain text inside the Web reader, but the
+    -- /web/book/addBookmark wire contract encodes markText as Base64 UTF-8.
+    -- Keep the synchronization layer and local database in plain text and
+    -- perform the transport encoding only at this API boundary.
+    local wire = U.copy(payload)
+    local plain = tostring(wire.markText or "")
+    wire.markText = Codec.b64encode(plain)
+    logger.info("[MiuRead][API] addBookmark wire",
+        "type=", tostring(wire.type),
+        "chapterIdx=", tostring(wire.chapterIdx),
+        "bookVersion=", tostring(wire.bookVersion),
+        "markText=base64",
+        "plain_chars=", tostring(U.utf8_len(plain)),
+        "plain_bytes=", tostring(#plain),
+        "wire_bytes=", tostring(#wire.markText))
+    return self:_web_annotation_write("/web/book/addBookmark", wire,
+        wire.bookId or wire.bookid, wire.chapterUid or wire.chapteruid)
 end
 
 function Api:remove_bookmark(bookmark_id, context)
