@@ -30,6 +30,7 @@ local MP=require("miuread.mp")
 local Access=require("miuread.access")
 local Annotations=require("miuread.annotations")
 local LocalAnnotationDatabase=require("miuread.local_annotation_database")
+local AnnotationSync=require("miuread.annotation_sync")
 local Downloader=require("miuread.downloader")
 local DownloadProgress=require("miuread.download_progress")
 local DownloadTask=require("miuread.download_task")
@@ -421,6 +422,7 @@ function Plugin:init()
     self.api=Api:new(self.http,self.store,self.reader)
     self.mp=MP:new(self.reader,self.http,self.store,self.api)
     self.annotations=Annotations:new(self.api)
+    self.annotation_sync=AnnotationSync:new(self.api,self.reader,self.store)
     self.downloader=Downloader:new(self.reader,self.api,self.annotations,self.store,self.http)
     self.download_task=DownloadTask:new(self.store)
     self.cache_cleanup_task=CacheCleanupTask:new(self.store)
@@ -440,6 +442,7 @@ function Plugin:init()
     self.identity_async=Async:new(self.store,{poll_interval=.20,allow_android=true,
         disable_fallback=true})
     self.repair_async=Async:new(self.store,{poll_interval=.35,allow_android=true})
+    self.annotation_async=Async:new(self.store,{poll_interval=.30,allow_android=true,disable_fallback=true})
     if self:_home_enabled() then
         self.home_async=Async:new(self.store,{poll_interval=.45,allow_android=true,disable_fallback=true})
         -- Desktop-only workers are not created in plugin mode.
@@ -2544,6 +2547,7 @@ function Plugin:_home_freeze_for_suspend()
     if self.home_metadata_async then self.home_metadata_async:cancel("device suspended") end
     if self.home_cover_async then self.home_cover_async:cancel("device suspended") end
     if self.cover_render_async then self.cover_render_async:cancel("device suspended") end
+    if self.annotation_async then self.annotation_async:cancel("device suspended") end
     if self.shelf_async and self._home_resume_pending_work.remote then self.shelf_async:cancel("device suspended") end
 
     logger.info("[MiuRead][Resume] home tasks frozen",
@@ -7916,17 +7920,67 @@ function Plugin:_reader_annotation_type(item)
     return "bookmark"
 end
 
+function Plugin:_reader_annotation_xpointer(item)
+    if type(item)~="table" then return nil end
+    local xp=item.pos0 or item.start or item.xpointer
+    if (xp==nil or xp=="") and type(item.page)=="string" and tonumber(item.page)==nil then
+        xp=item.page
+    end
+    if type(xp)=="string" and xp~="" then return xp end
+    return nil
+end
+
 function Plugin:_reader_annotation_page(item)
     if type(item)~="table" then return nil end
     local page=tonumber(item.page or item.pageno)
     if page then return math.floor(page+.5) end
-    local xp=item.pos0 or item.start or item.xpointer
+    local xp=self:_reader_annotation_xpointer(item)
     local doc=self.ui and self.ui.document or nil
     if xp and doc and type(doc.getPageFromXPointer)=="function" then
         local ok,value=pcall(doc.getPageFromXPointer,doc,xp)
         if ok and tonumber(value) then return math.floor(tonumber(value)+.5) end
     end
     return nil
+end
+
+function Plugin:_reader_bookmark_anchor_text(item)
+    local doc=self.ui and self.ui.document or nil
+    local xp=self:_reader_annotation_xpointer(item)
+    if not (doc and xp and type(doc.getTextFromXPointers)=="function") then return "" end
+    if type(doc.isXPointerInDocument)=="function" then
+        local ok,valid=pcall(doc.isXPointerInDocument,doc,xp)
+        if ok and valid==false then return "" end
+    end
+
+    -- KOReader rolling bookmarks store the page XPointer itself. Build a short
+    -- text anchor starting exactly at that XPointer, rather than using the
+    -- bookmark list label (which is usually only the chapter name).
+    local end_xp=xp
+    local steps=0
+    if type(doc.getNextVisibleWordEnd)=="function" then
+        for _=1,24 do
+            local ok,next_xp=pcall(doc.getNextVisibleWordEnd,doc,end_xp)
+            if not ok or type(next_xp)~="string" or next_xp=="" or next_xp==end_xp then break end
+            end_xp=next_xp
+            steps=steps+1
+        end
+    end
+    if steps==0 and type(doc.getNextVisibleChar)=="function" then
+        for _=1,32 do
+            local ok,next_xp=pcall(doc.getNextVisibleChar,doc,end_xp)
+            if not ok or type(next_xp)~="string" or next_xp=="" or next_xp==end_xp then break end
+            end_xp=next_xp
+            steps=steps+1
+        end
+    end
+    if steps==0 then return "" end
+
+    local ok,text=pcall(doc.getTextFromXPointers,doc,xp,end_xp,false)
+    if not ok then return "" end
+    if type(text)=="table" then text=text.text or text[1] end
+    text=U.trim(tostring(text or ""):gsub("%s+"," "))
+    if text=="" then return "" end
+    return U.utf8_truncate(text,96)
 end
 
 function Plugin:_reader_annotation_excerpt(item,kind)
@@ -15210,6 +15264,178 @@ function Plugin:onPageUpdate(page)
     self:_schedule_reader_toolbar_state_refresh(current,.12)
     self.sync:on_page(page)
 end
+function Plugin:_annotation_sync_preferences()
+    local p=self.store:preferences()
+    p.annotation_sync=type(p.annotation_sync)=="table" and p.annotation_sync or {}
+    if p.annotation_sync.enabled==nil then p.annotation_sync.enabled=false end
+    if tostring(p.annotation_sync.review_visibility or "")=="" then p.annotation_sync.review_visibility="private" end
+    p.annotation_sync.highlight_style=tonumber(p.annotation_sync.highlight_style) or 0
+    p.annotation_sync.highlight_color=tonumber(p.annotation_sync.highlight_color) or 0
+    return p.annotation_sync,p
+end
+
+function Plugin:annotation_sync_enabled()
+    local prefs=self:_annotation_sync_preferences()
+    return prefs.enabled==true
+end
+
+function Plugin:toggle_annotation_sync()
+    local prefs,all=self:_annotation_sync_preferences()
+    prefs.enabled=prefs.enabled~=true
+    all.annotation_sync=prefs
+    self.store:save_preferences(all)
+    self:toast(prefs.enabled and "本地批注云同步已开启（实验）" or "本地批注云同步已关闭",2)
+    return prefs.enabled
+end
+
+function Plugin:annotation_sync_visibility_label()
+    local prefs=self:_annotation_sync_preferences()
+    local labels={public="公开",friendship="关注可见",private="私密",friends_hidden="屏蔽好友",one_book="共读"}
+    return labels[tostring(prefs.review_visibility or "private")] or "私密"
+end
+
+function Plugin:set_annotation_sync_visibility(mode)
+    local allowed={public=true,friendship=true,private=true,friends_hidden=true,one_book=true}
+    mode=allowed[tostring(mode or "")] and tostring(mode) or "private"
+    local prefs,all=self:_annotation_sync_preferences()
+    prefs.review_visibility=mode
+    all.annotation_sync=prefs
+    self.store:save_preferences(all)
+    self:toast("新想法云端可见范围："..self:annotation_sync_visibility_label(),2)
+end
+
+function Plugin:annotation_sync_visibility_menu()
+    local labels={{"public","公开"},{"friendship","关注可见"},{"private","私密"},{"friends_hidden","屏蔽好友"},{"one_book","共读"}}
+    local rows={}
+    for _,item in ipairs(labels) do
+        local key,label=item[1],item[2]
+        rows[#rows+1]={text=label,checked_func=function()
+            local prefs=self:_annotation_sync_preferences(); return tostring(prefs.review_visibility)==key
+        end,keep_menu_open=true,callback=function() self:set_annotation_sync_visibility(key) end}
+    end
+    return rows
+end
+
+function Plugin:show_local_annotation_sync_status()
+    local current=self:_current_book_record()
+    local book_id=current and current.book and tostring(current.book.book_id or current.book.bookId or "") or ""
+    if book_id=="" then self:info("请先打开一本觅阅生成的书籍。") return false end
+    self:_capture_local_annotation_snapshot("sync_status")
+    local summary,err=LocalAnnotationDatabase.summary(self.store,book_id)
+    if not summary then self:info("读取本地批注状态失败："..tostring(err or "未知错误")); return false end
+    local lines={
+        "《"..tostring(current.book.title or "当前书籍").."》",
+        "",
+        "书签："..tostring(summary.bookmark or 0),
+        "划线："..tostring(summary.highlight or 0),
+        "想法："..tostring(summary.thought or 0),
+        "",
+        "已同步："..tostring(summary.synced or 0),
+        "待同步："..tostring(summary.pending or 0),
+        "待删除："..tostring(summary.delete_pending or 0),
+        "定位失败："..tostring(summary.locate_failed or 0),
+        "结果未知："..tostring(summary.unknown or 0),
+    }
+    self:info(table.concat(lines,"\n"))
+    return true
+end
+
+function Plugin:sync_local_annotations_now()
+    if not self:annotation_sync_enabled() then
+        self:info("请先在“评论与标注”中开启“本地批注云同步（实验）”。")
+        return false
+    end
+    if not self:logged_in() then self:info("请先登录微信读书账号。") return false end
+    local current=self:_current_book_record()
+    local book_id=current and current.book and tostring(current.book.book_id or current.book.bookId or "") or ""
+    if book_id=="" then self:info("请先打开一本觅阅生成的书籍。") return false end
+    if self.annotation_async and self.annotation_async:busy() then
+        self:toast("本地批注正在同步",1.5)
+        return false
+    end
+    if not self:_capture_local_annotation_snapshot("manual_sync") then
+        self:info("保存本地批注状态失败，本次未执行云同步。")
+        return false
+    end
+    local prefs=U.copy(self:_annotation_sync_preferences())
+    local book=U.copy(current.book or {})
+    local record=U.copy(current.record or {})
+    local service=self.annotation_sync
+    self:toast("正在同步本地批注…",2)
+    local started,err=self.annotation_async:run("annotation-sync",function()
+        return service:sync_book(book,record,{preferences=prefs,limit=200})
+    end,function(worker_result)
+        if not worker_result or worker_result.ok~=true then
+            self:info("本地批注同步失败："..tostring(worker_result and worker_result.error or "后台任务失败"))
+            return
+        end
+        local result=worker_result.value or {}
+        if result.ok==false then
+            self:info("本地批注同步失败："..tostring(result.error or "未知错误"))
+            return
+        end
+        local lines={
+            "本地批注同步完成",
+            "",
+            "已同步："..tostring(result.synced or 0),
+            "已删除："..tostring(result.deleted or 0),
+            "云端已存在："..tostring(result.reconciled or 0),
+            "定位失败："..tostring(result.locate_failed or 0),
+            "结果未知："..tostring(result.unknown or 0),
+        }
+        if tonumber(result.failed or 0)>0 then lines[#lines+1]="其他待处理："..tostring(result.failed or 0) end
+        if type(result.errors)=="table" and #result.errors>0 then
+            lines[#lines+1]=""
+            lines[#lines+1]="未上传的记录会继续保留在本地，不会猜测错误位置。"
+        end
+        self:info(table.concat(lines,"\n"))
+    end,180)
+    if not started then self:info("无法启动本地批注同步："..tostring(err or "后台任务不可用")); return false end
+    return true
+end
+
+function Plugin:_local_annotation_chapter_context(item,current,kind,reason)
+    if type(current)~="table" then return {} end
+    local record=type(current.record)=="table" and current.record or {}
+    local book=type(current.book)=="table" and current.book or {}
+    local standalone_uid=tostring(record.chapter_uid or "")
+    if standalone_uid~="" then
+        return {
+            chapter_uid=standalone_uid,
+            chapter_idx=tonumber((record.chapter_map or {})[1] and (record.chapter_map or {})[1].index) or 1,
+            anchor_text=(kind=="bookmark" and reason=="manual_sync") and self:_reader_bookmark_anchor_text(item) or "",
+        }
+    end
+    local chapter_map=type(record.chapter_map)=="table" and record.chapter_map
+        or (type(book.catalog)=="table" and book.catalog or {})
+    if #chapter_map==0 then return {} end
+    local page=self:_reader_annotation_page(item)
+    local toc=self.ui and self.ui.toc or nil
+    local toc_index
+    if toc and type(toc.fillToc)=="function" then pcall(toc.fillToc,toc) end
+    if page and toc and type(toc.getTocIndexByPage)=="function" then
+        local ok,value=pcall(toc.getTocIndexByPage,toc,page)
+        if ok then toc_index=tonumber(value) end
+    end
+    local toc_rows=toc and type(toc.toc)=="table" and toc.toc or {}
+    if page and not toc_index then
+        local best=-math.huge
+        for index,entry in ipairs(toc_rows) do
+            local p=tonumber(entry.page or entry.pageno)
+            if p and p<=page and p>=best then best=p; toc_index=index end
+        end
+    end
+    local index=math.max(1,math.min(#chapter_map,math.floor(tonumber(toc_index) or 1)))
+    local chapter=chapter_map[index] or {}
+    local uid=tostring(chapter.uid or chapter.chapterUid or chapter.chapter_uid or "")
+    if uid=="" then return {} end
+    return {
+        chapter_uid=uid,
+        chapter_idx=tonumber(chapter.index) or index,
+        anchor_text=(kind=="bookmark" and reason=="manual_sync") and self:_reader_bookmark_anchor_text(item) or "",
+    }
+end
+
 function Plugin:_capture_local_annotation_snapshot(reason)
     if not (self.ui and self.ui.document) then return false end
     local current=self:_current_book_record()
@@ -15218,7 +15444,9 @@ function Plugin:_capture_local_annotation_snapshot(reason)
     local annotations=(self.ui.annotation and self.ui.annotation.annotations)
         or (self.ui.bookmark and self.ui.bookmark.bookmarks) or {}
     local ok,result=xpcall(function()
-        return LocalAnnotationDatabase.snapshot(self.store,book_id,annotations,current.path)
+        return LocalAnnotationDatabase.snapshot(self.store,book_id,annotations,current.path,function(item,kind)
+            return self:_local_annotation_chapter_context(item,current,kind,reason)
+        end)
     end,debug.traceback)
     if ok and result then
         logger.info("[MiuRead][LocalAnnotations] snapshot saved",
@@ -15512,6 +15740,7 @@ function Plugin:onCloseDocument()
     self:_cancel_network_waits()
     if self.repair_async and self.repair_async.job and self.repair_async.job.label=="book-migration-check" then
         self.repair_async:cancel("document closed")
+        if self.annotation_async then self.annotation_async:cancel("document closed") end
     end
     self._repair_prompt_open=false
     if self._reader_active_path then os.remove(self._reader_active_path) end
