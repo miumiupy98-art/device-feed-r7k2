@@ -98,6 +98,41 @@ local function find_number(value, keys, seen, depth)
     end
 end
 
+local function positive_version(value)
+    local n = tonumber(value)
+    if n and n > 0 then return n end
+end
+
+local function find_book_version(value, book_id, seen, depth)
+    if type(value) ~= "table" or (depth or 0) > 8 then return nil end
+    seen = seen or {}
+    if seen[value] then return nil end
+    seen[value] = true
+    local target = tostring(book_id or "")
+
+    local id = tostring(value.bookId or value.book_id or "")
+    if id ~= "" and id == target then
+        local version = positive_version(value.bookVersion or value.book_version or value.version)
+        if version then return version end
+    end
+    for _, key in ipairs({"bookInfo", "book"}) do
+        local child = value[key]
+        if type(child) == "table" then
+            local child_id = tostring(child.bookId or child.book_id or target)
+            if child_id == target then
+                local version = positive_version(child.bookVersion or child.book_version or child.version)
+                if version then return version end
+            end
+        end
+    end
+    for _, child in pairs(value) do
+        if type(child) == "table" then
+            local version = find_book_version(child, book_id, seen, (depth or 0) + 1)
+            if version then return version end
+        end
+    end
+end
+
 local function find_id(value, keys, seen, depth)
     if type(value) ~= "table" or (depth or 0) > 6 then return "" end
     seen = seen or {}
@@ -430,21 +465,49 @@ function AnnotationSync:new(api, reader, store)
     return setmetatable({api=api, reader=reader, store=store}, self)
 end
 
-function AnnotationSync:_book_version(book_id, book, record)
-    for _, source in ipairs({record, book}) do
+function AnnotationSync:_book_version(book_id, book, record, chapter_uid_value)
+    local target = tostring(book_id or "")
+    for _, pair in ipairs({{"record", record}, {"book", book}}) do
+        local source = pair[2]
         if type(source) == "table" then
-            local n = tonumber(source.bookVersion or source.book_version or source.version)
-            if n then return n end
+            local n = find_book_version(source, target)
+                or positive_version(source.bookVersion or source.book_version or source.version)
+            if n then return n, pair[1] end
         end
     end
-    local ok, info = pcall(self.api.book, self.api, book_id)
-    if ok and type(info) == "table" then
-        local n = find_number(info, {"bookVersion", "book_version", "version"})
-        if n then return n end
+
+    if self.store and type(self.store.book) == "function" then
+        local ok, stored = pcall(self.store.book, self.store, target)
+        if ok and type(stored) == "table" then
+            local n = find_book_version(stored, target)
+                or positive_version(stored.bookVersion or stored.book_version or stored.version)
+            if n then return n, "store" end
+        end
     end
-    -- Observed web requests allow a zero fallback. The payload is still gated by
-    -- range/text verification, and any business rejection remains local.
-    return 0
+
+    local ok, info = pcall(self.api.book, self.api, target)
+    if ok and type(info) == "table" then
+        local n = find_book_version(info, target)
+        if n then return n, "book_info" end
+    end
+
+    local chapter_uid_text = tostring(chapter_uid_value or "")
+    if chapter_uid_text ~= "" and self.reader and type(self.reader.state) == "function" then
+        local state_ok, state = pcall(self.reader.state, self.reader, target, chapter_uid_text)
+        if state_ok and type(state) == "table" then
+            local n = positive_version(state.book_version) or find_book_version(state, target)
+            if n then return n, "reader_state" end
+        end
+    end
+
+    if self.reader and type(self.reader.catalog) == "function" then
+        local catalog_ok, catalog = pcall(self.reader.catalog, self.reader, target)
+        if catalog_ok and type(catalog) == "table" then
+            local n = find_book_version(catalog, target)
+            if n then return n, "catalog" end
+        end
+    end
+    return nil, "missing"
 end
 
 function AnnotationSync:_coord_map_for_chapter(book, row, candidate, cache)
@@ -482,8 +545,14 @@ function AnnotationSync:_coord_map_for_chapter(book, row, candidate, cache)
     end
     local raw_html = type(state) == "table" and tostring(state.raw_xhtml or "") or ""
     if raw_html == "" then raw_html = tostring(downloaded or "") end
+    local state_book_version = type(state) == "table" and
+        (positive_version(state.book_version) or find_book_version(state, book_arg.bookId)) or nil
     local ctx = {map=bridge.coord, bridge=bridge, html=coord_html, raw_html=raw_html, chapter=chapter,
-        chapter_uid=uid, chapter_idx=idx}
+        chapter_uid=uid, chapter_idx=idx, book_version=state_book_version,
+        book_version_source=state_book_version and "reader_chapter_state" or nil}
+    if state_book_version and self.store and type(self.store.save_book) == "function" then
+        pcall(self.store.save_book, self.store, book_arg.bookId, {version=state_book_version})
+    end
     cache[cache_key] = ctx
     return ctx
 end
@@ -629,10 +698,12 @@ local function validate_payload(row, payload)
     local start, ending, point = Range.parse(tostring(payload.range))
     if not start or not ending then return nil, "range_invalid" end
     if row.kind == "bookmark" then
+        if not positive_version(payload.bookVersion) then return nil, "bookVersion_missing" end
         if not point then return nil, "bookmark_range_not_point" end
         if tonumber(payload.type) ~= 0 then return nil, "bookmark_type_invalid" end
         if tostring(payload.markText or "") == "" then return nil, "bookmark_markText_missing" end
     elseif row.kind == "highlight" then
+        if not positive_version(payload.bookVersion) then return nil, "bookVersion_missing" end
         if point then return nil, "highlight_range_is_point" end
         if tonumber(payload.type) ~= 1 then return nil, "highlight_type_invalid" end
         if tostring(payload.markText or "") == "" then return nil, "highlight_markText_missing" end
@@ -695,7 +766,19 @@ function AnnotationSync:sync_book(book, record, options)
         if need_reviews and not cloud_reviews then review_error = review_error or "review reconciliation failed" end
     end
 
-    local version = diagnostic_only and 0 or self:_book_version(book_id, book or {}, record or {})
+    local version, version_source
+    if diagnostic_only then
+        version, version_source = 0, "diagnostic"
+    else
+        -- First use already cached metadata. The chapter download below already
+        -- opens the real WeRead reader page, so avoid a duplicate reader-state GET.
+        version, version_source = self:_book_version(book_id, book or {}, record or {}, nil)
+    end
+    if not diagnostic_only then
+        logger.info("[MiuRead][AnnotationSync] book version preflight",
+            "book=", tostring(book_id), "version=", tostring(version or 0),
+            "source=", tostring(version_source or "missing"))
+    end
     local coord_cache = {}
     local diagnostic_chapters = {}
 
@@ -847,13 +930,26 @@ function AnnotationSync:sync_book(book, record, options)
             else
                 row.chapter_uid = tostring(chapter_ctx.chapter_uid or chapter_uid(chapter_ctx.chapter) or row.chapter_uid or "")
                 row.chapter_idx = tonumber(chapter_ctx.chapter_idx or chapter_idx(chapter_ctx.chapter) or row.chapter_idx)
+                local write_version = positive_version(chapter_ctx.book_version)
+                    or positive_version(row.book_version) or positive_version(version)
+                local write_version_source = write_version and (chapter_ctx.book_version and
+                    tostring(chapter_ctx.book_version_source or "reader_chapter_state")
+                    or (positive_version(row.book_version) and "local_row" or tostring(version_source or "cached"))) or "missing"
+                if not write_version then
+                    local recovered, recovered_source = self:_book_version(book_id, book or {}, record or {}, row.chapter_uid)
+                    write_version = positive_version(recovered)
+                    write_version_source = tostring(recovered_source or "missing")
+                    if write_version then
+                        version, version_source = write_version, write_version_source
+                    end
+                end
                 local verification = self:_verify_coordinate_basis(book_id, chapter_ctx)
                 located.coord_verify = tostring(verification.status or "local_verified")
                 located.anchor_checked = tonumber(verification.checked or 0) or 0
                 located.anchor_matched = tonumber(verification.matched or 0) or 0
                 if verification.status == "mismatch" then
                     remember_error(row, "coord_failed", verification.error or "coord_basis_mismatch", "coord_basis", {
-                        range_key=located.range, book_version=version,
+                        range_key=located.range, book_version=write_version or 0,
                         chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
                         coord_version=COORD_VERSION, coord_source=COORD_SOURCE, coord_verify="mismatch",
                     })
@@ -862,7 +958,7 @@ function AnnotationSync:sync_book(book, record, options)
                         tostring(located.range), tostring(verification.status),
                         tonumber(verification.matched or 0) or 0, tonumber(verification.checked or 0) or 0))
                     LocalDB.mark_state(self.store, book_id, row.local_id, "local_only", {
-                        range_key=located.range, book_version=version,
+                        range_key=located.range, book_version=write_version or 0,
                         chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
                         coord_version=COORD_VERSION, coord_source=COORD_SOURCE, coord_verify=verification.status,
                         last_stage="verify", last_error="", last_attempt_at=os.time(),
@@ -881,7 +977,7 @@ function AnnotationSync:sync_book(book, record, options)
                     end
                     if match then
                         local rid = matched_id or (is_review and review_remote_id(match) or bookmark_remote_id(match))
-                        LocalDB.mark_synced(self.store, book_id, row.local_id, rid, located.range, version, {
+                        LocalDB.mark_synced(self.store, book_id, row.local_id, rid, located.range, write_version or 0, {
                             chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
                             coord_version=COORD_VERSION, coord_source=COORD_SOURCE, coord_verify=verification.status,
                         })
@@ -900,20 +996,21 @@ function AnnotationSync:sync_book(book, record, options)
                                 "preflight_unavailable_first_post:" .. tostring(cloud_error or "unknown"))
                         end
                         local payload = is_review
-                            and self:_review_payload(row, located, version, prefs)
-                            or self:_bookmark_payload(row, located, version, prefs)
+                            and self:_review_payload(row, located, write_version or 0, prefs)
+                            or self:_bookmark_payload(row, located, write_version or 0, prefs)
                         if not is_review then
                             stage_log(row, "payload", true, string.format(
                                 "book/addBookmark type=%d style=%d color=%s chapterIdx=%d bookVersion=%d markText=plain chars=%d",
                                 tonumber(payload.type) or -1, tonumber(payload.style) or -1,
                                 payload.colorStyle==nil and "none" or tostring(tonumber(payload.colorStyle) or 0),
                                 tonumber(payload.chapterIdx) or -1, tonumber(payload.bookVersion) or 0,
-                                U.utf8_len(tostring(payload.markText or ""))))
+                                U.utf8_len(tostring(payload.markText or "")))
+                                .. " source=" .. tostring(write_version_source or "missing"))
                         end
                         local payload_ok, payload_error = validate_payload(row, payload)
                         if not payload_ok then
                             remember_error(row, "metadata_failed", payload_error, "payload", {
-                                range_key=located.range, book_version=version,
+                                range_key=located.range, book_version=write_version or 0,
                                 chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
                                 coord_version=COORD_VERSION, coord_source=COORD_SOURCE, coord_verify=verification.status,
                             })
@@ -927,13 +1024,13 @@ function AnnotationSync:sync_book(book, record, options)
                                     or find_id(value, {"bookmarkId", "bookmarkID"})
                                 if not is_review and remote_id == "" then
                                     remember_error(row, "unknown", "服务器未返回 bookmarkId", "post", {
-                                        range_key=located.range, book_version=version,
+                                        range_key=located.range, book_version=write_version or 0,
                                         chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
                                         coord_version=COORD_VERSION, coord_source=COORD_SOURCE, coord_verify=verification.status,
                                     })
                                 else
                                     LocalDB.mark_synced(self.store, book_id, row.local_id,
-                                        remote_id, located.range, version, {
+                                        remote_id, located.range, write_version or 0, {
                                             chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
                                             coord_version=COORD_VERSION, coord_source=COORD_SOURCE, coord_verify=verification.status,
                                         })
@@ -942,13 +1039,13 @@ function AnnotationSync:sync_book(book, record, options)
                                 end
                             elseif Http.is_network_error(value) then
                                 remember_error(row, "unknown", value, "post", {
-                                    range_key=located.range, book_version=version,
+                                    range_key=located.range, book_version=write_version or 0,
                                     chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
                                     coord_version=COORD_VERSION, coord_source=COORD_SOURCE, coord_verify=verification.status,
                                 })
                             else
                                 remember_error(row, "local_only", value, "post", {
-                                    range_key=located.range, book_version=version,
+                                    range_key=located.range, book_version=write_version or 0,
                                     chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
                                     coord_version=COORD_VERSION, coord_source=COORD_SOURCE, coord_verify=verification.status,
                                 })

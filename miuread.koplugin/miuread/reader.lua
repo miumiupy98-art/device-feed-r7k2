@@ -80,6 +80,44 @@ local function regex_context(html)
     }
 end
 
+local function positive_number(value)
+    local n = tonumber(value)
+    if n and n > 0 then return n end
+end
+
+-- Locate the version belonging to the requested book, not an unrelated
+-- `version` field elsewhere in the reader bootstrap payload.
+local function find_book_version(value, book_id, depth, seen)
+    if type(value) ~= "table" or (depth or 0) > 8 then return nil end
+    seen = seen or {}
+    if seen[value] then return nil end
+    seen[value] = true
+
+    local id = tostring(value.bookId or value.book_id or "")
+    if id ~= "" and id == tostring(book_id or "") then
+        local version = positive_number(value.bookVersion or value.book_version or value.version)
+        if version then return version end
+    end
+
+    for _, key in ipairs({"bookInfo", "book"}) do
+        local child = value[key]
+        if type(child) == "table" then
+            local child_id = tostring(child.bookId or child.book_id or book_id or "")
+            if child_id == tostring(book_id or "") then
+                local version = positive_number(child.bookVersion or child.book_version or child.version)
+                if version then return version end
+            end
+        end
+    end
+
+    for _, child in pairs(value) do
+        if type(child) == "table" then
+            local version = find_book_version(child, book_id, (depth or 0) + 1, seen)
+            if version then return version end
+        end
+    end
+end
+
 local function catalog_records(data)
     local current = data
     for _ = 1, 4 do
@@ -758,6 +796,9 @@ local function load_reader_context(self,book_id,chapter_uid,require_psvts)
             end
         end
     end
+    context.book_version = positive_number(context.book and
+        (context.book.bookVersion or context.book.book_version or context.book.version))
+        or find_book_version(context.source, book_id)
     if html:find("可永久阅读",1,true) then context.ownership_hint="可永久阅读" end
     if html:find("书币购买或活动领取",1,true) then context.ownership_hint="书币购买或活动领取" end
     if html:find("个人上传",1,true) or html:find("用户上传",1,true) then context.ownership_hint="个人上传" end

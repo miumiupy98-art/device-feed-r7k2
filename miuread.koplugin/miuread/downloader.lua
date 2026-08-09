@@ -47,6 +47,8 @@ local function normalized_book(value)
         author = tostring(source.author or value.author or ""),
         cover = source.cover or source.coverUrl or value.cover,
         category = source.category or value.category,
+        version = tonumber(source.version or source.bookVersion or source.book_version
+            or value.version or value.bookVersion or value.book_version),
     }
 end
 
@@ -553,6 +555,9 @@ local function cache_save_base(cache, chapter, coord_body, body, style, assets, 
     if state and (state.psvts or state.pclts or state.token or state.url) then
         cache.manifest.session = {
             psvts=state.psvts, pclts=state.pclts, token=state.token,
+            book_version=tonumber(state.book_version
+                or (type(state.book)=="table" and
+                    (state.book.version or state.book.bookVersion or state.book.book_version))),
             url=state.url, content_format=state.content_format,
         }
     end
@@ -992,6 +997,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     end
     self.store:save_book(book.bookId, {
         book_id=book.bookId, title=book.title, author=book.author, cover=book.cover,
+        version=tonumber(book.version),
         directory=dir, updated_at=now, catalog=(type(opt.full_catalog_map)=="table" and opt.full_catalog_map or map),
         core_catalog_hash=BookIntegrity.core_map_hash(book.bookId,
             type(opt.full_catalog_map)=="table" and opt.full_catalog_map or map,{}),
@@ -1001,6 +1007,9 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     if session then
         self.store:save_session(book.bookId, {
             psvts=session.psvts, pclts=session.pclts, token=session.token,
+            book_version=tonumber(book.version or session.book_version
+                or (type(session.book)=="table" and
+                    (session.book.version or session.book.bookVersion or session.book.book_version))),
             reader_url=session.url, chapters=map, context_updated_at=os.time(),
             app_id=Protocol.app_id(Protocol.USER_AGENT),
         })
@@ -1482,8 +1491,16 @@ function Downloader:book(input, opt, progress)
                 end
                 return mark_failure(chapter, downloaded)
             end
-            if state and (state.psvts or state.pclts or state.token or state.url) then
-                session = state
+            if state then
+                local discovered_version = tonumber(state.book_version
+                    or (type(state.book)=="table" and
+                        (state.book.version or state.book.bookVersion or state.book.book_version)))
+                if discovered_version and discovered_version > 0 then
+                    book.version = discovered_version
+                end
+                if state.psvts or state.pclts or state.token or state.url then
+                    session = state
+                end
             end
             -- Freeze the coordinate source before resource URL rewriting. Server
             -- ranges are interpreted only against this immutable chapter body.
