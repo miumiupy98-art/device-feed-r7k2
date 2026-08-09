@@ -1,17 +1,17 @@
 {
-  "version": "4.3.0-beta.9",
-  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 4.3.0-beta.9 \u5185\u6d4b\u7248",
+  "version": "4.3.0-beta.11",
+  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 4.3.0-beta.11 \u5185\u6d4b\u7248",
   "channel": "beta",
   "package_type": "full",
-  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.9/miuread-v4.3.0-beta.9-full.zip",
+  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.11/miuread-v4.3.0-beta.11-full.zip",
   "package_urls": [
-    "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.9/miuread-v4.3.0-beta.9-full.zip",
-    "https://ghfast.top/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.9/miuread-v4.3.0-beta.9-full.zip",
-    "https://gh-proxy.com/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.9/miuread-v4.3.0-beta.9-full.zip",
-    "https://ghproxy.net/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.9/miuread-v4.3.0-beta.9-full.zip"
+    "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.11/miuread-v4.3.0-beta.11-full.zip",
+    "https://ghfast.top/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.11/miuread-v4.3.0-beta.11-full.zip",
+    "https://gh-proxy.com/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.11/miuread-v4.3.0-beta.11-full.zip",
+    "https://ghproxy.net/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.11/miuread-v4.3.0-beta.11-full.zip"
   ],
-  "size": 579364,
-  "sha256": "d60db5a932dae08a198223117ca55a50f7d23a9c13d25a002d6d168832ec18c1",
-  "summary": "\u754c\u9762 \u9605\u8bfb\u9875\u65b0\u589e\u7edf\u4e00\u6279\u6ce8\u5165\u53e3 \u4e66\u7b7e\u5212\u7ebf\u60f3\u6cd5\u4e0d\u518d\u5206\u6563\u663e\u793a\n\u540c\u6b65 \u9605\u8bfb\u9875\u53ef\u76f4\u63a5\u5f00\u542f\u5e76\u624b\u52a8\u540c\u6b65\u5f53\u524d\u4e66\u5168\u90e8\u672c\u5730\u6279\u6ce8\n\u8bbe\u7f6e \u4e3b\u9875\u4ec5\u4fdd\u7559\u5168\u5c40\u5f00\u5173 \u624b\u52a8\u8bf4\u660e\u548c\u60f3\u6cd5\u53ef\u89c1\u8303\u56f4\n\u6574\u7406 \u9605\u8bfb\u63a7\u5236\u4e2d\u5fc3\u5408\u5e76\u6279\u6ce8\u5165\u53e3\u5e76\u533a\u5206\u9605\u8bfb\u8fdb\u5ea6\u540c\u6b65",
-  "notes": "\u754c\u9762 \u9605\u8bfb\u9875\u65b0\u589e\u7edf\u4e00\u6279\u6ce8\u5165\u53e3 \u4e66\u7b7e\u5212\u7ebf\u60f3\u6cd5\u4e0d\u518d\u5206\u6563\u663e\u793a\n\u540c\u6b65 \u9605\u8bfb\u9875\u53ef\u76f4\u63a5\u5f00\u542f\u5e76\u624b\u52a8\u540c\u6b65\u5f53\u524d\u4e66\u5168\u90e8\u672c\u5730\u6279\u6ce8\n\u8bbe\u7f6e \u4e3b\u9875\u4ec5\u4fdd\u7559\u5168\u5c40\u5f00\u5173 \u624b\u52a8\u8bf4\u660e\u548c\u60f3\u6cd5\u53ef\u89c1\u8303\u56f4\n\u6574\u7406 \u9605\u8bfb\u63a7\u5236\u4e2d\u5fc3\u5408\u5e76\u6279\u6ce8\u5165\u53e3\u5e76\u533a\u5206\u9605\u8bfb\u8fdb\u5ea6\u540c\u6b65"
+  "size": 584483,
+  "sha256": "78132c59cda188e666aa1af2c7d9dcccc7748b78c4496520ae02a4e006f5b7a0",
+  "summary": "\u5750\u6807 \u5b8c\u6574\u89e3\u5bc6 XHTML \u4f5c\u4e3a\u4e66\u7b7e \u5212\u7ebf \u60f3\u6cd5\u7edf\u4e00 range \u57fa\u51c6\n\u4fee\u590d \u6bb5\u5c3e\u9009\u533a\u4e0d\u518d\u541e\u5165\u6362\u884c\u4e0e\u7f29\u8fdb\u7a7a\u767d\n\u5b89\u5168 \u589e\u52a0\u53cc\u5411\u6821\u9a8c\u4e0e\u5fae\u4fe1\u8bfb\u4e66\u5b98\u65b9 range \u951a\u70b9\u6821\u9a8c\n\u540c\u6b65 \u6062\u590d\u624b\u52a8\u4e0a\u4f20 \u65e7\u5750\u6807\u5df2\u540c\u6b65\u8bb0\u5f55\u4e0d\u81ea\u52a8\u91cd\u4f20",
+  "notes": "\u5750\u6807 \u5b8c\u6574\u89e3\u5bc6 XHTML \u4f5c\u4e3a\u4e66\u7b7e \u5212\u7ebf \u60f3\u6cd5\u7edf\u4e00 range \u57fa\u51c6\n\u4fee\u590d \u6bb5\u5c3e\u9009\u533a\u4e0d\u518d\u541e\u5165\u6362\u884c\u4e0e\u7f29\u8fdb\u7a7a\u767d\n\u5b89\u5168 \u589e\u52a0\u53cc\u5411\u6821\u9a8c\u4e0e\u5fae\u4fe1\u8bfb\u4e66\u5b98\u65b9 range \u951a\u70b9\u6821\u9a8c\n\u540c\u6b65 \u6062\u590d\u624b\u52a8\u4e0a\u4f20 \u65e7\u5750\u6807\u5df2\u540c\u6b65\u8bb0\u5f55\u4e0d\u81ea\u52a8\u91cd\u4f20"
 }
