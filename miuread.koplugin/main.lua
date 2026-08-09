@@ -440,11 +440,14 @@ function Plugin:init()
         self.local_browser_async=Async:new(self.store,{poll_interval=.20,allow_android=true,disable_fallback=true})
         self.home_metadata_async=Async:new(self.store,{poll_interval=.35,allow_android=true,disable_fallback=true})
         self.home_cover_async=Async:new(self.store,{poll_interval=.30,allow_android=true})
+        -- High-quality cover conversion must never run on the UI thread.
+        self.cover_render_async=Async:new(self.store,{poll_interval=.35,allow_android=true,disable_fallback=true})
     else
         self.home_async=nil
         self.local_browser_async=nil
         self.home_metadata_async=nil
         self.home_cover_async=nil
+        self.cover_render_async=nil
     end
     self.auth_flow=Auth:new(self.http,self.store,self)
     self.sync=Sync:new(self.reader,self.api,self.store,self,self.async,self.identity_async)
@@ -496,6 +499,8 @@ function Plugin:init()
     self._local_browser_fallback_scanner=nil
     self._home_inline_navigation_generation=0
     self._home_cover_inflight={}
+    self._home_cover_render_generation=0
+    self._home_cover_render_retry_task=nil
     self._home_suspended=false
     self._home_resume_generation=0
     self._home_resume_barrier=false
@@ -2459,6 +2464,7 @@ function Plugin:_home_freeze_for_suspend()
     if self.local_browser_async then self.local_browser_async:cancel("device suspended") end
     if self.home_metadata_async then self.home_metadata_async:cancel("device suspended") end
     if self.home_cover_async then self.home_cover_async:cancel("device suspended") end
+    if self.cover_render_async then self.cover_render_async:cancel("device suspended") end
     if self.shelf_async and self._home_resume_pending_work.remote then self.shelf_async:cancel("device suspended") end
 
     logger.info("[MiuRead][Resume] home tasks frozen",
@@ -2522,7 +2528,10 @@ function Plugin:_home_finish_resume_background(generation)
             if generation~=self._home_resume_generation or self:_home_background_blocked() or not HomeView.is_shown() then return end
             local metadata_targets,cover_targets=self:_home_resume_visible_targets()
             if pending.metadata then self:_home_schedule_local_metadata(metadata_targets) end
-            if pending.covers then self:_home_schedule_remote_covers(cover_targets) end
+            if pending.covers then
+                self:_home_schedule_remote_covers(cover_targets)
+                self:_home_schedule_cover_derivatives(cover_targets)
+            end
         end)
     end
     if self.download_task then self.download_task:on_resume() end
@@ -2674,17 +2683,21 @@ function Plugin:_home_apply_cover_path(book_id,path)
         if type(book)=="table" and tostring(book.bookId or book.book_id or "")==book_id
             and tostring(book.cover_path or "")~=path then
             book.cover_path=path
+            -- A new raw source invalidates the small display derivative. The
+            -- background renderer will replace it without blocking this view.
+            book.home_cover_path=nil
             changed=true
         end
     end
-    local hero_id=tostring(self._home_hero and (self._home_hero.bookId or self._home_hero.book_id) or "")
+    local hero_id=self:_home_cover_render_id(self._home_hero)
+    hero_id=tostring(hero_id or "")
     apply(self._home_hero)
     for _,section in pairs(self._home_sections or {}) do
         for _,book in ipairs(section.rows or {}) do apply(book) end
     end
     if hero_id==book_id then
         local current=HomeView.current()
-        if current and current.opts then current.opts.screensaver_file=path end
+        if current and current.opts and not current.opts.screensaver_file then current.opts.screensaver_file=path end
     end
     return changed
 end
@@ -2949,79 +2962,198 @@ function Plugin:_set_home_section(section)
     end
 end
 
+function Plugin:_home_cover_render_id(book)
+    if type(book)~="table" then return nil end
+    local id=tostring(book.bookId or book.book_id or "")
+    if id~="" then return id end
+    local seed=tostring(book.cover_path or book.file or book.title or "book")
+    local hash=5381
+    for i=1,#seed do hash=(hash*33+seed:byte(i))%4294967296 end
+    return string.format("local-%08x",hash)
+end
+
 function Plugin:_home_prepare_lockscreen_cover(book)
     if type(book)~="table" then return nil end
-    local LockscreenCover=require("miuread.lockscreen_cover")
     local width,height=Device.screen:getWidth(),Device.screen:getHeight()
     if width<=0 or height<=0 then return nil end
-    local id=tostring(book.bookId or book.book_id or "")
-    local fallback_source=tostring(book.cover_path or "")
-    if id=="" then
-        local seed=fallback_source~="" and fallback_source or tostring(book.file or book.title or "book")
-        local hash=5381
-        for i=1,#seed do hash=(hash*33+seed:byte(i))%4294967296 end
-        id=string.format("local-%08x",hash)
-    end
-    local stored=id~="" and self.store:book(id) or nil
-    local record=id~="" and self:_preferred_record(id) or nil
-    local file=tostring(book.file or (record and record.file) or "")
-
+    local id=self:_home_cover_render_id(book)
+    if not id then return tostring(book.cover_path or "")~="" and book.cover_path or nil end
     local dir=self.store.data_dir.."/lockscreen"
     U.mkdir(dir)
-    -- Version the generated artifact so beta.2 automatically discards the old
-    -- contain+margin rendering without touching the user's normal cover cache.
-    local target=dir.."/"..U.id_name(id).."-fill2-"..tostring(width).."x"..tostring(height)..".png"
-    local source_hint_mtime=tonumber(lfs.attributes(fallback_source,"modification") or 0) or 0
-    source_hint_mtime=math.max(source_hint_mtime,tonumber(lfs.attributes(file,"modification") or 0) or 0)
-    if type(stored)=="table" then
-        source_hint_mtime=math.max(source_hint_mtime,tonumber(lfs.attributes(tostring(stored.cover_path or ""),"modification") or 0) or 0)
-    end
-    if type(record)=="table" then
-        source_hint_mtime=math.max(source_hint_mtime,tonumber(lfs.attributes(tostring(record.cover_path or ""),"modification") or 0) or 0)
-    end
-    local target_mtime=tonumber(lfs.attributes(target,"modification") or 0) or 0
-    if target_mtime>0 and target_mtime>=source_hint_mtime and (tonumber(U.file_size(target) or 0) or 0)>0 then
-        return target
-    end
+    local prefix=dir.."/"..U.id_name(id)
+    local current=prefix.."-fill3-"..tostring(width).."x"..tostring(height)..".png"
+    if lfs.attributes(current,"mode")=="file" and (tonumber(U.file_size(current) or 0) or 0)>0 then return current end
+    -- Keep the beta.2 full-screen artifact as a temporary fallback while the
+    -- sharper beta.3 image is rebuilt in a low-priority worker.
+    local previous=prefix.."-fill2-"..tostring(width).."x"..tostring(height)..".png"
+    if lfs.attributes(previous,"mode")=="file" and (tonumber(U.file_size(previous) or 0) or 0)>0 then return previous end
+    local fallback=tostring(book.cover_path or "")
+    return fallback~="" and fallback or nil
+end
 
-    local sources={}
-    local seen={}
-    local function add(path)
-        path=tostring(path or "")
-        if path~="" and not seen[path] and lfs.attributes(path,"mode")=="file" then
-            seen[path]=true
-            sources[#sources+1]=path
+function Plugin:_home_apply_rendered_cover_path(book_id,path)
+    book_id=tostring(book_id or "")
+    path=tostring(path or "")
+    if book_id=="" or path=="" then return false,false,{} end
+    local changed=false
+    local hero_changed=false
+    local sections={}
+    local function apply(book,section)
+        if type(book)=="table" and tostring(self:_home_cover_render_id(book) or "")==book_id
+            and tostring(book.home_cover_path or "")~=path then
+            book.home_cover_path=path
+            changed=true
+            if section then sections[section]=true end
         end
     end
-    add(fallback_source)
+    if self._home_hero and tostring(self:_home_cover_render_id(self._home_hero) or "")==book_id then
+        apply(self._home_hero)
+        hero_changed=true
+    end
+    for key,section in pairs(self._home_sections or {}) do
+        for _,book in ipairs(section.rows or {}) do apply(book,key) end
+    end
+    return changed,hero_changed,sections
+end
 
-    if type(stored)=="table" then add(stored.cover_path) end
-    if type(record)=="table" then add(record.cover_path) end
-
-    -- Prefer an embedded/custom cover when the book already exists locally.
-    -- BookInfoManager extraction is bounded and cached, and often exposes a
-    -- larger source than the shelf thumbnail.
-    if file~="" and U.file_exists(file) then
-        local ok,metadata=pcall(LocalMetadata.read,file,self.store.data_dir.."/lockscreen-source",{
-            open_document=false,use_bim=true,
-        })
-        if ok and type(metadata)=="table" then add(metadata.cover_path) end
+function Plugin:_home_schedule_cover_derivatives(books)
+    if self:_home_background_blocked() then
+        self._home_resume_pending_work=self._home_resume_pending_work or {}
+        self._home_resume_pending_work.covers=true
+        return false
+    end
+    if not self.cover_render_async or not self.cover_render_async:available() then return false end
+    if self.cover_render_async:busy() then
+        if not self._home_cover_render_retry_task then
+            local retry
+            retry=function()
+                if self._home_cover_render_retry_task~=retry then return end
+                self._home_cover_render_retry_task=nil
+                if HomeView.is_shown() and not self:_active_reader_ui() then self:_home_schedule_cover_derivatives(books) end
+            end
+            self._home_cover_render_retry_task=retry
+            UIManager:scheduleIn(.8,retry)
+        end
+        return false
     end
 
-    local source=LockscreenCover.best_source(sources)
-    if not source then return fallback_source~="" and fallback_source or nil end
-    local source_mtime=tonumber(lfs.attributes(source,"modification") or 0) or 0
-    target_mtime=tonumber(lfs.attributes(target,"modification") or 0) or 0
-    if target_mtime>=source_mtime and target_mtime>0 and (tonumber(U.file_size(target) or 0) or 0)>0 then return target end
+    local sw,sh=Device.screen:getWidth(),Device.screen:getHeight()
+    if sw<=0 or sh<=0 then return false end
+    local thumb_w=math.max(240,math.min(420,math.floor(sw*.34+.5)))
+    local thumb_h=math.max(340,math.floor(thumb_w/.69+.5))
+    local render_dir=self.store.data_dir.."/cover-render-v1"
+    local lock_dir=self.store.data_dir.."/lockscreen"
+    local source_dir=self.store.data_dir.."/lockscreen-source"
+    U.mkdir(render_dir); U.mkdir(lock_dir); U.mkdir(source_dir)
 
-    local rendered,err=LockscreenCover.render_fill(source,target,width,height)
-    if not rendered or lfs.attributes(target,"mode")~="file" then
-        os.remove(target)
-        logger.warn("[MiuRead][Cover] lockscreen cache failed",tostring(err or "unknown"))
-        return source
+    local hero_id=tostring(self:_home_cover_render_id(self._home_hero) or "")
+    local items,seen={},{}
+    for _,book in ipairs(books or {}) do
+        if type(book)=="table" then
+            local id=self:_home_cover_render_id(book)
+            if id and not seen[id] then
+                local sources={}
+                local function add(path)
+                    path=tostring(path or "")
+                    if path~="" and lfs.attributes(path,"mode")=="file" then sources[#sources+1]=path end
+                end
+                add(book.cover_path)
+                local stored=(book.bookId or book.book_id) and self.store:book(tostring(book.bookId or book.book_id)) or nil
+                local record=(book.bookId or book.book_id) and self:_preferred_record(tostring(book.bookId or book.book_id)) or nil
+                if type(stored)=="table" then add(stored.cover_path) end
+                if type(record)=="table" then add(record.cover_path) end
+                local file=tostring(book.file or (record and record.file) or "")
+                if #sources>0 or (file~="" and U.file_exists(file)) then
+                    seen[id]=true
+                    items[#items+1]={
+                        id=id,
+                        sources=sources,
+                        file=file,
+                        source_dir=source_dir,
+                        home_target=render_dir.."/"..U.id_name(id).."-home1-"..tostring(thumb_w).."x"..tostring(thumb_h)..".png",
+                        home_w=thumb_w,home_h=thumb_h,
+                        lock_target=(hero_id~="" and id==hero_id)
+                            and (lock_dir.."/"..U.id_name(id).."-fill3-"..tostring(sw).."x"..tostring(sh)..".png") or nil,
+                        lock_w=sw,lock_h=sh,
+                    }
+                    if #items>=10 then break end
+                end
+            end
+        end
     end
-    logger.info("[MiuRead][Cover] lockscreen cache ready",tostring(id),tostring(width).."x"..tostring(height),"source=",tostring(source))
-    return target
+    if #items==0 then return false end
+
+    self._home_cover_render_generation=(tonumber(self._home_cover_render_generation) or 0)+1
+    local generation=self._home_cover_render_generation
+    local worker_items=items
+    local worker=function()
+        local CoverRender=require("miuread.cover_render")
+        local LocalMetadataChild=require("miuread.local_metadata")
+        local UChild=require("miuread.util")
+        CoverRender.lower_priority()
+        local out={}
+        for _,item in ipairs(worker_items) do
+            local sources={}
+            for _,path in ipairs(item.sources or {}) do sources[#sources+1]=path end
+            if item.file~="" and UChild.file_exists(item.file) then
+                local ok,metadata=pcall(LocalMetadataChild.read,item.file,item.source_dir,{open_document=false,use_bim=true})
+                if ok and type(metadata)=="table" and tostring(metadata.cover_path or "")~="" then
+                    sources[#sources+1]=metadata.cover_path
+                end
+            end
+            local source=CoverRender.best_source(sources)
+            if source then
+                local home_path=item.home_target
+                if not CoverRender.is_fresh(home_path,source) then
+                    home_path=CoverRender.render_home(source,item.home_target,item.home_w,item.home_h)
+                end
+                local lock_path
+                if item.lock_target then
+                    lock_path=item.lock_target
+                    if not CoverRender.is_fresh(lock_path,source) then
+                        lock_path=CoverRender.render_fill(source,item.lock_target,item.lock_w,item.lock_h,{ink_boost=.075})
+                    end
+                end
+                out[#out+1]={id=item.id,home_path=home_path,lock_path=lock_path,source=source}
+            end
+        end
+        return out
+    end
+
+    local started=self.cover_render_async:run("home-cover-render",worker,function(result)
+        if generation~=self._home_cover_render_generation then return end
+        if not result or result.ok~=true or type(result.value)~="table" then
+            if result and result.error then logger.warn("[MiuRead][CoverRender] worker failed",U.first_line(result.error,120)) end
+            return
+        end
+        local any_changed=false
+        local hero_changed=false
+        local changed_sections={}
+        for _,entry in ipairs(result.value) do
+            if entry.home_path and lfs.attributes(entry.home_path,"mode")=="file" then
+                local changed,is_hero,sections=self:_home_apply_rendered_cover_path(entry.id,entry.home_path)
+                any_changed=any_changed or changed
+                hero_changed=hero_changed or is_hero
+                for section in pairs(sections or {}) do changed_sections[section]=true end
+            end
+            if entry.lock_path and lfs.attributes(entry.lock_path,"mode")=="file" then
+                local current_hero_id=tostring(self:_home_cover_render_id(self._home_hero) or "")
+                if current_hero_id~="" and entry.id==current_hero_id then
+                    HOME_SESSION.screensaver_file=entry.lock_path
+                    local current=HomeView.current()
+                    if current and current.opts then current.opts.screensaver_file=entry.lock_path end
+                end
+            end
+        end
+        if any_changed and HomeView.is_shown() and not self:_active_reader_ui() then
+            for section in pairs(changed_sections) do self:_home_bump_section_revision(section) end
+            local active=self._home_active_section or "account"
+            if hero_changed then self:_home_schedule_render_refresh("content")
+            elseif changed_sections[active] then self:_home_apply_section(active) end
+        end
+        logger.info("[MiuRead][CoverRender] visible cache ready","count=",tostring(#result.value))
+    end,55)
+    return started==true
 end
 
 function Plugin:_time_preferences()
@@ -4935,6 +5067,9 @@ function Plugin:_home_force_refresh_current_cover(book,on_done)
                 HOME_SESSION.screensaver_file=screensaver
                 local current=HomeView.current()
                 if current and current.opts then current.opts.screensaver_file=screensaver end
+                UIManager:scheduleIn(.25,function()
+                    if HomeView.is_shown() and not self:_active_reader_ui() then self:_home_schedule_cover_derivatives({hero}) end
+                end)
             end
         end
 
@@ -5391,6 +5526,7 @@ function Plugin:_home_stop_background(reason)
     self:_cancel_home_directory_request(reason or "home hidden")
     if self.home_metadata_async then self.home_metadata_async:cancel(reason or "home hidden") end
     if self.home_cover_async then self.home_cover_async:cancel(reason or "home hidden") end
+    if self.cover_render_async then self.cover_render_async:cancel(reason or "home hidden") end
 end
 
 function Plugin:_home_merge_directory_snapshot(snapshot,old_snapshot)
@@ -5945,6 +6081,7 @@ function Plugin:_home_schedule_remote_covers(books)
     if #queue==0 or not self.home_cover_async then return end
     local index,changed_count=1,0
     local changed_sections={}
+    local rendered_books={}
     local hero_changed=false
     local function mark_changed(book_id)
         local hero_id=tostring(self._home_hero and (self._home_hero.bookId or self._home_hero.book_id) or "")
@@ -5979,6 +6116,13 @@ function Plugin:_home_schedule_remote_covers(books)
             -- Let the final worker callback leave the input path before one
             -- bounded e-ink update. A later tab switch wins automatically.
             UIManager:scheduleIn(.35,apply_batch)
+        end
+        if #rendered_books>0 and generation==self._home_cover_generation then
+            UIManager:scheduleIn(.75,function()
+                if generation==self._home_cover_generation and HomeView.is_shown() and not self:_active_reader_ui() then
+                    self:_home_schedule_cover_derivatives(rendered_books)
+                end
+            end)
         end
     end
     local function next_cover()
@@ -6025,7 +6169,11 @@ function Plugin:_home_schedule_remote_covers(books)
             if result and result.ok and result.value then
                 self:_remember_cover_path(item.bookId,result.value)
                 local changed=self:_home_apply_cover_path(item.bookId,result.value)
-                if item.book then item.book.cover_path=result.value end
+                if item.book then
+                    item.book.cover_path=result.value
+                    item.book.home_cover_path=nil
+                    rendered_books[#rendered_books+1]=item.book
+                end
                 if changed then
                     changed_count=changed_count+1
                     mark_changed(item.bookId)
@@ -6886,10 +7034,10 @@ function Plugin:_mark_reader_busy(seconds)
     local target=math.max(now+math.max(1,tonumber(seconds) or 4),tonumber(self._reader_busy_until or 0) or 0)
     self._reader_busy_until=target
     local active_download=(self.download_task and self.download_task:busy()) or self._download_runtime~=nil
-    local wrote=true
-    -- The subprocess only needs the shared marker while a download is actually
-    -- competing for I/O. Normal reader panel opens stay memory-only.
-    if active_download then wrote=U.atomic_write(path,tostring(target),true)==true end
+    -- /tmp is also consumed by the lightweight read-report subprocess. Keep a
+    -- short shared deadline there for all reader interactions, not only while
+    -- downloading, so new interval uploads can yield to visible gestures.
+    local wrote=U.atomic_write(path,tostring(target),true)==true
     if active_download and self.performance_mode and self.performance_mode:enabled() and self.download_task then
         self.download_task:pause("reader_interaction")
         self:_schedule_reader_interaction_resume(target)
@@ -8638,10 +8786,8 @@ function Plugin:show_reader_more_panel()
     return self:show_reader_control_center("reading")
 end
 
-function Plugin:_show_reader_quick_panel_now()
-    if not (self.ui and self.ui.document) then return false end
-    local started=os.clock()
-    self:_mark_reader_busy(4)
+function Plugin:_reader_quick_panel_options()
+    if not (self.ui and self.ui.document) then return nil end
     local title=self:_reader_toolbar_title()
     local definitions=self:_reader_quick_definitions()
 
@@ -8730,7 +8876,7 @@ function Plugin:_show_reader_quick_panel_now()
         {icon="full-refresh",label="全屏刷新",callback=function() self:_home_full_refresh(true) end},
     }
 
-    local panel,err=ReaderToolbar.show{
+    return {
         header=self:_reader_toolbar_header(title),
         actions=actions,
         typeset=typeset,
@@ -8738,6 +8884,15 @@ function Plugin:_show_reader_quick_panel_now()
         warmth=warmth,
         device_actions=device_actions,
     }
+end
+
+function Plugin:_show_reader_quick_panel_now()
+    if not (self.ui and self.ui.document) then return false end
+    local started=os.clock()
+    self:_mark_reader_busy(3)
+    local options=self:_reader_quick_panel_options()
+    if not options then return false end
+    local panel,err=ReaderToolbar.show(options)
     if not panel then
         logger.warn("[MiuRead][ReaderToolbar] unavailable",tostring(err or "unknown"))
         return false
@@ -8749,6 +8904,9 @@ end
 
 function Plugin:show_reader_quick_panel()
     if not (self.ui and self.ui.document) then return false end
+    -- Publish the foreground-interaction window before the next-tick build so
+    -- reporting/download workers do not start new work against this gesture.
+    self:_mark_reader_busy(3)
     if self._reader_quick_panel_pending==true then return true end
     self._reader_quick_panel_pending=true
     UIManager:nextTick(function()
@@ -9471,6 +9629,11 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     end
     self:_home_schedule_local_metadata(metadata_targets)
     self:_home_schedule_remote_covers(cover_targets)
+    -- Existing covers are converted only after the home is already interactive.
+    -- Newly downloaded covers schedule the same worker when their batch ends.
+    UIManager:scheduleIn(.85,function()
+        if HomeView.is_shown() and not self:_active_reader_ui() then self:_home_schedule_cover_derivatives(cover_targets) end
+    end)
     local hero_needs_network = hero and (
         U.trim(tostring(hero.description or hero.intro or hero.summary or ""))==""
         or U.trim(tostring(hero.category or ""))==""
@@ -14774,6 +14937,23 @@ function Plugin:onReaderReady()
             logger.info("[MiuRead][ThoughtPopup] local tap ready before cloud sync")
         end
     end)
+    -- Prebuild the static toolbar shortly after the first page becomes usable.
+    -- This keeps the first downward swipe close to later cache-hit opens while
+    -- leaving cloud/network work for a later window.
+    UIManager:scheduleIn(.12,function()
+        if self.ui and self.ui.document
+            and tonumber(HOME_SESSION.reader_session_generation or 0)==ready_session
+            and not reader_close_active() and self._reader_quick_panel_pending~=true then
+            local started=os.clock()
+            local options=self:_reader_quick_panel_options()
+            if options then
+                local _,reused=ReaderToolbar.prepare(options)
+                logger.info("[MiuRead][ReaderToolbar] prepared",
+                    "cache_hit=",tostring(reused==true),
+                    "ms=",tostring(math.floor((os.clock()-started)*1000+.5)))
+            end
+        end
+    end)
     self:_teardown_thought_tap()
     self._progress_prompted_book_id=nil
     self._progress_check_running=false
@@ -14796,8 +14976,8 @@ function Plugin:onReaderReady()
     -- Let KOReader paint the first page and restore input before identity and
     -- cloud-progress work begins. Local comment taps are already installed by
     -- the next-tick block above, so this does not delay reading interaction.
-    UIManager:scheduleIn(.35,task)
-    UIManager:scheduleIn(1.2,function()
+    UIManager:scheduleIn(.85,task)
+    UIManager:scheduleIn(1.8,function()
         if self.ui and self.ui.document and not reader_close_active() then HomeData.quick_device_state(true) end
     end)
 end
@@ -14836,6 +15016,7 @@ function Plugin:onSetDimensions()
                     self._reader_dimension_width,self._reader_dimension_height=sw,sh
                     self._reader_dimension_rotation=rotation
                     if changed then
+                        ReaderToolbar.reset()
                         self:_install_reader_menu_bridge()
                         self:_install_reader_quick_panel_zone()
                         UIManager:setDirty("all","full")

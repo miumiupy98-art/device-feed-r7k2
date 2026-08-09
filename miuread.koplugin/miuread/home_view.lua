@@ -274,7 +274,7 @@ local function hero_card(book, width, height, callback, compact, hold_callback)
         math.floor(inner_h * .82)
     ))
     local cover_h = math.max(UiScale.dp(108, 92, 155), math.min(inner_h, math.floor(cover_w / .68)))
-    local cover = image_widget(book.cover_path, cover_w, cover_h, .05) or placeholder(cover_w, cover_h, book.title)
+    local cover = image_widget(book.home_cover_path or book.cover_path, cover_w, cover_h, .05) or placeholder(cover_w, cover_h, book.title)
     local gap = math.max(UiScale.dp(9, 7, 14), math.floor(width * .014))
     local text_w = math.max(1, inner_w - cover_w - gap)
     local heading_h = UiScale.dp(22, 20, 30)
@@ -500,7 +500,7 @@ local function shelf_book_card(book, width, height, callback, hold_callback)
     local extra_gaps = (status_h > 0 and 1 or 0) + (download_h > 0 and 1 or 0)
     local cover_h = math.max(UiScale.dp(78, 64, 108), height - title_h - extra_h - vgap * (1 + extra_gaps))
     local cover_w = math.max(UiScale.dp(54, 46, 78), math.min(math.floor(inner_w * .995), math.floor(cover_h * .715)))
-    local cover = image_widget(book.cover_path, cover_w, cover_h, .06) or placeholder(cover_w, cover_h, book.title)
+    local cover = image_widget(book.home_cover_path or book.cover_path, cover_w, cover_h, .06) or placeholder(cover_w, cover_h, book.title)
 
     local cover_layer = OverlapGroup:new{dimen = Geom:new{w = cover_w, h = cover_h}, allow_mirroring = false}
     cover_layer[#cover_layer + 1] = cover

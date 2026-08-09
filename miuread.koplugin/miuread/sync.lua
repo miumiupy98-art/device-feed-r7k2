@@ -16,7 +16,7 @@ Sync.__index = Sync
 local legacy_daemon_retired = false
 
 local CONTEXT_MAX_AGE = 15 * 60
-local READ_REPORT_SERVICE_VERSION = 13
+local READ_REPORT_SERVICE_VERSION = 14
 local FIRST_REPORT_DELAY = 10
 local FINAL_REPORT_MIN_SECONDS = 10
 
@@ -1656,6 +1656,7 @@ function Sync:_ensure_daemon()
         stop_path = paths.stop,
         owner_path = paths.owner,
         lock_path = paths.lock,
+        reader_busy_path = "/tmp/miuread-reader-busy.until",
     }
     local child = function() return ReadReportService.run(service_job) end
     local ok, pid, err = pcall(FFIUtil.runInSubProcess, child, false, false)

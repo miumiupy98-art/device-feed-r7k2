@@ -136,6 +136,7 @@ function Service.run(job)
     local stop_path = assert(job.stop_path, "missing stop path")
     local owner_path = job.owner_path
     local lock_path = job.lock_path
+    local reader_busy_path = tostring(job.reader_busy_path or "")
     local parent_pid = tonumber(job.parent_pid)
     local poll_interval = math.max(0.5, tonumber(job.poll_interval) or 1)
 
@@ -152,6 +153,12 @@ function Service.run(job)
     local last_flush_seq = 0
     local consecutive_failures = 0
     local blocked = false
+
+    local function reader_busy_until()
+        if reader_busy_path == "" then return 0 end
+        local raw = U.read_file(reader_busy_path, true)
+        return tonumber(raw or 0) or 0
+    end
 
     local function write_service_status(value, source_job)
         value=type(value)=="table" and value or {}
@@ -444,7 +451,13 @@ function Service.run(job)
                 local idle = now - last_activity
 
                 if now >= next_due then
-                    if idle <= idle_timeout then
+                    local busy_until = reader_busy_until()
+                    if busy_until > now then
+                        -- Never start a normal interval upload while the user is
+                        -- actively paging or opening a reader panel. Final
+                        -- suspend/close flushes above are intentionally exempt.
+                        next_due = math.max(next_due, busy_until + 1)
+                    elseif idle <= idle_timeout then
                         local elapsed = math.max(1, now - last_report_at)
                         next_due = run_report(control, elapsed, false, "interval")
                     else
