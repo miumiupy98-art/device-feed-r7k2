@@ -1,17 +1,17 @@
 {
-  "version": "4.3.0-beta.18",
-  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 4.3.0-beta.18 \u5185\u6d4b\u7248",
+  "version": "4.3.0-beta.19",
+  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 4.3.0-beta.19 \u5185\u6d4b\u7248",
   "channel": "beta",
   "package_type": "full",
-  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.18/miuread-v4.3.0-beta.18-full.zip",
+  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.19/miuread-v4.3.0-beta.19-full.zip",
   "package_urls": [
-    "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.18/miuread-v4.3.0-beta.18-full.zip",
-    "https://ghfast.top/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.18/miuread-v4.3.0-beta.18-full.zip",
-    "https://gh-proxy.com/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.18/miuread-v4.3.0-beta.18-full.zip",
-    "https://ghproxy.net/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.18/miuread-v4.3.0-beta.18-full.zip"
+    "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.19/miuread-v4.3.0-beta.19-full.zip",
+    "https://ghfast.top/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.19/miuread-v4.3.0-beta.19-full.zip",
+    "https://gh-proxy.com/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.19/miuread-v4.3.0-beta.19-full.zip",
+    "https://ghproxy.net/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.19/miuread-v4.3.0-beta.19-full.zip"
   ],
-  "size": 598158,
-  "sha256": "1ac884430787e2111a5c75824e8d17943f02850ff5d2e2e1a2ba67ebf9f3b68b",
-  "summary": "\u7a33\u5b9a \u4fee\u590d\u8bbe\u7f6e \u5feb\u6377\u9762\u677f\u548c\u9605\u8bfb\u5de5\u5177\u680f\u91cd\u590d\u6253\u5f00\u540e\u53ef\u80fd\u9000\u51fa\u7684\u95ee\u9898\n\u6027\u80fd \u9605\u8bfb\u65f6\u95f4\u4e0e\u72b6\u6001\u5199\u5165\u4ece30\u79d2\u8c03\u6574\u4e3a60\u79d2 \u51cf\u5c11\u91cd\u590d\u5c01\u9762\u5904\u7406\u548c\u540e\u53f0\u9884\u70ed\n\u754c\u9762 \u91cd\u6392\u4e3b\u9875Wi-Fi \u540c\u6b65 \u65f6\u95f4 \u7535\u6c60\u533a\u57df \u7edf\u4e00\u9605\u8bfb\u5feb\u6377\u680f\u56fe\u6807\u5927\u5c0f\u4e0e\u57fa\u7ebf\n\u98ce\u683c \u91cd\u505a\u89c5\u9605\u8bbe\u7f6e\u4e3a\u7edf\u4e00\u5217\u8868 \u79fb\u9664\u624b\u7ed8\u8fb9\u6846 \u89d2\u6807\u4e0e\u6c14\u6ce1\u5c3e\u5df4",
-  "notes": "\u7a33\u5b9a \u4fee\u590d\u8bbe\u7f6e \u5feb\u6377\u9762\u677f\u548c\u9605\u8bfb\u5de5\u5177\u680f\u91cd\u590d\u6253\u5f00\u540e\u53ef\u80fd\u9000\u51fa\u7684\u95ee\u9898\n\u6027\u80fd \u9605\u8bfb\u65f6\u95f4\u4e0e\u72b6\u6001\u5199\u5165\u4ece30\u79d2\u8c03\u6574\u4e3a60\u79d2 \u51cf\u5c11\u91cd\u590d\u5c01\u9762\u5904\u7406\u548c\u540e\u53f0\u9884\u70ed\n\u754c\u9762 \u91cd\u6392\u4e3b\u9875Wi-Fi \u540c\u6b65 \u65f6\u95f4 \u7535\u6c60\u533a\u57df \u7edf\u4e00\u9605\u8bfb\u5feb\u6377\u680f\u56fe\u6807\u5927\u5c0f\u4e0e\u57fa\u7ebf\n\u98ce\u683c \u91cd\u505a\u89c5\u9605\u8bbe\u7f6e\u4e3a\u7edf\u4e00\u5217\u8868 \u79fb\u9664\u624b\u7ed8\u8fb9\u6846 \u89d2\u6807\u4e0e\u6c14\u6ce1\u5c3e\u5df4"
+  "size": 600194,
+  "sha256": "6d788d0b6ce1f0f9e8bf2c846249f2c9151855ab6f81a6da269b432d3e20ad0e",
+  "summary": "\u4ea4\u4e92 \u6062\u590d\u4e3b\u9875\u5feb\u6377\u680f\u70b9\u51fb\u6c14\u6ce1 \u957f\u6309\u72ec\u7acb\u7ba1\u7406\u6c14\u6ce1 \u4e66\u7c4d\u957f\u6309\u4fdd\u7559\u5c31\u5730\u64cd\u4f5c\n\u754c\u9762 \u6c14\u6ce1\u7edf\u4e00\u4e3a\u89c4\u6574\u5706\u89d2\u4e0e\u4e00\u4f53\u5f0f\u5c3e\u5df4 \u4e0d\u4f7f\u7528\u624b\u7ed8\u88c5\u9970\n\u4e66\u67b6 \u957f\u6309\u4e66\u7c4d\u4f18\u5148\u663e\u793a\u5e38\u7528\u64cd\u4f5c \u5176\u4f59\u529f\u80fd\u6536\u8fdb\u66f4\u591a\u64cd\u4f5c\n\u7a33\u5b9a \u6c14\u6ce1\u5173\u95ed\u540e\u9500\u6bc1\u4e0d\u590d\u7528 \u957f\u6309\u91ca\u653e\u4e0d\u518d\u8bef\u89e6\u70b9\u51fb",
+  "notes": "\u4ea4\u4e92 \u6062\u590d\u4e3b\u9875\u5feb\u6377\u680f\u70b9\u51fb\u6c14\u6ce1 \u957f\u6309\u72ec\u7acb\u7ba1\u7406\u6c14\u6ce1 \u4e66\u7c4d\u957f\u6309\u4fdd\u7559\u5c31\u5730\u64cd\u4f5c\n\u754c\u9762 \u6c14\u6ce1\u7edf\u4e00\u4e3a\u89c4\u6574\u5706\u89d2\u4e0e\u4e00\u4f53\u5f0f\u5c3e\u5df4 \u4e0d\u4f7f\u7528\u624b\u7ed8\u88c5\u9970\n\u4e66\u67b6 \u957f\u6309\u4e66\u7c4d\u4f18\u5148\u663e\u793a\u5e38\u7528\u64cd\u4f5c \u5176\u4f59\u529f\u80fd\u6536\u8fdb\u66f4\u591a\u64cd\u4f5c\n\u7a33\u5b9a \u6c14\u6ce1\u5173\u95ed\u540e\u9500\u6bc1\u4e0d\u590d\u7528 \u957f\u6309\u91ca\u653e\u4e0d\u518d\u8bef\u89e6\u70b9\u51fb"
 }
