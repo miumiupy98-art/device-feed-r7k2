@@ -61,16 +61,11 @@ function M.annotation_sync(plugin)
         }
     end
     return {
-        {
-            text="微信读书批注同步（实验）",
-            post_text=plugin:annotation_sync_enabled() and "已开启 · 手动" or "已关闭",
-            checked_func=function() return plugin:annotation_sync_enabled() end,
-            keep_menu_open=true,
-            callback=function() plugin:toggle_annotation_sync() end,
-        },
-        {text="同步方式",post_text="手动 · 当前书籍在阅读页操作",enabled=false},
+        {text="批注同步",post_text="手动 · 阅读页批注中操作",enabled=false},
+        {text="立即同步入口",post_text="阅读页下滑工具栏 · 批注",enabled=false},
+        {text="自动上传",post_text="暂未开启 · 完成真机验证后开放",enabled=false},
         {text="坐标保护",post_text="raw XHTML · 双向校验 · 官方锚点",enabled=false},
-        {text="坐标诊断",post_text="打开书籍后在阅读页“批注”中导出",enabled=false},
+        {text="坐标诊断",post_text="打开书籍后在阅读页批注中导出",enabled=false},
         {text="新想法可见范围",post_text=plugin:annotation_sync_visibility_label(),sub_item_table_func=function() return plugin:annotation_sync_visibility_menu() end},
     }
 end

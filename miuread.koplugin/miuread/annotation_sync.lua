@@ -587,19 +587,24 @@ end
 
 function AnnotationSync:_bookmark_payload(row, located, version, prefs)
     local is_bookmark = row.kind == "bookmark"
-    return {
+    local chapter_uid = tonumber(row.chapter_uid) or tostring(row.chapter_uid or "")
+    local payload = {
         bookId=tostring(row.book_id or ""),
-        chapterUid=tostring(row.chapter_uid or ""),
+        -- chapterInfos/currentChapter uses a numeric chapterUid in the Web reader.
+        -- Preserve a non-numeric fallback only for unusual content variants.
+        chapterUid=chapter_uid,
         chapterIdx=tonumber(row.chapter_idx) or 0,
         bookVersion=tonumber(version) or 0,
         type=is_bookmark and 0 or 1,
-        style=is_bookmark and 0 or tonumber(prefs.highlight_style) or 0,
-        colorStyle=is_bookmark and 0 or tonumber(prefs.highlight_color) or 0,
+        style=is_bookmark and 0 or tonumber(prefs.highlight_style) or 1,
         range=tostring(located.range or ""),
-        -- WeRead web sends selected text verbatim for ADD_BOOKMARK.
-        -- Base64 here is rejected by /web/book/addBookmark as a parameter-format error.
+        -- WeRead Web passes the selected UTF-8 text verbatim into ADD_BOOKMARK.
         markText=tostring(located.mark_text or ""),
     }
+    -- The Web corner-bookmark request has no colorStyle field. Highlight
+    -- requests do, and their default is color 0 with underline style 1.
+    if not is_bookmark then payload.colorStyle=tonumber(prefs.highlight_color) or 0 end
+    return payload
 end
 
 function AnnotationSync:_review_payload(row, located, version, prefs)
@@ -899,8 +904,11 @@ function AnnotationSync:sync_book(book, record, options)
                             or self:_bookmark_payload(row, located, version, prefs)
                         if not is_review then
                             stage_log(row, "payload", true, string.format(
-                                "book/addBookmark type=%d markText=plain chars=%d",
-                                tonumber(payload.type) or -1, U.utf8_len(tostring(payload.markText or ""))))
+                                "book/addBookmark type=%d style=%d color=%s chapterIdx=%d bookVersion=%d markText=plain chars=%d",
+                                tonumber(payload.type) or -1, tonumber(payload.style) or -1,
+                                payload.colorStyle==nil and "none" or tostring(tonumber(payload.colorStyle) or 0),
+                                tonumber(payload.chapterIdx) or -1, tonumber(payload.bookVersion) or 0,
+                                U.utf8_len(tostring(payload.markText or ""))))
                         end
                         local payload_ok, payload_error = validate_payload(row, payload)
                         if not payload_ok then

@@ -8128,14 +8128,8 @@ function Plugin:_reader_annotation_summary_label()
 end
 
 function Plugin:_enable_annotation_sync_and_sync_current()
-    if not self:annotation_sync_enabled() then
-        local prefs,all=self:_annotation_sync_preferences()
-        prefs.enabled=true
-        all.annotation_sync=prefs
-        self.store:save_preferences(all)
-        logger.info("[MiuRead][AnnotationSync] enabled changed","enabled=",true,"mode=manual","source=reader")
-        self:toast("微信读书批注同步已开启",1.5)
-    end
+    -- Compatibility shim for older callbacks. Manual sync is an explicit
+    -- command and no longer changes a persistent enable/disable switch.
     UIManager:scheduleIn(.08,function()
         if self.ui and self.ui.document then self:sync_local_annotations_now() end
     end)
@@ -8157,8 +8151,10 @@ function Plugin:_show_reader_annotation_panel(back_callback)
     local title=current and current.book and U.trim(tostring(current.book.title or "")) or ""
     if title=="" then title="当前书籍" end
     local function return_to_panel() self:_show_reader_annotation_panel(back_callback) end
-    local enabled=self:annotation_sync_enabled()
-    local pending=tonumber(summary.pending or 0) or 0
+    local visible_counts=self:_reader_annotation_counts()
+    local pending_upload=tonumber(summary.pending or 0) or 0
+    local pending_delete=tonumber(summary.delete_pending or 0) or 0
+    local pending_work=pending_upload+pending_delete
     local failed=(tonumber(summary.locate_failed or 0) or 0)+(tonumber(summary.metadata_failed or 0) or 0)
         +(tonumber(summary.coord_failed or 0) or 0)+(tonumber(summary.unknown or 0) or 0)
     local legacy_synced=tonumber(summary.legacy_synced or 0) or 0
@@ -8168,12 +8164,11 @@ function Plugin:_show_reader_annotation_panel(back_callback)
         on_back=back_callback or function() self:show_reader_quick_panel() end,
         on_home=function() return self:return_to_miuread_home("reader surface") end,
         sections=function()
-            local current_enabled=self:annotation_sync_enabled()
             return {
                 {title="本书批注",rows={
-                    {icon="bookmark",label="书签",value=tostring(summary.bookmark or 0),callback=function() self:_show_reader_records("bookmark",return_to_panel) end},
-                    {icon="highlight",label="划线",value=tostring(summary.highlight or 0),callback=function() self:_show_reader_records("highlight",return_to_panel) end},
-                    {icon="thought",label="想法",value=tostring(summary.thought or 0),callback=function() self:_show_reader_records("thought",return_to_panel) end},
+                    {icon="bookmark",label="书签",value=tostring(visible_counts.bookmark or 0),callback=function() self:_show_reader_records("bookmark",return_to_panel) end},
+                    {icon="highlight",label="划线",value=tostring(visible_counts.highlight or 0),callback=function() self:_show_reader_records("highlight",return_to_panel) end},
+                    {icon="thought",label="想法",value=tostring(visible_counts.thought or 0),callback=function() self:_show_reader_records("thought",return_to_panel) end},
                 }},
                 self:annotation_sync_diagnostic_only() and {title="批注坐标诊断 · beta.11",rows={
                     {icon="warning",label="云端批注写入",value="已暂停 · 防止错误 range",value_bold=true,enabled=false},
@@ -8182,16 +8177,18 @@ function Plugin:_show_reader_annotation_panel(back_callback)
                     end},
                     {label="诊断内容",value="含已同步与待同步本地批注",enabled=false},
                     {label="文件位置",value="books/<bookId>/annotation-coordinate-diagnostics",enabled=false},
-                }} or {title="微信读书同步 · 实验",rows={
-                    {icon="sync",label="批注云同步",value=current_enabled and "已开启 · 手动" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_annotation_sync() end},
-                    {icon="upload",label="同步本书批注",value=current_enabled and ("待同步 "..tostring(pending)) or "开启并同步",value_bold=true,callback=function()
-                        if self:annotation_sync_enabled() then self:sync_local_annotations_now()
-                        else self:_enable_annotation_sync_and_sync_current() end
+                }} or {title="微信读书同步 · 手动",rows={
+                    {icon="upload",label="立即同步本书批注",value="上传 删除 云端对账",value_bold=true,callback=function()
+                        self:sync_local_annotations_now()
                     end},
-                    {label="同步状态",value=legacy_synced>0
+                    {icon="sync",label="待处理",value=pending_work>0
+                        and string.format("共 %d · 上传重试 %d · 删除 %d",pending_work,pending_upload,pending_delete)
+                        or "0 · 仍可手动对账",enabled=false},
+                    {label="同步详情",value=legacy_synced>0
                         and string.format("已同步 %d · 旧坐标 %d",tonumber(summary.synced or 0) or 0,legacy_synced)
                         or string.format("已同步 %d · 失败 %d",tonumber(summary.synced or 0) or 0,failed),
                         callback=function() self:show_local_annotation_sync_status() end},
+                    {label="自动上传",value="暂未开启 · 先完成真机验证",enabled=false},
                     {icon="diagnostics",label="坐标诊断",value="导出 raw / coord / range",callback=function()
                         self:sync_local_annotations_now(true)
                     end},
@@ -15434,7 +15431,7 @@ function Plugin:_annotation_sync_preferences()
     p.annotation_sync=type(p.annotation_sync)=="table" and p.annotation_sync or {}
     if p.annotation_sync.enabled==nil then p.annotation_sync.enabled=false end
     if tostring(p.annotation_sync.review_visibility or "")=="" then p.annotation_sync.review_visibility="private" end
-    p.annotation_sync.highlight_style=tonumber(p.annotation_sync.highlight_style) or 0
+    p.annotation_sync.highlight_style=tonumber(p.annotation_sync.highlight_style) or 1
     p.annotation_sync.highlight_color=tonumber(p.annotation_sync.highlight_color) or 0
     return p.annotation_sync,p
 end
@@ -15506,8 +15503,9 @@ function Plugin:show_local_annotation_sync_status()
         "想法："..tostring(summary.thought or 0),
         "",
         "已同步："..tostring(summary.synced or 0),
-        "待同步："..tostring(summary.pending or 0),
+        "待上传及重试："..tostring(summary.pending or 0),
         "待删除："..tostring(summary.delete_pending or 0),
+        "待处理合计："..tostring((tonumber(summary.pending or 0) or 0)+(tonumber(summary.delete_pending or 0) or 0)),
         "定位失败："..tostring(summary.locate_failed or 0),
         "元数据失败："..tostring(summary.metadata_failed or 0),
         "坐标校验失败："..tostring(summary.coord_failed or 0),
@@ -15531,14 +15529,9 @@ function Plugin:show_local_annotation_sync_status()
 end
 
 function Plugin:sync_local_annotations_now(force_diagnostic)
-    local annotation_enabled=self:annotation_sync_enabled()
     local diagnostic_only=force_diagnostic==true or self:annotation_sync_diagnostic_only()
     logger.info("[MiuRead][AnnotationSync] manual sync requested",
-        "enabled=",tostring(annotation_enabled), diagnostic_only and "mode=coordinate_diagnostic" or "mode=manual")
-    if not diagnostic_only and not annotation_enabled then
-        self:info("请先开启“微信读书批注同步（实验）”，或在阅读页“批注”中直接选择“同步本书批注”。")
-        return false
-    end
+        diagnostic_only and "mode=coordinate_diagnostic" or "mode=manual", "explicit=true")
     if not self:logged_in() then self:info("请先登录微信读书账号。") return false end
     local current=self:_current_book_record()
     local book_id=current and current.book and tostring(current.book.book_id or current.book.bookId or "") or ""
