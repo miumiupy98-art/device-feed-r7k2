@@ -5315,7 +5315,7 @@ function Plugin:_show_home_settings_popup(anchor)
         actions={
             {icon="▦",label="首页与书架",detail="布局、快捷入口和书架来源",callback=function() self:_show_standalone_menu("首页与书架",self:display_settings_menu()) end},
             {icon="A",label="阅读界面",detail="阅读快捷栏和显示方式",callback=function() self:_show_standalone_menu("阅读界面",self:reader_quick_panel_settings_menu()) end},
-            {icon="✎",label="评论与标注",detail="评论显示、本地划线与想法云同步",callback=function() self:_show_standalone_menu("评论与标注",PluginSettings.comments(self)) end},
+            {icon="✎",label="评论与批注",detail="评论显示、本地书签划线想法与云同步",callback=function() self:_show_standalone_menu("评论与批注",PluginSettings.comments(self)) end},
             {icon="⇩",label="下载与存储",detail="下载策略、目录和清理",callback=function() self:_show_standalone_menu("下载与存储",self:download_settings_menu()) end},
             {icon="⇅",label="账号与同步",detail="登录状态和同步设置",callback=function() self:_show_standalone_menu("账号与同步",self:account_sync_settings_menu()) end},
             {icon="◷",label="时间与时区",detail="修正 KOReader 的本地时间显示",callback=function() self:_show_standalone_menu("时间与时区",self:time_display_settings_menu()) end},
@@ -8106,6 +8106,90 @@ function Plugin:_reader_record_rows(kind)
     return rows
 end
 
+function Plugin:_reader_annotation_counts()
+    local annotations=(self.ui and self.ui.annotation and self.ui.annotation.annotations)
+        or (self.ui and self.ui.bookmark and self.ui.bookmark.bookmarks) or {}
+    local counts={bookmark=0,highlight=0,thought=0,total=0}
+    for _,item in ipairs(type(annotations)=="table" and annotations or {}) do
+        local kind=self:_reader_annotation_type(item)
+        if counts[kind]~=nil then
+            counts[kind]=counts[kind]+1
+            counts.total=counts.total+1
+        end
+    end
+    return counts
+end
+
+function Plugin:_reader_annotation_summary_label()
+    local counts=self:_reader_annotation_counts()
+    if (counts.total or 0)<=0 then return "暂无批注" end
+    return string.format("书签 %d · 划线 %d · 想法 %d",
+        tonumber(counts.bookmark or 0),tonumber(counts.highlight or 0),tonumber(counts.thought or 0))
+end
+
+function Plugin:_enable_annotation_sync_and_sync_current()
+    if not self:annotation_sync_enabled() then
+        local prefs,all=self:_annotation_sync_preferences()
+        prefs.enabled=true
+        all.annotation_sync=prefs
+        self.store:save_preferences(all)
+        logger.info("[MiuRead][AnnotationSync] enabled changed","enabled=",true,"mode=manual","source=reader")
+        self:toast("微信读书批注同步已开启",1.5)
+    end
+    UIManager:scheduleIn(.08,function()
+        if self.ui and self.ui.document then self:sync_local_annotations_now() end
+    end)
+    return true
+end
+
+function Plugin:_show_reader_annotation_panel(back_callback)
+    if not (self.ui and self.ui.document) then return false end
+    -- Refresh only the local mirror when the user explicitly opens this panel.
+    -- No network/range work runs during a normal highlight gesture or page turn.
+    self:_capture_local_annotation_snapshot("annotation_panel")
+    local current=self:_current_book_record()
+    local book_id=current and current.book and tostring(current.book.book_id or current.book.bookId or "") or ""
+    local summary=book_id~="" and LocalAnnotationDatabase.summary(self.store,book_id) or nil
+    summary=type(summary)=="table" and summary or {
+        total=0,bookmark=0,highlight=0,thought=0,pending=0,synced=0,
+        delete_pending=0,locate_failed=0,metadata_failed=0,unknown=0,
+    }
+    local title=current and current.book and U.trim(tostring(current.book.title or "")) or ""
+    if title=="" then title="当前书籍" end
+    local function return_to_panel() self:_show_reader_annotation_panel(back_callback) end
+    local enabled=self:annotation_sync_enabled()
+    local pending=tonumber(summary.pending or 0) or 0
+    local failed=(tonumber(summary.locate_failed or 0) or 0)+(tonumber(summary.metadata_failed or 0) or 0)+(tonumber(summary.unknown or 0) or 0)
+    ReaderSettingsDialog.show{
+        title="批注",
+        subtitle=U.utf8_truncate(title,42,"…").." · 书签 划线 想法统一管理",
+        on_back=back_callback or function() self:show_reader_quick_panel() end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        sections=function()
+            local current_enabled=self:annotation_sync_enabled()
+            return {
+                {title="本书批注",rows={
+                    {icon="bookmark",label="书签",value=tostring(summary.bookmark or 0),callback=function() self:_show_reader_records("bookmark",return_to_panel) end},
+                    {icon="highlight",label="划线",value=tostring(summary.highlight or 0),callback=function() self:_show_reader_records("highlight",return_to_panel) end},
+                    {icon="thought",label="想法",value=tostring(summary.thought or 0),callback=function() self:_show_reader_records("thought",return_to_panel) end},
+                }},
+                {title="微信读书同步 · 实验",rows={
+                    {icon="sync",label="批注云同步",value=current_enabled and "已开启 · 手动" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_annotation_sync() end},
+                    {icon="upload",label="同步本书批注",value=current_enabled and ("待同步 "..tostring(pending)) or "开启并同步",value_bold=true,callback=function()
+                        if self:annotation_sync_enabled() then self:sync_local_annotations_now()
+                        else self:_enable_annotation_sync_and_sync_current() end
+                    end},
+                    {label="同步状态",value=string.format("已同步 %d · 失败 %d",tonumber(summary.synced or 0) or 0,failed),callback=function() self:show_local_annotation_sync_status() end},
+                    {label="新想法可见范围",value=self:annotation_sync_visibility_label(),callback=function()
+                        self:_show_reader_menu_table("新想法可见范围",self:annotation_sync_visibility_menu(),return_to_panel)
+                    end},
+                }},
+            }
+        end,
+    }
+    return true
+end
+
 function Plugin:_show_reader_records(initial_kind,back_callback)
     local labels={bookmark="书签",highlight="划线",thought="想法"}
     ReaderListDialog.show{
@@ -8999,9 +9083,7 @@ function Plugin:_reader_control_categories()
             {icon="progress",label="阅读进度",value=(self:_reader_progress_percent() and (tostring(math.floor(self:_reader_progress_percent()+.5)).."%") or ""),callback=function() self:_show_reader_progress_control(back_to("reading")) end},
             {icon="search",label="书内搜索",value="搜索当前书籍",callback=function() self:_reader_show_search(back_to("reading")) end},
             {icon="undo",label="回到阅读处",value="返回跳转前位置",callback=function() self:_reader_go_back_location() end},
-            {icon="bookmark",label="书签",value="只看书页书签",callback=function() self:_show_reader_records("bookmark",back_to("reading")) end},
-            {icon="highlight",label="划线",value="只看正文划线",callback=function() self:_show_reader_records("highlight",back_to("reading")) end},
-            {icon="thought",label="想法",value="只看自己的想法",callback=function() self:_show_reader_records("thought",back_to("reading")) end},
+            {icon="highlight",label="批注",value=self:_reader_annotation_summary_label(),callback=function() self:_show_reader_annotation_panel(back_to("reading")) end},
             {icon="comment",label="评论",value=self:_thoughts_enabled_label(),value_bold=true,callback=function() self:_show_reader_comment_settings(back_to("reading")) end},
         }}}},
         {key="typeset",label="排版",sections={{items={
@@ -9064,9 +9146,7 @@ function Plugin:_reader_quick_definitions()
             self:_toggle_thoughts_enabled()
             UIManager:scheduleIn(.05,function() self:show_reader_quick_panel() end)
         end},
-        bookmark={key="bookmark",icon="bookmark",label="书签",callback=function() self:_show_reader_records("bookmark",function() self:show_reader_quick_panel() end) end},
-        highlight={key="highlight",icon="highlight",label="划线",callback=function() self:_show_reader_records("highlight",function() self:show_reader_quick_panel() end) end},
-        thought={key="thought",icon="thought",label="想法",callback=function() self:_show_reader_records("thought",function() self:show_reader_quick_panel() end) end},
+        annotations={key="annotations",icon="highlight",label="批注",callback=function() self:_show_reader_annotation_panel(function() self:show_reader_quick_panel() end) end},
         sync={key="sync",icon="sync",label="同步",callback=function() self:_show_reader_sync_panel(function() self:show_reader_quick_panel() end) end},
     }
 end
@@ -9086,9 +9166,8 @@ function Plugin:_reader_quick_panel_options()
 
     local actions={
         definitions.search,
-        definitions.bookmark,
-        definitions.highlight,
-        definitions.thought,
+        definitions.back,
+        definitions.annotations,
         definitions.comments,
     }
 
@@ -14420,7 +14499,7 @@ function Plugin:settings_menu()
     rows[#rows+1]={text="性能与兼容性",post_text=self:_performance_mode_label(),sub_item_table_func=function() return self:performance_settings_menu() end}
     -- Do not maintain a desktop-only comments menu. PluginSettings.comments()
     -- also owns local annotation sync controls and is shared with plugin mode.
-    rows[#rows+1]={text="评论与标注",post_text=self:_thought_display_label(),sub_item_table_func=function() return PluginSettings.comments(self) end}
+    rows[#rows+1]={text="评论与批注",post_text=self:_thought_display_label(),sub_item_table_func=function() return PluginSettings.comments(self) end}
     rows[#rows+1]={text="账号与同步",post_text=self:progress_sync_label(),sub_item_table_func=function() return self:account_sync_settings_menu() end}
     rows[#rows+1]={text="下载与存储",post_text=self:_download_settings_summary(),sub_item_table_func=function() return self:download_settings_menu() end}
     rows[#rows+1]={text="公众号阅读",sub_item_table_func=function() return self:mp_settings_menu() end}
@@ -15435,7 +15514,7 @@ function Plugin:sync_local_annotations_now()
     logger.info("[MiuRead][AnnotationSync] manual sync requested",
         "enabled=",tostring(annotation_enabled),"mode=manual")
     if not annotation_enabled then
-        self:info("请先在“评论与标注”中开启“本地批注云同步（实验）”。")
+        self:info("请先开启“微信读书批注同步（实验）”，或在阅读页“批注”中直接选择“同步本书批注”。")
         return false
     end
     if not self:logged_in() then self:info("请先登录微信读书账号。") return false end
