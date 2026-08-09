@@ -1,6 +1,7 @@
 local Protocol = require("miuread.protocol")
 local Config = require("miuread.config")
 local Codec = require("miuread.codec")
+local AnnotationCoord = require("miuread.annotation_coord")
 local Footnotes = require("miuread.footnotes")
 local ResourceRefs = require("miuread.resource_refs")
 local InternalLinks = require("miuread.internal_links")
@@ -27,7 +28,7 @@ local FOOTNOTE_TRANSFORM_VERSION = 2
 local LEGACY_TITLE_TRANSFORM_VERSION = 1
 local TITLE_TRANSFORM_VERSION = 2
 local LEGACY_ANNOTATION_TRANSFORM_VERSION = 1
-local ANNOTATION_TRANSFORM_VERSION = 4
+local ANNOTATION_TRANSFORM_VERSION = 5
 local IMAGE_TRANSFORM_VERSION = 2
 
 local BASE_CSS = [[
@@ -398,6 +399,7 @@ local function chapter_paths(cache, uid)
     return {
         dir = dir,
         base = dir .. "/base.xhtml",
+        coord = dir .. "/coord.xhtml",
         final = dir .. "/final.xhtml",
         css = dir .. "/style.css",
         asset_dir = dir .. "/assets",
@@ -515,13 +517,17 @@ local function cache_load_assets(cache, entry)
     return assets
 end
 
-local function cache_save_base(cache, chapter, body, style, assets, state)
+local function cache_save_base(cache, chapter, coord_body, body, style, assets, state)
     local uid = tostring(chapter.chapterUid or chapter.uid)
     local paths = chapter_paths(cache, uid)
     U.remove_tree(paths.dir)
     U.mkdir(paths.asset_dir)
     local ok, err = U.atomic_write(paths.base, body or "", true)
     if not ok then error("无法保存章节正文断点：" .. tostring(err)) end
+    if type(coord_body) == "string" and coord_body ~= "" then
+        ok, err = U.atomic_write(paths.coord, coord_body, true)
+        if not ok then error("无法保存章节坐标原文：" .. tostring(err)) end
+    end
     ok, err = U.atomic_write(paths.css, style or "", true)
     if not ok then error("无法保存章节样式断点：" .. tostring(err)) end
     cache_save_assets(cache, uid, assets)
@@ -533,6 +539,7 @@ local function cache_save_base(cache, chapter, body, style, assets, state)
     entry.content_done = true
     entry.complete = false
     entry.base_file = relative(cache.root, paths.base)
+    entry.coord_file = (type(coord_body) == "string" and coord_body ~= "") and relative(cache.root, paths.coord) or nil
     entry.css_file = relative(cache.root, paths.css)
     entry.content_format = state and state.content_format
     entry.structural = state and state.structural == true or false
@@ -559,7 +566,15 @@ local function cache_load_base(cache, entry)
     local style = U.read_file(absolute(cache.root, entry.css_file), true)
     local assets, asset_error = cache_load_assets(cache, entry)
     if body == nil or style == nil or not assets then return nil, asset_error or "正文断点文件缺失" end
-    return body, style, assets
+    local coord_body
+    if tostring(entry.coord_file or "") ~= "" then
+        coord_body = U.read_file(absolute(cache.root, entry.coord_file), true)
+        if coord_body == nil then
+            logger.warn("[MiuRead][Download] coord source missing; legacy alignment only",
+                "chapter=", tostring(entry.uid or ""))
+        end
+    end
+    return body, style, assets, coord_body
 end
 
 local function cache_save_final(cache, chapter, body, annotation, style, footnote_stats)
@@ -1361,7 +1376,7 @@ function Downloader:book(input, opt, progress)
         respect_reader_priority("chapter")
         local uid = tostring(chapter.chapterUid or chapter.uid)
         local entry = cache.manifest.chapters[uid]
-        local body, style, new_assets
+        local body, style, new_assets, coord_body
 
         if entry then
             local current_title = tostring(chapter.title or "")
@@ -1445,7 +1460,7 @@ function Downloader:book(input, opt, progress)
         end
 
         if entry and entry.content_done then
-            body, style, new_assets = cache_load_base(cache, entry)
+            body, style, new_assets, coord_body = cache_load_base(cache, entry)
             if body then
                 progress("resume", index, expected, chapter.title, {message="正文已完成，正在获取附加内容"})
             else
@@ -1470,9 +1485,13 @@ function Downloader:book(input, opt, progress)
             if state and (state.psvts or state.pclts or state.token or state.url) then
                 session = state
             end
+            -- Freeze the coordinate source before resource URL rewriting. Server
+            -- ranges are interpreted only against this immutable chapter body.
+            coord_body = type(state) == "table" and tostring(state.coord_html or "") or ""
+            if coord_body == "" then coord_body = AnnotationCoord.fromDownloadedXhtml(downloaded) end
             body = Codec.body(downloaded)
             body, style, new_assets = namespace_assets(body, downloaded_style, downloaded_assets, uid)
-            entry = cache_save_base(cache, chapter, body, style, new_assets, state)
+            entry = cache_save_base(cache, chapter, coord_body, body, style, new_assets, state)
         end
 
         local annotation
@@ -1497,8 +1516,12 @@ function Downloader:book(input, opt, progress)
                 annotation_error_map[uid]=nil
             end
             local extra_css,apply_stats
-            body,extra_css,apply_stats=self.annotations:apply(body,annotation)
+            body,extra_css,apply_stats=self.annotations:apply(body,annotation,coord_body)
             entry.annotation_fallback=tonumber(apply_stats and apply_stats.fallback or 0) or 0
+            entry.annotation_official=tonumber(apply_stats and apply_stats.official or 0) or 0
+            entry.annotation_official_verified=tonumber(apply_stats and apply_stats.official_verified or 0) or 0
+            entry.annotation_official_roundtrip=tonumber(apply_stats and apply_stats.official_roundtrip or 0) or 0
+            entry.annotation_official_failed=tonumber(apply_stats and apply_stats.official_failed or 0) or 0
             style=tostring(style or "").."\n"..tostring(extra_css or "")
             cache_save(cache)
         end
@@ -1538,7 +1561,7 @@ function Downloader:book(input, opt, progress)
         local rebuilt_chapters, rebuilt_assets = {}, {}
         local rebuilt_css_list, rebuilt_css_seen = {}, {}
         css_add(rebuilt_css_list, rebuilt_css_seen, BASE_CSS)
-        local rebuilt_annotations = {underlines=0, thoughts=0, fallbacks=0, chapters_ok=0, chapters_failed=0, errors={}}
+        local rebuilt_annotations = {underlines=0, thoughts=0, fallbacks=0, official=0, official_verified=0, official_roundtrip=0, official_failed=0, chapters_ok=0, chapters_failed=0, errors={}}
         local rebuilt_images={
             discovered=0,localized=0,optional=0,recovered=0,stale=0,missing=0,chapters=0,
             required_discovered=0,required_localized=0,required_missing=0,
@@ -1567,6 +1590,10 @@ function Downloader:book(input, opt, progress)
                     rebuilt_annotations.underlines = rebuilt_annotations.underlines + (tonumber(entry.underlines) or 0)
                     rebuilt_annotations.thoughts = rebuilt_annotations.thoughts + (tonumber(entry.thoughts) or 0)
                     rebuilt_annotations.fallbacks = rebuilt_annotations.fallbacks + (tonumber(entry.annotation_fallback) or 0)
+                    rebuilt_annotations.official = rebuilt_annotations.official + (tonumber(entry.annotation_official) or 0)
+                    rebuilt_annotations.official_verified = rebuilt_annotations.official_verified + (tonumber(entry.annotation_official_verified) or 0)
+                    rebuilt_annotations.official_roundtrip = rebuilt_annotations.official_roundtrip + (tonumber(entry.annotation_official_roundtrip) or 0)
+                    rebuilt_annotations.official_failed = rebuilt_annotations.official_failed + (tonumber(entry.annotation_official_failed) or 0)
                 end
             else
                 failure_map[uid] = failure_map[uid] or {uid=uid, title=chapter.title, error=tostring(final_style)}

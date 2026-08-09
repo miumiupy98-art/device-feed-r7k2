@@ -498,11 +498,11 @@ local function service_error(data, url)
         return "请求频率受限 " .. RATE_LIMIT_MARKER .. " error_code=" .. tostring(code or "rate_limit")
             .. (message ~= "" and (": " .. message) or "")
     end
-    if tonumber(code) == -2012 or tonumber(code) == -2041 or lower:find("login timeout", 1, true)
+    if tonumber(code) == -2011 or tonumber(code) == -2012 or tonumber(code) == -2041 or lower:find("login timeout", 1, true)
         or message:find("登录超时", 1, true) then
-        -- -2012 means the current web session can no longer be used. It does
+        -- -2011/-2012 mean the current web session can no longer be used. They do
         -- not prove that another device replaced this one, so keep the real
-        -- code and let the caller attempt one controlled cookie renewal.
+        -- code and let write callers decide whether one controlled renewal is safe.
         return auth_error_message(code or -2012, message)
     end
     if is_weread_url(url) and (message == "用户不存在" or lower == "user not found") then
@@ -521,6 +521,7 @@ local function is_auth_error(value)
     local text = tostring(value or "")
     local lower = text:lower()
     return text:find(AUTH_ERROR_MARKER, 1, true) ~= nil
+        or tonumber(auth_error_code(text)) == -2011
         or tonumber(auth_error_code(text)) == -2012
         or tonumber(auth_error_code(text)) == -2041
         or lower:find("http 401", 1, true) ~= nil

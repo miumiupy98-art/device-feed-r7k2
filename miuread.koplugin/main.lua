@@ -29,6 +29,7 @@ local Protocol=require("miuread.protocol")
 local MP=require("miuread.mp")
 local Access=require("miuread.access")
 local Annotations=require("miuread.annotations")
+local LocalAnnotationDatabase=require("miuread.local_annotation_database")
 local Downloader=require("miuread.downloader")
 local DownloadProgress=require("miuread.download_progress")
 local DownloadTask=require("miuread.download_task")
@@ -15209,12 +15210,55 @@ function Plugin:onPageUpdate(page)
     self:_schedule_reader_toolbar_state_refresh(current,.12)
     self.sync:on_page(page)
 end
+function Plugin:_capture_local_annotation_snapshot(reason)
+    if not (self.ui and self.ui.document) then return false end
+    local current=self:_current_book_record()
+    local book_id=current and current.book and tostring(current.book.book_id or current.book.bookId or "") or ""
+    if book_id=="" then return false end
+    local annotations=(self.ui.annotation and self.ui.annotation.annotations)
+        or (self.ui.bookmark and self.ui.bookmark.bookmarks) or {}
+    local ok,result=xpcall(function()
+        return LocalAnnotationDatabase.snapshot(self.store,book_id,annotations,current.path)
+    end,debug.traceback)
+    if ok and result then
+        logger.info("[MiuRead][LocalAnnotations] snapshot saved",
+            "book=",book_id,"count=",tostring(result.count or 0),
+            "reason=",tostring(reason or "quiet"))
+        return true
+    end
+    logger.warn("[MiuRead][LocalAnnotations] snapshot failed",
+        "book=",book_id,"reason=",tostring(reason or "quiet"),
+        tostring(result))
+    return false
+end
+
+function Plugin:_schedule_local_annotation_snapshot(reason,delay)
+    if not (self.ui and self.ui.document) then return false end
+    if self._local_annotation_snapshot_task then
+        UIManager:unschedule(self._local_annotation_snapshot_task)
+        self._local_annotation_snapshot_task=nil
+    end
+    local task
+    task=function()
+        if self._local_annotation_snapshot_task~=task then return end
+        self._local_annotation_snapshot_task=nil
+        self:_capture_local_annotation_snapshot(reason)
+    end
+    self._local_annotation_snapshot_task=task
+    UIManager:scheduleIn(math.max(.5,tonumber(delay) or 2.4),task)
+    return true
+end
+
 function Plugin:onAnnotationsModified()
     self._reader_checkpoint_dirty=true
     -- KOReader emits this for new, edited and deleted highlights/notes. Save
     -- once after a short quiet period so a later crash cannot discard a whole
     -- reading session, without writing on every pen movement.
     self:_schedule_reader_checkpoint("annotations_modified",2.0)
+    -- Mirror KOReader's local records after the same quiet period. This phase is
+    -- local-only: no range calculation and no network request runs in the pen/
+    -- gesture callback.
+    self:_schedule_local_annotation_snapshot("annotations_modified",2.4)
 end
 function Plugin:onSuspend()
     self._miuread_suspended=true
@@ -15224,6 +15268,10 @@ function Plugin:onSuspend()
     self:_set_foreground("suspended")
     StatusToast.set_blocked(true)
     StatusToast.close()
+    if self._local_annotation_snapshot_task then
+        UIManager:unschedule(self._local_annotation_snapshot_task)
+        self._local_annotation_snapshot_task=nil
+    end
     self:_close_miuread_transients()
     self:_cancel_reader_close_settle("suspend")
     if READER_CLOSE.state=="idle" then
@@ -15447,6 +15495,10 @@ function Plugin:onCloseDocument()
     if self._reader_checkpoint_task then
         UIManager:unschedule(self._reader_checkpoint_task)
         self._reader_checkpoint_task=nil
+    end
+    if self._local_annotation_snapshot_task then
+        UIManager:unschedule(self._local_annotation_snapshot_task)
+        self._local_annotation_snapshot_task=nil
     end
     if READER_CLOSE.state=="idle" then self._home_reader_transition=false end
     local closing_path=tostring(self:_current_document_path() or "")

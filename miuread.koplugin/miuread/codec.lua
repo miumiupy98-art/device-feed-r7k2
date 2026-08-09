@@ -22,6 +22,34 @@ function Codec.b64decode(data)
     return table.concat(out)
 end
 
+function Codec.b64encode(data)
+    local s = tostring(data or "")
+    local out = {}
+    for i = 1, #s, 3 do
+        local a = s:byte(i) or 0
+        local b = s:byte(i + 1) or 0
+        local c = s:byte(i + 2) or 0
+        local n = a * 65536 + b * 256 + c
+        local c1 = math.floor(n / 262144) % 64
+        local c2 = math.floor(n / 4096) % 64
+        local c3 = math.floor(n / 64) % 64
+        local c4 = n % 64
+        out[#out + 1] = alphabet:sub(c1 + 1, c1 + 1)
+        out[#out + 1] = alphabet:sub(c2 + 1, c2 + 1)
+        if i + 1 <= #s then
+            out[#out + 1] = alphabet:sub(c3 + 1, c3 + 1)
+        else
+            out[#out + 1] = "="
+        end
+        if i + 2 <= #s then
+            out[#out + 1] = alphabet:sub(c4 + 1, c4 + 1)
+        else
+            out[#out + 1] = "="
+        end
+    end
+    return table.concat(out)
+end
+
 local function positions(s)
     local n=#s; if n<4 then return {} elseif n<11 then return {0,2} end
     local take=math.min(4,math.floor((n+9)/10)); local pieces={}

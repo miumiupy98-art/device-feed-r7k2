@@ -3,6 +3,7 @@ local Protocol = require("miuread.protocol")
 local Cookies = require("miuread.cookies")
 local Http = require("miuread.http")
 local Codec = require("miuread.codec")
+local AnnotationCoord = require("miuread.annotation_coord")
 local Util = require("miuread.util")
 local logger = require("logger")
 local ok_socket, socket = pcall(require, "socket")
@@ -820,6 +821,7 @@ function Reader:_txt_once(book, chapter, opt, state)
     if not ok_b then b = "" end
     local xhtml = Codec.text_xhtml(Codec.decode_parts({a, b}))
     if not has_readable_content(xhtml, false) then error("decoded TXT chapter is empty") end
+    state.coord_html = AnnotationCoord.fromDownloadedXhtml(xhtml)
     state.content_format = "txt"
     return xhtml, "body{line-height:1.75;margin:5%;}", {}, state
 end
@@ -837,6 +839,9 @@ function Reader:_epub_once(book, chapter, opt, state)
     local b = self:shard("/web/book/chapter/e_1", id, uid, state.psvts, false)
     local c = self:shard("/web/book/chapter/e_3", id, uid, state.psvts, false)
     local xhtml = Codec.decode_parts({a, b, c})
+    -- Preserve the official coordinate source before image localization or any
+    -- MiuRead rewrite changes HTML character offsets.
+    state.coord_html = AnnotationCoord.fromDownloadedXhtml(xhtml)
 
     local css = "body{line-height:1.7;margin:5%;}img{max-width:100%;height:auto;}"
     local ok_style, style_raw = pcall(self.shard, self, "/web/book/chapter/e_2", id, uid, state.psvts, true)
