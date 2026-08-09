@@ -104,11 +104,15 @@ local HOME_QUICK_ITEM_LEGACY_DEFAULT={wifi=true,frontlight=true,refresh_shelf=tr
 -- 3.5 separates the always-visible home actions from the pull-down control
 -- center. Defaults intentionally avoid duplicates, while both areas remain
 -- fully configurable.
-local HOME_ACTION_ITEM_ORDER={"refresh","search","downloads","sync","frontlight","miuread_settings","all_books","history","file_manager","screenshot"}
-local HOME_ACTION_ITEM_DEFAULT={refresh=true,search=true,downloads=true,sync=true,frontlight=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false}
-local HOME_PANEL_ITEM_ORDER={"wifi","rotate","screenshot","koreader_settings","return_koreader","quit","frontlight","sync","miuread_settings","downloads","restart","sleep","full_refresh"}
+local HOME_ACTION_ITEM_V1_ORDER={"refresh","search","downloads","sync","frontlight","miuread_settings","all_books","history","file_manager","screenshot"}
+local HOME_ACTION_ITEM_V1_DEFAULT={refresh=true,search=true,downloads=true,sync=true,frontlight=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false}
+local HOME_ACTION_ITEM_ORDER={"refresh","search","downloads","sync","sleep","miuread_settings","frontlight","all_books","history","file_manager","screenshot"}
+local HOME_ACTION_ITEM_DEFAULT={refresh=true,search=true,downloads=true,sync=true,sleep=true,miuread_settings=true,frontlight=false,all_books=false,history=false,file_manager=false,screenshot=false}
+local HOME_ACTION_LAYOUT_VERSION=2
+local HOME_PANEL_ITEM_V1_ORDER={"wifi","rotate","screenshot","koreader_settings","return_koreader","quit","frontlight","sync","miuread_settings","downloads","restart","sleep","full_refresh"}
+local HOME_PANEL_ITEM_ORDER={"wifi","rotate","screenshot","koreader_settings","return_koreader","quit","sync","miuread_settings","downloads","restart","sleep","full_refresh"}
 local HOME_PANEL_ITEM_V1_DEFAULT={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=true,frontlight=false,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=false,full_refresh=false}
-local HOME_PANEL_ITEM_DEFAULT={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=false,frontlight=false,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=true,full_refresh=false}
+local HOME_PANEL_ITEM_DEFAULT={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=true,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=false,full_refresh=false}
 local HOME_PANEL_LAYOUT_VERSION=2
 local READER_QUICK_ITEM_LEGACY_ORDER={"home","toc","progress","font","typeset","sync","current_book","downloads","full_refresh","koreader_menu","sleep","more"}
 local READER_QUICK_ITEM_LEGACY_DEFAULT={home=true,toc=true,progress=true,font=true,typeset=true,sync=true,current_book=true,downloads=false,full_refresh=false,koreader_menu=false,sleep=false,more=true}
@@ -2124,27 +2128,75 @@ function Plugin:_home_preferences()
         if table.concat(normalized,"|")~=table.concat(home[order_key],"|") then changed=true end
         home[order_key]=normalized
     end
-    normalize_quick_group("action_items","action_order","action_layout_version",1,HOME_ACTION_ITEM_ORDER,HOME_ACTION_ITEM_DEFAULT)
-    normalize_quick_group("panel_items","panel_order","panel_layout_version",1,HOME_PANEL_ITEM_ORDER,HOME_PANEL_ITEM_DEFAULT)
-    -- Pull-down layout v2 changes only the recommended layout: sleep replaces
-    -- the low-frequency Exit KOReader slot. Preserve genuinely customized
-    -- layouts instead of resetting them during migration.
-    if (tonumber(home.panel_layout_version) or 0)<HOME_PANEL_LAYOUT_VERSION then
-        local old_recommended=quick_boolean_layout_matches(home.panel_items,HOME_PANEL_ITEM_V1_DEFAULT,HOME_PANEL_ITEM_ORDER)
-            and quick_order_matches(home.panel_order,HOME_PANEL_ITEM_ORDER)
+    -- Home action layout v2 replaces the duplicated frontlight shortcut with
+    -- the much more useful Sleep entry. Exact old recommended layouts migrate
+    -- automatically; customized layouts are preserved and merely learn about
+    -- the new optional Sleep item.
+    if (tonumber(home.action_layout_version) or 0)<HOME_ACTION_LAYOUT_VERSION then
+        home.action_items=type(home.action_items)=="table" and home.action_items or {}
+        home.action_order=type(home.action_order)=="table" and home.action_order or U.copy(HOME_ACTION_ITEM_V1_ORDER)
+        local old_recommended=quick_boolean_layout_matches(home.action_items,HOME_ACTION_ITEM_V1_DEFAULT,HOME_ACTION_ITEM_V1_ORDER)
+            and quick_order_matches(home.action_order,HOME_ACTION_ITEM_V1_ORDER)
         if old_recommended then
-            home.panel_items.quit=false
-            home.panel_items.sleep=Device:canSuspend()==true
+            home.action_items.frontlight=false
+            home.action_items.sleep=Device:canSuspend()==true
+        elseif home.action_items.sleep==nil then
+            home.action_items.sleep=false
         end
+        local has_sleep=false
+        for _,name in ipairs(home.action_order) do if name=="sleep" then has_sleep=true; break end end
+        if not has_sleep then
+            local inserted=false
+            local ordered={}
+            for _,name in ipairs(home.action_order) do
+                ordered[#ordered+1]=name
+                if name=="sync" then ordered[#ordered+1]="sleep"; inserted=true end
+            end
+            if not inserted then ordered[#ordered+1]="sleep" end
+            home.action_order=ordered
+        end
+        home.action_layout_version=HOME_ACTION_LAYOUT_VERSION
+        changed=true
+    end
+    normalize_quick_group("action_items","action_order","action_layout_version",HOME_ACTION_LAYOUT_VERSION,HOME_ACTION_ITEM_ORDER,HOME_ACTION_ITEM_DEFAULT)
+    -- Pull-down layout v2 keeps one horizontal row of six controls. Migrate
+    -- the old recommended row before frontlight is removed from the selectable
+    -- shortcut list; customized rows keep their enabled choices when possible.
+    if (tonumber(home.panel_layout_version) or 0)<HOME_PANEL_LAYOUT_VERSION then
+        home.panel_items=type(home.panel_items)=="table" and home.panel_items or {}
+        home.panel_order=type(home.panel_order)=="table" and home.panel_order or U.copy(HOME_PANEL_ITEM_V1_ORDER)
+        local old_recommended=quick_boolean_layout_matches(home.panel_items,HOME_PANEL_ITEM_V1_DEFAULT,HOME_PANEL_ITEM_V1_ORDER)
+            and quick_order_matches(home.panel_order,HOME_PANEL_ITEM_V1_ORDER)
+        -- Preserve the existing six shortcut choices. Only the old optional
+        -- frontlight tile is removed because frontlight now has its own direct
+        -- control section immediately below this row.
+        if old_recommended then
+            home.panel_items.quit=true
+            home.panel_items.sleep=false
+        end
+        home.panel_items.frontlight=nil
+        local kept={}
+        for _,name in ipairs(home.panel_order) do if name~="frontlight" then kept[#kept+1]=name end end
+        home.panel_order=kept
         home.panel_layout_version=HOME_PANEL_LAYOUT_VERSION
         changed=true
     end
+    normalize_quick_group("panel_items","panel_order","panel_layout_version",HOME_PANEL_LAYOUT_VERSION,HOME_PANEL_ITEM_ORDER,HOME_PANEL_ITEM_DEFAULT)
     -- Unsupported hardware controls disappear instead of leaving dead slots.
     if not Device:hasFrontlight() then
         if home.action_items.frontlight==true then home.action_items.frontlight=false; changed=true end
-        if home.panel_items.frontlight==true then home.panel_items.frontlight=false; changed=true end
     end
-    if not Device:canSuspend() and home.panel_items.sleep==true then home.panel_items.sleep=false; changed=true end
+    if not Device:canSuspend() then
+        if home.panel_items.sleep==true then home.panel_items.sleep=false; changed=true end
+        if home.action_items.sleep==true then home.action_items.sleep=false; changed=true end
+    end
+    local panel_enabled=0
+    for _,key in ipairs(home.panel_order or HOME_PANEL_ITEM_ORDER) do
+        if home.panel_items[key]==true then
+            panel_enabled=panel_enabled+1
+            if panel_enabled>6 then home.panel_items[key]=false; changed=true end
+        end
+    end
     if type(home.hidden_local_files)~="table" then home.hidden_local_files={}; changed=true end
     if home.more_expanded==nil then home.more_expanded=false; changed=true end
     if home.network_metadata==nil then home.network_metadata=true; changed=true end
@@ -3092,7 +3144,7 @@ function Plugin:_home_apply_section(section)
         shelf_page=page,
         shelf_pages=total_pages,
         empty_text=selected.empty,
-        on_open_book=function(book) self:_home_open_book(book) end,
+        on_open_book=function(book,anchor) self:_home_open_book(book,anchor) end,
         on_hold_book=function(book,anchor) self:_home_hold_book(book,anchor) end,
         home_actions=self:_home_action_entries(),
         on_shelf_all=function()
@@ -3681,7 +3733,7 @@ function Plugin:home_source_settings_menu()
 end
 
 local HOME_ACTION_LABELS={
-    refresh="刷新",search="搜索",downloads="下载",sync="同步",frontlight="前光",
+    refresh="刷新",search="搜索",downloads="下载",sync="同步",sleep="休眠",frontlight="前光",
     miuread_settings="觅阅设置",all_books="全部书籍",history="阅读历史",file_manager="文件管理",screenshot="截图",
 }
 local HOME_PANEL_LABELS={
@@ -3695,13 +3747,13 @@ function Plugin:_home_toggle_group_item(group,key)
     local is_action=group=="action"
     local items_key=is_action and "action_items" or "panel_items"
     local order=is_action and HOME_ACTION_ITEM_ORDER or HOME_PANEL_ITEM_ORDER
-    local max_count=is_action and 6 or 12
+    local max_count=6
     local items=home[items_key] or {}
     local currently=items[key]==true
     local count=0
     for _,name in ipairs(order) do if items[name]==true then count=count+1 end end
     if not currently and count>=max_count then
-        self:toast((is_action and "主页快捷栏最多显示六项" or "下滑工具栏最多显示十二项"),2)
+        self:toast((is_action and "主页快捷栏最多显示六项" or "下滑工具栏最多显示六项"),2)
         return false
     end
     items[key]=not currently
@@ -3775,7 +3827,7 @@ function Plugin:_home_group_settings_menu(group)
         home[items_key]={}
         for _,key in ipairs(order) do home[items_key][key]=defaults[key]==true end
         home[order_key]=U.copy(order)
-        home[version_key]=is_action and 1 or HOME_PANEL_LAYOUT_VERSION
+        home[version_key]=is_action and HOME_ACTION_LAYOUT_VERSION or HOME_PANEL_LAYOUT_VERSION
         self:_save_home_preferences(home,preferences)
         if HomeView.is_shown() then self:_refresh_home_view(nil,"content") end
         self:toast("已恢复推荐布局")
@@ -3801,7 +3853,7 @@ function Plugin:_home_restore_all_quick_defaults()
     home.action_items={}
     for _,key in ipairs(HOME_ACTION_ITEM_ORDER) do home.action_items[key]=HOME_ACTION_ITEM_DEFAULT[key]==true end
     home.action_order=U.copy(HOME_ACTION_ITEM_ORDER)
-    home.action_layout_version=1
+    home.action_layout_version=HOME_ACTION_LAYOUT_VERSION
     home.panel_items={}
     for _,key in ipairs(HOME_PANEL_ITEM_ORDER) do home.panel_items[key]=HOME_PANEL_ITEM_DEFAULT[key]==true end
     home.panel_order=U.copy(HOME_PANEL_ITEM_ORDER)
@@ -3819,13 +3871,13 @@ end
 function Plugin:home_customization_menu()
     return {
         {text="主页快捷栏",post_text=tostring(self:_home_group_enabled_count("action")).." / 6",sub_item_table_func=function() return self:home_action_settings_menu() end},
-        {text="下滑工具栏",post_text=tostring(self:_home_group_enabled_count("panel")).." / 12",sub_item_table_func=function() return self:home_panel_settings_menu() end},
+        {text="下滑工具栏",post_text=tostring(self:_home_group_enabled_count("panel")).." / 6",sub_item_table_func=function() return self:home_panel_settings_menu() end},
         {text="恢复全部推荐布局",post_text="主页 + 下滑工具栏",callback=function() self:_home_restore_all_quick_defaults() end},
     }
 end
 
-function Plugin:show_home_customization()
-    return self:_show_standalone_menu("主页自定义",self:home_customization_menu())
+function Plugin:show_home_customization(anchor)
+    return self:_show_standalone_menu("主页自定义",self:home_customization_menu(),{anchor=anchor})
 end
 
 local READER_QUICK_LABELS={
@@ -4102,12 +4154,98 @@ function Plugin:_show_miuread_menu(title,items,options)
     return dialog
 end
 
+function Plugin:_show_home_bubble_menu(title,items,options)
+    options=type(options)=="table" and options or {}
+    items=type(items)=="table" and items or {}
+    local resolved={}
+    for _,source in ipairs(items) do
+        if type(source)=="table" and source.hidden~=true then
+            local enabled=source.enabled~=false
+            if type(source.enabled_func)=="function" then
+                local ok,value=pcall(source.enabled_func)
+                enabled=ok and value~=false
+            end
+            local label=source.text
+            if label==nil and type(source.text_func)=="function" then
+                local ok,value=pcall(source.text_func); if ok then label=value end
+            end
+            label=tostring(label or "")
+            if type(source.checked_func)=="function" then
+                local ok,checked=pcall(source.checked_func)
+                if ok and checked==true then label="✓ "..label end
+            end
+            resolved[#resolved+1]={source=source,label=label,enabled=enabled,detail=tostring(source.post_text or "")}
+        end
+    end
+    if #resolved==0 then return ActionSheet.show{anchor=options.anchor,title=tostring(title or "觅阅"),subtitle="没有可用选项",auto_close=1.6} end
+    local page_size=math.max(4,math.min(8,tonumber(options.page_size) or 8))
+    local pages=math.max(1,math.ceil(#resolved/page_size))
+    local page=math.max(1,math.min(pages,tonumber(options.page) or 1))
+    local first=(page-1)*page_size+1
+    local last=math.min(#resolved,first+page_size-1)
+    local actions={}
+    local parent=options._bubble_parent
+    for index=first,last do
+        local row=resolved[index]
+        local source=row.source
+        local has_child=source.sub_item_table_func~=nil or source.sub_item_table~=nil
+        actions[#actions+1]={
+            icon=has_child and "›" or (row.label:sub(1,3)=="✓ " and "✓" or "•"),
+            label=row.label,detail=row.detail,enabled=row.enabled,submenu=has_child,
+            callback=function()
+                if has_child then
+                    local child=source.sub_item_table
+                    if type(source.sub_item_table_func)=="function" then
+                        local ok,value=xpcall(source.sub_item_table_func,debug.traceback)
+                        if not ok then self:info("这个入口暂时无法打开。\n\n"..tostring(value)); return end
+                        child=value
+                    end
+                    local child_opts=U.copy(options)
+                    child_opts.page=1
+                    child_opts._bubble_parent={title=title,items=items,options=U.copy(options)}
+                    child_opts._bubble_parent.options._bubble_parent=parent
+                    return self:_show_home_bubble_menu(tostring(source.text or title),child,child_opts)
+                end
+                if type(source.callback)=="function" then
+                    local ok,err=xpcall(source.callback,debug.traceback)
+                    if not ok then self:info("这个入口暂时无法打开。\n\n"..tostring(err)); return end
+                    if source.keep_menu_open==true then
+                        local reopen=U.copy(options); reopen.page=page
+                        UIManager:scheduleIn(.04,function() self:_show_home_bubble_menu(title,items,reopen) end)
+                    end
+                end
+            end,
+        }
+    end
+    local footer={}
+    if parent then
+        footer[#footer+1]={label="‹ 返回",callback=function()
+            local back=U.copy(parent.options or {})
+            return self:_show_home_bubble_menu(parent.title,parent.items,back)
+        end}
+    end
+    if page>1 then footer[#footer+1]={label="‹ 上一页",callback=function()
+        local previous=U.copy(options); previous.page=page-1
+        return self:_show_home_bubble_menu(title,items,previous)
+    end} end
+    if page<pages then footer[#footer+1]={label="下一页 ›",callback=function()
+        local following=U.copy(options); following.page=page+1
+        return self:_show_home_bubble_menu(title,items,following)
+    end} end
+    return ActionSheet.show{
+        anchor=options.anchor,preferred_direction=options.preferred_direction or "below",
+        width_ratio=tonumber(options.width_ratio) or .78,columns=1,
+        title=tostring(title or "觅阅"),subtitle=pages>1 and ("第 "..page.." / "..pages.." 页") or tostring(options.subtitle or ""),
+        actions=actions,footer_actions=footer,
+    }
+end
+
 function Plugin:_show_standalone_menu(title,items,options)
     options=options or {}
     items=type(items)=="table" and items or {}
     if options.force_native~=true and options.native_input~=true
         and HomeView.is_shown() and not self:_active_reader_ui() then
-        return self:_show_miuread_menu(title,items,options)
+        return self:_show_home_bubble_menu(title,items,options)
     end
     if options.reader_context==true and type(options.on_home)=="function"
         and not (items[1] and items[1]._miuread_reader_home==true) then
@@ -4936,7 +5074,28 @@ function Plugin:_home_source_text(book)
     return category~="" and ("微信书架 · "..category) or "微信书架"
 end
 
-function Plugin:_home_open_book(book)
+function Plugin:_show_home_book_open_popup(book,anchor)
+    local id=tostring(book and (book.bookId or book.book_id) or "")
+    local target=U.copy(book or {})
+    local state=self:_download_state()
+    local same_failed=state.status=="failed" and tostring(state.book_id or state.bookId or "")==id
+    local partial=id~="" and self.store:book_has_partial_cache(id)==true
+    local label=(same_failed or partial) and "继续下载 / 修复" or "下载并阅读"
+    ActionSheet.show{
+        anchor=anchor,preferred_direction="above",width_ratio=.62,
+        title=tostring(target.title or "书籍"),
+        subtitle=(same_failed or partial) and "下载尚未完整" or "这本书尚未下载",
+        actions={
+            {icon="⇩",label=label,detail=(same_failed or partial) and "继续现有任务，必要时重新生成" or "加入下载任务",callback=function()
+                self:choose_download(target,nil,false)
+            end},
+            {icon="i",label="查看详情",detail="书籍简介和出版信息",callback=function() self:book_details(target) end},
+        },
+    }
+    return true
+end
+
+function Plugin:_home_open_book(book,anchor)
     if book and (book.local_folder==true or book.kind=="folder") then
         local folder_path=LocalLibrary.normalize(book.folder_path or book.path)
         local root_path=LocalLibrary.normalize(book.root_path or folder_path)
@@ -4953,7 +5112,15 @@ function Plugin:_home_open_book(book)
     if Protocol.is_mp_account(id) then
         return self:_home_leave_and_run("mp account",function() self:mp_account(book) end)
     end
-    return self:_home_open_miuread(book)
+    self:_home_attach_local_record(book)
+    local record=id~="" and self:_preferred_record(id) or nil
+    if record and record.file and U.file_exists(record.file) then
+        self:_home_stop_background("opening book")
+        return self:_open_file_direct(record.file)
+    end
+    if id~="" then return self:_show_home_book_open_popup(book,anchor) end
+    self:info("本地书籍记录不存在")
+    return false
 end
 
 function Plugin:_home_book_key(book)
@@ -5032,7 +5199,7 @@ function Plugin:_home_show_full_shelf(title,rows,options)
             right_action_label=options.right_action_label,
             on_left_action=options.on_left_action,
             on_right_action=options.on_right_action,
-            on_select=function(book) self:_home_open_book(book) end,
+            on_select=function(book,anchor) self:_home_open_book(book,anchor) end,
             on_hold=function(book,anchor) self:_home_hold_book(book,anchor) end,
             on_page_changed=function(page,first,last,current)
                 if show_covers then self:_on_shelf_page(rows,current,page,first,last) end
@@ -5060,7 +5227,7 @@ function Plugin:_home_show_full_shelf(title,rows,options)
         items[#items+1]={
             text=tostring(row.title or "未命名"),
             post_text=tostring(row.author or ""),
-            callback=function() self:_home_open_book(row) end,
+            callback=function(anchor) self:_home_open_book(row,anchor) end,
             hold_callback=function() self:_home_hold_book(row) end,
         }
     end
@@ -5433,24 +5600,32 @@ function Plugin:_home_hide_local_book(book)
     return true
 end
 
-function Plugin:_home_delete_local_book(book)
+function Plugin:_home_delete_local_book(book,anchor,confirmed)
     local path=tostring(book and book.file or "")
     if path=="" or not U.file_exists(path) then self:info("本地文件不存在") return false end
-    UIManager:show(ConfirmBox:new{
-        text="删除本地文件《"..tostring(book.title or "书籍").."》？\n\n文件删除后无法通过觅阅恢复。阅读进度侧边文件不会主动删除。",
-        ok_text="删除文件",cancel_text="取消",
-        ok_callback=function()
-            local ok,err=os.remove(path)
-            if not ok then self:info("删除失败：\n"..tostring(err or "无法删除文件")); return end
-            local cache=self:_home_local_cache()
-            local kept={}
-            for _,row in ipairs(cache.books or {}) do if tostring(row.file or "")~=path then kept[#kept+1]=row end end
-            cache.books=kept
-            self.store:set("home_local_index",cache)
-            self:_show_miuread_home_now(false,true,true,"content")
-            self:toast("本地文件已删除")
-        end,
-    })
+    local function delete_now()
+        local ok,err=os.remove(path)
+        if not ok then self:info("删除失败：\n"..tostring(err or "无法删除文件")); return end
+        local cache=self:_home_local_cache()
+        local kept={}
+        for _,row in ipairs(cache.books or {}) do if tostring(row.file or "")~=path then kept[#kept+1]=row end end
+        cache.books=kept
+        self.store:set("home_local_index",cache)
+        self:_show_miuread_home_now(false,true,true,"content")
+        self:toast("本地文件已删除")
+    end
+    if confirmed==true then delete_now(); return true end
+    if HomeView.is_shown() then
+        return ActionSheet.show{
+            anchor=anchor,preferred_direction="above",width_ratio=.60,
+            title="删除本地文件？",subtitle="《"..tostring(book.title or "书籍").."》删除后无法通过觅阅恢复。",
+            actions={
+                {icon="×",label="取消",detail="保留本地文件",callback=function() end},
+                {icon="!",label="删除文件",detail="阅读进度侧边文件不会主动删除",danger=true,callback=delete_now},
+            },
+        }
+    end
+    UIManager:show(ConfirmBox:new{text="删除本地文件《"..tostring(book.title or "书籍").."》？\n\n文件删除后无法通过觅阅恢复。阅读进度侧边文件不会主动删除。",ok_text="删除文件",cancel_text="取消",ok_callback=delete_now})
     return true
 end
 
@@ -5569,15 +5744,16 @@ end
 
 function Plugin:_show_home_settings_popup(anchor)
     ActionSheet.show{
-        cache_key="home_settings_shortcut",
-        anchor=anchor,
-        preferred_direction="below",
-        width_ratio=.58,
-        title="觅阅设置",
-        subtitle="快捷入口",
+        cache_key="home_settings_shortcut",anchor=anchor,preferred_direction="below",width_ratio=.78,
+        title="觅阅设置",subtitle="所有设置保持统一气泡界面",
         actions={
-            {icon="⚙",label="打开觅阅设置",detail="进入完整设置中心",callback=function() self:_show_home_settings_center() end},
-            {icon="▦",label="主页自定义",detail="调整快捷栏与下滑工具栏",callback=function() self:show_home_customization() end},
+            {icon="▦",label="首页与书架",detail="布局 书架与快捷入口",callback=function() self:_show_standalone_menu("首页与书架",self:display_settings_menu(),{anchor=anchor}) end},
+            {icon="Aa",label="阅读界面",detail="显示与快捷控制",callback=function() self:_show_standalone_menu("阅读界面",self:reader_quick_panel_settings_menu(),{anchor=anchor}) end},
+            {icon="✎",label="评论、划线与想法",detail="评论显示与本地批注",callback=function() self:_show_standalone_menu("评论、划线与想法",PluginSettings.comments(self),{anchor=anchor}) end},
+            {icon="⇅",label="同步",detail="进度 时间与批注",callback=function() self:_show_standalone_menu("同步",self:sync_settings_menu(),{anchor=anchor}) end},
+            {icon="◷",label="时间与时区",detail="时间来源与地区显示",callback=function() self:_show_standalone_menu("时间与时区",self:time_display_settings_menu(),{anchor=anchor}) end},
+            {icon="↺",label="更新与关于",detail="版本 更新通道与说明",callback=function() self:_show_standalone_menu("更新与关于",PluginSettings.update_about(self),{anchor=anchor}) end},
+            {icon="⚙",label="工具与维护",detail="修复 清理与诊断",callback=function() self:_show_standalone_menu("工具与维护",self:maintenance_menu(),{anchor=anchor}) end},
         },
     }
 end
@@ -5667,20 +5843,141 @@ function Plugin:_home_move_visible_action(key,direction)
     return true
 end
 
+function Plugin:_show_home_quick_notice(anchor,title,subtitle,delay)
+    return ActionSheet.show{
+        anchor=anchor,preferred_direction="below",width_ratio=.48,
+        title=tostring(title or "完成"),subtitle=tostring(subtitle or ""),auto_close=tonumber(delay) or 1.4,
+    }
+end
+
+function Plugin:_home_replace_action_item(from_key,to_key)
+    if from_key==to_key then return true end
+    local home,preferences=self:_home_preferences()
+    local items=home.action_items or {}
+    if items[to_key]==true then return false end
+    local order=home.action_order or U.copy(HOME_ACTION_ITEM_ORDER)
+    local from_i,to_i
+    for i,name in ipairs(order) do
+        if name==from_key then from_i=i end
+        if name==to_key then to_i=i end
+    end
+    if not from_i or not to_i then return false end
+    order[from_i],order[to_i]=order[to_i],order[from_i]
+    items[from_key]=false; items[to_key]=true
+    home.action_items=items; home.action_order=order
+    self:_save_home_preferences(home,preferences)
+    if HomeView.is_shown() then self:_refresh_home_view(nil,"content") end
+    return true
+end
+
+function Plugin:_show_home_action_replace_popup(key,anchor)
+    local home=self:_home_preferences()
+    local actions={}
+    for _,candidate in ipairs(home.action_order or HOME_ACTION_ITEM_ORDER) do
+        if candidate~=key and home.action_items[candidate]~=true then
+            if candidate~="sleep" or Device:canSuspend() then
+                if candidate~="frontlight" or Device:hasFrontlight() then
+                    local target=candidate
+                    actions[#actions+1]={icon="↔",label=HOME_ACTION_LABELS[target] or target,detail="替换当前快捷项",callback=function()
+                        self:_home_replace_action_item(key,target)
+                    end}
+                end
+            end
+        end
+    end
+    return ActionSheet.show{
+        anchor=anchor,preferred_direction="below",width_ratio=.70,title="更换快捷项",subtitle="替换后保持当前位置",
+        actions=actions,
+    }
+end
+
+function Plugin:_home_action_function_actions(key,anchor)
+    if key=="refresh" then return {
+        {icon="↻",label="刷新当前页面",detail="只更新当前书架和状态",callback=function() self:_home_manual_refresh() end},
+        {icon="☁",label="更新微信书架",detail="重新获取微信书架变化",callback=function() self:_home_refresh_remote(true,true) end},
+        {icon="⌕",label="扫描本地书库",detail="检查本地书籍变化",callback=function() self:_home_scan_local(true) end},
+        {icon="i",label="补全书籍信息",detail="更新缺失资料",callback=function() self:_home_complete_refresh(true) end},
+        {icon="▤",label="全屏刷新",detail="清除墨水屏残影",callback=function() self:_home_full_refresh() end},
+        {icon="▦",label="刷新设置",detail="进入书架与刷新设置",callback=function() self:_show_standalone_menu("首页与书架",self:display_settings_menu(),{anchor=anchor}) end},
+    } end
+    if key=="search" then return {
+        {icon="⌕",label="搜索书籍",detail="按书名或作者查找",callback=function() self:show_home_search_dialog() end},
+        {icon="▦",label="全部书籍",detail="打开完整书架",callback=function() self:show_home_all_books() end},
+        {icon="◷",label="阅读历史",detail="查看最近阅读记录",callback=function() self:show_home_reading_history() end},
+        {icon="▤",label="本地书库",detail="浏览本地书籍",callback=function() self:show_home_local_library() end},
+        {icon="◎",label="公众号",detail="切换到公众号书架",callback=function() self:_set_home_section("mp") end},
+    } end
+    if key=="downloads" then return {
+        {icon="⇩",label="下载任务",detail="进度 排队与失败重试",callback=function() self:show_downloads() end},
+        {icon="⚙",label="下载设置",detail="策略 目录与提醒",callback=function() self:_show_standalone_menu("下载设置",self:download_settings_menu(),{anchor=anchor}) end},
+        {icon="✚",label="检查书籍完整性",detail="发现需要修复的已下载书",callback=function() self:scan_downloaded_books_for_integrity_repair() end},
+        {icon="⌫",label="存储清理",detail="清理临时文件与失效缓存",callback=function() self:show_download_cleanup_dialog() end},
+    } end
+    if key=="sync" then return {
+        {icon="⇅",label="立即同步",detail="处理当前待同步内容",callback=function() self:_sync_home_pending() end},
+        {icon="i",label="同步详情",detail="查看各类数据状态",callback=function() self:show_sync_status(false) end},
+        {icon="✚",label="修复同步",detail="检查并修复异常状态",callback=function() self:show_sync_status(true) end},
+        {icon="⚙",label="同步设置",detail="开关 范围与提醒",callback=function() self:_show_standalone_menu("同步设置",self:sync_settings_menu(),{anchor=anchor}) end},
+        {icon="!",label="同步诊断",detail="查看诊断信息",callback=function() self:_show_standalone_menu("同步诊断",self:sync_diagnostics_menu(),{anchor=anchor}) end},
+    } end
+    if key=="sleep" then
+        local rows={
+            {icon="◐",label="休眠",detail="立即进入休眠",callback=function() self:_home_sleep() end},
+            {icon="←",label="返回 KOReader",detail="离开觅阅桌面",callback=function() self:_home_close_to_native(true) end},
+            {icon="↺",label="重启 KOReader",detail="保存状态后重新启动",callback=function() self:_show_home_power_confirm(anchor,"重启 KOReader？","阅读状态会先保存。","重启",function() self:_restart_koreader("home power bubble") end) end},
+            {icon="⏻",label="退出 KOReader",detail="返回 Kindle 原生环境",callback=function() self:_show_home_power_confirm(anchor,"退出 KOReader？","当前阅读和设置会先保存。","退出",function() self:_quit_koreader(true) end) end},
+        }
+        if type(Device.canReboot)=="function" and Device:canReboot() then rows[#rows+1]={icon="↻",label="重启设备",detail="重新启动 Kindle",callback=function() self:_home_reboot_device(anchor) end} end
+        if type(Device.canPowerOff)=="function" and Device:canPowerOff() then rows[#rows+1]={icon="■",label="关闭设备",detail="完全关闭 Kindle",danger=true,callback=function() self:_home_poweroff_device(anchor) end} end
+        return rows
+    end
+    if key=="miuread_settings" then return {
+        {icon="▦",label="首页与书架",detail="布局 书架与快捷入口",callback=function() self:_show_standalone_menu("首页与书架",self:display_settings_menu(),{anchor=anchor}) end},
+        {icon="Aa",label="阅读界面",detail="显示与快捷控制",callback=function() self:_show_standalone_menu("阅读界面",self:reader_quick_panel_settings_menu(),{anchor=anchor}) end},
+        {icon="✎",label="评论与批注",detail="评论 划线与想法",callback=function() self:_show_standalone_menu("评论、划线与想法",PluginSettings.comments(self),{anchor=anchor}) end},
+        {icon="⇅",label="同步",detail="进度 时间与批注同步",callback=function() self:_show_standalone_menu("同步",self:sync_settings_menu(),{anchor=anchor}) end},
+        {icon="↺",label="更新与关于",detail="版本 更新通道与说明",callback=function() self:_show_standalone_menu("更新与关于",PluginSettings.update_about(self),{anchor=anchor}) end},
+        {icon="⚙",label="工具与维护",detail="修复 清理与诊断",callback=function() self:_show_standalone_menu("工具与维护",self:maintenance_menu(),{anchor=anchor}) end},
+    } end
+    if key=="frontlight" then return {
+        {icon="☼",label="亮度与色温",detail="完整前光控制",callback=function() self:_home_frontlight() end},
+        {icon="○",label="前光开关",detail="直接开启或关闭",callback=function() self:_reader_toggle_frontlight() end},
+        {icon="◐",label="夜间模式",detail="切换黑白显示",callback=function() self:_home_toggle_night() end},
+    } end
+    if key=="all_books" then return {
+        {icon="▦",label="全部书籍",detail="打开完整书架",callback=function() self:show_home_all_books() end},
+        {icon="◷",label="阅读历史",detail="最近阅读记录",callback=function() self:show_home_reading_history() end},
+    } end
+    if key=="history" then return {
+        {icon="◷",label="阅读历史",detail="最近阅读记录",callback=function() self:show_home_reading_history() end},
+        {icon="▦",label="全部书籍",detail="打开完整书架",callback=function() self:show_home_all_books() end},
+    } end
+    if key=="file_manager" then return {
+        {icon="▤",label="KOReader 文件管理",detail="打开原生文件浏览器",callback=function() self:_home_close_to_native(true) end},
+        {icon="▦",label="本地书库",detail="查看觅阅本地书籍",callback=function() self:show_home_local_library() end},
+    } end
+    if key=="screenshot" then return {
+        {icon="▣",label="开始截图",detail="进入截图模式",callback=function() ScreenshotMode.start(self,anchor) end},
+        {icon="▤",label="全屏刷新",detail="清除残影",callback=function() self:_home_full_refresh() end},
+    } end
+    return {}
+end
+
 function Plugin:_show_home_action_manage_popup(key,label,anchor)
     local can_left=self:_home_visible_action_neighbor(key,-1)~=nil
     local can_right=self:_home_visible_action_neighbor(key,1)~=nil
-    ActionSheet.show{
+    local actions=self:_home_action_function_actions(key,anchor)
+    local manage={
+        {label="← 左移",enabled=can_left,callback=function() self:_home_move_visible_action(key,-1) end},
+        {label="更换",callback=function() self:_show_home_action_replace_popup(key,anchor) end},
+        {label="隐藏",callback=function() self:_home_toggle_group_item("action",key) end},
+        {label="右移 →",enabled=can_right,callback=function() self:_home_move_visible_action(key,1) end},
+    }
+    return ActionSheet.show{
         cache_key="home_action_manage_"..tostring(key),
-        anchor=anchor,preferred_direction="below",width_ratio=.62,
-        title=tostring(label or HOME_ACTION_LABELS[key] or "快捷项"),
-        subtitle="长按管理主页快捷栏",
-        actions={
-            {icon="←",label="向左移动",detail="与左侧快捷项交换",enabled=can_left,callback=function() self:_home_move_visible_action(key,-1) end},
-            {icon="→",label="向右移动",detail="与右侧快捷项交换",enabled=can_right,callback=function() self:_home_move_visible_action(key,1) end},
-            {icon="−",label="隐藏此快捷项",detail="可在主页自定义中恢复",callback=function() self:_home_toggle_group_item("action",key) end},
-            {icon="⚙",label="快捷栏设置",detail="显示 隐藏与完整排序",callback=function() self:_show_standalone_menu("主页快捷栏",self:home_action_settings_menu()) end},
-        },
+        anchor=anchor,preferred_direction="below",width_ratio=.80,
+        title=tostring(label or HOME_ACTION_LABELS[key] or "快捷项"),subtitle="点击使用主功能 · 长按扩展与管理",
+        actions=actions,footer_actions=manage,
     }
 end
 
@@ -5770,14 +6067,28 @@ function Plugin:_show_home_local_book_more(book,anchor)
     }
 end
 
+function Plugin:_show_home_remote_book_more(book,anchor)
+    local target=U.copy(book or {})
+    local id=tostring(target.bookId or target.book_id or "")
+    local rows={
+        {text="生成／更新书籍",callback=function() self:choose_download(target,nil,false) end},
+        {text="按章节下载",callback=function() self:chapters(target) end},
+    }
+    if id~="" and self:_has_range_variant(id) then
+        rows[#rows+1]={text="扩展已有章节版",sub_item_table_func=function() return self:range_extend_menu(target) end}
+    end
+    if id~="" and (self:_book_has_cache(id) or self.store:book_has_partial_cache(id)) then
+        rows[#rows+1]={text="管理本书文件",callback=function() self:downloaded_book_menu(id) end}
+    end
+    rows[#rows+1]={text="书籍详情",callback=function() self:book_details(target) end}
+    return self:_show_standalone_menu("更多书籍操作",rows,{anchor=anchor})
+end
+
 function Plugin:_home_hold_book(book,anchor)
     if not book then return end
     if book.local_folder==true or book.kind=="folder" then
         local actions={
-            {icon=book.local_parent and "back" or "folder",
-                label=book.local_parent and "返回上一级" or "打开文件夹",
-                detail=book.local_parent and tostring(book.status_text or "上一级") or "在主页中显示这一层",
-                callback=function() self:_home_open_book(book) end},
+            {icon="▤",label="在文件管理中查看",detail="打开 KOReader 文件浏览器",callback=function() self:_home_close_to_native(true) end},
         }
         if not book.local_parent then
             actions[#actions+1]={icon="refresh",label="刷新这一层",detail="只更新当前文件夹",callback=function()
@@ -5807,7 +6118,6 @@ function Plugin:_home_hold_book(book,anchor)
             title=tostring(target.title or "公众号"),
             subtitle=U.trim(tostring(target.author or ""))~="" and tostring(target.author) or "公众号内容",
             actions={
-                {icon="▶",label="打开公众号",detail="查看文章列表",callback=function() self:mp_account(target) end},
                 {icon="i",label="查看信息",detail="作者与简介",callback=function()
                     local lines={tostring(target.title or "公众号")}
                     if U.trim(tostring(target.author or ""))~="" then lines[#lines+1]="作者："..tostring(target.author) end
@@ -5830,10 +6140,9 @@ function Plugin:_home_hold_book(book,anchor)
             title=tostring(book.title or "本地书籍"),
             subtitle=U.trim(tostring(book.author or ""))~="" and tostring(book.author) or "本地书籍",
             actions={
-                {icon="▶",label="打开书籍",detail="继续阅读",callback=function() self:_home_open_local(book) end},
                 {icon="i",label="查看详情",detail="文件、进度和图书信息",callback=function() self:_home_local_book_details(book) end},
                 {icon="↻",label="更新书籍信息",detail="重新提取并尝试网络补全",callback=function() self:_home_refresh_one_book_metadata(book,true) end},
-                {icon="!",label="删除本地文件",detail="删除后无法通过觅阅恢复",danger=true,callback=function() self:_home_delete_local_book(book) end},
+                {icon="!",label="删除本地文件",detail="删除后无法通过觅阅恢复",danger=true,callback=function() self:_home_delete_local_book(book,anchor) end},
             },
             footer_action={label="更多书籍操作  ›",callback=function() self:_show_home_local_book_more(book,anchor) end},
         }
@@ -5845,18 +6154,16 @@ function Plugin:_home_hold_book(book,anchor)
     local record=id~="" and self:_preferred_record(id) or nil
     local available=record and record.file and U.file_exists(record.file)
     local primary_actions={
-        {icon=available and "▶" or "⇩",label=available and "打开书籍" or "下载书籍",
-            detail=available and "继续阅读" or "加入下载任务",callback=function()
-                if available then self:_home_open_miuread(target) else self:choose_download(target,nil,false) end
-            end},
         {icon="i",label="查看详情",detail="书籍简介和出版信息",callback=function() self:book_details(target) end},
         {icon="↻",label="更新书籍信息",detail="微信读书详情与网络补全",callback=function() self:_home_refresh_one_book_metadata(target,true) end},
     }
     if available then
-        primary_actions[3]={icon="✚",label="修复这本书",detail="检查正文、目录和生成记录",callback=function() self:_home_repair_book(target) end}
-        primary_actions[4]={icon="⌫",label="删除书籍",detail="选择删除当前或全部版本",danger=true,callback=function()
+        primary_actions[#primary_actions+1]={icon="✚",label="修复这本书",detail="检查正文、目录和生成记录",callback=function() self:_home_repair_book(target) end}
+        primary_actions[#primary_actions+1]={icon="⌫",label="删除书籍",detail="选择删除当前或全部版本",danger=true,callback=function()
             self:_show_home_delete_book_popup(target,anchor)
         end}
+    else
+        primary_actions[#primary_actions+1]={icon="⇩",label="下载书籍",detail="加入下载任务",callback=function() self:choose_download(target,nil,false) end}
     end
     ActionSheet.show{
         anchor=anchor,
@@ -5866,7 +6173,7 @@ function Plugin:_home_hold_book(book,anchor)
         subtitle=U.trim(tostring(target.author or ""))~="" and tostring(target.author)
             or (available and "已下载" or "尚未下载"),
         actions=primary_actions,
-        footer_action={label="更多书籍操作  ›",callback=function() self:book_menu(target) end},
+        footer_action={label="更多书籍操作  ›",callback=function() self:_show_home_remote_book_more(target,anchor) end},
     }
 end
 
@@ -5885,27 +6192,27 @@ function Plugin:_home_action_entries()
     elseif sync_summary.total>0 then sync_badge=sync_summary.total>99 and "99+" or tostring(sync_summary.total) end
 
     local definitions={
-        refresh={icon="↻",icon_key="refresh",label="刷新",callback=function(anchor) self:_show_home_refresh_popup(anchor) end},
+        refresh={icon="↻",icon_key="refresh",label="刷新",callback=function(anchor)
+            self:_home_manual_refresh(); self:_show_home_quick_notice(anchor,"已刷新","当前书架和状态已更新")
+        end},
         search={icon="⌕",icon_key="search",label="搜索",callback=function(anchor) self:_show_home_search_popup(anchor) end},
-        downloads={icon="⇩",icon_key="download",label="下载",badge=download_badge,
-            callback=function(anchor) self:_show_home_download_popup(anchor) end},
-        sync={icon="⇅",icon_key="sync",label="同步",badge=sync_badge,callback=function(anchor) self:_show_home_sync_popup(anchor) end},
+        downloads={icon="⇩",icon_key="download",label="下载",badge=download_badge,callback=function(anchor) self:_show_home_download_popup(anchor) end},
+        sync={icon="⇅",icon_key="sync",label="同步",badge=sync_badge,callback=function(anchor)
+            self:_sync_home_pending(); self:_show_home_quick_notice(anchor,"正在同步","待处理内容已提交")
+        end},
         miuread_settings={icon="⚙",icon_key="settings",label="觅阅设置",callback=function(anchor) self:_show_home_settings_popup(anchor) end},
-        all_books={icon="▦",label="全部书籍",callback=function(anchor) self:_show_home_all_books_popup(anchor) end},
-        history={icon="◷",label="阅读历史",callback=function(anchor) self:_show_home_history_popup(anchor) end},
+        all_books={icon="▦",label="全部书籍",callback=function() self:show_home_all_books() end},
+        history={icon="◷",label="阅读历史",callback=function() self:show_home_reading_history() end},
         file_manager={icon="▤",label="文件管理",callback=function(anchor) self:_show_home_file_manager_popup(anchor) end},
-        screenshot={icon="▣",label="截图",callback=function(anchor) self:_show_home_screenshot_popup(anchor) end},
+        screenshot={icon="▣",label="截图",callback=function(anchor) ScreenshotMode.start(self,anchor) end},
     }
-    if Device:hasFrontlight() then
-        definitions.frontlight={icon="☼",icon_key="frontlight",label="前光",callback=function(anchor) self:_show_home_frontlight_popup(anchor) end}
-    end
+    if Device:canSuspend() then definitions.sleep={icon="◐",icon_key="sleep",label="休眠",callback=function() self:_home_sleep() end} end
+    if Device:hasFrontlight() then definitions.frontlight={icon="☼",icon_key="frontlight",label="前光",callback=function(anchor) self:_show_home_frontlight_popup(anchor) end} end
     for key,entry in pairs(definitions) do
-        local item_key=key
-        local item_label=entry.label
+        local item_key=key; local item_label=entry.label
         entry.hold_callback=function(anchor) self:_show_home_action_manage_popup(item_key,item_label,anchor) end
     end
-    local entries={}
-    local used={}
+    local entries,used={},{}
     for _,key in ipairs(home.action_order or HOME_ACTION_ITEM_ORDER) do
         if home.action_items[key]==true and definitions[key] and not used[key] then
             used[key]=true; entries[#entries+1]=definitions[key]
@@ -7298,37 +7605,52 @@ function Plugin:_home_device_power_busy(action_label)
     return false
 end
 
-function Plugin:_home_reboot_device()
+function Plugin:_show_home_power_confirm(anchor,title,detail,confirm_label,callback)
+    return ActionSheet.show{
+        anchor=anchor,preferred_direction="above",width_ratio=.58,
+        title=tostring(title or "确认操作"),subtitle=tostring(detail or ""),
+        actions={
+            {icon="×",label="取消",detail="不执行任何操作",callback=function() end},
+            {icon="!",label=tostring(confirm_label or "确定"),detail="保存当前状态后执行",danger=true,callback=callback},
+        },
+    }
+end
+
+function Plugin:_flush_before_power_action()
+    pcall(function() self:_flush_home_preferences() end)
+    pcall(function() self:onFlushSettings() end)
+    if Device and Device.saveSettings then pcall(Device.saveSettings,Device) end
+end
+
+function Plugin:_home_reboot_device(anchor,confirmed)
     if type(Device.canReboot)~="function" or not Device:canReboot() then
         self:info("当前设备不支持由 KOReader 重启设备")
         return false
     end
     if self:_home_device_power_busy("重启设备") then return false end
-    UIManager:show(ConfirmBox:new{
-        text="重启整个设备？\n\n这会重新启动 Kindle，而不是只重启 KOReader。",
-        ok_text="重启设备",
-        cancel_text="取消",
-        ok_callback=function()
-            UIManager:broadcastEvent(Event:new("RequestReboot"))
-        end,
-    })
+    if confirmed~=true and HomeView.is_shown() then
+        return self:_show_home_power_confirm(anchor,"重启整个设备？","这会重新启动 Kindle，而不是只重启 KOReader。","重启设备",function()
+            self:_home_reboot_device(anchor,true)
+        end)
+    end
+    self:_flush_before_power_action()
+    UIManager:broadcastEvent(Event:new("RequestReboot"))
     return true
 end
 
-function Plugin:_home_poweroff_device()
+function Plugin:_home_poweroff_device(anchor,confirmed)
     if type(Device.canPowerOff)~="function" or not Device:canPowerOff() then
         self:info("当前设备不支持由 KOReader 关机")
         return false
     end
     if self:_home_device_power_busy("关机") then return false end
-    UIManager:show(ConfirmBox:new{
-        text="关闭整个设备？\n\n日常使用建议优先使用休眠。",
-        ok_text="关机",
-        cancel_text="取消",
-        ok_callback=function()
-            UIManager:broadcastEvent(Event:new("RequestPowerOff"))
-        end,
-    })
+    if confirmed~=true and HomeView.is_shown() then
+        return self:_show_home_power_confirm(anchor,"关闭整个设备？","日常使用建议优先使用休眠。","关机",function()
+            self:_home_poweroff_device(anchor,true)
+        end)
+    end
+    self:_flush_before_power_action()
+    UIManager:broadcastEvent(Event:new("RequestPowerOff"))
     return true
 end
 
@@ -7445,9 +7767,6 @@ function Plugin:show_home_quick_panel(more_expanded)
         restart={icon="↺",icon_key="restart",label="重启",detail="",callback=function() self:_restart_koreader() end},
         full_refresh={icon="▤",icon_key="full-refresh",label="全屏刷新",detail="",callback=function() self:_home_full_refresh() end},
     }
-    if Device:hasFrontlight() then
-        definitions.frontlight={icon="☼",icon_key="frontlight",label="前光",detail="",callback=function() self:_home_frontlight() end}
-    end
     if Device:canSuspend() then
         definitions.sleep={icon="◐",icon_key="sleep",label="休眠",detail="",callback=function() self:_home_sleep() end}
     end
@@ -7456,21 +7775,39 @@ function Plugin:show_home_quick_panel(more_expanded)
     local buttons={}
     for _,key in ipairs(home.panel_order or HOME_PANEL_ITEM_ORDER) do
         if home.panel_items[key]==true and definitions[key] then buttons[#buttons+1]=definitions[key] end
-        if #buttons>=12 then break end
+        if #buttons>=6 then break end
     end
 
     local battery=tonumber(state.battery) and (tostring(math.floor(state.battery+.5)).."%") or "未知"
     local status_text=tostring(self._home_panel_status_text or "")
     if status_text=="" and sync_label:match("^失败") then status_text="同步需要处理" end
+    local frontlight_control=nil
+    if Device:hasFrontlight() then
+        local minimum,maximum=self:_reader_frontlight_bounds()
+        local warmth_state=self:_reader_warmth_state()
+        frontlight_control={
+            on_toggle=function() return self:_reader_toggle_frontlight() end,
+            on_night=function() return self:_home_toggle_night() end,
+            brightness={min=minimum,max=maximum,value=self:_reader_frontlight_value() or minimum,on_set=function(value)
+                if not self:_reader_set_frontlight(value) then return false end
+                return self:_reader_frontlight_value() or value
+            end},
+            warmth=warmth_state and {min=warmth_state.min,max=warmth_state.max,value=warmth_state.value,on_set=function(value)
+                if not self:_reader_set_warmth(value) then return false end
+                local latest=self:_reader_warmth_state(); return latest and latest.value or value
+            end} or nil,
+        }
+    end
     local prepared=os.clock()
     local panel,err=HomeQuickPanel.show{
         time_text=self:_display_time("%H:%M"),
         battery_text=battery,
         status_text=status_text,
         buttons=buttons,
-        on_customize=function() self:show_home_customization() end,
-        on_tools=function()
-            self:_show_standalone_menu("工具与维护",self:maintenance_menu())
+        frontlight=frontlight_control,
+        on_customize=function(anchor) self:show_home_customization(anchor) end,
+        on_tools=function(anchor)
+            self:_show_standalone_menu("工具与维护",self:maintenance_menu(),{anchor=anchor})
         end,
     }
     self._home_quick_panel_opening=false
@@ -7507,31 +7844,24 @@ function Plugin:_begin_koreader_exit(reason)
     self._home_view=nil
 end
 
-function Plugin:_quit_koreader()
+function Plugin:_quit_koreader(confirmed,anchor)
     local active=(self.download_task and self.download_task:busy()) or self._download_runtime~=nil
     local queued=#self.store:download_queue()>0
     local detail=""
-    if active and queued then
-        detail="\n\n当前任务会中断，重新启动后可继续；排队任务会保留。"
-    elseif active then
-        detail="\n\n当前任务会中断，重新启动后可继续。"
-    elseif queued then
-        detail="\n\n当前有一个排队任务，重新启动后仍会保留。"
+    if active and queued then detail="当前任务会中断，重启后可继续；排队任务会保留。"
+    elseif active then detail="当前任务会中断，重新启动后可继续。"
+    elseif queued then detail="当前有一个排队任务，重新启动后仍会保留。" end
+    local function do_exit()
+        self:_begin_koreader_exit("quit")
+        pcall(function() self:onFlushSettings() end)
+        if Device and Device.saveSettings then pcall(Device.saveSettings,Device) end
+        UIManager:nextTick(function() UIManager:broadcastEvent(Event:new("Exit")) end)
     end
-    UIManager:show(ConfirmBox:new{
-        text="退出 KOReader？"..detail,
-        ok_text="退出",
-        cancel_text="取消",
-        ok_callback=function()
-            self:_begin_koreader_exit("quit")
-            pcall(function() self:onFlushSettings() end)
-            if Device and Device.saveSettings then pcall(Device.saveSettings,Device) end
-            -- Use KOReader's normal Exit event so FileManager/ReaderUI can tear
-            -- down the entire widget stack. Calling UIManager:quit() directly
-            -- can leave a fullscreen replacement home as the last visible UI.
-            UIManager:nextTick(function() UIManager:broadcastEvent(Event:new("Exit")) end)
-        end,
-    })
+    if confirmed==true then do_exit(); return true end
+    if HomeView.is_shown() then
+        return self:_show_home_power_confirm(anchor,"退出 KOReader？",detail~="" and detail or "当前阅读和设置会先保存。","退出",do_exit)
+    end
+    UIManager:show(ConfirmBox:new{text="退出 KOReader？"..(detail~="" and ("\n\n"..detail) or ""),ok_text="退出",cancel_text="取消",ok_callback=do_exit})
     return true
 end
 
@@ -10389,7 +10719,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         elseif variant:find("clean",1,true) then
             hero.edition_text="纯净版"
         end
-        hero.on_tap=function() self:_home_open_book(hero) end
+        hero.on_tap=function(anchor) self:_home_open_book(hero,anchor) end
         hero.on_refresh_metadata=function() self:_home_refresh_current_network_metadata(hero) end
     end
 
@@ -10461,7 +10791,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         on_menu=function() self:show_home_menu() end,
         on_back=function() return self:_home_handle_back() end,
         on_empty_account=function() self:_home_open_section(active) end,
-        on_open_book=function(book) self:_home_open_book(book) end,
+        on_open_book=function(book,anchor) self:_home_open_book(book,anchor) end,
         on_hold_book=function(book,anchor) self:_home_hold_book(book,anchor) end,
         home_actions=self:_home_action_entries(),
         on_shelf_all=function()
@@ -13235,7 +13565,7 @@ function Plugin:downloaded_book_menu(book_ref)
     if self._download_book_menu then pcall(function() UIManager:close(self._download_book_menu) end) end
     if HomeView.is_shown() and not self:_active_reader_ui() then
         self._download_book_menu=nil
-        return self:_show_miuread_menu(b.title or book_id,items,{on_back=function() self:show_downloads() end,page_size=7})
+        return self:_show_home_bubble_menu(b.title or book_id,items,{page_size=7})
     end
     local menu=Menu:new{title=b.title or book_id,item_table=items,is_borderless=true,title_bar_fm_style=true}
     self._download_book_menu=menu

@@ -22,7 +22,7 @@ local TransientGuard = require("miuread.transient_guard")
 local UiScale = require("miuread.ui_scale")
 
 local live_sheet
-local MAX_PRIMARY_ACTIONS = 6
+local MAX_PRIMARY_ACTIONS = 10
 
 local function clock_ms()
     return math.floor((os.clock() or 0) * 1000 + .5)
@@ -241,7 +241,7 @@ function SheetWidget:_footer_group(actions, width, height)
     for _, action in ipairs(actions) do
         if type(action) == "table" and action.hidden ~= true then
             visible[#visible + 1] = action
-            if #visible >= 3 then break end
+            if #visible >= 4 then break end
         end
     end
     if #visible == 0 then return nil end
@@ -338,12 +338,12 @@ function SheetWidget:_build()
         columns=count<=1 and 1 or 2
     end
     local wide_last = self.opts.wide_last == true and columns == 2 and count % 2 == 1
-    local rows = math.max(1, math.ceil(count / columns))
+    local rows = count > 0 and math.ceil(count / columns) or 0
     local card_w = columns == 1 and inner_w or math.floor((inner_w - gap * (columns - 1)) / columns)
     local header_h = title_h + subtitle_h
     local content_h = header_h + (header_h > 0 and count > 0 and gap or 0)
         + rows * card_h + math.max(0, rows - 1) * gap
-        + (footer_h > 0 and (gap + footer_h) or 0)
+        + (footer_h > 0 and ((header_h > 0 or rows > 0) and gap or 0) + footer_h or 0)
     local panel_h = pad * 2 + content_h
     local max_h = math.floor(sh * (metrics.portrait and .66 or .82))
     panel_h = math.min(max_h, panel_h)
@@ -503,8 +503,19 @@ function SheetWidget:onScreenResize() return self:_close() end
 function SheetWidget:onRotation() return self:_close() end
 function SheetWidget:onShow()
     UIManager:setDirty(self, function() return "ui", self.bubble_dimen or self.panel_dimen end)
+    local delay=tonumber(self.opts and self.opts.auto_close)
+    if delay and delay>0 then
+        self._auto_close_callback=function()
+            if not self._closed then self:_close() end
+        end
+        UIManager:scheduleIn(delay,self._auto_close_callback)
+    end
 end
 function SheetWidget:onCloseWidget()
+    if self._auto_close_callback then
+        pcall(UIManager.unschedule,UIManager,self._auto_close_callback)
+        self._auto_close_callback=nil
+    end
     local region = self.bubble_dimen and self.bubble_dimen:copy() or (self.panel_dimen and self.panel_dimen:copy() or nil)
     local action = self.pending_action
     self.pending_action = nil

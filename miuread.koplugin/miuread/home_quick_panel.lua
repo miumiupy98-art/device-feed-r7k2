@@ -25,6 +25,11 @@ local Ui = require("miuread.ui_components")
 
 local Screen = Device.screen
 local live_panel
+local ok_socket, socket = pcall(require, "socket")
+local function wall_time()
+    if ok_socket and socket and type(socket.gettime) == "function" then return socket.gettime() end
+    return os.time()
+end
 
 local function face(name, nominal, maximum, minimum)
     return UiScale.face(name, nominal, maximum, minimum)
@@ -113,6 +118,87 @@ local function tappable(width, height, child, callback, hold_callback)
     return tap
 end
 
+local ControlSlider = InputContainer:extend{
+    dimen=nil, bar_w=1, value_w=1, value_gap=0,
+    min=0, max=100, value=0, on_change=nil, owner=nil,
+    slide_dimen=nil, value_text=nil, last_refresh=0,
+}
+function ControlSlider:init()
+    self.dimen=self.dimen or Geom:new{w=1,h=1}
+    self.min=tonumber(self.min) or 0
+    self.max=tonumber(self.max) or self.min+1
+    if self.max<=self.min then self.max=self.min+1 end
+    self.value=math.max(self.min,math.min(self.max,tonumber(self.value) or self.min))
+    self.slide_dimen=Geom:new{x=0,y=0,w=math.max(1,self.bar_w),h=self.dimen.h}
+    self.ges_events={
+        TapSlide={GestureRange:new{ges="tap",range=self.slide_dimen}},
+        PanSlide={GestureRange:new{ges="pan",range=self.slide_dimen}},
+    }
+    self.value_text=TextWidget:new{
+        text=tostring(math.floor(self.value+.5)),
+        face=face("smallinfofont",9.4,12.8,8.2),bold=true,
+        fgcolor=Blitbuffer.COLOR_BLACK,
+    }
+end
+function ControlSlider:getSize() return Geom:new{w=self.dimen.w,h=self.dimen.h} end
+function ControlSlider:_armed()
+    return self.owner and type(self.owner._controls_armed)=="function" and self.owner:_controls_armed()
+end
+function ControlSlider:_ratio()
+    return math.max(0,math.min(1,(self.value-self.min)/math.max(1,self.max-self.min)))
+end
+function ControlSlider:paintTo(bb,x,y)
+    self.dimen.x,self.dimen.y=x,y
+    self.slide_dimen.x,self.slide_dimen.y=x,y
+    local track_h=math.max(UiScale.line("medium"),UiScale.dp(4,3,6))
+    local marker=UiScale.dp(12,10,16)
+    local bar_y=y+math.floor((self.dimen.h-track_h)/2)
+    local ratio=self:_ratio()
+    local fill_w=math.max(track_h,math.floor(self.bar_w*ratio))
+    local marker_x=x+math.floor((self.bar_w-marker)*ratio)
+    bb:paintRect(x,bar_y,self.bar_w,track_h,Blitbuffer.COLOR_GRAY)
+    bb:paintRect(x,bar_y,math.min(self.bar_w,fill_w),track_h,Blitbuffer.COLOR_BLACK)
+    bb:paintRect(marker_x,y+math.floor((self.dimen.h-marker)/2),marker,marker,Blitbuffer.COLOR_BLACK)
+    local size=self.value_text:getSize()
+    self.value_text:paintTo(bb,x+self.bar_w+self.value_gap+math.floor((self.value_w-size.w)/2),y+math.floor((self.dimen.h-size.h)/2))
+end
+function ControlSlider:_set_from_position(ges,force)
+    if not self:_armed() then return true end
+    local pos=ges and ges.pos
+    if not pos then return false end
+    local ratio=math.max(0,math.min(1,(pos.x-self.dimen.x)/math.max(1,self.bar_w)))
+    local target=math.floor(self.min+ratio*(self.max-self.min)+.5)
+    local actual=target
+    if self.on_change then
+        local ok,result=pcall(self.on_change,target)
+        if not ok then logger.warn("[MiuRead][QuickPanel] frontlight slider failed",tostring(result)); return true end
+        if result==false then return true end
+        if tonumber(result) then actual=tonumber(result) end
+    end
+    self.value=math.max(self.min,math.min(self.max,actual))
+    self.value_text:setText(tostring(math.floor(self.value+.5)))
+    local interval=Screen.low_pan_rate and .10 or .04
+    if force or os.clock()-(tonumber(self.last_refresh) or 0)>=interval then
+        self.last_refresh=os.clock()
+        UIManager:setDirty(self.owner,function() return "ui",self.dimen end)
+    end
+    return true
+end
+function ControlSlider:onTapSlide(_,ges) return self:_set_from_position(ges,true) end
+function ControlSlider:onPanSlide(_,ges)
+    if not self:_armed() then return true end
+    local direction=tostring(ges and ges.direction or "")
+    local horizontal=direction=="east" or direction=="west"
+    local relative=ges and ges.relative
+    if not horizontal and relative then
+        local dx=math.abs(tonumber(relative.x) or 0)
+        local dy=math.abs(tonumber(relative.y) or 0)
+        horizontal=dx>=UiScale.dp(8,6,12) and dx>dy*1.25
+    end
+    if not horizontal then return true end
+    return self:_set_from_position(ges,false)
+end
+
 local function panel_button(entry, width, height, close_callback, compact, owner, index)
     local label = tostring(entry.label or entry.text or "")
     local detail = tostring(entry.detail or "")
@@ -195,6 +281,7 @@ local QuickPanelWidget = InputContainer:extend{
     panel_h = 0,
     _closed = false,
     pending_action = nil,
+    _controls_armed_at = 0,
 }
 
 function QuickPanelWidget:handleEvent(event)
@@ -211,6 +298,18 @@ end
 
 function QuickPanelWidget:_add(children, x, y, widget)
     children[#children + 1] = OffsetContainer:new{x_off = x, y_off = y, widget}
+end
+
+function QuickPanelWidget:_controls_armed()
+    return wall_time()>=(tonumber(self._controls_armed_at) or 0)
+end
+
+function QuickPanelWidget:_guarded(action)
+    return function(anchor)
+        if not self:_controls_armed() then return true end
+        if type(action)=="function" then return action(anchor) end
+        return true
+    end
 end
 
 function QuickPanelWidget:_close(action, cancel_pending)
@@ -235,10 +334,12 @@ function QuickPanelWidget:_build()
     local buttons = type(self.opts.buttons) == "table" and self.opts.buttons or {}
     local line = UiScale.line("thin")
 
-    -- Keep the default six controls on one row. Custom layouts use the same
-    -- six-column grid, so 7–12 controls simply add a second row.
+    -- The pull-down shortcut strip is always one horizontal row of six.
     local columns = 6
-    local rows = #buttons > 0 and math.ceil(math.min(#buttons, 12) / columns) or 0
+    local rows = #buttons > 0 and 1 or 0
+    local frontlight=type(self.opts.frontlight)=="table" and self.opts.frontlight or nil
+    local warmth=frontlight and type(frontlight.warmth)=="table" and frontlight.warmth or nil
+    local frontlight_h=frontlight and UiScale.dp(warmth and 142 or 94,warmth and 126 or 84,warmth and 182 or 122) or 0
 
     local title_h = UiScale.dp(52, 47, 70)
     local button_h = UiScale.dp(98, 90, 128)
@@ -250,6 +351,7 @@ function QuickPanelWidget:_build()
         self.panel_h = self.panel_h + rows * button_h + math.max(0, rows - 1) * gap + gap
     end
     if status_h > 0 then self.panel_h = self.panel_h + status_h + gap end
+    if frontlight_h > 0 then self.panel_h = self.panel_h + line + gap + frontlight_h + gap end
     if footer_h > 0 then self.panel_h = self.panel_h + line + gap + footer_h end
     self.panel_h = math.min(sh - margin, self.panel_h)
 
@@ -305,7 +407,7 @@ function QuickPanelWidget:_build()
     if rows > 0 then
         local button_w = math.floor((sw - margin * 2 - gap * (columns - 1)) / columns)
         for index, entry in ipairs(buttons) do
-            if index > 12 then break end
+            if index > 6 then break end
             local row = math.floor((index - 1) / columns)
             local col = (index - 1) % columns
             self:_add(children, margin + col * (button_w + gap), y + row * (button_h + gap),
@@ -314,8 +416,60 @@ function QuickPanelWidget:_build()
         y = y + rows * button_h + math.max(0, rows - 1) * gap + gap
     end
 
+    if frontlight_h > 0 and y + line + gap + frontlight_h <= self.panel_h then
+        self:_add(children,margin,y,LineWidget:new{
+            background=Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_GRAY,
+            dimen=Geom:new{w=sw-margin*2,h=line},
+        })
+        y=y+line+gap
+        local content_w=sw-margin*2
+        local header_h=UiScale.dp(36,32,47)
+        local button_w=UiScale.dp(116,100,150)
+        local header_gap=UiScale.dp(7,5,10)
+        local title_w=math.max(1,content_w-button_w*2-header_gap*2)
+        local toggle=tappable(button_w,header_h,
+            fixed_frame(button_w,header_h,{bordersize=UiScale.line("thin"),radius=UiScale.radius(6,5,9),background=Blitbuffer.COLOR_WHITE},
+                Ui.text("前光开关",button_w-UiScale.dp(6,4,8),header_h,face("smallinfofont",9.6,13.2),{bold=true})),
+            self:_guarded(frontlight.on_toggle))
+        local night=tappable(button_w,header_h,
+            fixed_frame(button_w,header_h,{bordersize=UiScale.line("thin"),radius=UiScale.radius(6,5,9),background=Blitbuffer.COLOR_WHITE},
+                Ui.text("夜间模式",button_w-UiScale.dp(6,4,8),header_h,face("smallinfofont",9.6,13.2),{bold=true})),
+            self:_guarded(frontlight.on_night))
+        self:_add(children,margin,y,HorizontalGroup:new{
+            align="center",
+            LeftContainer:new{dimen=Geom:new{w=title_w,h=header_h},Ui.text("前光",title_w,header_h,face("cfont",13.4,18.2),{bold=true,halign="left"})},
+            HorizontalSpan:new{width=header_gap},toggle,HorizontalSpan:new{width=header_gap},night,
+        })
+        y=y+header_h+UiScale.dp(5,4,7)
+
+        local function add_slider(setting,label)
+            setting=type(setting)=="table" and setting or nil
+            if not setting then return end
+            local row_h=UiScale.dp(42,37,54)
+            local label_w=UiScale.dp(72,62,94)
+            local value_w=UiScale.dp(48,42,62)
+            local value_gap=UiScale.dp(5,4,8)
+            local bar_w=math.max(1,content_w-label_w-value_w-value_gap)
+            local slider=ControlSlider:new{
+                dimen=Geom:new{w=bar_w+value_gap+value_w,h=row_h},bar_w=bar_w,value_w=value_w,value_gap=value_gap,
+                min=setting.min,max=setting.max,value=setting.value,on_change=setting.on_set,owner=self,
+            }
+            self:_add(children,margin,y,HorizontalGroup:new{
+                align="center",
+                LeftContainer:new{dimen=Geom:new{w=label_w,h=row_h},Ui.text(label,label_w,row_h,face("smallinfofont",10.2,14),{bold=true,halign="left"})},
+                slider,
+            })
+            y=y+row_h+UiScale.dp(3,2,5)
+        end
+        add_slider(frontlight.brightness,"亮度")
+        if warmth then add_slider(warmth,"色温") end
+        y=math.max(y,margin+title_h+line+gap*2+rows*button_h+gap+frontlight_h)
+    end
+
+    -- Keep the frontlight controls immediately below the six horizontal
+    -- shortcuts. Any transient status message follows the controls instead
+    -- of splitting that relationship.
     if status_h > 0 and y + status_h <= self.panel_h then
-        -- Status/notice is intentionally text-first, not another boxed card.
         local status_box=Ui.textbox(tostring(self.opts.status_text or ""),
             sw - margin * 2, status_h,
             face("smallinfofont", 10.8, 15), {
@@ -347,8 +501,8 @@ function QuickPanelWidget:_build()
             local customize = tappable(item_w, footer_h,
                 fixed_frame(item_w, footer_h, {bordersize = 0, background = Blitbuffer.COLOR_WHITE},
                     Ui.text("自定义", item_w, footer_h, face("cfont", 13.2, 18), {bold = true})),
-                function()
-                    self:_close(function() self.opts.on_customize() end)
+                function(anchor)
+                    self:_close(function() self.opts.on_customize(anchor) end)
                 end)
             self:_add(children, x, y, customize)
             x = x + item_w + footer_gap
@@ -357,8 +511,8 @@ function QuickPanelWidget:_build()
             local tools = tappable(item_w, footer_h,
                 fixed_frame(item_w, footer_h, {bordersize = 0, background = Blitbuffer.COLOR_WHITE},
                     Ui.text("工具与维护  ›", item_w, footer_h, face("cfont", 13.2, 18), {bold = true})),
-                function()
-                    self:_close(function() self.opts.on_tools() end)
+                function(anchor)
+                    self:_close(function() self.opts.on_tools(anchor) end)
                 end)
             self:_add(children, x, y, tools)
         end
@@ -377,7 +531,9 @@ local function panel_signature(opts)
         tostring(UiScale.getDisplayMode and UiScale.getDisplayMode() or "standard"),
         tostring(UiScale.getFontName and UiScale.getFontName() or ""),
         tostring(type(opts.on_customize)=="function"),tostring(type(opts.on_tools)=="function"),
-        tostring((opts.status_text and opts.status_text~="") and 1 or 0)}
+        tostring((opts.status_text and opts.status_text~="") and 1 or 0),
+        tostring(type(opts.frontlight)=="table"),
+        tostring(type(opts.frontlight)=="table" and type(opts.frontlight.warmth)=="table")}
     for _,entry in ipairs(type(opts.buttons)=="table" and opts.buttons or {}) do
         parts[#parts+1]=tostring(entry.icon_key or entry.icon or "")..":"..tostring(entry.label or "")
     end
@@ -407,6 +563,7 @@ end
 
 function QuickPanelWidget:init()
     self._signature=panel_signature(self.opts)
+    self._controls_armed_at=wall_time()+.20
     self:_build()
 end
 
@@ -443,6 +600,7 @@ function QuickPanelWidget:onRotation()
 end
 
 function QuickPanelWidget:onShow()
+    self._controls_armed_at=math.max(tonumber(self._controls_armed_at) or 0,wall_time()+.12)
     UIManager:setDirty(self, function() return "ui", self.panel_dimen end)
 end
 
