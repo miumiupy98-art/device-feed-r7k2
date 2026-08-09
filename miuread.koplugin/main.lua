@@ -423,6 +423,11 @@ function Plugin:init()
     self.mp=MP:new(self.reader,self.http,self.store,self.api)
     self.annotations=Annotations:new(self.api)
     self.annotation_sync=AnnotationSync:new(self.api,self.reader,self.store)
+    do
+        local annotation_prefs=self:_annotation_sync_preferences()
+        logger.info("[MiuRead][AnnotationSync] initialized",
+            "enabled=",tostring(annotation_prefs.enabled==true),"mode=manual")
+    end
     self.downloader=Downloader:new(self.reader,self.api,self.annotations,self.store,self.http)
     self.download_task=DownloadTask:new(self.store)
     self.cache_cleanup_task=CacheCleanupTask:new(self.store)
@@ -5310,6 +5315,7 @@ function Plugin:_show_home_settings_popup(anchor)
         actions={
             {icon="▦",label="首页与书架",detail="布局、快捷入口和书架来源",callback=function() self:_show_standalone_menu("首页与书架",self:display_settings_menu()) end},
             {icon="A",label="阅读界面",detail="阅读快捷栏和显示方式",callback=function() self:_show_standalone_menu("阅读界面",self:reader_quick_panel_settings_menu()) end},
+            {icon="✎",label="评论与标注",detail="评论显示、本地划线与想法云同步",callback=function() self:_show_standalone_menu("评论与标注",PluginSettings.comments(self)) end},
             {icon="⇩",label="下载与存储",detail="下载策略、目录和清理",callback=function() self:_show_standalone_menu("下载与存储",self:download_settings_menu()) end},
             {icon="⇅",label="账号与同步",detail="登录状态和同步设置",callback=function() self:_show_standalone_menu("账号与同步",self:account_sync_settings_menu()) end},
             {icon="◷",label="时间与时区",detail="修正 KOReader 的本地时间显示",callback=function() self:_show_standalone_menu("时间与时区",self:time_display_settings_menu()) end},
@@ -14376,13 +14382,10 @@ function Plugin:mp_settings_menu()
     }
 end
 function Plugin:account_sync_settings_menu()
-    local rows={
-        {text="账号状态",post_text=self:_account_status_label(),callback=function() self:show_account_status() end},
-        {text=self:logged_in() and "重新扫码登录" or "扫码登录",callback=function() self.auth_flow:start() end},
-    }
-    if self:logged_in() then rows[#rows+1]={text="退出登录",callback=function() self:confirm_logout() end} end
-    for _,row in ipairs(self:sync_menu()) do rows[#rows+1]=row end
-    return rows
+    -- Keep desktop mode and plugin mode on the same settings source.  beta.7
+    -- had a second desktop-only menu here, so the annotation-sync controls
+    -- added in plugin_settings.lua were invisible from the desktop UI.
+    return PluginSettings.account_sync(self)
 end
 
 function Plugin:more_settings_menu()
@@ -14415,7 +14418,9 @@ function Plugin:settings_menu()
         rows[#rows+1]={text="阅读界面",post_text="桌面模式阅读面板",sub_item_table_func=function() return self:reader_quick_panel_settings_menu() end}
     end
     rows[#rows+1]={text="性能与兼容性",post_text=self:_performance_mode_label(),sub_item_table_func=function() return self:performance_settings_menu() end}
-    rows[#rows+1]={text="评论与标注",post_text=self:_thought_display_label(),sub_item_table_func=function() return self:thought_font_settings_menu() end}
+    -- Do not maintain a desktop-only comments menu. PluginSettings.comments()
+    -- also owns local annotation sync controls and is shared with plugin mode.
+    rows[#rows+1]={text="评论与标注",post_text=self:_thought_display_label(),sub_item_table_func=function() return PluginSettings.comments(self) end}
     rows[#rows+1]={text="账号与同步",post_text=self:progress_sync_label(),sub_item_table_func=function() return self:account_sync_settings_menu() end}
     rows[#rows+1]={text="下载与存储",post_text=self:_download_settings_summary(),sub_item_table_func=function() return self:download_settings_menu() end}
     rows[#rows+1]={text="公众号阅读",sub_item_table_func=function() return self:mp_settings_menu() end}
@@ -15350,7 +15355,13 @@ function Plugin:toggle_annotation_sync()
     prefs.enabled=prefs.enabled~=true
     all.annotation_sync=prefs
     self.store:save_preferences(all)
-    self:toast(prefs.enabled and "本地批注云同步已开启（实验）" or "本地批注云同步已关闭",2)
+    logger.info("[MiuRead][AnnotationSync] enabled changed",
+        "enabled=",tostring(prefs.enabled==true),"mode=manual")
+    if prefs.enabled then
+        self:toast("本地批注云同步已开启；当前为手动上传",2.5)
+    else
+        self:toast("本地批注云同步已关闭",2)
+    end
     return prefs.enabled
 end
 
@@ -15420,7 +15431,10 @@ function Plugin:show_local_annotation_sync_status()
 end
 
 function Plugin:sync_local_annotations_now()
-    if not self:annotation_sync_enabled() then
+    local annotation_enabled=self:annotation_sync_enabled()
+    logger.info("[MiuRead][AnnotationSync] manual sync requested",
+        "enabled=",tostring(annotation_enabled),"mode=manual")
+    if not annotation_enabled then
         self:info("请先在“评论与标注”中开启“本地批注云同步（实验）”。")
         return false
     end

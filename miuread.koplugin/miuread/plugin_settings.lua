@@ -28,7 +28,13 @@ function M.account_sync(plugin)
         {text=plugin:logged_in() and "重新扫码登录" or "扫码登录",callback=function() plugin.auth_flow:start() end},
     }
     if plugin:logged_in() then rows[#rows+1]={text="退出登录",callback=function() plugin:confirm_logout() end} end
-    return append(rows,M.sync(plugin))
+    append(rows,M.sync(plugin))
+    rows[#rows+1]={
+        text="本地批注同步（实验）",
+        post_text=plugin:annotation_sync_enabled() and "已开启 · 手动" or "已关闭",
+        sub_item_table_func=function() return M.annotation_sync(plugin) end,
+    }
+    return rows
 end
 
 function M.comment_data(plugin)
@@ -51,13 +57,25 @@ function M.comment_data(plugin)
     }
 end
 
+function M.annotation_sync(plugin)
+    return {
+        {
+            text="本地批注云同步（实验）",
+            post_text=plugin:annotation_sync_enabled() and "已开启 · 手动" or "已关闭",
+            checked_func=function() return plugin:annotation_sync_enabled() end,
+            keep_menu_open=true,
+            callback=function() plugin:toggle_annotation_sync() end,
+        },
+        {text="同步当前书籍本地批注",post_text="手动上传",callback=function() plugin:sync_local_annotations_now() end},
+        {text="本地批注同步状态",callback=function() plugin:show_local_annotation_sync_status() end},
+        {text="新想法可见范围",post_text=plugin:annotation_sync_visibility_label(),sub_item_table_func=function() return plugin:annotation_sync_visibility_menu() end},
+    }
+end
+
 function M.comments(plugin)
     local rows={}
     append(rows,plugin:thought_font_settings_menu())
-    rows[#rows+1]={text="本地批注云同步（实验）",checked_func=function() return plugin:annotation_sync_enabled() end,keep_menu_open=true,callback=function() plugin:toggle_annotation_sync() end}
-    rows[#rows+1]={text="同步当前书籍本地批注",callback=function() plugin:sync_local_annotations_now() end}
-    rows[#rows+1]={text="本地批注同步状态",callback=function() plugin:show_local_annotation_sync_status() end}
-    rows[#rows+1]={text="新想法可见范围",post_text=plugin:annotation_sync_visibility_label(),sub_item_table_func=function() return plugin:annotation_sync_visibility_menu() end}
+    append(rows,M.annotation_sync(plugin))
     rows[#rows+1]={text="评论数据管理",sub_item_table_func=function() return M.comment_data(plugin) end}
     return rows
 end
