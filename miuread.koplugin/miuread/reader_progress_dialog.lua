@@ -13,6 +13,7 @@ local UIManager = require("ui/uimanager")
 local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
+local TransientGuard = require("miuread.transient_guard")
 local Skin = require("miuread.reader_skin")
 local Ui = require("miuread.ui_components")
 
@@ -56,6 +57,7 @@ end
 local Dialog = InputContainer:extend{
     name = "miuread_reader_progress_dialog",
     _miuread_transient = true,
+    _miuread_modal_surface = true,
     covers_fullscreen = true,
     stop_events_propagation = true,
     percent = 0,
@@ -301,6 +303,7 @@ function M.close()
     live_dialog = nil
 end
 function M.show(opts)
+    TransientGuard.close_all()
     opts = opts or {}
     M.close()
     local ok, dialog = pcall(Dialog.new, Dialog, {

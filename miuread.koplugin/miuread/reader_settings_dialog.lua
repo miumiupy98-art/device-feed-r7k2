@@ -14,6 +14,7 @@ local UIManager = require("ui/uimanager")
 local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
+local TransientGuard = require("miuread.transient_guard")
 local Skin = require("miuread.reader_skin")
 local Ui = require("miuread.ui_components")
 
@@ -47,6 +48,7 @@ end
 local Dialog = InputContainer:extend{
     name = "miuread_reader_settings_dialog",
     _miuread_transient = true,
+    _miuread_modal_surface = true,
     covers_fullscreen = true,
     stop_events_propagation = true,
     opts = nil,
@@ -294,6 +296,8 @@ function Dialog:_build_content()
     local body_h = row_count * row_h + titled_count * section_title_h + math.max(0, #sections - 1) * gap
     local content_h = header_h + subtitle_h + (hero_h > 0 and gap + hero_h or 0) + gap + body_h + handle_h
     self.panel_h = math.min(max_h, pad * 2 + content_h)
+    self._stable_panel_h = math.max(tonumber(self._stable_panel_h) or 0, self.panel_h)
+    self.panel_h = self._stable_panel_h
     self.dimen = Geom:new{x = 0, y = 0, w = sw, h = sh}
     self.frame_dimen = Geom:new{x = outer_margin, y = top_inset, w = panel_w, h = self.panel_h}
 
@@ -451,6 +455,7 @@ function M.close()
     live_dialog = nil
 end
 function M.show(opts)
+    TransientGuard.close_all()
     M.close()
     local ok, dialog = pcall(Dialog.new, Dialog, {opts = opts or {}})
     if not ok or not dialog then

@@ -13,6 +13,7 @@ local VerticalGroup = require("ui/widget/verticalgroup")
 local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
+local TransientGuard = require("miuread.transient_guard")
 local Skin = require("miuread.reader_skin")
 local Ui = require("miuread.ui_components")
 
@@ -166,6 +167,7 @@ function SliderBox:handleEvent(event) return InputContainer.handleEvent(self, ev
 local Dialog = InputContainer:extend{
     name = "miuread_reader_frontlight_dialog",
     _miuread_transient = true,
+    _miuread_modal_surface = true,
     covers_fullscreen = true,
     stop_events_propagation = true,
     opts = nil,
@@ -361,6 +363,8 @@ function Dialog:_build_content()
     local desired_h = pad * 2 + header_h + gap + slider_h * setting_count
         + gap * math.max(0, setting_count - 1) + gap + action_h + handle_h
     self.panel_h = math.min(sh - outer_margin * 2, desired_h)
+    self._stable_panel_h = math.max(tonumber(self._stable_panel_h) or 0, self.panel_h)
+    self.panel_h = self._stable_panel_h
     local placement = tostring(self.opts and self.opts.placement or "top")
     local panel_y = placement == "center" and math.max(outer_margin, math.floor((sh - self.panel_h) / 2)) or top_margin
 
@@ -542,6 +546,7 @@ function M.close()
     live_dialog = nil
 end
 function M.show(opts)
+    TransientGuard.close_all()
     M.close()
     local ok, dialog = pcall(Dialog.new, Dialog, {opts = opts or {}})
     if not ok or not dialog then

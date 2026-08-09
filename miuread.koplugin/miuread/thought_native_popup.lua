@@ -10,6 +10,7 @@ local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local logger = require("logger")
+local TransientGuard = require("miuread.transient_guard")
 local OverlapGroup = require("ui/widget/overlapgroup")
 local TextBoxWidget = require("ui/widget/textboxwidget")
 local TextWidget = require("ui/widget/textwidget")
@@ -255,6 +256,7 @@ end
 local NativePopup = InputContainer:extend{
     name = "miuread_thought_native_popup",
     _miuread_transient = true,
+    _miuread_modal_surface = true,
     -- This is a transparent full-screen input layer around a smaller popup.
     -- Marking it as opaque prevents ReaderUI from repainting areas exposed when
     -- a dynamically sized page becomes shorter.
@@ -1390,6 +1392,7 @@ end
 
 local M = {}
 function M.show(opts)
+    TransientGuard.close_all()
     opts = opts or {}
     local popup = pooled_popup
     if popup then

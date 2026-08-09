@@ -19,6 +19,7 @@ local VerticalSpan = require("ui/widget/verticalspan")
 local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
+local TransientGuard = require("miuread.transient_guard")
 local UiScale = require("miuread.ui_scale")
 local Ui = require("miuread.ui_components")
 
@@ -181,6 +182,7 @@ end
 local QuickPanelWidget = InputContainer:extend{
     name = "miuread_quick_panel",
     _miuread_transient = true,
+    _miuread_modal_surface = true,
     covers_fullscreen = true,
     stop_events_propagation = true,
     opts = nil,
@@ -409,6 +411,7 @@ function QuickPanel.close()
     live_panel = nil
 end
 function QuickPanel.show(opts)
+    TransientGuard.close_all()
     local started=os.clock()
     QuickPanel.close()
     local ok, panel = pcall(QuickPanelWidget.new, QuickPanelWidget, {opts = opts or {}})

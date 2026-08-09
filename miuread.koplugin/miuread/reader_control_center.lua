@@ -15,6 +15,7 @@ local UIManager = require("ui/uimanager")
 local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
+local TransientGuard = require("miuread.transient_guard")
 local Skin = require("miuread.reader_skin")
 local Ui = require("miuread.ui_components")
 
@@ -56,6 +57,7 @@ end
 local Center = InputContainer:extend{
     name = "miuread_reader_control_center",
     _miuread_transient = true,
+    _miuread_modal_surface = true,
     covers_fullscreen = true,
     stop_events_propagation = true,
     opts = nil,
@@ -251,6 +253,8 @@ function Center:_build_root()
     local content_h = header_h + tabs_h + gap + body_h
     local max_h = sh - top_inset - math.max(28, math.floor(sh * .052))
     self.panel_h = math.min(max_h, pad * 2 + content_h)
+    self._stable_panel_h = math.max(tonumber(self._stable_panel_h) or 0, self.panel_h)
+    self.panel_h = self._stable_panel_h
     self.dimen = Geom:new{x = 0, y = 0, w = sw, h = sh}
     self.panel_dimen = Geom:new{x = outer_margin, y = top_inset, w = panel_w, h = self.panel_h}
     local refresh_y = top_inset + pad + header_h
@@ -421,6 +425,7 @@ function M.close()
     live_center = nil
 end
 function M.show(opts)
+    TransientGuard.close_all()
     M.close()
     local ok, center = pcall(Center.new, Center, {opts = opts or {}})
     if not ok or not center then

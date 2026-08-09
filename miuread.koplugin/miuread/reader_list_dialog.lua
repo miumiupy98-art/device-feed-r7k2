@@ -12,6 +12,7 @@ local UIManager = require("ui/uimanager")
 local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
+local TransientGuard = require("miuread.transient_guard")
 local Skin = require("miuread.reader_skin")
 local Ui = require("miuread.ui_components")
 
@@ -54,6 +55,7 @@ end
 local Dialog = InputContainer:extend{
     name = "miuread_reader_list_dialog",
     _miuread_transient = true,
+    _miuread_modal_surface = true,
     covers_fullscreen = true,
     stop_events_propagation = true,
     opts = nil,
@@ -243,12 +245,21 @@ function Dialog:_build_content()
     local page_size = self:_page_size()
     local items = self:_items(selected)
     local pages = math.max(1, math.ceil(#items / page_size))
-    local pager_h = pages > 1 and pager_h_default or 0
     self.page = math.max(1, math.min(pages, tonumber(self.page) or 1))
     local first = (self.page - 1) * page_size + 1
     local last = math.min(#items, first + page_size - 1)
-    local visible = math.max(1, last >= first and (last - first + 1) or 1)
-    local body_h = visible * row_h
+    -- Keep both the list body and pager footprint stable across every page and
+    -- category. Otherwise a short final page (or a tab without pagination) can
+    -- leave lower rows from the previous state visible after a partial refresh.
+    local visible_slots = 1
+    local has_pager = false
+    for _, candidate in ipairs(categories) do
+        local candidate_items = self:_items(candidate)
+        visible_slots = math.max(visible_slots, math.min(page_size, math.max(1, #candidate_items)))
+        if #candidate_items > page_size then has_pager = true end
+    end
+    local pager_h = has_pager and pager_h_default or 0
+    local body_h = visible_slots * row_h
     local max_h = sh - Skin.dp(24, 20, 36)
     local panel_h = math.min(max_h, pad * 2 + header_h + subtitle_h + tab_h + body_h + pager_h + Skin.dp(8, 6, 12))
 
@@ -416,6 +427,7 @@ function M.close()
     live_dialog = nil
 end
 function M.show(opts)
+    TransientGuard.close_all()
     M.close()
     local ok, dialog = pcall(Dialog.new, Dialog, {opts = opts or {}})
     if not ok or not dialog then

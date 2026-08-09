@@ -19,6 +19,7 @@ local VerticalSpan = require("ui/widget/verticalspan")
 local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
+local TransientGuard = require("miuread.transient_guard")
 local UiScale = require("miuread.ui_scale")
 
 local Screen = Device.screen
@@ -151,6 +152,7 @@ end
 local SheetWidget = InputContainer:extend{
     name = "miuread_action_sheet",
     _miuread_transient = true,
+    _miuread_modal_surface = true,
     covers_fullscreen = true,
     stop_events_propagation = true,
     opts = nil,
@@ -544,6 +546,8 @@ local function show_fallback(opts, reason)
     local subtitle = tostring(opts.subtitle or "")
     if subtitle ~= "" then title = title .. "\n\n" .. subtitle end
     dialog = ButtonDialog:new{title = title, title_align = "left", buttons = buttons}
+    dialog._miuread_transient = true
+    dialog._miuread_modal_surface = true
     logger.warn("[MiuRead][ActionSheet] using fallback", tostring(reason or "unknown"))
     UIManager:show(dialog)
     return dialog
@@ -555,6 +559,7 @@ function ActionSheet.close()
     live_sheet = nil
 end
 function ActionSheet.show(opts)
+    TransientGuard.close_all()
     ActionSheet.close()
     opts = opts or {}
     local ok, sheet = pcall(SheetWidget.new, SheetWidget, {opts = opts})

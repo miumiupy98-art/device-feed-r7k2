@@ -7,7 +7,6 @@ local RawPathChooser=require("ui/widget/pathchooser")
 local UIManager=require("ui/uimanager")
 local Device=require("device")
 local Blitbuffer=require("ffi/blitbuffer")
-local ImageWidget=require("ui/widget/imagewidget")
 local Event=require("ui/event")
 local WidgetContainer=require("ui/widget/container/widgetcontainer")
 local logger=require("logger")
@@ -46,6 +45,7 @@ local LocalBrowserView=require("miuread.local_browser_view")
 local HomeView=require("miuread.home_view")
 local HomeQuickPanel=require("miuread.home_quick_panel")
 local ActionSheet=require("miuread.action_sheet")
+local TransientGuard=require("miuread.transient_guard")
 local ScreenshotMode=require("miuread.screenshot_mode")
 local GestureBridge=require("miuread.gesture_bridge")
 local HomeData=require("miuread.home_data")
@@ -81,12 +81,12 @@ local function gesture_aware_class(base, attributes)
     end
     return class
 end
-local ButtonDialog=gesture_aware_class(RawButtonDialog,{_miuread_transient=true})
-local ConfirmBox=gesture_aware_class(RawConfirmBox,{_miuread_transient=true})
-local InfoMessage=gesture_aware_class(RawInfoMessage,{_miuread_transient=true})
-local InputDialog=gesture_aware_class(RawInputDialog,{_miuread_transient=true})
-local Menu=gesture_aware_class(RawMenu,{_miuread_transient=true})
-local PathChooser=gesture_aware_class(RawPathChooser,{_miuread_transient=true})
+local ButtonDialog=gesture_aware_class(RawButtonDialog,{_miuread_transient=true,_miuread_modal_surface=true})
+local ConfirmBox=gesture_aware_class(RawConfirmBox,{_miuread_transient=true,_miuread_modal_surface=true})
+local InfoMessage=gesture_aware_class(RawInfoMessage,{_miuread_transient=true,_miuread_modal_surface=true})
+local InputDialog=gesture_aware_class(RawInputDialog,{_miuread_transient=true,_miuread_modal_surface=true})
+local Menu=gesture_aware_class(RawMenu,{_miuread_transient=true,_miuread_modal_surface=true})
+local PathChooser=gesture_aware_class(RawPathChooser,{_miuread_transient=true,_miuread_modal_surface=true})
 local _=Text.tr
 local unpack_args=unpack or table.unpack
 local SHELF_CACHE_TTL=15*60
@@ -590,7 +590,10 @@ function Plugin:addToMainMenu(items)
         end,
     }
 end
-function Plugin:info(t) UIManager:show(InfoMessage:new{text=tostring(t or "")}) end
+function Plugin:info(t)
+    TransientGuard.close_all()
+    UIManager:show(InfoMessage:new{text=tostring(t or "")})
+end
 function Plugin:toast(t,s) UIManager:show(InfoMessage:new{text=tostring(t or ""),timeout=s or 2}) end
 function Plugin:status_toast(title,text,timeout)
     local ok,err=pcall(StatusToast.show,{
@@ -681,6 +684,7 @@ function Plugin:list(title,items,empty)
             return self:_show_standalone_menu(title,items)
         end
     end
+    TransientGuard.close_all()
     local menu=Menu:new{title=title,item_table=items,is_borderless=true,title_bar_fm_style=true}
     UIManager:show(menu)
     return menu
@@ -2946,48 +2950,77 @@ function Plugin:_set_home_section(section)
 end
 
 function Plugin:_home_prepare_lockscreen_cover(book)
-    local source=book and tostring(book.cover_path or "") or ""
-    if source=="" or lfs.attributes(source,"mode")~="file" then return source~="" and source or nil end
+    if type(book)~="table" then return nil end
+    local LockscreenCover=require("miuread.lockscreen_cover")
     local width,height=Device.screen:getWidth(),Device.screen:getHeight()
-    if width<=0 or height<=0 then return source end
+    if width<=0 or height<=0 then return nil end
     local id=tostring(book.bookId or book.book_id or "")
+    local fallback_source=tostring(book.cover_path or "")
     if id=="" then
+        local seed=fallback_source~="" and fallback_source or tostring(book.file or book.title or "book")
         local hash=5381
-        for i=1,#source do hash=(hash*33+source:byte(i))%4294967296 end
+        for i=1,#seed do hash=(hash*33+seed:byte(i))%4294967296 end
         id=string.format("local-%08x",hash)
     end
+    local stored=id~="" and self.store:book(id) or nil
+    local record=id~="" and self:_preferred_record(id) or nil
+    local file=tostring(book.file or (record and record.file) or "")
+
     local dir=self.store.data_dir.."/lockscreen"
     U.mkdir(dir)
-    local target=dir.."/"..U.id_name(id).."-"..tostring(width).."x"..tostring(height)..".png"
-    local source_mtime=tonumber(lfs.attributes(source,"modification") or 0) or 0
+    -- Version the generated artifact so beta.2 automatically discards the old
+    -- contain+margin rendering without touching the user's normal cover cache.
+    local target=dir.."/"..U.id_name(id).."-fill2-"..tostring(width).."x"..tostring(height)..".png"
+    local source_hint_mtime=tonumber(lfs.attributes(fallback_source,"modification") or 0) or 0
+    source_hint_mtime=math.max(source_hint_mtime,tonumber(lfs.attributes(file,"modification") or 0) or 0)
+    if type(stored)=="table" then
+        source_hint_mtime=math.max(source_hint_mtime,tonumber(lfs.attributes(tostring(stored.cover_path or ""),"modification") or 0) or 0)
+    end
+    if type(record)=="table" then
+        source_hint_mtime=math.max(source_hint_mtime,tonumber(lfs.attributes(tostring(record.cover_path or ""),"modification") or 0) or 0)
+    end
     local target_mtime=tonumber(lfs.attributes(target,"modification") or 0) or 0
-    if target_mtime>=source_mtime and (tonumber(U.file_size(target) or 0) or 0)>0 then return target end
+    if target_mtime>0 and target_mtime>=source_hint_mtime and (tonumber(U.file_size(target) or 0) or 0)>0 then
+        return target
+    end
 
-    local image,canvas
-    local ok,err=pcall(function()
-        local bbtype=Device.screen.bb and Device.screen.bb:getType() or Blitbuffer.TYPE_BB8
-        canvas=Blitbuffer.new(width,height,bbtype)
-        canvas:fill(Blitbuffer.COLOR_WHITE)
-        local margin=math.max(0,math.floor(math.min(width,height)*.025))
-        local inner_w=math.max(1,width-margin*2)
-        local inner_h=math.max(1,height-margin*2)
-        image=ImageWidget:new{
-            file=source,width=inner_w,height=inner_h,scale_factor=0,
-            use_legacy_image_scaling=false,file_do_cache=false,
-        }
-        image:getSize()
-        image:paintTo(canvas,margin,margin)
-        local written,write_error=pcall(canvas.writePNG,canvas,target)
-        if not written then error(write_error or "lockscreen write failed") end
-    end)
-    if image and type(image.free)=="function" then pcall(image.free,image) end
-    if canvas and type(canvas.free)=="function" then pcall(canvas.free,canvas) end
-    if not ok or lfs.attributes(target,"mode")~="file" then
+    local sources={}
+    local seen={}
+    local function add(path)
+        path=tostring(path or "")
+        if path~="" and not seen[path] and lfs.attributes(path,"mode")=="file" then
+            seen[path]=true
+            sources[#sources+1]=path
+        end
+    end
+    add(fallback_source)
+
+    if type(stored)=="table" then add(stored.cover_path) end
+    if type(record)=="table" then add(record.cover_path) end
+
+    -- Prefer an embedded/custom cover when the book already exists locally.
+    -- BookInfoManager extraction is bounded and cached, and often exposes a
+    -- larger source than the shelf thumbnail.
+    if file~="" and U.file_exists(file) then
+        local ok,metadata=pcall(LocalMetadata.read,file,self.store.data_dir.."/lockscreen-source",{
+            open_document=false,use_bim=true,
+        })
+        if ok and type(metadata)=="table" then add(metadata.cover_path) end
+    end
+
+    local source=LockscreenCover.best_source(sources)
+    if not source then return fallback_source~="" and fallback_source or nil end
+    local source_mtime=tonumber(lfs.attributes(source,"modification") or 0) or 0
+    target_mtime=tonumber(lfs.attributes(target,"modification") or 0) or 0
+    if target_mtime>=source_mtime and target_mtime>0 and (tonumber(U.file_size(target) or 0) or 0)>0 then return target end
+
+    local rendered,err=LockscreenCover.render_fill(source,target,width,height)
+    if not rendered or lfs.attributes(target,"mode")~="file" then
         os.remove(target)
         logger.warn("[MiuRead][Cover] lockscreen cache failed",tostring(err or "unknown"))
         return source
     end
-    logger.info("[MiuRead][Cover] lockscreen cache ready",tostring(id),tostring(width).."x"..tostring(height))
+    logger.info("[MiuRead][Cover] lockscreen cache ready",tostring(id),tostring(width).."x"..tostring(height),"source=",tostring(source))
     return target
 end
 
@@ -3748,15 +3781,18 @@ function Plugin:_show_standalone_menu(title,items,options)
     -- Reader-side menus must receive their own title-bar tap before any
     -- ReaderUI gesture zone. RawMenu keeps KOReader's native event order; the
     -- bridged Menu remains unchanged for MiuRead home pages.
+    TransientGuard.close_all()
     local MenuClass=options.native_input==true and RawMenu or Menu
     menu=MenuClass:new{title=tostring(title or "觅阅"),item_table=rows,is_borderless=true,title_bar_fm_style=true}
     menu._miuread_transient=true
+    menu._miuread_modal_surface=true
     -- TitleBar captures a dynamic self:onClose() call when it is created.
     -- Replacing Menu:onClose on this concrete instance is sufficient and avoids
     -- mutating already-built child button fields that differ across KOReader
     -- versions.
     close_standalone=function(suppress_restore)
         if not menu or menu._miuread_closing then return true end
+        suppress_restore=suppress_restore==true or menu._miuread_suppress_restore==true
         menu._miuread_closing=true
         local ok,err=pcall(UIManager.close,UIManager,menu)
         if not ok then
@@ -3775,6 +3811,10 @@ function Plugin:_show_standalone_menu(title,items,options)
     end
     menu.onClose=close_standalone
     menu.onCloseAllMenus=close_standalone
+    menu._close=function(_,_,cancel_pending)
+        menu._miuread_suppress_restore=cancel_pending==true
+        return close_standalone(cancel_pending==true)
+    end
     UIManager:show(menu)
     return menu
 end

@@ -14,6 +14,7 @@ local VerticalGroup = require("ui/widget/verticalgroup")
 local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
+local TransientGuard = require("miuread.transient_guard")
 local Skin = require("miuread.reader_skin")
 local Ui = require("miuread.ui_components")
 
@@ -251,6 +252,7 @@ end
 local Toolbar = InputContainer:extend{
     name = "miuread_reader_toolbar",
     _miuread_transient = true,
+    _miuread_modal_surface = true,
     covers_fullscreen = true,
     stop_events_propagation = true,
     opts = nil,
@@ -684,6 +686,7 @@ function M.close()
     live_toolbar = nil
 end
 function M.show(opts)
+    TransientGuard.close_all()
     local started=os.clock()
     M.close()
     local ok, toolbar = pcall(Toolbar.new, Toolbar, {opts = opts or {}})
