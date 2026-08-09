@@ -53,6 +53,13 @@ function M.comment_data(plugin)
 end
 
 function M.annotation_sync(plugin)
+    if plugin:annotation_sync_diagnostic_only() then
+        return {
+            {text="批注坐标诊断（beta.10）",post_text="云端写入已暂停",enabled=false},
+            {text="诊断方式",post_text="打开书籍后在阅读页“批注”中生成",enabled=false},
+            {text="导出内容",post_text="raw.xhtml · coord.xhtml · range-debug.json",enabled=false},
+        }
+    end
     return {
         {
             text="微信读书批注同步（实验）",

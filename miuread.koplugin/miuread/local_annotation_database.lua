@@ -304,6 +304,29 @@ local function row_from_sql(row)
     }
 end
 
+function LocalAnnotationDatabase.list(store, book_id, limit)
+    if not LocalAnnotationDatabase.exists(store, book_id) then return {} end
+    local conn = open(store, book_id, true)
+    local out = {}
+    local ok, err = xpcall(function()
+        local statement = conn:prepare("SELECT " .. SELECT_COLUMNS .. [[
+            FROM local_annotations
+            WHERE book_id = ? AND present = 1
+            ORDER BY updated_at DESC LIMIT ?
+        ]])
+        statement:bind(tostring(book_id or ""), math.max(1, tonumber(limit) or 200))
+        while true do
+            local row = statement:step()
+            if not row then break end
+            out[#out + 1] = row_from_sql(row)
+        end
+        statement:close()
+    end, debug.traceback)
+    pcall(conn.close, conn)
+    if not ok then return nil, tostring(err) end
+    return out
+end
+
 function LocalAnnotationDatabase.pending(store, book_id, limit)
     if not LocalAnnotationDatabase.exists(store, book_id) then return {} end
     local conn = open(store, book_id, false)

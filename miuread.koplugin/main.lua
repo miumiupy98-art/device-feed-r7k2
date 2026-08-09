@@ -8173,7 +8173,14 @@ function Plugin:_show_reader_annotation_panel(back_callback)
                     {icon="highlight",label="划线",value=tostring(summary.highlight or 0),callback=function() self:_show_reader_records("highlight",return_to_panel) end},
                     {icon="thought",label="想法",value=tostring(summary.thought or 0),callback=function() self:_show_reader_records("thought",return_to_panel) end},
                 }},
-                {title="微信读书同步 · 实验",rows={
+                self:annotation_sync_diagnostic_only() and {title="批注坐标诊断 · beta.10",rows={
+                    {icon="warning",label="云端批注写入",value="已暂停 · 防止错误 range",value_bold=true,enabled=false},
+                    {icon="diagnostics",label="生成本书坐标诊断",value="导出 raw / coord / range",value_bold=true,callback=function()
+                        self:sync_local_annotations_now()
+                    end},
+                    {label="诊断内容",value="含已同步与待同步本地批注",enabled=false},
+                    {label="文件位置",value="books/<bookId>/annotation-coordinate-diagnostics",enabled=false},
+                }} or {title="微信读书同步 · 实验",rows={
                     {icon="sync",label="批注云同步",value=current_enabled and "已开启 · 手动" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_annotation_sync() end},
                     {icon="upload",label="同步本书批注",value=current_enabled and ("待同步 "..tostring(pending)) or "开启并同步",value_bold=true,callback=function()
                         if self:annotation_sync_enabled() then self:sync_local_annotations_now()
@@ -15424,6 +15431,10 @@ function Plugin:_annotation_sync_preferences()
     return p.annotation_sync,p
 end
 
+function Plugin:annotation_sync_diagnostic_only()
+    return Config.ANNOTATION_COORD_DIAGNOSTIC_ONLY == true
+end
+
 function Plugin:annotation_sync_enabled()
     local prefs=self:_annotation_sync_preferences()
     return prefs.enabled==true
@@ -15511,9 +15522,10 @@ end
 
 function Plugin:sync_local_annotations_now()
     local annotation_enabled=self:annotation_sync_enabled()
+    local diagnostic_only=self:annotation_sync_diagnostic_only()
     logger.info("[MiuRead][AnnotationSync] manual sync requested",
-        "enabled=",tostring(annotation_enabled),"mode=manual")
-    if not annotation_enabled then
+        "enabled=",tostring(annotation_enabled), diagnostic_only and "mode=coordinate_diagnostic" or "mode=manual")
+    if not diagnostic_only and not annotation_enabled then
         self:info("请先开启“微信读书批注同步（实验）”，或在阅读页“批注”中直接选择“同步本书批注”。")
         return false
     end
@@ -15533,9 +15545,9 @@ function Plugin:sync_local_annotations_now()
     local book=U.copy(current.book or {})
     local record=U.copy(current.record or {})
     local service=self.annotation_sync
-    self:toast("正在同步本地批注…",2)
+    self:toast(diagnostic_only and "正在生成批注坐标诊断…" or "正在同步本地批注…",2)
     local started,err=self.annotation_async:run("annotation-sync",function()
-        return service:sync_book(book,record,{preferences=prefs,limit=200})
+        return service:sync_book(book,record,{preferences=prefs,limit=200,diagnostic_only=diagnostic_only})
     end,function(worker_result)
         if not worker_result or worker_result.ok~=true then
             self:info("本地批注同步失败："..tostring(worker_result and worker_result.error or "后台任务失败"))
@@ -15544,6 +15556,25 @@ function Plugin:sync_local_annotations_now()
         local result=worker_result.value or {}
         if result.ok==false then
             self:info("本地批注同步失败："..tostring(result.error or "未知错误"))
+            return
+        end
+        if result.diagnostic_only==true then
+            local lines={
+                "批注坐标诊断完成",
+                "",
+                "云端批注写入：已暂停",
+                "导出章节："..tostring(result.diagnostic_exported or 0),
+                "检查本地批注："..tostring(result.total or 0),
+            }
+            if tonumber(result.failed or 0)>0 then
+                lines[#lines+1]="定位异常："..tostring(result.failed or 0)
+            end
+            lines[#lines+1]=""
+            lines[#lines+1]="文件目录："
+            lines[#lines+1]=tostring(result.diagnostic_root or "")
+            lines[#lines+1]=""
+            lines[#lines+1]="请把对应章节文件夹、thoughts.sqlite3、local_annotations.sqlite3 和生成的 EPUB 一起给 AI。"
+            self:info(table.concat(lines,"\n"))
             return
         end
         local lines={

@@ -6,6 +6,9 @@ local Coord = require("miuread.annotation_coord")
 local PosMap = require("miuread.annotations.posmap")
 local Range = require("miuread.annotations.range")
 local LocalDB = require("miuread.local_annotation_database")
+local ThoughtDatabase = require("miuread.thought_database")
+local Json = require("miuread.json")
+local Config = require("miuread.config")
 
 local AnnotationSync = {}
 AnnotationSync.__index = AnnotationSync
@@ -197,6 +200,151 @@ local function stage_log(row, stage, ok, detail)
         detail and ("detail=" .. tostring(detail)) or "")
 end
 
+local function diagnostic_root(store, book_id)
+    return store:book_dir(book_id) .. "/annotation-coordinate-diagnostics"
+end
+
+local function diagnostic_chapter_dir(store, book_id, chapter_uid_value)
+    return diagnostic_root(store, book_id) .. "/" .. U.id_name(tostring(chapter_uid_value or "unknown"))
+end
+
+local function first_abstract(group)
+    for _, item in ipairs(type(group) == "table" and group.texts or {}) do
+        local abstract = U.trim(tostring(item.abstract or ""))
+        if abstract ~= "" then return abstract, tostring(item.review_id or "") end
+    end
+    return "", ""
+end
+
+local function official_anchor_rows(store, book_id, chapter_uid_value)
+    local groups = ThoughtDatabase.load_chapter(store, book_id, chapter_uid_value)
+    if type(groups) ~= "table" then return {} end
+    local out = {}
+    for _, group in ipairs(groups) do
+        local abstract, review_id = first_abstract(group)
+        if tostring(group.range or "") ~= "" then
+            out[#out + 1] = {
+                range=tostring(group.range or ""),
+                abstract=abstract,
+                review_id=review_id,
+                comment_count=#(group.texts or {}),
+            }
+        end
+    end
+    return out
+end
+
+local function diagnostic_local_row(row, located, locate_error, locate_stage)
+    return {
+        local_id=tostring(row.local_id or ""), kind=tostring(row.kind or ""),
+        sync_state=tostring(row.sync_state or ""), remote_id=tostring(row.remote_id or ""),
+        stored_range=tostring(row.range_key or ""), calculated_range=located and tostring(located.range or "") or "",
+        selected_text=tostring(row.selected_text or row.text or ""), note=tostring(row.note or ""),
+        context_before=tostring(row.context_before or ""), context_after=tostring(row.context_after or ""),
+        pos0=tostring(row.pos0 or ""), pos1=tostring(row.pos1 or ""), xpointer=tostring(row.xpointer or ""),
+        chapter_uid=tostring(row.chapter_uid or ""), chapter_idx=tonumber(row.chapter_idx),
+        locate_ok=located ~= nil, locate_stage=tostring(locate_stage or ""),
+        locate_error=tostring(locate_error or ""),
+    }
+end
+
+local function copy_diagnostic_file(source, target, max_bytes)
+    source = tostring(source or "")
+    if source == "" then return false, "source_missing" end
+    local size = U.file_size(source)
+    if not size then return false, "source_not_found" end
+    if max_bytes and size > max_bytes then return false, "source_too_large:" .. tostring(size) end
+    local data, read_error = U.read_file(source, true)
+    if data == nil then return false, read_error or "read_failed" end
+    return U.atomic_write(target, data, true)
+end
+
+function AnnotationSync:_save_coordinate_diagnostics(book_id, chapters)
+    local root = diagnostic_root(self.store, book_id)
+    U.mkdir(root)
+    local copied = {}
+    local thoughts_path = ThoughtDatabase.path(self.store, book_id)
+    local local_db_path = LocalDB.path(self.store, book_id)
+    copied.thoughts = copy_diagnostic_file(thoughts_path, root .. "/thoughts.sqlite3", 64 * 1024 * 1024) == true
+    copied.local_annotations = copy_diagnostic_file(local_db_path, root .. "/local_annotations.sqlite3", 64 * 1024 * 1024) == true
+    local exported = 0
+    for uid, diag in pairs(chapters or {}) do
+        local dir = diagnostic_chapter_dir(self.store, book_id, uid)
+        U.mkdir(dir)
+        if tostring(diag.raw_html or "") ~= "" then
+            local ok, err = U.atomic_write(dir .. "/raw.xhtml", diag.raw_html, true)
+            if not ok then logger.warn("[MiuRead][AnnotationCoordDiag] raw write failed", "chapter=", uid, "error=", tostring(err)) end
+        end
+        if tostring(diag.coord_html or "") ~= "" then
+            local ok, err = U.atomic_write(dir .. "/coord.xhtml", diag.coord_html, true)
+            if not ok then logger.warn("[MiuRead][AnnotationCoordDiag] coord write failed", "chapter=", uid, "error=", tostring(err)) end
+        end
+        local payload = {
+            format="miuread-annotation-coordinate-diagnostic-v1",
+            version=Config.VERSION,
+            generated_at=os.time(),
+            book_id=tostring(book_id or ""),
+            chapter_uid=tostring(uid or ""),
+            chapter_idx=diag.chapter_idx,
+            chapter_title=tostring(diag.chapter_title or ""),
+            raw_bytes=#tostring(diag.raw_html or ""),
+            coord_bytes=#tostring(diag.coord_html or ""),
+            source_epub=tostring(diag.source_epub or ""),
+            thoughts_database=ThoughtDatabase.path(self.store, book_id),
+            local_annotations_database=LocalDB.path(self.store, book_id),
+            local_annotations=diag.local_annotations or {},
+            official_anchors=official_anchor_rows(self.store, book_id, uid),
+            notes={
+                "raw.xhtml is the complete decrypted chapter before MiuRead body extraction or image rewriting.",
+                "coord.xhtml is the exact coordinate candidate currently used by MiuRead.",
+                "official_anchors are existing WeRead ranges from thoughts.sqlite3 and are the external reference.",
+                "Cloud annotation writes are paused in this diagnostic build.",
+            },
+        }
+        local ok_json, encoded = pcall(Json.encode, payload)
+        if ok_json then
+            local ok, err = U.atomic_write(dir .. "/range-debug.json", encoded, false)
+            if not ok then logger.warn("[MiuRead][AnnotationCoordDiag] json write failed", "chapter=", uid, "error=", tostring(err)) end
+        else
+            logger.warn("[MiuRead][AnnotationCoordDiag] json encode failed", "chapter=", uid, "error=", tostring(encoded))
+        end
+        local readme = table.concat({
+            "MiuRead annotation coordinate diagnostic",
+            "bookId=" .. tostring(book_id or ""),
+            "chapterUid=" .. tostring(uid or ""),
+            "raw.xhtml = complete decrypted XHTML",
+            "coord.xhtml = current MiuRead range coordinate source",
+            "range-debug.json = local ranges + official WeRead range anchors",
+            "Also provide thoughts.sqlite3, local_annotations.sqlite3 and the generated EPUB to AI.",
+        }, "\n")
+        U.atomic_write(dir .. "/README.txt", readme, false)
+        logger.info("[MiuRead][AnnotationCoordDiag] exported",
+            "book=", tostring(book_id), "chapter=", tostring(uid),
+            "raw_bytes=", tostring(payload.raw_bytes), "coord_bytes=", tostring(payload.coord_bytes),
+            "local_rows=", tostring(#payload.local_annotations),
+            "official_anchors=", tostring(#payload.official_anchors), "dir=", dir)
+        if not copied.epub and tostring(diag.source_epub or "") ~= "" then
+            local ok, reason = copy_diagnostic_file(diag.source_epub, root .. "/generated.epub", 64 * 1024 * 1024)
+            if ok then copied.epub = true else copied.epub_error = tostring(reason or "copy_failed") end
+        end
+        exported = exported + 1
+    end
+    local bundle_readme = table.concat({
+        "MiuRead beta.10 coordinate diagnostic bundle",
+        "Upload this annotation-coordinate-diagnostics folder to AI.",
+        "Included when available: thoughts.sqlite3, local_annotations.sqlite3, generated.epub.",
+        "Each chapter folder contains raw.xhtml, coord.xhtml and range-debug.json.",
+        "Cloud annotation writes are paused in this diagnostic build.",
+        "bookId=" .. tostring(book_id or ""),
+        "thoughts_copy=" .. tostring(copied.thoughts == true),
+        "local_annotations_copy=" .. tostring(copied.local_annotations == true),
+        "generated_epub_copy=" .. tostring(copied.epub == true),
+        copied.epub_error and ("generated_epub_copy_error=" .. copied.epub_error) or "",
+    }, "\n")
+    U.atomic_write(root .. "/README.txt", bundle_readme, false)
+    return root, exported
+end
+
 function AnnotationSync:new(api, reader, store)
     return setmetatable({api=api, reader=reader, store=store}, self)
 end
@@ -251,7 +399,9 @@ function AnnotationSync:_coord_map_for_chapter(book, row, candidate, cache)
     if not built_ok or type(bridge) ~= "table" or type(bridge.coord) ~= "table" then
         return nil, tostring(bridge or "coord_bridge_failed")
     end
-    local ctx = {map=bridge.coord, bridge=bridge, html=coord_html, chapter=chapter,
+    local raw_html = type(state) == "table" and tostring(state.raw_xhtml or "") or ""
+    if raw_html == "" then raw_html = tostring(downloaded or "") end
+    local ctx = {map=bridge.coord, bridge=bridge, html=coord_html, raw_html=raw_html, chapter=chapter,
         chapter_uid=uid, chapter_idx=idx}
     cache[cache_key] = ctx
     return ctx
@@ -425,10 +575,17 @@ function AnnotationSync:sync_book(book, record, options)
     local book_id = tostring((book and (book.book_id or book.bookId)) or (record and record.book_id) or "")
     if book_id == "" then return {ok=false, error="bookId missing"} end
     local prefs = options.preferences or {}
-    local rows, rows_error = LocalDB.pending(self.store, book_id, options.limit or 200)
+    local diagnostic_only = options.diagnostic_only == true or Config.ANNOTATION_COORD_DIAGNOSTIC_ONLY == true
+    local rows, rows_error
+    if diagnostic_only then
+        rows, rows_error = LocalDB.list(self.store, book_id, options.limit or 200)
+    else
+        rows, rows_error = LocalDB.pending(self.store, book_id, options.limit or 200)
+    end
     if not rows then return {ok=false, error=rows_error} end
     local result = {ok=true,total=#rows,synced=0,deleted=0,failed=0,locate_failed=0,
-        metadata_failed=0,unknown=0,skipped=0,reconciled=0,errors={}}
+        metadata_failed=0,unknown=0,skipped=0,reconciled=0,errors={}, diagnostic_only=diagnostic_only,
+        diagnostic_exported=0, diagnostic_root=diagnostic_root(self.store, book_id)}
     if #rows == 0 then return result end
 
     local need_bookmarks, need_reviews = false, false
@@ -437,13 +594,20 @@ function AnnotationSync:sync_book(book, record, options)
     end
     local cloud_bookmarks, bookmark_error = {}, nil
     local cloud_reviews, review_error = {}, nil
-    if need_bookmarks then cloud_bookmarks, bookmark_error = fetch_cloud_bookmarks(self.api, book_id) end
-    if need_reviews then cloud_reviews, review_error = fetch_cloud_reviews(self.api, book_id) end
-    if need_bookmarks and not cloud_bookmarks then bookmark_error = bookmark_error or "bookmark reconciliation failed" end
-    if need_reviews and not cloud_reviews then review_error = review_error or "review reconciliation failed" end
+    if not diagnostic_only then
+        if need_bookmarks then cloud_bookmarks, bookmark_error = fetch_cloud_bookmarks(self.api, book_id) end
+        if need_reviews then cloud_reviews, review_error = fetch_cloud_reviews(self.api, book_id) end
+    else
+        cloud_bookmarks, cloud_reviews = nil, nil
+    end
+    if not diagnostic_only then
+        if need_bookmarks and not cloud_bookmarks then bookmark_error = bookmark_error or "bookmark reconciliation failed" end
+        if need_reviews and not cloud_reviews then review_error = review_error or "review reconciliation failed" end
+    end
 
-    local version = self:_book_version(book_id, book or {}, record or {})
+    local version = diagnostic_only and 0 or self:_book_version(book_id, book or {}, record or {})
     local coord_cache = {}
+    local diagnostic_chapters = {}
 
     local function remember_error(row, state, message, stage, fields)
         fields = fields or {}
@@ -478,7 +642,43 @@ function AnnotationSync:sync_book(book, record, options)
             end
         end
 
-        if row.sync_state == "delete_pending" or row.sync_state == "delete_unknown" then
+        if diagnostic_only then
+            stage_log(row, "diagnostic", true, "coordinate_export")
+            local located, chapter_ctx, locate_error, locate_stage =
+                self:_locate_with_chapter_candidates(book or {}, record or {}, row, coord_cache)
+            local ctx = chapter_ctx
+            local uid = tostring(ctx and ctx.chapter_uid or row.chapter_uid or "unknown")
+            local diag = diagnostic_chapters[uid]
+            if not diag then
+                diag = {
+                    raw_html=ctx and tostring(ctx.raw_html or "") or "",
+                    coord_html=ctx and tostring(ctx.html or "") or "",
+                    chapter_idx=ctx and ctx.chapter_idx or row.chapter_idx,
+                    chapter_title=ctx and ctx.chapter and tostring(ctx.chapter.title or "") or "",
+                    source_epub=tostring(row.source_path or ""),
+                    local_annotations={},
+                }
+                diagnostic_chapters[uid] = diag
+            end
+            diag.local_annotations[#diag.local_annotations + 1] =
+                diagnostic_local_row(row, located, locate_error, locate_stage)
+            if located then
+                stage_log(row, "diagnostic", true, "range=" .. tostring(located.range or ""))
+                logger.info("[MiuRead][AnnotationCoordDiag] range",
+                    "book=", tostring(book_id), "chapter=", tostring(uid),
+                    "local=", tostring(row.local_id or ""), "kind=", tostring(row.kind or ""),
+                    "stored=", tostring(row.range_key or ""), "calculated=", tostring(located.range or ""),
+                    "text=", U.utf8_truncate(tostring(row.selected_text or row.text or ""), 48, "…"))
+            else
+                result.failed = result.failed + 1
+                if #result.errors < 12 then
+                    result.errors[#result.errors + 1] = {kind=tostring(row.kind or ""),
+                        stage=tostring(locate_stage or "locate"), error=tostring(locate_error or "diagnostic locate failed")}
+                end
+                stage_log(row, "diagnostic", false, locate_error or "locate_failed")
+            end
+            result.skipped = result.skipped + 1
+        elseif row.sync_state == "delete_pending" or row.sync_state == "delete_unknown" then
             if is_review then
                 remember_error(row, "delete_pending", "想法云端删除接口尚未接入", "delete")
             elseif not cloud_rows then
@@ -606,6 +806,14 @@ function AnnotationSync:sync_book(book, record, options)
                 end
             end
         end
+    end
+
+    if diagnostic_only then
+        local root, exported = self:_save_coordinate_diagnostics(book_id, diagnostic_chapters)
+        result.diagnostic_root = root
+        result.diagnostic_exported = exported
+        logger.info("[MiuRead][AnnotationCoordDiag] cloud writes paused", "book=", book_id,
+            "chapters=", tostring(exported), "root=", tostring(root))
     end
 
     logger.info("[MiuRead][AnnotationSync] completed",

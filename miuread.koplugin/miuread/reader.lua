@@ -821,6 +821,9 @@ function Reader:_txt_once(book, chapter, opt, state)
     if not ok_b then b = "" end
     local xhtml = Codec.text_xhtml(Codec.decode_parts({a, b}))
     if not has_readable_content(xhtml, false) then error("decoded TXT chapter is empty") end
+    -- Keep the complete decrypted chapter before any coordinate/body trimming.
+    -- beta.10 exports this only for local coordinate diagnostics.
+    state.raw_xhtml = xhtml
     state.coord_html = AnnotationCoord.fromDownloadedXhtml(xhtml)
     state.content_format = "txt"
     return xhtml, "body{line-height:1.75;margin:5%;}", {}, state
@@ -839,8 +842,12 @@ function Reader:_epub_once(book, chapter, opt, state)
     local b = self:shard("/web/book/chapter/e_1", id, uid, state.psvts, false)
     local c = self:shard("/web/book/chapter/e_3", id, uid, state.psvts, false)
     local xhtml = Codec.decode_parts({a, b, c})
-    -- Preserve the official coordinate source before image localization or any
-    -- MiuRead rewrite changes HTML character offsets.
+    -- Keep the exact decrypted XHTML before image localization, body extraction
+    -- or any MiuRead rewrite. This is the missing reference required to compare
+    -- local coordinates with real WeRead ranges.
+    state.raw_xhtml = xhtml
+    -- Preserve the current MiuRead coordinate candidate separately so raw.xhtml
+    -- and coord.xhtml can be compared byte-for-byte.
     state.coord_html = AnnotationCoord.fromDownloadedXhtml(xhtml)
 
     local css = "body{line-height:1.7;margin:5%;}img{max-width:100%;height:auto;}"
