@@ -23,7 +23,7 @@ local defaults={
              annotations={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
              read_report={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
          }}},
- preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_reader_warning=true,download_reader_policy="ask",download_dir="",shelf_section="account",account_shelf_kind="books",home_ui={enabled=true,layout_version=23,layout_style="desk",display_size="standard",ui_font_mode="default",ui_font_face="",local_root="",local_roots={},local_browse_version=2,local_library_mode="auto",local_auto_update=true,performance_defaults_version=1,auto_scan=true,local_check_on_open=true,page_by_section={},source_order={"account","generated","local","mp"},action_items={refresh=true,search=true,downloads=true,sync=true,sleep=true,miuread_settings=true,frontlight=false,all_books=false,history=false,file_manager=false,screenshot=false},action_order={"refresh","search","downloads","sync","sleep","miuread_settings","frontlight","all_books","history","file_manager","screenshot"},action_layout_version=2,panel_items={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=true,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=false,full_refresh=false},panel_order={"wifi","rotate","screenshot","koreader_settings","return_koreader","quit","sync","miuread_settings","downloads","restart","sleep","full_refresh"},panel_layout_version=2,more_expanded=false,network_metadata_defaults_version=1,network_metadata=true},reader_ui={enabled=true,show_title=true,show_status=true,show_recent=false,recent_actions={},quick_layout_version=10,quick_items={toc=true,progress=true,font=true,page=true,comments=true,search=true,bookmark=true,back=true,rotation=true,screenshot=true},quick_order={"toc","progress","font","page","comments","search","bookmark","back","rotation","screenshot"}},notices={reader_download=true,low_battery=true,low_storage=true,full_refresh=true,lockscreen=true,library_scan=true,repair_while_reading=true,mode_switch=true,mode_environment=true},mode_intro={pending_mode="desktop",pending_reason="first_install",last_confirmed_mode="",confirmed_at=0},memory_mode={enabled=false,previous_known=false,previous_ratio=false},performance_mode={enabled=false,auto_detect=true,last_prompt_at=0,reminders_disabled=false},time_display={mode="device",zone="Asia/Shanghai",offset_minutes=480},thoughts={enabled=true,font="standard",font_face="",follow_body_font=false,width_ratio=0.90,height_ratio=0.55,display_mode="native_compact_rounded"},annotation_sync={enabled=false,review_visibility="private",highlight_style=1,highlight_color=0},repair={auto_check=true},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=false,progress_enabled=true,success_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
+ preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_reader_warning=true,download_reader_policy="ask",download_dir="",shelf_section="account",account_shelf_kind="books",home_ui={enabled=true,layout_version=23,layout_style="desk",display_size="standard",ui_font_mode="default",ui_font_face="",local_root="",local_roots={},local_browse_version=2,local_library_mode="auto",local_auto_update=true,performance_defaults_version=1,auto_scan=true,local_check_on_open=true,page_by_section={},source_order={"account","generated","local","mp"},action_items={refresh=true,search=true,downloads=true,sync=true,sleep=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false},action_order={"refresh","search","downloads","sync","sleep","miuread_settings","all_books","history","file_manager","screenshot"},action_layout_version=3,panel_items={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=true,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=false,full_refresh=false},panel_order={"wifi","rotate","screenshot","koreader_settings","return_koreader","quit","sync","miuread_settings","downloads","restart","sleep","full_refresh"},panel_layout_version=2,more_expanded=false,network_metadata_defaults_version=1,network_metadata=true},reader_ui={enabled=true,show_title=true,show_status=true,show_recent=false,recent_actions={},quick_layout_version=10,quick_items={toc=true,progress=true,font=true,page=true,comments=true,search=true,bookmark=true,back=true,rotation=true,screenshot=true},quick_order={"toc","progress","font","page","comments","search","bookmark","back","rotation","screenshot"}},notices={reader_download=true,low_battery=true,low_storage=true,full_refresh=true,lockscreen=true,library_scan=true,repair_while_reading=true,mode_switch=true,mode_environment=true},mode_intro={pending_mode="desktop",pending_reason="first_install",last_confirmed_mode="",confirmed_at=0},memory_mode={enabled=false,previous_known=false,previous_ratio=false},performance_mode={enabled=false,auto_detect=true,last_prompt_at=0,reminders_disabled=false},time_display={mode="device",zone="Asia/Shanghai",offset_minutes=480},thoughts={enabled=true,font="standard",font_face="",follow_body_font=false,width_ratio=0.90,height_ratio=0.55,display_mode="native_compact_rounded"},annotation_sync={enabled=false,review_visibility="private",highlight_style=1,highlight_color=0},repair={auto_check=true},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=false,progress_enabled=true,success_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
  library={},sessions={},shelf_cache={books={},mp={},updated_at=0},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},download_queue={},
  pending_installs={},last_cleanup_result={},read_report_consumed={},
 }
@@ -1309,6 +1309,38 @@ function Store:migrate()
             current.sync=type(current.sync)=="table" and current.sync or {}
             local interval=tonumber(current.sync.interval)
             if interval==nil or interval<=30 then current.sync.interval=Config.READ_INTERVAL end
+            self:save_preferences(current)
+        end
+        if schema<111 then
+            -- 4.3.0-beta.21 repairs the beta.20 homepage row. Frontlight is no
+            -- longer selectable there; removing it lets MiuRead Settings return
+            -- to the visible sixth slot without resetting other custom choices.
+            local current=self:preferences()
+            current.home_ui=type(current.home_ui)=="table" and current.home_ui or {}
+            local home=current.home_ui
+            home.action_items=type(home.action_items)=="table" and home.action_items or {}
+            home.action_order=type(home.action_order)=="table" and home.action_order or {}
+            home.action_items.frontlight=nil
+            if home.action_items.sleep==nil then home.action_items.sleep=true end
+            if home.action_items.miuread_settings==nil then home.action_items.miuread_settings=true end
+            local seen,order={},{}
+            for _,key in ipairs(home.action_order) do
+                if key~="frontlight" and not seen[key] then seen[key]=true; order[#order+1]=key end
+            end
+            local function ensure_after(after_key,key)
+                if seen[key] then return end
+                local out,inserted={},false
+                for _,name in ipairs(order) do
+                    out[#out+1]=name
+                    if name==after_key then out[#out+1]=key; inserted=true end
+                end
+                if not inserted then out[#out+1]=key end
+                order=out; seen[key]=true
+            end
+            ensure_after("sync","sleep")
+            ensure_after("sleep","miuread_settings")
+            home.action_order=order
+            home.action_layout_version=3
             self:save_preferences(current)
         end
         self.db:saveSetting("schema",Config.SCHEMA)

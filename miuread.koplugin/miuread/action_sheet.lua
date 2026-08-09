@@ -214,16 +214,14 @@ function SheetWidget:_footer(action, width, height)
             dimen = Geom:new{w = width, h = math.max(1, UiScale.line("thin"))},
         },
     }
-    layers[#layers + 1] = TextBoxWidget:new{
-        text = tostring(action.label or action.text or "更多操作  ›"),
-        face = UiScale.face("cfont", 9.8, 13.8, 8.4),
-        bold = true,
-        width = width,
-        height = height,
-        height_adjust = false,
-        height_overflow_show_ellipsis = true,
-        alignment = "center",
-        fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+    layers[#layers + 1] = CenterContainer:new{
+        dimen = Geom:new{w = width, h = height},
+        TextWidget:new{
+            text = tostring(action.label or action.text or "更多操作  ›"),
+            face = UiScale.face("cfont", 9.8, 13.8, 8.4),
+            bold = true,
+            fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+        },
     }
     local tap = TapBox:new{
         dimen = Geom:new{w = width, h = height},
@@ -247,21 +245,18 @@ function SheetWidget:_footer_group(actions, width, height)
     if #visible == 0 then return nil end
     local gap = UiScale.dp(4, 3, 6)
     local cell_w = math.floor((width - gap * (#visible - 1)) / #visible)
-    local group = HorizontalGroup:new{align = "center"}
+    local row = HorizontalGroup:new{align = "center"}
     for index, action in ipairs(visible) do
         local enabled = action.enabled ~= false
         local label = tostring(action.label or action.text or "更多")
-        local layers = OverlapGroup:new{dimen = Geom:new{w = cell_w, h = height}, allow_mirroring = false}
-        layers[#layers + 1] = TextBoxWidget:new{
-            text = label,
-            face = UiScale.face("cfont", 9.3, 13.3, 8.2),
-            bold = true,
-            width = cell_w,
-            height = height,
-            height_adjust = false,
-            height_overflow_show_ellipsis = true,
-            alignment = "center",
-            fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+        local content = CenterContainer:new{
+            dimen = Geom:new{w = cell_w, h = height},
+            TextWidget:new{
+                text = label,
+                face = UiScale.face("cfont", 9.3, 13.3, 8.2),
+                bold = true,
+                fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+            },
         }
         local tap = TapBox:new{
             dimen = Geom:new{w = cell_w, h = height},
@@ -269,11 +264,17 @@ function SheetWidget:_footer_group(actions, width, height)
                 if enabled then self:_close(action.callback) end
             end,
         }
-        tap[1] = layers
-        group[#group + 1] = tap
-        if index < #visible then group[#group + 1] = HorizontalSpan:new{width = gap} end
+        tap[1] = content
+        row[#row + 1] = tap
+        if index < #visible then row[#row + 1] = HorizontalSpan:new{width = gap} end
     end
-    return group
+    local layers=OverlapGroup:new{dimen=Geom:new{w=width,h=height},allow_mirroring=false}
+    layers[#layers+1]=LineWidget:new{
+        background=Blitbuffer.COLOR_GRAY,
+        dimen=Geom:new{w=width,h=math.max(1,UiScale.line("thin"))},
+    }
+    layers[#layers+1]=CenterContainer:new{dimen=Geom:new{w=width,h=height},row}
+    return layers
 end
 
 local function normalized_anchor(anchor)
@@ -324,7 +325,8 @@ function SheetWidget:_build()
     local footer_action = type(self.opts.footer_action) == "table" and self.opts.footer_action or nil
     local footer_actions = type(self.opts.footer_actions) == "table" and self.opts.footer_actions or nil
     local has_footer_actions = footer_actions and #footer_actions > 0
-    local footer_h = (footer_action or has_footer_actions) and UiScale.dp(39, 35, 52) or 0
+    local footer_h = (footer_action or has_footer_actions) and UiScale.dp(43, 39, 57) or 0
+    local footer_gap_h = footer_h > 0 and UiScale.dp(17, 14, 24) or 0
     local show_close = self.opts.show_close == true
     if show_close and count < MAX_PRIMARY_ACTIONS then
         actions[#actions + 1] = {icon = "×", label = tostring(self.opts.close_label or "关闭"), close_only = true}
@@ -343,7 +345,7 @@ function SheetWidget:_build()
     local header_h = title_h + subtitle_h
     local content_h = header_h + (header_h > 0 and count > 0 and gap or 0)
         + rows * card_h + math.max(0, rows - 1) * gap
-        + (footer_h > 0 and ((header_h > 0 or rows > 0) and gap or 0) + footer_h or 0)
+        + (footer_h > 0 and ((header_h > 0 or rows > 0) and footer_gap_h or 0) + footer_h or 0)
     local panel_h = pad * 2 + content_h
     local max_h = math.floor(sh * (metrics.portrait and .66 or .82))
     panel_h = math.min(max_h, panel_h)
@@ -399,7 +401,7 @@ function SheetWidget:_build()
         if row < rows then list[#list + 1] = VerticalSpan:new{height = gap} end
     end
     if footer_h > 0 then
-        list[#list + 1] = VerticalSpan:new{height = gap}
+        list[#list + 1] = VerticalSpan:new{height = footer_gap_h}
         if has_footer_actions then
             list[#list + 1] = self:_footer_group(footer_actions, inner_w, footer_h)
         else

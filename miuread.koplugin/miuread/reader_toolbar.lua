@@ -152,6 +152,7 @@ function SliderBar:setValue(value, force)
     self:_refresh(force ~= false)
 end
 function SliderBar:_set_from_position(ges, force)
+    if not (self.owner and self.owner._controls_ready==true) then return true end
     local pos = ges and ges.pos
     if not pos then return false end
     local ratio = math.max(0, math.min(1, (pos.x - self.dimen.x) / math.max(1, self.track_w)))
@@ -170,7 +171,19 @@ function SliderBar:_set_from_position(ges, force)
     return true
 end
 function SliderBar:onTapSlide(_, ges) return self:_set_from_position(ges, true) end
-function SliderBar:onPanSlide(_, ges) return self:_set_from_position(ges, false) end
+function SliderBar:onPanSlide(_, ges)
+    if not (self.owner and self.owner._controls_ready==true) then return true end
+    local direction=tostring(ges and ges.direction or "")
+    local horizontal=direction=="east" or direction=="west"
+    local relative=ges and ges.relative
+    if not horizontal and relative then
+        local dx=math.abs(tonumber(relative.x) or 0)
+        local dy=math.abs(tonumber(relative.y) or 0)
+        horizontal=dx>=Skin.dp(8,6,12) and dx>dy*1.25
+    end
+    if not horizontal then return true end
+    return self:_set_from_position(ges, false)
+end
 function SliderBar:handleEvent(event) return InputContainer.handleEvent(self, event) end
 
 local function status_item(entry, width, height, callback, hold_callback, owner, ref_key)
@@ -279,21 +292,21 @@ function Toolbar:_close(action, cancel_pending)
 end
 
 function Toolbar:_activate(action, label)
-    if self.closed or self.action_locked then return true end
+    if self.closed or self.action_locked or self._controls_ready~=true then return true end
     self.action_locked = true
     logger.info("[MiuRead][ReaderToolbar] tapped", tostring(label or "unknown"))
     return self:_close(action)
 end
 
 function Toolbar:_activate_hold(action, label)
-    if self.closed or self.action_locked then return true end
+    if self.closed or self.action_locked or self._controls_ready~=true then return true end
     self.action_locked = true
     logger.info("[MiuRead][ReaderToolbar] held", tostring(label or "unknown"))
     return self:_close(action)
 end
 
 function Toolbar:_inline(action, label, value_widget, suffix)
-    if self.closed or type(action) ~= "function" then return true end
+    if self.closed or self._controls_ready~=true or type(action) ~= "function" then return true end
     local ok, result = pcall(action)
     if not ok then
         logger.warn("[MiuRead][ReaderToolbar] inline action failed", tostring(label or "unknown"), tostring(result))
@@ -673,6 +686,8 @@ function Toolbar:updateFromOptions(opts)
     self.opts=opts
     self.closed=false
     self.action_locked=false
+    self._controls_ready=false
+    UIManager:nextTick(function() if not self.closed and live_toolbar==self then self._controls_ready=true end end)
     self.pending_action=nil
     local header=type(opts.header)=="table" and opts.header or {}
     set_ref(self._text_refs.wifi,header.wifi_label or "Wi-Fi")
@@ -706,6 +721,7 @@ end
 function Toolbar:init()
     self.opts = self.opts or {}
     self.action_locked = false
+    self._controls_ready=false
     self._text_refs={}
     self._sliders={}
     self._layout_signature=self:_signature(self.opts)
@@ -732,6 +748,10 @@ function Toolbar:onSwipeDismiss(_, ges)
 end
 function Toolbar:onClose() return self:_close() end
 function Toolbar:onShow()
+    self._controls_ready=false
+    UIManager:nextTick(function()
+        if not self.closed and live_toolbar==self then self._controls_ready=true end
+    end)
     UIManager:setDirty(self, function() return "ui", Skin.expand_region(self.panel_dimen, Skin.dp(2, 2, 3)) end)
 end
 function Toolbar:onCloseWidget()

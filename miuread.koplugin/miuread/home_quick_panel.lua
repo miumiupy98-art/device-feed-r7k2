@@ -25,11 +25,7 @@ local Ui = require("miuread.ui_components")
 
 local Screen = Device.screen
 local live_panel
-local ok_socket, socket = pcall(require, "socket")
-local function wall_time()
-    if ok_socket and socket and type(socket.gettime) == "function" then return socket.gettime() end
-    return os.time()
-end
+local update_text
 
 local function face(name, nominal, maximum, minimum)
     return UiScale.face(name, nominal, maximum, minimum)
@@ -120,7 +116,7 @@ end
 
 local ControlSlider = InputContainer:extend{
     dimen=nil, bar_w=1, value_w=1, value_gap=0,
-    min=0, max=100, value=0, on_change=nil, owner=nil,
+    min=0, max=100, value=0, on_change=nil, owner=nil, enabled=true,
     slide_dimen=nil, value_text=nil, last_refresh=0,
 }
 function ControlSlider:init()
@@ -142,7 +138,7 @@ function ControlSlider:init()
 end
 function ControlSlider:getSize() return Geom:new{w=self.dimen.w,h=self.dimen.h} end
 function ControlSlider:_armed()
-    return self.owner and type(self.owner._controls_armed)=="function" and self.owner:_controls_armed()
+    return self.enabled~=false and self.owner and type(self.owner._controls_armed)=="function" and self.owner:_controls_armed()
 end
 function ControlSlider:_ratio()
     return math.max(0,math.min(1,(self.value-self.min)/math.max(1,self.max-self.min)))
@@ -156,9 +152,12 @@ function ControlSlider:paintTo(bb,x,y)
     local ratio=self:_ratio()
     local fill_w=math.max(track_h,math.floor(self.bar_w*ratio))
     local marker_x=x+math.floor((self.bar_w-marker)*ratio)
+    local active=self.enabled~=false
+    local fill_color=active and Blitbuffer.COLOR_BLACK or (Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_GRAY)
+    local marker_color=active and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY
     bb:paintRect(x,bar_y,self.bar_w,track_h,Blitbuffer.COLOR_GRAY)
-    bb:paintRect(x,bar_y,math.min(self.bar_w,fill_w),track_h,Blitbuffer.COLOR_BLACK)
-    bb:paintRect(marker_x,y+math.floor((self.dimen.h-marker)/2),marker,marker,Blitbuffer.COLOR_BLACK)
+    bb:paintRect(x,bar_y,math.min(self.bar_w,fill_w),track_h,fill_color)
+    bb:paintRect(marker_x,y+math.floor((self.dimen.h-marker)/2),marker,marker,marker_color)
     local size=self.value_text:getSize()
     self.value_text:paintTo(bb,x+self.bar_w+self.value_gap+math.floor((self.value_w-size.w)/2),y+math.floor((self.dimen.h-size.h)/2))
 end
@@ -250,6 +249,7 @@ local function panel_button(entry, width, height, close_callback, compact, owner
     }, CenterContainer:new{dimen = Geom:new{w = inner_w, h = math.max(1, height - pad * 2)}, content})
 
     local function run_action(action, anchor)
+        if owner and type(owner._controls_armed)=="function" and not owner:_controls_armed() then return end
         if not enabled or type(action) ~= "function" then return end
         if entry.keep_open == true then
             UIManager:nextTick(function()
@@ -281,7 +281,9 @@ local QuickPanelWidget = InputContainer:extend{
     panel_h = 0,
     _closed = false,
     pending_action = nil,
-    _controls_armed_at = 0,
+    _controls_ready = false,
+    _frontlight_enabled = true,
+    _night_enabled = false,
 }
 
 function QuickPanelWidget:handleEvent(event)
@@ -301,7 +303,7 @@ function QuickPanelWidget:_add(children, x, y, widget)
 end
 
 function QuickPanelWidget:_controls_armed()
-    return wall_time()>=(tonumber(self._controls_armed_at) or 0)
+    return self._controls_ready==true and self._closed~=true
 end
 
 function QuickPanelWidget:_guarded(action)
@@ -310,6 +312,38 @@ function QuickPanelWidget:_guarded(action)
         if type(action)=="function" then return action(anchor) end
         return true
     end
+end
+
+function QuickPanelWidget:_refresh_frontlight_state()
+    local frontlight=type(self.opts.frontlight)=="table" and self.opts.frontlight or nil
+    if not frontlight then return end
+    if type(frontlight.get_enabled)=="function" then
+        local ok,value=pcall(frontlight.get_enabled)
+        if ok then self._frontlight_enabled=value==true end
+    end
+    if type(frontlight.get_night)=="function" then
+        local ok,value=pcall(frontlight.get_night)
+        if ok then self._night_enabled=value==true end
+    end
+    update_text(self._text_refs.frontlight_toggle,self._frontlight_enabled and "关闭前光" or "开启前光")
+    update_text(self._text_refs.night_toggle,self._night_enabled and "夜间：开" or "夜间：关")
+    if self._sliders and self._sliders.brightness then
+        local slider=self._sliders.brightness
+        slider.enabled=self._frontlight_enabled
+        if frontlight.brightness and type(frontlight.brightness.get_value)=="function" then
+            local ok,value=pcall(frontlight.brightness.get_value)
+            if ok and tonumber(value) then slider.value=math.max(slider.min,math.min(slider.max,tonumber(value))); slider.value_text:setText(tostring(math.floor(slider.value+.5))) end
+        end
+    end
+    if self._sliders and self._sliders.warmth then
+        local slider=self._sliders.warmth
+        slider.enabled=self._frontlight_enabled
+        if frontlight.warmth and type(frontlight.warmth.get_value)=="function" then
+            local ok,value=pcall(frontlight.warmth.get_value)
+            if ok and tonumber(value) then slider.value=math.max(slider.min,math.min(slider.max,tonumber(value))); slider.value_text:setText(tostring(math.floor(slider.value+.5))) end
+        end
+    end
+    if self.panel_dimen then UIManager:setDirty(self,function() return "ui",self.panel_dimen end) end
 end
 
 function QuickPanelWidget:_close(action, cancel_pending)
@@ -327,6 +361,7 @@ end
 function QuickPanelWidget:_build()
     self._button_refs={}
     self._text_refs={}
+    self._sliders={}
     local scale = UiScale.metrics()
     local sw, sh = scale.sw, scale.sh
     local margin = math.max(UiScale.dp(11, 9, 18), math.floor(scale.short * .018))
@@ -339,6 +374,14 @@ function QuickPanelWidget:_build()
     local rows = #buttons > 0 and 1 or 0
     local frontlight=type(self.opts.frontlight)=="table" and self.opts.frontlight or nil
     local warmth=frontlight and type(frontlight.warmth)=="table" and frontlight.warmth or nil
+    if frontlight then
+        if type(frontlight.get_enabled)=="function" then
+            local ok,value=pcall(frontlight.get_enabled); if ok then self._frontlight_enabled=value==true end
+        end
+        if type(frontlight.get_night)=="function" then
+            local ok,value=pcall(frontlight.get_night); if ok then self._night_enabled=value==true end
+        end
+    end
     local frontlight_h=frontlight and UiScale.dp(warmth and 142 or 94,warmth and 126 or 84,warmth and 182 or 122) or 0
 
     local title_h = UiScale.dp(52, 47, 70)
@@ -393,7 +436,7 @@ function QuickPanelWidget:_build()
         tappable(close_w, title_h,
             fixed_frame(close_w, title_h, {bordersize = 0, background = Blitbuffer.COLOR_WHITE},
                 Ui.text("收起 ↑", close_w, title_h, face("smallinfofont", 11.8, 16), {bold = true})),
-            function() self:_close() end),
+            self:_guarded(function() self:_close() end)),
     }
     self:_add(children, margin, margin, title_row)
 
@@ -427,14 +470,25 @@ function QuickPanelWidget:_build()
         local button_w=UiScale.dp(116,100,150)
         local header_gap=UiScale.dp(7,5,10)
         local title_w=math.max(1,content_w-button_w*2-header_gap*2)
+        local toggle_text=Ui.text(self._frontlight_enabled and "关闭前光" or "开启前光",button_w-UiScale.dp(6,4,8),header_h,face("smallinfofont",9.6,13.2),{bold=true})
+        local night_text=Ui.text(self._night_enabled and "夜间：开" or "夜间：关",button_w-UiScale.dp(6,4,8),header_h,face("smallinfofont",9.6,13.2),{bold=true})
+        self._text_refs.frontlight_toggle=toggle_text and toggle_text[1]
+        self._text_refs.night_toggle=night_text and night_text[1]
         local toggle=tappable(button_w,header_h,
-            fixed_frame(button_w,header_h,{bordersize=UiScale.line("thin"),radius=UiScale.radius(6,5,9),background=Blitbuffer.COLOR_WHITE},
-                Ui.text("前光开关",button_w-UiScale.dp(6,4,8),header_h,face("smallinfofont",9.6,13.2),{bold=true})),
-            self:_guarded(frontlight.on_toggle))
+            fixed_frame(button_w,header_h,{bordersize=UiScale.line("thin"),radius=UiScale.radius(6,5,9),background=Blitbuffer.COLOR_WHITE},toggle_text),
+            function(anchor)
+                if not self:_controls_armed() then return true end
+                if type(frontlight.on_toggle)=="function" then pcall(frontlight.on_toggle,anchor) end
+                self:_refresh_frontlight_state(); return true
+            end)
         local night=tappable(button_w,header_h,
-            fixed_frame(button_w,header_h,{bordersize=UiScale.line("thin"),radius=UiScale.radius(6,5,9),background=Blitbuffer.COLOR_WHITE},
-                Ui.text("夜间模式",button_w-UiScale.dp(6,4,8),header_h,face("smallinfofont",9.6,13.2),{bold=true})),
-            self:_guarded(frontlight.on_night))
+            fixed_frame(button_w,header_h,{bordersize=UiScale.line("thin"),radius=UiScale.radius(6,5,9),background=Blitbuffer.COLOR_WHITE},night_text),
+            function(anchor)
+                if not self:_controls_armed() then return true end
+                if type(frontlight.on_night)=="function" then pcall(frontlight.on_night,anchor) end
+                UIManager:scheduleIn(.24,function() if not self._closed then self:_refresh_frontlight_state() end end)
+                return true
+            end)
         self:_add(children,margin,y,HorizontalGroup:new{
             align="center",
             LeftContainer:new{dimen=Geom:new{w=title_w,h=header_h},Ui.text("前光",title_w,header_h,face("cfont",13.4,18.2),{bold=true,halign="left"})},
@@ -452,8 +506,9 @@ function QuickPanelWidget:_build()
             local bar_w=math.max(1,content_w-label_w-value_w-value_gap)
             local slider=ControlSlider:new{
                 dimen=Geom:new{w=bar_w+value_gap+value_w,h=row_h},bar_w=bar_w,value_w=value_w,value_gap=value_gap,
-                min=setting.min,max=setting.max,value=setting.value,on_change=setting.on_set,owner=self,
+                min=setting.min,max=setting.max,value=setting.value,on_change=setting.on_set,owner=self,enabled=self._frontlight_enabled,
             }
+            self._sliders[label=="亮度" and "brightness" or "warmth"]=slider
             self:_add(children,margin,y,HorizontalGroup:new{
                 align="center",
                 LeftContainer:new{dimen=Geom:new{w=label_w,h=row_h},Ui.text(label,label_w,row_h,face("smallinfofont",10.2,14),{bold=true,halign="left"})},
@@ -502,6 +557,7 @@ function QuickPanelWidget:_build()
                 fixed_frame(item_w, footer_h, {bordersize = 0, background = Blitbuffer.COLOR_WHITE},
                     Ui.text("自定义", item_w, footer_h, face("cfont", 13.2, 18), {bold = true})),
                 function(anchor)
+                    if not self:_controls_armed() then return true end
                     self:_close(function() self.opts.on_customize(anchor) end)
                 end)
             self:_add(children, x, y, customize)
@@ -512,6 +568,7 @@ function QuickPanelWidget:_build()
                 fixed_frame(item_w, footer_h, {bordersize = 0, background = Blitbuffer.COLOR_WHITE},
                     Ui.text("工具与维护  ›", item_w, footer_h, face("cfont", 13.2, 18), {bold = true})),
                 function(anchor)
+                    if not self:_controls_armed() then return true end
                     self:_close(function() self.opts.on_tools(anchor) end)
                 end)
             self:_add(children, x, y, tools)
@@ -540,7 +597,7 @@ local function panel_signature(opts)
     return table.concat(parts,"|")
 end
 
-local function update_text(ref,value)
+update_text=function(ref,value)
     if ref and type(ref.setText)=="function" then ref:setText(tostring(value or "")) end
 end
 
@@ -550,6 +607,8 @@ function QuickPanelWidget:updateFromOptions(opts)
     self.opts=opts
     self._closed=false
     self.pending_action=nil
+    self._controls_ready=false
+    UIManager:nextTick(function() if not self._closed and live_panel==self then self._controls_ready=true end end)
     update_text(self._text_refs.time,opts.time_text or os.date("%H:%M"))
     update_text(self._text_refs.battery,opts.battery_text or "未知")
     update_text(self._text_refs.status,opts.status_text or "")
@@ -563,7 +622,7 @@ end
 
 function QuickPanelWidget:init()
     self._signature=panel_signature(self.opts)
-    self._controls_armed_at=wall_time()+.20
+    self._controls_ready=false
     self:_build()
 end
 
@@ -600,7 +659,13 @@ function QuickPanelWidget:onRotation()
 end
 
 function QuickPanelWidget:onShow()
-    self._controls_armed_at=math.max(tonumber(self._controls_armed_at) or 0,wall_time()+.12)
+    -- Arm controls only after the event loop has returned from the south-swipe
+    -- that opened this panel. This isolates the opening gesture without relying
+    -- on a guessed millisecond delay.
+    self._controls_ready=false
+    UIManager:nextTick(function()
+        if not self._closed and live_panel==self then self._controls_ready=true end
+    end)
     UIManager:setDirty(self, function() return "ui", self.panel_dimen end)
 end
 
