@@ -317,6 +317,20 @@ function Api:add_review(payload)
         payload.bookId or payload.bookid, payload.chapterUid or payload.chapteruid)
 end
 
+function Api:remove_review(payload)
+    payload = type(payload) == "table" and payload or {}
+    local review_id = tostring(payload.reviewId or payload.review_id or "")
+    if review_id == "" then error("reviewId missing") end
+    payload.reviewId = review_id
+    -- The legacy web bundle exposes this mutation as FETCH_BOOK_REVIEW_DELETE.
+    -- Its concrete path is not emitted in clear text in the obfuscated bundle;
+    -- `/web/review/delete` follows the companion add/list/single endpoint family.
+    -- Keep it on the no-transport-retry write path so a device-side rejection is
+    -- harmless: the local tombstone stays pending and no blind second delete runs.
+    return self:_web_annotation_write("/web/review/delete", payload,
+        payload.bookId or payload.bookid, payload.chapterUid or payload.chapteruid)
+end
+
 function Api:_agent_underlines(id,chapter_uid)
     local value=self:_chapter_call("/book/underlines",id,chapter_uid,nil,AGENT_ANNOTATION_REQUEST_OPTIONS)
     if type(value)=="table" then value._annotation_source="agent" end

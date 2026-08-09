@@ -1,6 +1,5 @@
 local logger = require("logger")
 local U = require("miuread.util")
-local Codec = require("miuread.codec")
 local Http = require("miuread.http")
 local Coord = require("miuread.annotation_coord")
 local PosMap = require("miuread.annotations.posmap")
@@ -597,7 +596,9 @@ function AnnotationSync:_bookmark_payload(row, located, version, prefs)
         style=is_bookmark and 0 or tonumber(prefs.highlight_style) or 0,
         colorStyle=is_bookmark and 0 or tonumber(prefs.highlight_color) or 0,
         range=tostring(located.range or ""),
-        markText=Codec.b64encode(located.mark_text or ""),
+        -- WeRead web sends selected text verbatim for ADD_BOOKMARK.
+        -- Base64 here is rejected by /web/book/addBookmark as a parameter-format error.
+        markText=tostring(located.mark_text or ""),
     }
 end
 
@@ -772,9 +773,11 @@ function AnnotationSync:sync_book(book, record, options)
             end
             result.skipped = result.skipped + 1
         elseif row.sync_state == "delete_pending" or row.sync_state == "delete_unknown" then
-            if is_review then
-                remember_error(row, "delete_pending", "想法云端删除接口尚未接入", "delete")
-            elseif not cloud_rows then
+            -- A local tombstone is only removed after cloud reconciliation proves
+            -- the remote item is already absent or a delete request returns
+            -- successfully. Network-unknown writes remain retry-blocked until the
+            -- next reconciliation pass, exactly like create writes.
+            if not cloud_rows then
                 remember_error(row, row.sync_state, "删除前云端对账失败：" .. tostring(cloud_error or "unknown"), "reconcile")
             elseif row.remote_id ~= "" and not match then
                 LocalDB.delete_row(self.store, book_id, row.local_id)
@@ -783,15 +786,34 @@ function AnnotationSync:sync_book(book, record, options)
             else
                 local remote_id = row.remote_id ~= "" and row.remote_id or matched_id
                 if remote_id == "" then
-                    remember_error(row, "delete_pending", "缺少 bookmarkId，无法安全删除", "delete")
+                    remember_error(row, "delete_pending",
+                        is_review and "缺少 reviewId，无法安全删除" or "缺少 bookmarkId，无法安全删除", "delete")
                 else
-                    stage_log(row, "delete", true, "post")
-                    local ok, value = pcall(self.api.remove_bookmark, self.api, remote_id, {
-                        bookId=book_id, chapterUid=row.chapter_uid,
-                    })
+                    local ok, value
+                    if is_review then
+                        -- WeRead's reader dispatches FETCH_BOOK_REVIEW_DELETE with
+                        -- reviewId plus the current book/chapter/range context.
+                        -- Keep the full context when available instead of reducing
+                        -- the request to reviewId only.
+                        local delete_payload = {
+                            reviewId=remote_id,
+                            bookId=book_id,
+                            chapterUid=tostring(row.chapter_uid or ""),
+                            range=tostring(row.range_key or ""),
+                            bookVersion=tonumber(row.book_version) or tonumber(version) or 0,
+                        }
+                        stage_log(row, "delete", true, "post review/delete")
+                        ok, value = pcall(self.api.remove_review, self.api, delete_payload)
+                    else
+                        stage_log(row, "delete", true, "post book/removeBookmark")
+                        ok, value = pcall(self.api.remove_bookmark, self.api, remote_id, {
+                            bookId=book_id, chapterUid=row.chapter_uid,
+                        })
+                    end
                     if ok then
                         LocalDB.delete_row(self.store, book_id, row.local_id)
                         result.deleted = result.deleted + 1
+                        stage_log(row, "delete", true, "remote_deleted")
                     elseif Http.is_network_error(value) then
                         remember_error(row, "delete_unknown", value, "delete", {remote_id=remote_id})
                     else
@@ -875,6 +897,11 @@ function AnnotationSync:sync_book(book, record, options)
                         local payload = is_review
                             and self:_review_payload(row, located, version, prefs)
                             or self:_bookmark_payload(row, located, version, prefs)
+                        if not is_review then
+                            stage_log(row, "payload", true, string.format(
+                                "book/addBookmark type=%d markText=plain chars=%d",
+                                tonumber(payload.type) or -1, U.utf8_len(tostring(payload.markText or ""))))
+                        end
                         local payload_ok, payload_error = validate_payload(row, payload)
                         if not payload_ok then
                             remember_error(row, "metadata_failed", payload_error, "payload", {
