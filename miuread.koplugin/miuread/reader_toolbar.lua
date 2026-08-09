@@ -21,8 +21,6 @@ local UiScale = require("miuread.ui_scale")
 
 local Screen = Device.screen
 local live_toolbar
-local prepared_toolbar
-local prepared_key
 
 local OffsetContainer = WidgetContainer:extend{x_off = 0, y_off = 0}
 function OffsetContainer:getSize() return self[1]:getSize() end
@@ -742,7 +740,6 @@ function Toolbar:onCloseWidget()
     self.pending_action = nil
     self.closed = true
     if live_toolbar == self then live_toolbar = nil end
-    if self.cache_key then prepared_toolbar=self; prepared_key=self.cache_key end
     if region then UIManager:setDirty(nil, function() return "ui", region end) end
     if action then
         UIManager:scheduleIn(.04, function()
@@ -759,67 +756,32 @@ function M.close()
 end
 function M.invalidate()
     M.close()
-    prepared_toolbar=nil
-    prepared_key=nil
+    return true
 end
 function M.prepare(opts,key)
+    -- Keep prewarm side-effect free: validate data only, never retain a Widget.
+    opts=opts or {}
     key=tostring(key or "reader")
-    if prepared_toolbar and prepared_key==key and prepared_toolbar:updateFromOptions(opts or {}) then
-        return prepared_toolbar
-    end
-    local ok,toolbar=pcall(Toolbar.new,Toolbar,{opts=opts or {}})
-    if not ok or not toolbar then return nil,tostring(toolbar) end
-    toolbar.cache_key=key
-    toolbar.closed=true
-    prepared_toolbar=toolbar
-    prepared_key=key
-    return toolbar
+    return true,nil
 end
 function M.show(opts,key)
     TransientGuard.close_all()
     local started=os.clock()
     M.close()
     key=tostring(key or "reader")
-    local toolbar
-    local reused=false
-    if prepared_toolbar and prepared_key==key and prepared_toolbar:updateFromOptions(opts or {}) then
-        toolbar=prepared_toolbar
-        reused=true
-    else
-        local ok,built=pcall(Toolbar.new,Toolbar,{opts=opts or {}})
-        if not ok or not built then return nil,tostring(built) end
-        toolbar=built
-        toolbar.cache_key=key
-        prepared_toolbar=toolbar
-        prepared_key=key
-    end
+    local ok,toolbar=pcall(Toolbar.new,Toolbar,{opts=opts or {}})
+    if not ok or not toolbar then return nil,tostring(toolbar) end
     local built=os.clock()
+    toolbar.cache_key=key
     toolbar.closed=false
     live_toolbar=toolbar
     local shown,show_err=pcall(UIManager.show,UIManager,toolbar,"ui",toolbar.panel_dimen)
-    if not shown and reused then
-        prepared_toolbar=nil
-        prepared_key=nil
-        live_toolbar=nil
-        local ok,rebuilt=pcall(Toolbar.new,Toolbar,{opts=opts or {}})
-        if ok and rebuilt then
-            toolbar=rebuilt
-            toolbar.cache_key=key
-            prepared_toolbar=toolbar
-            prepared_key=key
-            live_toolbar=toolbar
-            shown,show_err=pcall(UIManager.show,UIManager,toolbar,"ui",toolbar.panel_dimen)
-            reused=false
-        end
-    end
     if not shown then
         live_toolbar=nil
-        prepared_toolbar=nil
-        prepared_key=nil
         return nil,tostring(show_err or "show failed")
     end
     logger.info("[MiuRead][ReaderToolbar] build timing",
-        "reused=",tostring(reused),
+        "reused=", "false",
         "build_ms=",tostring(math.floor((built-started)*1000+.5)),
         "submit_ms=",tostring(math.floor((os.clock()-built)*1000+.5)))
     return toolbar

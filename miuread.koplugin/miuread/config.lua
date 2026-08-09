@@ -1,7 +1,7 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.3.0-beta.17",
-    SCHEMA = 108,
+    VERSION = "4.3.0-beta.18",
+    SCHEMA = 109,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
@@ -25,13 +25,13 @@ local C = {
     AUTO_UPDATE_INTERVAL = 24 * 60 * 60,
     AUTO_UPDATE_RETRY_INTERVAL = 6 * 60 * 60,
 
-    READ_INTERVAL = 30,
+    READ_INTERVAL = 60,
     IDLE_TIMEOUT = 600,
     REMOTE_THRESHOLD = 2,
 
     -- Coalesce page-turn control snapshots. Reading position stays in memory
     -- and is written at most once per window; suspend/close still flushes now.
-    CONTROL_WRITE_DELAY = 30,
+    CONTROL_WRITE_DELAY = 60,
 
     LOW_MEMORY_SETTING = "DGLOBAL_CACHE_FREE_PROPORTION",
     LOW_MEMORY_RATIO = 0.15,

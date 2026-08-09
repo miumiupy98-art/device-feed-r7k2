@@ -25,8 +25,6 @@ local Ui = require("miuread.ui_components")
 
 local Screen = Device.screen
 local live_panel
-local prepared_panel
-local prepared_signature
 
 local function face(name, nominal, maximum, minimum)
     return UiScale.face(name, nominal, maximum, minimum)
@@ -454,8 +452,6 @@ function QuickPanelWidget:onCloseWidget()
     self.pending_action = nil
     self._closed = true
     if live_panel == self then live_panel = nil end
-    prepared_panel=self
-    prepared_signature=self._signature
     if not self._rotation_close and region then
         UIManager:setDirty(nil, function() return "ui", region end)
     end
@@ -474,57 +470,29 @@ function QuickPanel.close()
 end
 function QuickPanel.invalidate()
     QuickPanel.close()
-    prepared_panel=nil
-    prepared_signature=nil
+    return true
 end
 function QuickPanel.show(opts)
     TransientGuard.close_all()
     local started=os.clock()
     QuickPanel.close()
     opts=opts or {}
-    local signature=panel_signature(opts)
-    local panel
-    local reused=false
-    if prepared_panel and prepared_signature==signature and prepared_panel:updateFromOptions(opts) then
-        panel=prepared_panel
-        reused=true
-    else
-        local ok,built=pcall(QuickPanelWidget.new,QuickPanelWidget,{opts=opts})
-        if not ok or not built then
-            logger.warn("[MiuRead][QuickPanel] build failed",tostring(built))
-            return nil,tostring(built)
-        end
-        panel=built
-        prepared_panel=panel
-        prepared_signature=signature
+    local ok,panel=pcall(QuickPanelWidget.new,QuickPanelWidget,{opts=opts})
+    if not ok or not panel then
+        logger.warn("[MiuRead][QuickPanel] build failed",tostring(panel))
+        return nil,tostring(panel)
     end
     local built=os.clock()
     panel._closed=false
     live_panel=panel
     local shown,show_err=pcall(UIManager.show,UIManager,panel,"ui",panel.panel_dimen)
-    if not shown and reused then
-        prepared_panel=nil
-        prepared_signature=nil
-        live_panel=nil
-        local ok,rebuilt=pcall(QuickPanelWidget.new,QuickPanelWidget,{opts=opts})
-        if ok and rebuilt then
-            panel=rebuilt
-            prepared_panel=panel
-            prepared_signature=signature
-            live_panel=panel
-            shown,show_err=pcall(UIManager.show,UIManager,panel,"ui",panel.panel_dimen)
-            reused=false
-        end
-    end
     if not shown then
         live_panel=nil
-        prepared_panel=nil
-        prepared_signature=nil
         logger.warn("[MiuRead][QuickPanel] show failed",tostring(show_err or "unknown"))
         return nil,tostring(show_err or "show failed")
     end
     logger.info("[MiuRead][QuickPanel] build timing",
-        "reused=",tostring(reused),
+        "reused=", "false",
         "build_ms=",tostring(math.floor((built-started)*1000+.5)),
         "submit_ms=",tostring(math.floor((os.clock()-built)*1000+.5)))
     return panel

@@ -1543,7 +1543,7 @@ function Sync:_retire_legacy_daemon()
         }
         local generation=2147483000
         U.atomic_write(prefix..".job.json",Json.encode({
-            generation=generation,controller_token="retired",book_id="",book={},auth={},interval=30,
+            generation=generation,controller_token="retired",book_id="",book={},auth={},interval=Config.READ_INTERVAL,
         }),true)
         U.atomic_write(prefix..".control.json",Json.encode({
             active=false,generation=generation,controller_token="retired",updated_at=os.time(),
@@ -1610,7 +1610,7 @@ function Sync:_attach_existing_daemon(paths, owner)
     self.daemon = {
         pid=tonumber(owner.pid), paths=paths, active=false,
         generation=tonumber(control.generation or 0) or 0,
-        book_id=nil, interval=30, reason="reused", is_child=false,
+        book_id=nil, interval=Config.READ_INTERVAL, reason="reused", is_child=false,
         service_version=READ_REPORT_SERVICE_VERSION,
         login_session_id=tostring(job.login_session_id or ""),
         account_vid=tostring(job.account_vid or ""),
@@ -1672,7 +1672,7 @@ function Sync:_ensure_daemon()
     }), true)
     self.daemon = {
         pid=pid, paths=paths, active=false, generation=0,
-        book_id=nil, interval=30, reason="prestarted", is_child=true,
+        book_id=nil, interval=Config.READ_INTERVAL, reason="prestarted", is_child=true,
         service_version=READ_REPORT_SERVICE_VERSION,
     }
     self.daemon_status_stamp = nil
@@ -1755,7 +1755,7 @@ function Sync:_write_daemon_control(active, immediate, extra)
         write_now()
     end
     self.control_write_task = task
-    UIManager:scheduleIn(tonumber(Config.CONTROL_WRITE_DELAY) or 30, task)
+    UIManager:scheduleIn(tonumber(Config.CONTROL_WRITE_DELAY) or 60, task)
     return true
 end
 
@@ -2088,7 +2088,7 @@ function Sync:_start_daemon(reason)
 
     local daemon = self.daemon
     local prefs = self.store:preferences().sync
-    local interval = math.max(10, tonumber(prefs.interval) or 30)
+    local interval = math.max(10, tonumber(prefs.interval) or tonumber(Config.READ_INTERVAL) or 60)
     local session = self.store:session(book_id) or {}
     if session.sync_repair_required==true then
         local repair_kind=self:_normalize_report_error_kind(session.sync_repair_kind,session.sync_repair_error)
@@ -2279,14 +2279,14 @@ function Sync:_final_elapsed(skip_status_import)
     local uploaded = tonumber(self.last_upload or 0) or 0
     local base = math.max(started, uploaded)
     local elapsed = math.max(0, now - base)
-    local maximum = math.max(FINAL_REPORT_MIN_SECONDS, tonumber(Config.READ_INTERVAL) or 30)
+    local maximum = math.max(FINAL_REPORT_MIN_SECONDS, tonumber(Config.READ_INTERVAL) or 60)
     elapsed = math.min(elapsed, maximum)
     if elapsed < FINAL_REPORT_MIN_SECONDS then return nil end
     return elapsed
 end
 
 -- Kept for compatibility with older callers. Automatic reporting now uses one
--- long-lived subprocess instead of forking a fresh worker every 30 seconds.
+-- long-lived subprocess instead of forking a fresh worker every 60 seconds.
 function Sync:_schedule(_delay)
     if self.store:preferences().sync.time_enabled and not self.suspended then
         self:_start_daemon("schedule_compat")
@@ -2529,7 +2529,7 @@ function Sync:on_suspend()
         }, false)
         self:_defer_session_flush(.8)
     end
-    -- The background worker may submit only the current 10-30 second tail.
+    -- The background worker may submit only the current 10-60 second tail.
     -- Failed time is discarded and is never carried into the next session.
     self:stop_fast("suspend", pending_elapsed)
 end
@@ -2609,7 +2609,7 @@ function Sync:invalidate_login_session(reason)
             and tonumber(owner.parent_pid or 0)==tonumber(parent_pid or 0) then
             daemon={
                 pid=tonumber(owner.pid),paths=paths,active=false,
-                generation=0,book_id=nil,interval=30,reason="auth_reset_attach",
+                generation=0,book_id=nil,interval=Config.READ_INTERVAL,reason="auth_reset_attach",
                 is_child=false,service_version=READ_REPORT_SERVICE_VERSION,
             }
             self.daemon=daemon
@@ -2633,7 +2633,7 @@ function Sync:invalidate_login_session(reason)
         os.remove(daemon.paths.status)
         U.atomic_write(daemon.paths.job,Json.encode({
             action="reset_auth",generation=generation,controller_token=self.controller_token,
-            login_session_id="",account_vid="",book_id="",book={},auth={},interval=30,first_delay=10,
+            login_session_id="",account_vid="",book_id="",book={},auth={},interval=Config.READ_INTERVAL,first_delay=10,
         }),true)
         U.atomic_write(daemon.paths.control,Json.encode({
             active=false,generation=generation,controller_token=self.controller_token,

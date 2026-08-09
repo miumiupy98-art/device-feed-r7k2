@@ -3194,19 +3194,6 @@ function Plugin:_home_schedule_cover_derivatives(books)
         return false
     end
     if not self.cover_render_async or not self.cover_render_async:available() then return false end
-    if self.cover_render_async:busy() then
-        if not self._home_cover_render_retry_task then
-            local retry
-            retry=function()
-                if self._home_cover_render_retry_task~=retry then return end
-                self._home_cover_render_retry_task=nil
-                if HomeView.is_shown() and not self:_active_reader_ui() then self:_home_schedule_cover_derivatives(books) end
-            end
-            self._home_cover_render_retry_task=retry
-            UIManager:scheduleIn(.8,retry)
-        end
-        return false
-    end
 
     local sw,sh=Device.screen:getWidth(),Device.screen:getHeight()
     if sw<=0 or sh<=0 then return false end
@@ -3254,6 +3241,30 @@ function Plugin:_home_schedule_cover_derivatives(books)
     end
     if #items==0 then return false end
 
+    local signature_parts={tostring(sw),tostring(sh),tostring(thumb_w),tostring(thumb_h),hero_id}
+    for _,item in ipairs(items) do
+        signature_parts[#signature_parts+1]=table.concat({tostring(item.id),tostring(item.home_target),tostring(item.lock_target or "")},"|")
+    end
+    local request_signature=table.concat(signature_parts,";")
+    local now_clock=os.time()
+    if self._home_cover_render_inflight_signature==request_signature then return false end
+    if self._home_cover_render_last_signature==request_signature
+        and now_clock-(tonumber(self._home_cover_render_last_clock) or 0)<5 then return false end
+    if self.cover_render_async:busy() then
+        if not self._home_cover_render_retry_task then
+            local retry
+            retry=function()
+                if self._home_cover_render_retry_task~=retry then return end
+                self._home_cover_render_retry_task=nil
+                if HomeView.is_shown() and not self:_active_reader_ui() then self:_home_schedule_cover_derivatives(books) end
+            end
+            self._home_cover_render_retry_task=retry
+            UIManager:scheduleIn(.8,retry)
+        end
+        return false
+    end
+
+    self._home_cover_render_inflight_signature=request_signature
     self._home_cover_render_generation=(tonumber(self._home_cover_render_generation) or 0)+1
     local generation=self._home_cover_render_generation
     local worker_items=items
@@ -3292,11 +3303,16 @@ function Plugin:_home_schedule_cover_derivatives(books)
     end
 
     local started=self.cover_render_async:run("home-cover-render",worker,function(result)
+        if self._home_cover_render_inflight_signature==request_signature then
+            self._home_cover_render_inflight_signature=nil
+        end
         if generation~=self._home_cover_render_generation then return end
         if not result or result.ok~=true or type(result.value)~="table" then
             if result and result.error then logger.warn("[MiuRead][CoverRender] worker failed",U.first_line(result.error,120)) end
             return
         end
+        self._home_cover_render_last_signature=request_signature
+        self._home_cover_render_last_clock=os.time()
         local any_changed=false
         local hero_changed=false
         local changed_sections={}
@@ -3324,6 +3340,9 @@ function Plugin:_home_schedule_cover_derivatives(books)
         end
         logger.info("[MiuRead][CoverRender] visible cache ready","count=",tostring(#result.value))
     end,55)
+    if started~=true and self._home_cover_render_inflight_signature==request_signature then
+        self._home_cover_render_inflight_signature=nil
+    end
     return started==true
 end
 
@@ -4405,18 +4424,21 @@ function Plugin:_reader_wifi_settings(back_callback)
     return false
 end
 
-function Plugin:_home_status_line()
-    local parts={}
+function Plugin:_home_wifi_text()
     local state=HomeData.cached_device_state() or HomeData.quick_device_state() or {}
-    if state.wifi_on==false then
-        parts[#parts+1]="离线"
-    elseif state.wifi_on==true then
+    if state.wifi_on==false then return "已关闭" end
+    if state.wifi_on==true then
         local ssid=U.trim(tostring(state.wifi_name or ""))
-        parts[#parts+1]=ssid~="" and U.utf8_truncate(ssid,15,"…") or (state.online==true and "Wi-Fi" or "未连接")
+        if ssid~="" then return U.utf8_truncate(ssid,13,"…") end
+        return state.online==true and "已连接" or "未连接"
     end
-    parts[#parts+1]=self:_home_sync_status_label()
-    parts[#parts+1]=self:_display_time("%H:%M")
-    return table.concat(parts,"  ·  ")
+    return "Wi-Fi"
+end
+
+function Plugin:_home_status_line()
+    -- Backward-compatible text for older callers; the home header renders
+    -- Wi-Fi, sync and time as independent groups from beta.18 onward.
+    return self:_home_wifi_text()
 end
 
 function Plugin:_home_battery_text()
@@ -5505,26 +5527,30 @@ function Plugin:_show_home_settings_popup(anchor)
         cache_key="home_settings",
         anchor=anchor,
         preferred_direction="below",
-        width_ratio=.84,
+        width_ratio=.72,
         title="觅阅设置",
-        subtitle="快捷入口没有覆盖的常用设置",
-        columns=3,
+        subtitle="常用设置",
+        columns=1,
         simple_cards=true,
         actions={
-            {icon="▦",label="首页书架",detail="布局 书库与快捷入口",callback=function()
+            {icon="▦",label="首页与书架",detail="布局 书架与快捷入口",submenu=true,callback=function()
                 self:_show_standalone_menu("首页与书架",self:display_settings_menu())
             end},
-            {icon="A",label="阅读界面",detail="显示与快捷控制",callback=function()
+            {icon="A",label="阅读界面",detail="显示与快捷控制",submenu=true,callback=function()
                 self:_show_standalone_menu("阅读界面",self:reader_quick_panel_settings_menu())
             end},
-            {icon="✎",label="评论批注",detail="评论 划线与想法",callback=function()
+            {icon="✎",label="评论、划线与想法",detail="评论显示与本地批注",submenu=true,callback=function()
                 self:_show_standalone_menu("评论 划线与想法",PluginSettings.comments(self))
             end},
-        },
-        footer_actions={
-            {label="时间",callback=function() self:_show_standalone_menu("时间与时区",self:time_display_settings_menu()) end},
-            {label="更新",callback=function() self:_show_standalone_menu("更新与关于",PluginSettings.update_about(self)) end},
-            {label="工具",callback=function() self:_show_standalone_menu("工具与维护",self:maintenance_menu()) end},
+            {icon="◷",label="时间与时区",detail="时间来源与地区显示",submenu=true,callback=function()
+                self:_show_standalone_menu("时间与时区",self:time_display_settings_menu())
+            end},
+            {icon="i",label="更新与关于",detail="版本 更新通道与说明",submenu=true,callback=function()
+                self:_show_standalone_menu("更新与关于",PluginSettings.update_about(self))
+            end},
+            {icon="⚙",label="工具与维护",detail="修复 清理与诊断",submenu=true,callback=function()
+                self:_show_standalone_menu("工具与维护",self:maintenance_menu())
+            end},
         },
     }
 end
@@ -9571,30 +9597,14 @@ function Plugin:_reader_quick_panel_options()
     }
 end
 
-function Plugin:_schedule_reader_toolbar_prewarm(session,delay)
-    session=tonumber(session) or tonumber(HOME_SESSION.reader_session_generation or 0) or 0
-    if self._reader_toolbar_prewarm_task then UIManager:unschedule(self._reader_toolbar_prewarm_task) end
-    local task
-    task=function()
-        if self._reader_toolbar_prewarm_task~=task then return end
-        if not (self.ui and self.ui.document) or reader_close_active()
-            or tonumber(HOME_SESSION.reader_session_generation or 0)~=session then
-            self._reader_toolbar_prewarm_task=nil
-            return
-        end
-        local idle_for=os.clock()-(tonumber(self._reader_last_interaction_clock) or 0)
-        if idle_for<1.0 then UIManager:scheduleIn(.45,task); return end
+function Plugin:_schedule_reader_toolbar_prewarm(_session,_delay)
+    -- beta.18 avoids building reader UI in the background. The toolbar is
+    -- created fresh on demand so an idle prewarm cannot contend with paging.
+    if self._reader_toolbar_prewarm_task then
+        UIManager:unschedule(self._reader_toolbar_prewarm_task)
         self._reader_toolbar_prewarm_task=nil
-        local started=os.clock()
-        local options=self:_reader_quick_panel_options()
-        if options then
-            local panel,err=ReaderToolbar.prepare(options,tostring(session))
-            if not panel then logger.warn("[MiuRead][ReaderToolbar] prewarm failed",tostring(err or "unknown"))
-            else logger.info("[MiuRead][ReaderToolbar] prewarmed","ms=",tostring(math.floor((os.clock()-started)*1000+.5))) end
-        end
     end
-    self._reader_toolbar_prewarm_task=task
-    UIManager:scheduleIn(math.max(.35,tonumber(delay) or 1.1),task)
+    return false
 end
 
 function Plugin:_show_reader_quick_panel_now()
@@ -10280,7 +10290,9 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     self._home_panel_status_text=(home_alerts[1] and tostring(home_alerts[1].title or "")) or ""
     local view,err=HomeView.show({
         title="觅阅",
-        status_line=self:_home_status_line(),
+        wifi_text=self:_home_wifi_text(),
+        sync_text=self:_home_sync_status_label(),
+        time_text=self:_display_time("%H:%M"),
         battery_text=self:_home_battery_text(),
         account_name=self:_home_account_name(),
         layout_style=home.layout_style,
@@ -16530,7 +16542,9 @@ function Plugin:_schedule_post_reader_work(reason,delay)
 end
 
 function Plugin:onCloseDocument()
-    self:_begin_page_transition("closing_reader")
+    if tostring(HOME_SESSION.page_transition_state or "")~="closing_reader" then
+        self:_begin_page_transition("closing_reader")
+    end
     self:_ensure_reader_transition_guard("close document")
     if self._reader_checkpoint_dirty==true then
         self:_flush_reader_checkpoint("close_document",true)

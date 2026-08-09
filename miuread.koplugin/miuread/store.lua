@@ -1301,6 +1301,16 @@ function Store:migrate()
             current.annotation_sync.highlight_color=tonumber(current.annotation_sync.highlight_color) or 0
             self:save_preferences(current)
         end
+        if schema<109 then
+            -- 4.3.0-beta.18 halves routine read-report/control writes. Existing
+            -- installs that still carry the old 30-second default move to 60s;
+            -- an explicitly longer interval remains untouched.
+            local current=self:preferences()
+            current.sync=type(current.sync)=="table" and current.sync or {}
+            local interval=tonumber(current.sync.interval)
+            if interval==nil or interval<=30 then current.sync.interval=Config.READ_INTERVAL end
+            self:save_preferences(current)
+        end
         self.db:saveSetting("schema",Config.SCHEMA)
     end
 end

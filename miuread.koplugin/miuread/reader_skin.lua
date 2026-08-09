@@ -4,44 +4,10 @@ local Device = require("device")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local LineWidget = require("ui/widget/linewidget")
-local OverlapGroup = require("ui/widget/overlapgroup")
 local Widget = require("ui/widget/widget")
 local UiScale = require("miuread.ui_scale")
 
 local Skin = {}
-
-local CornerAccent = Widget:extend{
-    width = 1,
-    height = 1,
-    seed = 1,
-    color = Blitbuffer.COLOR_DARK_GRAY,
-    safe_inset = 0,
-}
-
-function CornerAccent:getSize()
-    return Geom:new{w = self.width, h = self.height}
-end
-
-function CornerAccent:paintTo(bb, x, y)
-    if not bb or type(bb.paintRect) ~= "function" then return end
-    local t = math.max(1, UiScale.line("thin"))
-    local safe = math.max(0, tonumber(self.safe_inset) or 0)
-    local inset = safe + UiScale.dp(6, 4, 9)
-    local long = math.max(UiScale.dp(18, 14, 26), math.floor(self.width * .08))
-    local short = math.max(UiScale.dp(8, 6, 12), math.floor(long * .42))
-    local shift = (tonumber(self.seed) or 1) % 2
-    local color = self.color or Blitbuffer.COLOR_GRAY
-
-    -- Fixed-cost corner marks: enough to connect the reader panels with the
-    -- homepage's hand-drawn paper language, without tracing every edge.
-    bb:paintRect(x + inset + shift, y + safe + 1, long, t, color)
-    bb:paintRect(x + safe + 1, y + inset + shift, t, long, color)
-    bb:paintRect(x + inset + long + UiScale.dp(4, 3, 6), y + safe + 2, short, t, color)
-
-    bb:paintRect(x + self.width - inset - long - shift, y + self.height - safe - t - 1, long, t, color)
-    bb:paintRect(x + self.width - safe - t - 1, y + self.height - inset - long - shift, t, long, color)
-    bb:paintRect(x + self.width - inset - long - short - UiScale.dp(4, 3, 6), y + self.height - safe - t - 2, short, t, color)
-end
 
 local function fixed_frame(width, height, options, content)
     options = options or {}
@@ -71,16 +37,11 @@ end
 
 function Skin.paper(width, height, options, content)
     options = options or {}
-    local layers = OverlapGroup:new{
-        dimen = Geom:new{w = width, h = height},
-        allow_mirroring = false,
-    }
-    -- Keep the main outline away from the widget and dirty-region edges. Some
-    -- e-ink framebuffers clip the outermost pixel during partial refreshes.
+    -- Clean e-ink frame: regular border only, no decorative corner marks.
     local safe = math.max(UiScale.line("thin"), UiScale.dp(2, 2, 4))
     local frame_w = math.max(1, width - safe * 2)
     local frame_h = math.max(1, height - safe * 2)
-    layers[#layers + 1] = CenterContainer:new{
+    return CenterContainer:new{
         dimen = Geom:new{w = width, h = height},
         fixed_frame(frame_w, frame_h, {
             bordersize = options.bordersize or UiScale.line("thick"),
@@ -90,16 +51,6 @@ function Skin.paper(width, height, options, content)
             color = options.color or Blitbuffer.COLOR_DARK_GRAY,
         }, content),
     }
-    if options.accent ~= false then
-        layers[#layers + 1] = CornerAccent:new{
-            width = width,
-            height = height,
-            seed = options.seed or 1,
-            safe_inset = safe,
-            color = options.accent_color or Blitbuffer.COLOR_DARK_GRAY,
-        }
-    end
-    return layers
 end
 
 function Skin.divider(width, color, thickness)

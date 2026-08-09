@@ -87,7 +87,7 @@ end
 
 local function retry_delay(kind,failures,interval)
     failures=math.min(10,math.max(1,tonumber(failures) or 1))
-    interval=math.max(10,tonumber(interval) or 30)
+    interval=math.max(10,tonumber(interval) or tonumber(Config.READ_INTERVAL) or 60)
     local function configured(values,fallback)
         values=type(values)=="table" and values or {}
         return tonumber(values[math.min(failures,#values)] or values[#values]) or fallback
@@ -98,7 +98,7 @@ local function retry_delay(kind,failures,interval)
     if kind=="context" then
         return math.min(30*60,configured(Config.READ_REPORT_CONTEXT_RETRY_DELAYS,60))
     end
-    if kind=="transport" then return math.min(30*60,math.max(interval,30)*(2^(failures-1))) end
+    if kind=="transport" then return math.min(30*60,math.max(interval,tonumber(Config.READ_INTERVAL) or 60)*(2^(failures-1))) end
     if kind=="server" then return math.min(30*60,math.max(120,interval*2)*(2^(failures-1))) end
     return math.max(interval,60)
 end
@@ -188,7 +188,7 @@ function Service.run(job)
     end
 
     local function run_report(control, elapsed, final_flush, reason)
-        local interval = math.max(10, tonumber(current_job.interval) or 30)
+        local interval = math.max(10, tonumber(current_job.interval) or tonumber(Config.READ_INTERVAL) or 60)
         -- The service process may be reused across books, but every reporting
         -- request is bound to one generation, book and immutable core map.
         if tostring(control.book_id or "")~=tostring(current_job.book_id or "")
@@ -369,7 +369,7 @@ function Service.run(job)
                 else
                     book = U.copy(loaded.book or {})
                     auth = U.copy(loaded.auth or {})
-                    local interval = math.max(10, tonumber(loaded.interval) or 30)
+                    local interval = math.max(10, tonumber(loaded.interval) or tonumber(Config.READ_INTERVAL) or 60)
                     local first_delay = math.max(5, math.min(interval, tonumber(loaded.first_delay) or interval))
                     local now = os.time()
                     next_due = now + first_delay
@@ -415,7 +415,7 @@ function Service.run(job)
                         })
                     end
                 elseif next_due <= 0 then
-                    local interval = math.max(10, tonumber(current_job.interval) or 30)
+                    local interval = math.max(10, tonumber(current_job.interval) or tonumber(Config.READ_INTERVAL) or 60)
                     local first_delay = math.max(5, math.min(interval, tonumber(current_job.first_delay) or interval))
                     local now = os.time()
                     last_report_at = now
@@ -445,7 +445,7 @@ function Service.run(job)
                 end
             elseif active and not blocked then
                 local now = os.time()
-                local interval = math.max(10, tonumber(current_job.interval) or 30)
+                local interval = math.max(10, tonumber(current_job.interval) or tonumber(Config.READ_INTERVAL) or 60)
                 local idle_timeout = math.max(interval, tonumber(current_job.idle_timeout) or 600)
                 local last_activity = tonumber(control.last_activity) or now
                 local idle = now - last_activity

@@ -833,16 +833,25 @@ function HomeWidget:onHomeShelfSwipe(_,ges)
 end
 
 function HomeWidget:_build_header(children, m)
-    -- Five stable zones keep account access visible without sacrificing SSID
-    -- or battery. Only the account/SSID fields may ellipsize.
-    local gap = math.max(UiScale.dp(3, 2, 6), math.floor(m.content_w * .0045))
-    local title_w = math.max(UiScale.dp(72, 64, 94), math.floor(m.content_w * .115))
-    local account_w = math.max(UiScale.dp(120, 105, 155), math.floor(m.content_w * .175))
-    local battery_w = math.max(UiScale.dp(62, 56, 82), math.floor(m.content_w * .085))
-    local menu_w = math.max(UiScale.dp(68, 60, 90), math.floor(m.content_w * .095))
-    local status_w = math.max(1, m.content_w - title_w - account_w - battery_w - menu_w - gap * 4)
+    -- Independent compact groups: account | Wi-Fi/SSID | sync | time | battery.
+    local gap = math.max(UiScale.dp(2, 2, 4), math.floor(m.content_w * .003))
+    local title_w = math.max(UiScale.dp(66, 58, 86), math.floor(m.content_w * .10))
+    local account_w = math.max(UiScale.dp(112, 98, 145), math.floor(m.content_w * .15))
+    local sync_w = math.max(UiScale.dp(94, 82, 124), math.floor(m.content_w * .13))
+    local time_w = math.max(UiScale.dp(57, 51, 74), math.floor(m.content_w * .075))
+    local battery_w = math.max(UiScale.dp(78, 69, 102), math.floor(m.content_w * .10))
+    local menu_w = math.max(UiScale.dp(62, 55, 82), math.floor(m.content_w * .085))
+    local wifi_w = math.max(UiScale.dp(132, 116, 176),
+        m.content_w - title_w - account_w - sync_w - time_w - battery_w - menu_w - gap * 6)
+    local used = title_w + account_w + wifi_w + sync_w + time_w + battery_w + menu_w + gap * 6
+    if used > m.content_w then
+        wifi_w = math.max(UiScale.dp(92, 82, 122), wifi_w - (used - m.content_w))
+    end
     local account_text=tostring(self.opts.account_name or "")
     if account_text=="" then account_text="未登录" end
+    local wifi_text=tostring(self.opts.wifi_text or "")
+    if wifi_text=="" then wifi_text="Wi-Fi" end
+    local sync_text=tostring(self.opts.sync_text or "已同步")
     local header = HorizontalGroup:new{
         align = "center",
         LeftContainer:new{dimen = Geom:new{w = title_w, h = m.header_h}, TextWidget:new{
@@ -857,29 +866,48 @@ function HomeWidget:_build_header(children, m)
                 height_overflow_show_ellipsis = true,
             }), self.opts.on_account),
         HorizontalSpan:new{width = gap},
-        tappable(status_w, m.header_h, CenterContainer:new{
-            dimen=Geom:new{w=status_w,h=m.header_h},
+        tappable(wifi_w, m.header_h, LeftContainer:new{
+            dimen=Geom:new{w=wifi_w,h=m.header_h},
             HorizontalGroup:new{
                 align="center",
-                Ui.icon("wifi",UiScale.dp(23,20,30),m.header_h,UiScale.dp(18,16,24),{icon_key="wifi"}),
-                HorizontalSpan:new{width=UiScale.dp(3,2,5)},
-                Ui.textbox(tostring(self.opts.status_line or ""),
-                    math.max(1,status_w-UiScale.dp(26,22,35)),m.header_h,face("smallinfofont",10.8,14.8),{
-                        bold=true,alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_BLACK,
+                Ui.icon("wifi",UiScale.dp(22,19,29),m.header_h,UiScale.dp(18,16,24),{icon_key="wifi"}),
+                HorizontalSpan:new{width=UiScale.dp(2,2,4)},
+                Ui.textbox(wifi_text,math.max(1,wifi_w-UiScale.dp(24,21,33)),m.header_h,
+                    face("smallinfofont",10.5,14.5),{
+                        bold=true,alignment="left",halign="left",fgcolor=Blitbuffer.COLOR_BLACK,
                         height_overflow_show_ellipsis=true,
                     }),
             },
         }, self.opts.on_quick_panel),
+        HorizontalSpan:new{width = gap},
+        tappable(sync_w, m.header_h, LeftContainer:new{
+            dimen=Geom:new{w=sync_w,h=m.header_h},
+            HorizontalGroup:new{
+                align="center",
+                Ui.icon("sync",UiScale.dp(20,18,27),m.header_h,UiScale.dp(16,14,21),{icon_key="sync"}),
+                HorizontalSpan:new{width=UiScale.dp(2,1,3)},
+                Ui.textbox(sync_text,math.max(1,sync_w-UiScale.dp(22,19,30)),m.header_h,
+                    face("smallinfofont",10.1,14),{
+                        bold=true,alignment="left",halign="left",fgcolor=Blitbuffer.COLOR_BLACK,
+                        height_overflow_show_ellipsis=true,
+                    }),
+            },
+        }, self.opts.on_quick_panel),
+        HorizontalSpan:new{width = gap},
+        Ui.textbox(tostring(self.opts.time_text or "--:--"),time_w,m.header_h,
+            face("smallinfofont",10.6,14.6),{
+                bold=true,alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_BLACK,
+            }),
         HorizontalSpan:new{width = gap},
         CenterContainer:new{
             dimen=Geom:new{w=battery_w,h=m.header_h},
             HorizontalGroup:new{
                 align="center",
                 Ui.icon("battery",UiScale.dp(22,19,29),m.header_h,UiScale.dp(17,15,22),{icon_key="battery"}),
-                HorizontalSpan:new{width=UiScale.dp(2,2,4)},
+                HorizontalSpan:new{width=UiScale.dp(2,1,3)},
                 Ui.textbox(tostring(self.opts.battery_text or "--%"),math.max(1,battery_w-UiScale.dp(24,21,33)),m.header_h,
-                    face("smallinfofont",10.8,14.8),{
-                        bold=true,alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_BLACK,
+                    face("smallinfofont",10.6,14.6),{
+                        bold=true,alignment="left",halign="left",fgcolor=Blitbuffer.COLOR_BLACK,
                     }),
             },
         },
