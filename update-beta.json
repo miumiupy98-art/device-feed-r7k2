@@ -1,17 +1,17 @@
 {
-  "version": "4.3.0-beta.7",
-  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 4.3.0-beta.7 \u5185\u6d4b\u7248",
+  "version": "4.3.0-beta.8",
+  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 4.3.0-beta.8 \u5185\u6d4b\u7248",
   "channel": "beta",
   "package_type": "full",
-  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.7/miuread-v4.3.0-beta.7-full.zip",
+  "package_url": "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.8/miuread-v4.3.0-beta.8-full.zip",
   "package_urls": [
-    "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.7/miuread-v4.3.0-beta.7-full.zip",
-    "https://ghfast.top/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.7/miuread-v4.3.0-beta.7-full.zip",
-    "https://gh-proxy.com/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.7/miuread-v4.3.0-beta.7-full.zip",
-    "https://ghproxy.net/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.7/miuread-v4.3.0-beta.7-full.zip"
+    "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.8/miuread-v4.3.0-beta.8-full.zip",
+    "https://ghfast.top/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.8/miuread-v4.3.0-beta.8-full.zip",
+    "https://gh-proxy.com/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.8/miuread-v4.3.0-beta.8-full.zip",
+    "https://ghproxy.net/https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/v4.3.0-beta.8/miuread-v4.3.0-beta.8-full.zip"
   ],
-  "size": 578077,
-  "sha256": "d3eb49ae2d809bc3ba5f67352906f20145d571d67f7434e82e2165818f3539ab",
-  "summary": "\u6279\u6ce8 \u4fee\u590d\u672c\u5730\u5212\u7ebf\u4e0e\u60f3\u6cd5\u5206\u7c7b\u5e76\u8865\u5168\u4e0a\u4e0b\u6587\u5b9a\u4f4d\n\u5750\u6807 \u4e0a\u4f20\u7edf\u4e00\u8d70 PosMap Bridge \u5e76\u9a8c\u8bc1\u7ae0\u8282\u4e0e range\n\u540c\u6b65 \u589e\u52a0\u76f8\u90bb\u7ae0\u8282\u6821\u9a8c\u548c\u5206\u9636\u6bb5\u5931\u8d25\u539f\u56e0\n\u5b89\u5168 \u5b9a\u4f4d\u4e0d\u552f\u4e00\u6216\u6821\u9a8c\u5931\u8d25\u65f6\u7ee7\u7eed\u53ea\u4fdd\u7559\u672c\u5730",
-  "notes": "\u6279\u6ce8 \u4fee\u590d\u672c\u5730\u5212\u7ebf\u4e0e\u60f3\u6cd5\u5206\u7c7b\u5e76\u8865\u5168\u4e0a\u4e0b\u6587\u5b9a\u4f4d\n\u5750\u6807 \u4e0a\u4f20\u7edf\u4e00\u8d70 PosMap Bridge \u5e76\u9a8c\u8bc1\u7ae0\u8282\u4e0e range\n\u540c\u6b65 \u589e\u52a0\u76f8\u90bb\u7ae0\u8282\u6821\u9a8c\u548c\u5206\u9636\u6bb5\u5931\u8d25\u539f\u56e0\n\u5b89\u5168 \u5b9a\u4f4d\u4e0d\u552f\u4e00\u6216\u6821\u9a8c\u5931\u8d25\u65f6\u7ee7\u7eed\u53ea\u4fdd\u7559\u672c\u5730"
+  "size": 578458,
+  "sha256": "7727a10bcf76a3c2113b0d74bf29a0e27cc9027ca9c8000c3c21b32d3baf726b",
+  "summary": "\u754c\u9762 \u4fee\u590d\u684c\u9762\u6a21\u5f0f\u8bc4\u8bba\u4e0e\u6807\u6ce8\u672a\u63a5\u5165\u6279\u6ce8\u4e91\u540c\u6b65\u5165\u53e3\n\u540c\u6b65 \u8d26\u53f7\u4e0e\u540c\u6b65\u65b0\u589e\u672c\u5730\u6279\u6ce8\u540c\u6b65\u5feb\u6377\u5165\u53e3\u5e76\u660e\u786e\u4e3a\u624b\u52a8\u4e0a\u4f20\n\u8bca\u65ad \u589e\u52a0\u6279\u6ce8\u540c\u6b65\u521d\u59cb\u5316 \u5f00\u5173\u548c\u624b\u52a8\u89e6\u53d1\u65e5\u5fd7\n\u517c\u5bb9 \u63d2\u4ef6\u6a21\u5f0f\u4e0e\u684c\u9762\u6a21\u5f0f\u7edf\u4e00\u4f7f\u7528\u540c\u4e00\u5957\u6279\u6ce8\u8bbe\u7f6e\u83dc\u5355",
+  "notes": "\u754c\u9762 \u4fee\u590d\u684c\u9762\u6a21\u5f0f\u8bc4\u8bba\u4e0e\u6807\u6ce8\u672a\u63a5\u5165\u6279\u6ce8\u4e91\u540c\u6b65\u5165\u53e3\n\u540c\u6b65 \u8d26\u53f7\u4e0e\u540c\u6b65\u65b0\u589e\u672c\u5730\u6279\u6ce8\u540c\u6b65\u5feb\u6377\u5165\u53e3\u5e76\u660e\u786e\u4e3a\u624b\u52a8\u4e0a\u4f20\n\u8bca\u65ad \u589e\u52a0\u6279\u6ce8\u540c\u6b65\u521d\u59cb\u5316 \u5f00\u5173\u548c\u624b\u52a8\u89e6\u53d1\u65e5\u5fd7\n\u517c\u5bb9 \u63d2\u4ef6\u6a21\u5f0f\u4e0e\u684c\u9762\u6a21\u5f0f\u7edf\u4e00\u4f7f\u7528\u540c\u4e00\u5957\u6279\u6ce8\u8bbe\u7f6e\u83dc\u5355"
 }
