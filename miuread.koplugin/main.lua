@@ -348,11 +348,20 @@ function Plugin:init()
     self._reader_active_path="/tmp/miuread-reader-active.flag"
     self._reader_busy_path="/tmp/miuread-reader-busy.until"
     self._reader_busy_until=tonumber(U.read_file(self._reader_busy_path,true) or 0) or 0
+    self._reader_last_interaction_clock=0
     self._home_quick_panel_last_open=0
     self._home_quick_panel_opening=false
+    -- Keep expensive home workers out of the user's immediate interaction path.
+    -- Every touch extends a short quiet window; visible metadata/cover work is
+    -- resumed only after that window expires.
+    self._home_ui_quiet_until=0
+    self._home_ui_resume_task=nil
+    self._home_visible_metadata_targets={}
+    self._home_visible_cover_targets={}
     self._reader_quick_panel_pending=false
     self._reader_toolbar_state_cache={session=0,page=nil,total=nil,chapter="",updated_at=0}
     self._reader_toolbar_state_task=nil
+    self._reader_toolbar_prewarm_task=nil
     self._reader_toolbar_header_perf=nil
     self._reader_toolbar_options_perf=nil
     self._mode_intro_generation=0
@@ -449,6 +458,12 @@ function Plugin:init()
         disable_fallback=true})
     self.repair_async=Async:new(self.store,{poll_interval=.35,allow_android=true})
     self.annotation_async=Async:new(self.store,{poll_interval=.30,allow_android=true,disable_fallback=true})
+    -- Summary scans may touch one SQLite cache per annotated book. Keep them
+    -- out of every home tap and pull-down path.
+    self.sync_summary_async=Async:new(self.store,{poll_interval=.45,allow_android=true,disable_fallback=true})
+    self._annotation_summary_cache=nil
+    self._annotation_summary_cache_at=0
+    self._home_sync_summary_task=nil
     if self:_home_enabled() then
         self.home_async=Async:new(self.store,{poll_interval=.45,allow_android=true,disable_fallback=true})
         -- Desktop-only workers are not created in plugin mode.
@@ -2520,6 +2535,56 @@ function Plugin:_home_background_blocked()
         or self:_page_transition_active()
 end
 
+function Plugin:_home_ui_busy()
+    return self:_home_background_blocked()
+        or os.clock() < (tonumber(self._home_ui_quiet_until) or 0)
+end
+
+function Plugin:_home_resume_visible_work_after_idle()
+    if self._home_ui_resume_task then UIManager:unschedule(self._home_ui_resume_task) end
+    local task
+    task=function()
+        if self._home_ui_resume_task~=task then return end
+        local remain=(tonumber(self._home_ui_quiet_until) or 0)-os.clock()
+        if remain>0 then
+            UIManager:scheduleIn(math.max(.20,remain+.08),task)
+            return
+        end
+        self._home_ui_resume_task=nil
+        if not HomeView.is_shown() or self:_active_reader_ui() or self:_home_background_blocked() then return end
+        local metadata=self._home_visible_metadata_targets or {}
+        local covers=self._home_visible_cover_targets or {}
+        self:_home_schedule_local_metadata(metadata)
+        self:_home_schedule_remote_covers(covers)
+        UIManager:scheduleIn(.70,function()
+            if HomeView.is_shown() and not self:_active_reader_ui() and not self:_home_ui_busy() then
+                self:_home_schedule_cover_derivatives(covers)
+            end
+        end)
+        if self.download_task then self.download_task:resume("home_interaction") end
+    end
+    self._home_ui_resume_task=task
+    UIManager:scheduleIn(.35,task)
+end
+
+function Plugin:_home_note_interaction(first,kind)
+    self._home_ui_quiet_until=math.max(tonumber(self._home_ui_quiet_until) or 0,os.clock()+1.35)
+    self._home_interaction_generation=(tonumber(self._home_interaction_generation) or 0)+1
+    -- Stop optional visible-book work immediately; it can be restarted from
+    -- cached targets after the user has been idle for a moment.
+    self._home_metadata_generation=(tonumber(self._home_metadata_generation) or 0)+1
+    self._home_cover_generation=(tonumber(self._home_cover_generation) or 0)+1
+    self._home_cover_render_generation=(tonumber(self._home_cover_render_generation) or 0)+1
+    if self.home_metadata_async and self.home_metadata_async:busy() then self.home_metadata_async:cancel("home interaction") end
+    if self.home_cover_async and self.home_cover_async:busy() then self.home_cover_async:cancel("home interaction") end
+    if self.cover_render_async and self.cover_render_async:busy() then self.cover_render_async:cancel("home interaction") end
+    if self.download_task and self.download_task:busy() then self.download_task:pause("home_interaction") end
+    self:_home_resume_visible_work_after_idle()
+    if first then
+        logger.info("[MiuRead][HomePerf] interaction priority","kind=",tostring(kind or "input"))
+    end
+end
+
 function Plugin:_home_unschedule_task(field)
     local task=self[field]
     if task then
@@ -2565,6 +2630,8 @@ function Plugin:_home_freeze_for_suspend()
     if self.home_cover_async then self.home_cover_async:cancel("device suspended") end
     if self.cover_render_async then self.cover_render_async:cancel("device suspended") end
     if self.annotation_async then self.annotation_async:cancel("device suspended") end
+    if self.sync_summary_async then self.sync_summary_async:cancel("device suspended") end
+    self:_home_unschedule_task("_home_sync_summary_task")
     if self.shelf_async and self._home_resume_pending_work.remote then self.shelf_async:cancel("device suspended") end
 
     logger.info("[MiuRead][Resume] home tasks frozen",
@@ -3121,7 +3188,7 @@ function Plugin:_home_apply_rendered_cover_path(book_id,path)
 end
 
 function Plugin:_home_schedule_cover_derivatives(books)
-    if self:_home_background_blocked() then
+    if self:_home_ui_busy() then
         self._home_resume_pending_work=self._home_resume_pending_work or {}
         self._home_resume_pending_work.covers=true
         return false
@@ -4340,7 +4407,7 @@ end
 
 function Plugin:_home_status_line()
     local parts={}
-    local state=HomeData.quick_device_state() or {}
+    local state=HomeData.cached_device_state() or HomeData.quick_device_state() or {}
     if state.wifi_on==false then
         parts[#parts+1]="离线"
     elseif state.wifi_on==true then
@@ -4353,7 +4420,7 @@ function Plugin:_home_status_line()
 end
 
 function Plugin:_home_battery_text()
-    local device=HomeData.quick_device_state() or {}
+    local device=HomeData.cached_device_state() or HomeData.quick_device_state() or {}
     if tonumber(device.battery) then
         return tostring(math.floor(tonumber(device.battery)+.5)).."%"
     end
@@ -5373,6 +5440,7 @@ end
 
 function Plugin:_show_home_refresh_popup(anchor)
     ActionSheet.show{
+        cache_key="home_refresh",
         anchor=anchor,
         preferred_direction="below",
         title="刷新",
@@ -5391,6 +5459,7 @@ end
 
 function Plugin:_show_home_download_popup(anchor)
     ActionSheet.show{
+        cache_key="home_download",
         anchor=anchor,
         preferred_direction="below",
         title="下载",
@@ -5415,6 +5484,7 @@ function Plugin:_show_home_sync_popup(anchor)
             .."  想法 "..tostring(summary.thought)
     end
     ActionSheet.show{
+        cache_key="home_sync",
         anchor=anchor,
         preferred_direction="below",
         title="同步",
@@ -5432,26 +5502,29 @@ end
 
 function Plugin:_show_home_settings_popup(anchor)
     ActionSheet.show{
+        cache_key="home_settings",
         anchor=anchor,
         preferred_direction="below",
+        width_ratio=.84,
         title="觅阅设置",
-        subtitle="只保留主页快捷入口没有覆盖的设置",
+        subtitle="快捷入口没有覆盖的常用设置",
+        columns=3,
+        simple_cards=true,
         actions={
-            {icon="▦",label="首页与书架",detail="布局 书架 本地书库与快捷入口",callback=function()
+            {icon="▦",label="首页书架",detail="布局 书库与快捷入口",callback=function()
                 self:_show_standalone_menu("首页与书架",self:display_settings_menu())
             end},
-            {icon="A",label="阅读界面",detail="阅读控制中心与显示方式",callback=function()
+            {icon="A",label="阅读界面",detail="显示与快捷控制",callback=function()
                 self:_show_standalone_menu("阅读界面",self:reader_quick_panel_settings_menu())
             end},
-            {icon="✎",label="评论 划线与想法",detail="显示 字体与本地数据",callback=function()
+            {icon="✎",label="评论批注",detail="评论 划线与想法",callback=function()
                 self:_show_standalone_menu("评论 划线与想法",PluginSettings.comments(self))
             end},
         },
-        wide_last=true,
         footer_actions={
-            {label="时间与时区",callback=function() self:_show_standalone_menu("时间与时区",self:time_display_settings_menu()) end},
-            {label="更新与关于",callback=function() self:_show_standalone_menu("更新与关于",PluginSettings.update_about(self)) end},
-            {label="工具与维护",callback=function() self:_show_standalone_menu("工具与维护",self:maintenance_menu()) end},
+            {label="时间",callback=function() self:_show_standalone_menu("时间与时区",self:time_display_settings_menu()) end},
+            {label="更新",callback=function() self:_show_standalone_menu("更新与关于",PluginSettings.update_about(self)) end},
+            {label="工具",callback=function() self:_show_standalone_menu("工具与维护",self:maintenance_menu()) end},
         },
     }
 end
@@ -5646,7 +5719,9 @@ function Plugin:_home_action_entries()
     local definitions={
         refresh={icon="↻",icon_key="refresh",label="刷新",callback=function() self:_home_manual_refresh() end,hold_callback=function(anchor) self:_show_home_refresh_popup(anchor) end},
         search={icon="⌕",icon_key="search",label="搜索",callback=function() self:show_home_search_dialog() end},
-        downloads={icon="⇩",icon_key="download",label="下载",badge=download_badge,callback=function() self:show_downloads() end},
+        downloads={icon="⇩",icon_key="download",label="下载",badge=download_badge,
+            callback=function(anchor) self:_show_home_download_popup(anchor) end,
+            hold_callback=function() self:show_downloads() end},
         sync={icon="⇅",icon_key="sync",label="同步",badge=sync_badge,callback=function() self:_sync_home_pending() end,hold_callback=function(anchor) self:_show_home_sync_popup(anchor) end},
         miuread_settings={icon="⚙",icon_key="settings",label="觅阅设置",callback=function(anchor) self:_show_home_settings_popup(anchor) end,hold_callback=function(anchor) self:_show_home_settings_popup(anchor) end},
         all_books={icon="▦",label="全部书籍",callback=function() self:show_home_all_books() end},
@@ -6138,7 +6213,7 @@ function Plugin:_home_save_network_metadata(book,patch,completed)
 end
 
 function Plugin:_home_schedule_network_metadata(book,force,silent,on_done)
-    if self:_home_background_blocked() then
+    if self:_home_ui_busy() then
         self._home_resume_pending_work=self._home_resume_pending_work or {}
         self._home_resume_pending_work.metadata=true
         return false
@@ -6224,7 +6299,7 @@ function Plugin:_home_schedule_network_metadata(book,force,silent,on_done)
 end
 
 function Plugin:_home_schedule_local_metadata(books)
-    if self:_home_background_blocked() then
+    if self:_home_ui_busy() then
         self._home_resume_pending_work=self._home_resume_pending_work or {}
         self._home_resume_pending_work.metadata=true
         return false
@@ -6266,6 +6341,7 @@ function Plugin:_home_schedule_local_metadata(books)
     end
     local function next_book()
         if generation~=self._home_metadata_generation or not HomeView.is_shown() or self:_active_reader_ui() then return end
+        if self:_home_ui_busy() then UIManager:scheduleIn(.45,next_book); return end
         local item=queue[index]
         if not item then finish(); return end
         if self.home_metadata_async and self.home_metadata_async:available() then
@@ -6297,7 +6373,7 @@ function Plugin:_home_schedule_local_metadata(books)
 end
 
 function Plugin:_home_schedule_remote_covers(books)
-    if self:_home_background_blocked() then
+    if self:_home_ui_busy() then
         self._home_resume_pending_work=self._home_resume_pending_work or {}
         self._home_resume_pending_work.covers=true
         return false
@@ -6364,6 +6440,7 @@ function Plugin:_home_schedule_remote_covers(books)
     end
     local function next_cover()
         if generation~=self._home_cover_generation or not HomeView.is_shown() or self:_active_reader_ui() then return end
+        if self:_home_ui_busy() then UIManager:scheduleIn(.45,next_cover); return end
         if self.home_cover_async:busy() then UIManager:scheduleIn(.3,next_cover); return end
         local item=queue[index]
         if not item then finish(); return end
@@ -7190,7 +7267,9 @@ function Plugin:show_home_quick_panel(more_expanded)
         quit={icon="⏻",icon_key="power",label="退出 KOReader",detail="",callback=function() self:_quit_koreader() end},
         sync={icon="⇅",icon_key="sync",label="同步",detail=sync_label,callback=function() self:_sync_home_pending() end,hold_callback=function(anchor) self:_show_home_sync_popup(anchor) end},
         miuread_settings={icon="⚙",icon_key="settings",label="觅阅设置",detail="",callback=function(anchor) self:_show_home_settings_popup(anchor) end},
-        downloads={icon="⇩",icon_key="download",label="下载",detail=download_detail,callback=function() self:show_downloads() end},
+        downloads={icon="⇩",icon_key="download",label="下载",detail=download_detail,
+            callback=function(anchor) self:_show_home_download_popup(anchor) end,
+            hold_callback=function() self:show_downloads() end},
         restart={icon="↺",icon_key="restart",label="重启",detail="",callback=function() self:_restart_koreader() end},
         full_refresh={icon="▤",icon_key="full-refresh",label="全屏刷新",detail="",callback=function() self:_home_full_refresh() end},
     }
@@ -7286,7 +7365,7 @@ end
 
 function Plugin:show_home_menu()
     if not self:_home_enabled() then return self:_show_standalone_menu("插件设置",PluginSettings.menu(self)) end
-    return self:_show_home_settings_popup(nil)
+    return self:_show_standalone_menu("觅阅菜单",self:settings_menu())
 end
 
 function Plugin:home_preview_menu()
@@ -7324,6 +7403,7 @@ end
 function Plugin:_mark_reader_busy(seconds,share_report)
     local path=tostring(self._reader_busy_path or "")
     if path=="" then return false end
+    self._reader_last_interaction_clock=os.clock()
     local now=os.time()
     local target=math.max(now+math.max(1,tonumber(seconds) or 4),tonumber(self._reader_busy_until or 0) or 0)
     self._reader_busy_until=target
@@ -7333,11 +7413,19 @@ function Plugin:_mark_reader_busy(seconds,share_report)
     -- written only when a visible panel gesture specifically asks the report
     -- subprocess to yield, or while a download is already competing for I/O.
     if active_download or share_report==true then wrote=U.atomic_write(path,tostring(target),true)==true end
-    if active_download and self.performance_mode and self.performance_mode:enabled() and self.download_task then
+    -- Reading interaction always wins over background generation. This used to
+    -- happen only in optional lightweight mode, which is why active downloads
+    -- could still make the first page turn or pull-down panel feel sticky.
+    if active_download and self.download_task then
         self.download_task:pause("reader_interaction")
         self:_schedule_reader_interaction_resume(target)
     end
     return wrote
+end
+
+function Plugin:_reader_background_idle()
+    if os.time()<(tonumber(self._reader_busy_until) or 0) then return false end
+    return os.clock()-(tonumber(self._reader_last_interaction_clock) or 0)>=.80
 end
 
 function Plugin:_reader_toolbar_cache()
@@ -7407,6 +7495,10 @@ function Plugin:_schedule_reader_toolbar_state_refresh(page,delay)
     local task
     task=function()
         if self._reader_toolbar_state_task~=task then return end
+        if not self:_reader_background_idle() then
+            UIManager:scheduleIn(.35,task)
+            return
+        end
         self._reader_toolbar_state_task=nil
         if self.ui and self.ui.document and not reader_close_active()
             and tonumber(HOME_SESSION.reader_session_generation or 0)==session then
@@ -9479,6 +9571,32 @@ function Plugin:_reader_quick_panel_options()
     }
 end
 
+function Plugin:_schedule_reader_toolbar_prewarm(session,delay)
+    session=tonumber(session) or tonumber(HOME_SESSION.reader_session_generation or 0) or 0
+    if self._reader_toolbar_prewarm_task then UIManager:unschedule(self._reader_toolbar_prewarm_task) end
+    local task
+    task=function()
+        if self._reader_toolbar_prewarm_task~=task then return end
+        if not (self.ui and self.ui.document) or reader_close_active()
+            or tonumber(HOME_SESSION.reader_session_generation or 0)~=session then
+            self._reader_toolbar_prewarm_task=nil
+            return
+        end
+        local idle_for=os.clock()-(tonumber(self._reader_last_interaction_clock) or 0)
+        if idle_for<1.0 then UIManager:scheduleIn(.45,task); return end
+        self._reader_toolbar_prewarm_task=nil
+        local started=os.clock()
+        local options=self:_reader_quick_panel_options()
+        if options then
+            local panel,err=ReaderToolbar.prepare(options,tostring(session))
+            if not panel then logger.warn("[MiuRead][ReaderToolbar] prewarm failed",tostring(err or "unknown"))
+            else logger.info("[MiuRead][ReaderToolbar] prewarmed","ms=",tostring(math.floor((os.clock()-started)*1000+.5))) end
+        end
+    end
+    self._reader_toolbar_prewarm_task=task
+    UIManager:scheduleIn(math.max(.35,tonumber(delay) or 1.1),task)
+end
+
 function Plugin:_show_reader_quick_panel_now()
     if not (self.ui and self.ui.document) then return false end
     local started=os.clock()
@@ -9486,7 +9604,7 @@ function Plugin:_show_reader_quick_panel_now()
     local options=self:_reader_quick_panel_options()
     local options_done=os.clock()
     if not options then return false end
-    local panel,err=ReaderToolbar.show(options)
+    local panel,err=ReaderToolbar.show(options,tostring(HOME_SESSION.reader_session_generation or 0))
     local shown=os.clock()
     if not panel then
         logger.warn("[MiuRead][ReaderToolbar] unavailable",tostring(err or "unknown"))
@@ -9507,7 +9625,9 @@ function Plugin:_show_reader_quick_panel_now()
 end
 
 function Plugin:show_reader_quick_panel()
-    self:_home_preferences() -- applies MiuRead display size and interface font to reader panels
+    -- UiScale is already applied when preferences are loaded/saved. Re-reading
+    -- and normalizing the whole home preference tree on every swipe needlessly
+    -- adds work to the most latency-sensitive reader gesture.
     if not (self.ui and self.ui.document) then return false end
     -- Only the visible downward-swipe path publishes a short shared busy marker
     -- for the read-report subprocess. Page turns themselves stay memory-only.
@@ -10178,6 +10298,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         lockscreen_enabled=home.lockscreen_recent~=false,
         screensaver_file=screensaver_file,
         on_quick_panel=function() self:show_home_quick_panel() end,
+        on_interaction=function(first,kind) self:_home_note_interaction(first,kind) end,
         on_account=function() self:_home_leave_and_run("account status",function() self:show_account_status() end) end,
         on_menu=function() self:show_home_menu() end,
         on_back=function() return self:_home_handle_back() end,
@@ -10232,6 +10353,8 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         metadata_targets[#metadata_targets+1]=book
         cover_targets[#cover_targets+1]=book
     end
+    self._home_visible_metadata_targets=metadata_targets
+    self._home_visible_cover_targets=cover_targets
     self:_home_schedule_local_metadata(metadata_targets)
     self:_home_schedule_remote_covers(cover_targets)
     -- Existing covers are converted only after the home is already interactive.
@@ -13043,12 +13166,47 @@ function Plugin:sync_diagnostics_menu()
     }
 end
 
-function Plugin:_home_sync_summary(force)
+function Plugin:_schedule_home_annotation_summary_refresh(force)
     local now=os.time()
-    if force~=true and type(self._home_sync_summary_cache)=="table"
-        and now-(tonumber(self._home_sync_summary_cache_at) or 0)<=2 then
-        return self._home_sync_summary_cache
+    if force~=true and type(self._annotation_summary_cache)=="table"
+        and now-(tonumber(self._annotation_summary_cache_at) or 0)<12 then return false end
+    if self.sync_summary_async and self.sync_summary_async:busy() then return false end
+    if self._home_sync_summary_task then return false end
+    local task
+    task=function()
+        if self._home_sync_summary_task~=task then return end
+        if self:_home_ui_busy() or self:_active_reader_ui() then
+            UIManager:scheduleIn(.55,task)
+            return
+        end
+        self._home_sync_summary_task=nil
+        if not self.sync_summary_async or not self.sync_summary_async:available() then return end
+        local started,err=self.sync_summary_async:run("annotation-summary",function()
+            return LocalAnnotationDatabase.global_summary(self.store) or {}
+        end,function(result)
+            if result and result.ok and type(result.value)=="table" then
+                self._annotation_summary_cache=result.value
+                self._annotation_summary_cache_at=os.time()
+                self._home_sync_summary_cache=nil
+                self._home_sync_summary_cache_at=nil
+                if HomeView.is_shown() and not self:_active_reader_ui() then
+                    self:_notify_home_data_changed("header")
+                end
+            elseif result and result.error then
+                logger.warn("[MiuRead][SyncSummary] refresh failed",tostring(result.error))
+            end
+        end,20)
+        if not started then logger.warn("[MiuRead][SyncSummary] worker unavailable",tostring(err or "unknown")) end
     end
+    self._home_sync_summary_task=task
+    UIManager:scheduleIn(force==true and .12 or .70,task)
+    return true
+end
+
+function Plugin:_home_sync_summary(force)
+    -- Never walk every local annotation database from a home gesture. Session
+    -- counters are cheap; annotation counters come from an asynchronously
+    -- refreshed snapshot.
     local sessions=self.store:get("sessions",{}) or {}
     local progress,time_count,progress_failed=0,0,0
     local pending_progress_states={
@@ -13065,20 +13223,23 @@ function Plugin:_home_sync_summary(force)
             if tonumber(session.pending_report_seconds or 0)>0 then time_count=time_count+1 end
         end
     end
-    local annotations=LocalAnnotationDatabase.global_summary(self.store) or {}
+    local annotations=type(self._annotation_summary_cache)=="table" and self._annotation_summary_cache or {}
     local highlight=tonumber(annotations.highlight or 0) or 0
     local thought=tonumber(annotations.thought or 0) or 0
     local bookmark=tonumber(annotations.bookmark or 0) or 0
     local total=progress+time_count+highlight+thought+bookmark
+    local checking=type(self._annotation_summary_cache)~="table"
+        or (self.sync_summary_async and self.sync_summary_async:busy())==true
     local summary={
         progress=progress,time=time_count,highlight=highlight,thought=thought,bookmark=bookmark,
         annotation_pending=tonumber(annotations.pending or 0) or 0,
         annotation_failed=tonumber(annotations.failed or 0) or 0,
         failed=progress_failed+(tonumber(annotations.failed or 0) or 0),
-        total=total,books=tonumber(annotations.books or 0) or 0,
+        total=total,books=tonumber(annotations.books or 0) or 0,checking=checking,
     }
     self._home_sync_summary_cache=summary
-    self._home_sync_summary_cache_at=now
+    self._home_sync_summary_cache_at=os.time()
+    self:_schedule_home_annotation_summary_refresh(force==true)
     return summary
 end
 
@@ -13087,6 +13248,7 @@ function Plugin:_home_sync_status_label(force)
     if summary.failed>0 then return "失败 "..tostring(summary.failed) end
     if summary.total>0 then return "待同步 "..tostring(summary.total) end
     if self.annotation_async and self.annotation_async:busy() then return "同步中" end
+    if summary.checking==true then return "同步检查中" end
     return "已同步"
 end
 
@@ -13138,32 +13300,90 @@ function Plugin:_sync_all_pending_annotations(on_done)
 end
 
 function Plugin:_sync_home_pending()
-    local summary=self:_home_sync_summary(true)
-    if summary.total<=0 then self:toast("所有待处理内容都已同步",2); return true end
-    if not self:logged_in() then self:info("请先登录微信读书账号。") return false end
-    self:toast("正在同步待处理内容…",2)
-    local annotation_count=summary.annotation_pending
-    local function finish(ok,result)
-        self._home_sync_summary_cache=nil
-        self._home_sync_summary_cache_at=nil
-        if HomeView.is_shown() then self:_notify_home_data_changed("header") end
-        local after=self:_home_sync_summary(true)
-        if ok and after.total<=0 then
-            self:status_toast("同步完成","进度 时间 划线和想法已处理",3)
-        elseif ok then
-            local message="仍有 "..tostring(after.total).." 项待处理"
-            if after.progress>0 or after.time>0 then message=message.."\n阅读进度或时间将在对应书籍同步环境恢复后继续处理" end
-            self:info(message)
-        else
-            self:info("同步未全部完成\n\n"..tostring(result and result.error or "失败项目已保留 可稍后重试"))
+    local function proceed(summary)
+        summary=summary or self:_home_sync_summary(false)
+        if summary.total<=0 and summary.checking~=true then
+            self:toast("所有待处理内容都已同步",2)
+            return true
         end
+        if not self:logged_in() then self:info("请先登录微信读书账号。") return false end
+        self:toast("正在同步待处理内容…",2)
+        local annotation_count=tonumber(summary.annotation_pending or 0) or 0
+        local function finish(ok,result)
+            self._home_sync_summary_cache=nil
+            self._home_sync_summary_cache_at=nil
+            if ok then
+                -- The annotation worker has just completed successfully, so use
+                -- an immediate zero snapshot instead of rescanning every book on
+                -- the UI thread merely to paint a success message.
+                self._annotation_summary_cache={pending=0,failed=0,delete_pending=0,bookmark=0,highlight=0,thought=0,books=0}
+                self._annotation_summary_cache_at=os.time()
+            else
+                self._annotation_summary_cache=nil
+                self._annotation_summary_cache_at=0
+            end
+            self:_schedule_home_annotation_summary_refresh(true)
+            if HomeView.is_shown() then self:_notify_home_data_changed("header") end
+            local after=self:_home_sync_summary(false)
+            if ok and after.total<=0 then
+                self:status_toast("同步完成","进度 时间 划线和想法已处理",3)
+            elseif ok then
+                local message="仍有 "..tostring(after.total).." 项待处理"
+                if after.progress>0 or after.time>0 then message=message.."\n阅读进度或时间将在对应书籍同步环境恢复后继续处理" end
+                self:info(message)
+            else
+                self:info("同步未全部完成\n\n"..tostring(result and result.error or "失败项目已保留 可稍后重试"))
+            end
+        end
+        if annotation_count>0 then return self:_sync_all_pending_annotations(finish) end
+        -- Progress/time are normally submitted as the reader closes. If a stale
+        -- pending state remains, keep it visible instead of fabricating a current
+        -- book from the home screen.
+        finish(true,{})
+        return true
     end
-    if annotation_count>0 then return self:_sync_all_pending_annotations(finish) end
-    -- Progress/time are normally submitted as the reader closes. If a stale
-    -- pending state remains, keep it visible instead of fabricating a current
-    -- book from the home screen.
-    finish(true,{})
-    return true
+
+    local age=os.time()-(tonumber(self._annotation_summary_cache_at) or 0)
+    if type(self._annotation_summary_cache)=="table" and age<=6 then
+        return proceed(self:_home_sync_summary(false))
+    end
+    -- A manual sync must never claim "已同步" from an unknown annotation
+    -- snapshot. Do the exact multi-book SQLite count in a subprocess, then
+    -- continue with the result without blocking the tap animation.
+    if self.sync_summary_async and self.sync_summary_async:available() and not self.sync_summary_async:busy() then
+        self:toast("正在检查待同步内容…",2)
+        local started,err=self.sync_summary_async:run("annotation-summary-manual",function()
+            return LocalAnnotationDatabase.global_summary(self.store) or {}
+        end,function(result)
+            if result and result.ok and type(result.value)=="table" then
+                self._annotation_summary_cache=result.value
+                self._annotation_summary_cache_at=os.time()
+                proceed(self:_home_sync_summary(false))
+            else
+                self:info("无法检查本地划线与想法\n\n"..tostring(result and result.error or "后台检查失败"))
+            end
+        end,20)
+        if started then return true end
+        logger.warn("[MiuRead][SyncSummary] manual start failed",tostring(err or "unknown"))
+    elseif self.sync_summary_async and self.sync_summary_async:busy() then
+        self:toast("正在检查同步状态…",2)
+        local generation=(tonumber(self._home_sync_manual_wait_generation) or 0)+1
+        self._home_sync_manual_wait_generation=generation
+        local wait
+        wait=function()
+            if generation~=self._home_sync_manual_wait_generation then return end
+            if self.sync_summary_async and self.sync_summary_async:busy() then UIManager:scheduleIn(.45,wait); return end
+            if type(self._annotation_summary_cache)=="table" then proceed(self:_home_sync_summary(false))
+            else self:info("同步状态检查未完成 请稍后重试") end
+        end
+        UIManager:scheduleIn(.45,wait)
+        return true
+    end
+    -- Subprocess support is expected on Kindle. If it is unavailable, keep the
+    -- UI responsive and make the limitation explicit rather than performing a
+    -- potentially long full-database scan on the main thread.
+    self:info("当前环境无法在后台检查本地划线与想法 请稍后重试")
+    return false
 end
 
 function Plugin:sync_settings_menu()
@@ -14834,13 +15054,24 @@ function Plugin:_download_settings_summary()
 end
 
 function Plugin:settings_menu()
-    local rows={}
+    -- "更多" is the complete MiuRead menu.  It may point to the same
+    -- underlying pages as home shortcuts, but it never owns a second copy of
+    -- those settings.
+    local rows={
+        {text="运行模式",post_text=self:_home_mode_label(),sub_item_table_func=function() return self:home_mode_menu() end},
+    }
     if self:_home_enabled() then
-        rows[#rows+1]={text="首页与书架",post_text="布局 书架与本地书库",sub_item_table_func=function() return self:display_settings_menu() end}
+        rows[#rows+1]={text="首页与书架",post_text="布局 书架与快捷入口",sub_item_table_func=function() return self:display_settings_menu() end}
         rows[#rows+1]={text="阅读界面",post_text="显示与快捷控制",sub_item_table_func=function() return self:reader_quick_panel_settings_menu() end}
     end
     rows[#rows+1]={text="评论 划线与想法",post_text=self:_thought_display_label(),sub_item_table_func=function() return PluginSettings.comments(self) end}
+    rows[#rows+1]={text="本地书库",post_text=(self:_home_preferences().local_auto_update==true and "自动更新" or "手动更新"),sub_item_table_func=function() return self:local_library_settings_menu() end}
+    rows[#rows+1]={text="账户",post_text=self:logged_in() and "已登录" or "未登录",callback=function() self:show_account_status() end}
+    rows[#rows+1]={text="阅读同步",post_text=self:_home_sync_status_label(),sub_item_table_func=function() return self:sync_settings_menu() end}
+    rows[#rows+1]={text="下载管理",post_text=self:_download_menu_text(),callback=function() self:show_downloads() end}
     rows[#rows+1]={text="时间与时区",post_text=TimeZone.label((self:_time_preferences())),sub_item_table_func=function() return self:time_display_settings_menu() end}
+    rows[#rows+1]={text="性能与兼容性",post_text=self:_performance_mode_label(),sub_item_table_func=function() return self:performance_settings_menu() end}
+    rows[#rows+1]={text="公众号阅读",sub_item_table_func=function() return self:mp_settings_menu() end}
     rows[#rows+1]={text="更新与关于",sub_item_table_func=function() return PluginSettings.update_about(self) end}
     rows[#rows+1]={text="工具与维护",sub_item_table_func=function() return self:maintenance_menu() end}
     return rows
@@ -15636,9 +15867,11 @@ function Plugin:onReaderReady()
     self:_close_home_for_reader("reader ready")
     self:_ensure_reader_transition_guard("reader ready")
     if self._reader_active_path then U.atomic_write(self._reader_active_path,"1",true) end
-    -- Give EPUB opening and the first visible page priority over a background
-    -- book generation task. The worker resumes automatically after this window.
-    self:_mark_reader_busy(8)
+    -- Give EPUB opening and the first visible page priority over background
+    -- work, but do not keep cloud/state workers blocked for a fixed eight
+    -- seconds. Three seconds is enough to protect the first interactions; the
+    -- idle gate below keeps extending the delay while the user is active.
+    self:_mark_reader_busy(3)
     logger.info("[MiuRead][Sync] reader ready","session=",tostring(self._reader_session_generation or 0))
     -- ReaderUI already paints its first page. Avoid a second forced full-screen
     -- refresh, which was the visible extra flash after opening a book.
@@ -15664,8 +15897,10 @@ function Plugin:onReaderReady()
     end)
     -- Prime only lightweight page/chapter data. No toolbar widget survives a
     -- close or page turn; every visible panel is created fresh and destroyed.
+    ReaderToolbar.invalidate()
     self:_reset_reader_toolbar_state_cache()
-    self:_schedule_reader_toolbar_state_refresh(nil,.06)
+    self:_schedule_reader_toolbar_state_refresh(nil,.35)
+    self:_schedule_reader_toolbar_prewarm(ready_session,1.1)
     self:_teardown_thought_tap()
     self._progress_prompted_book_id=nil
     self._progress_check_running=false
@@ -15679,6 +15914,10 @@ function Plugin:onReaderReady()
     local task
     task=function()
         if self._reader_sync_ready_task~=task then return end
+        if not self:_reader_background_idle() then
+            UIManager:scheduleIn(.65,task)
+            return
+        end
         self._reader_sync_ready_task=nil
         if self.ui and self.ui.document
             and tonumber(HOME_SESSION.reader_session_generation or 0)==ready_session
@@ -15689,9 +15928,14 @@ function Plugin:onReaderReady()
     -- cloud-progress work begins. Local comment taps are already installed by
     -- the next-tick block above, so this does not delay reading interaction.
     UIManager:scheduleIn(.60,task)
-    UIManager:scheduleIn(1.8,function()
-        if self.ui and self.ui.document and not reader_close_active() then HomeData.quick_device_state(true) end
-    end)
+    local device_task
+    device_task=function()
+        if not (self.ui and self.ui.document) or reader_close_active()
+            or tonumber(HOME_SESSION.reader_session_generation or 0)~=ready_session then return end
+        if not self:_reader_background_idle() then UIManager:scheduleIn(.75,device_task); return end
+        HomeData.quick_device_state(true)
+    end
+    UIManager:scheduleIn(1.8,device_task)
 end
 function Plugin:onSetDimensions()
     self:_close_miuread_transients()
@@ -15728,6 +15972,7 @@ function Plugin:onSetDimensions()
                     self._reader_dimension_width,self._reader_dimension_height=sw,sh
                     self._reader_dimension_rotation=rotation
                     if changed then
+                        ReaderToolbar.invalidate()
                         self:_reset_reader_toolbar_state_cache()
                         self:_schedule_reader_toolbar_state_refresh(nil,.08)
                         self:_install_reader_menu_bridge()
@@ -15750,7 +15995,10 @@ function Plugin:onPageUpdate(page)
     local cache=self:_reader_toolbar_cache()
     local current=tonumber(page)
     if current then cache.page=current end
-    self:_schedule_reader_toolbar_state_refresh(current,.12)
+    -- Page turns only update the in-memory position immediately. Chapter/ToC
+    -- lookup is delayed until the reader has been idle, keeping the flip path
+    -- free of optional work.
+    self:_schedule_reader_toolbar_state_refresh(current,.55)
     self.sync:on_page(page)
 end
 function Plugin:_annotation_sync_preferences()

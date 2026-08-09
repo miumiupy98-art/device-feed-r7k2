@@ -25,6 +25,8 @@ local Ui = require("miuread.ui_components")
 
 local Screen = Device.screen
 local live_panel
+local prepared_panel
+local prepared_signature
 
 local function face(name, nominal, maximum, minimum)
     return UiScale.face(name, nominal, maximum, minimum)
@@ -113,7 +115,7 @@ local function tappable(width, height, child, callback, hold_callback)
     return tap
 end
 
-local function panel_button(entry, width, height, close_callback, compact)
+local function panel_button(entry, width, height, close_callback, compact, owner, index)
     local label = tostring(entry.label or entry.text or "")
     local detail = tostring(entry.detail or "")
     local icon = tostring(entry.icon_key or entry.icon or "")
@@ -129,6 +131,21 @@ local function panel_button(entry, width, height, close_callback, compact)
     local detail_slot_h = UiScale.dp(compact and 20 or 22, compact and 18 or 20, compact and 26 or 29)
     local icon_size = UiScale.dp(compact and 27 or 30, compact and 24 or 27, compact and 35 or 39)
 
+    local label_box=Ui.textbox(label, inner_w, label_slot_h,
+        face("smallinfofont", compact and 11.6 or 12.3, compact and 14.8 or 16.0, compact and 10.1 or 10.7), {
+            bold = true, alignment = "center", halign = "center",
+            height_overflow_show_ellipsis = true,
+            fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+        })
+    local detail_box=Ui.textbox(has_detail and detail or " ", inner_w, detail_slot_h,
+        face("smallinfofont", compact and 9.2 or 9.8, compact and 12.0 or 12.8, compact and 8.0 or 8.5), {
+            alignment = "center", halign = "center",
+            height_overflow_show_ellipsis = true,
+            fgcolor = enabled and Blitbuffer.COLOR_DARK_GRAY or Blitbuffer.COLOR_GRAY,
+        })
+    if owner and index then
+        owner._button_refs[index]={label=label_box and label_box[1],detail=detail_box and detail_box[1]}
+    end
     local content = VerticalGroup:new{
         align = "center",
         Ui.icon(icon, inner_w, icon_slot_h, icon_size, {
@@ -138,19 +155,9 @@ local function panel_button(entry, width, height, close_callback, compact)
             fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
         }),
         VerticalSpan:new{height = gap_h},
-        Ui.textbox(label, inner_w, label_slot_h,
-            face("smallinfofont", compact and 11.6 or 12.3, compact and 14.8 or 16.0, compact and 10.1 or 10.7), {
-                bold = true, alignment = "center", halign = "center",
-                height_overflow_show_ellipsis = true,
-                fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
-            }),
+        label_box,
+        detail_box,
     }
-    content[#content + 1] = Ui.textbox(has_detail and detail or " ", inner_w, detail_slot_h,
-        face("smallinfofont", compact and 9.2 or 9.8, compact and 12.0 or 12.8, compact and 8.0 or 8.5), {
-            alignment = "center", halign = "center",
-            height_overflow_show_ellipsis = true,
-            fgcolor = enabled and Blitbuffer.COLOR_DARK_GRAY or Blitbuffer.COLOR_GRAY,
-        })
 
     local surface = fixed_frame(width, height, {
         bordersize = 0,
@@ -221,6 +228,8 @@ function QuickPanelWidget:_close(action, cancel_pending)
 end
 
 function QuickPanelWidget:_build()
+    self._button_refs={}
+    self._text_refs={}
     local scale = UiScale.metrics()
     local sw, sh = scale.sw, scale.sh
     local margin = math.max(UiScale.dp(11, 9, 18), math.floor(scale.short * .018))
@@ -260,14 +269,26 @@ function QuickPanelWidget:_build()
     local battery_w = UiScale.dp(98, 84, 126)
     local time_w = math.max(1, sw - margin * 2 - close_w - battery_w - gap * 2)
 
+    local time_box=Ui.text(tostring(self.opts.time_text or os.date("%H:%M")), time_w, title_h,
+        face("cfont", 20.5, 28.5), {bold = true, halign = "left"})
+    local battery_text_w=math.max(1,battery_w-UiScale.dp(28,24,38))
+    local battery_box=Ui.text(tostring(self.opts.battery_text or "未知"),battery_text_w,title_h,
+        face("smallinfofont",11.8,16),{bold=true})
+    self._text_refs.time=time_box and time_box[1]
+    self._text_refs.battery=battery_box and battery_box[1]
     local title_row = HorizontalGroup:new{
         align = "center",
-        LeftContainer:new{dimen = Geom:new{w = time_w, h = title_h},
-            Ui.text(tostring(self.opts.time_text or os.date("%H:%M")), time_w, title_h,
-                face("cfont", 20.5, 28.5), {bold = true, halign = "left"})},
+        LeftContainer:new{dimen = Geom:new{w = time_w, h = title_h},time_box},
         HorizontalSpan:new{width = gap},
-        Ui.text("电量 "..tostring(self.opts.battery_text or "未知"), battery_w, title_h,
-            face("smallinfofont", 11.8, 16), {bold = true}),
+        CenterContainer:new{
+            dimen=Geom:new{w=battery_w,h=title_h},
+            HorizontalGroup:new{
+                align="center",
+                Ui.icon("battery",UiScale.dp(25,22,33),title_h,UiScale.dp(19,17,25),{icon_key="battery"}),
+                HorizontalSpan:new{width=UiScale.dp(3,2,5)},
+                battery_box,
+            },
+        },
         HorizontalSpan:new{width = gap},
         tappable(close_w, title_h,
             fixed_frame(close_w, title_h, {bordersize = 0, background = Blitbuffer.COLOR_WHITE},
@@ -290,20 +311,22 @@ function QuickPanelWidget:_build()
             local row = math.floor((index - 1) / columns)
             local col = (index - 1) % columns
             self:_add(children, margin + col * (button_w + gap), y + row * (button_h + gap),
-                panel_button(entry, button_w, button_h, function(action) self:_close(action) end, true))
+                panel_button(entry, button_w, button_h, function(action) self:_close(action) end, true, self, index))
         end
         y = y + rows * button_h + math.max(0, rows - 1) * gap + gap
     end
 
     if status_h > 0 and y + status_h <= self.panel_h then
         -- Status/notice is intentionally text-first, not another boxed card.
-        self:_add(children, margin, y, Ui.textbox(tostring(self.opts.status_text or ""),
+        local status_box=Ui.textbox(tostring(self.opts.status_text or ""),
             sw - margin * 2, status_h,
             face("smallinfofont", 10.8, 15), {
                 bold = true, alignment = "left", halign = "left",
                 height_overflow_show_ellipsis = true,
                 fgcolor = Blitbuffer.COLOR_BLACK,
-            }))
+            })
+        self._text_refs.status=status_box and status_box[1]
+        self:_add(children, margin, y, status_box)
         y = y + status_h + gap
     end
 
@@ -350,7 +373,44 @@ function QuickPanelWidget:_build()
     self[1] = children
 end
 
-function QuickPanelWidget:init() self:_build() end
+local function panel_signature(opts)
+    opts=type(opts)=="table" and opts or {}
+    local parts={tostring(Screen:getWidth()),tostring(Screen:getHeight()),
+        tostring(UiScale.getDisplayMode and UiScale.getDisplayMode() or "standard"),
+        tostring(UiScale.getFontName and UiScale.getFontName() or ""),
+        tostring(type(opts.on_customize)=="function"),tostring(type(opts.on_tools)=="function"),
+        tostring((opts.status_text and opts.status_text~="") and 1 or 0)}
+    for _,entry in ipairs(type(opts.buttons)=="table" and opts.buttons or {}) do
+        parts[#parts+1]=tostring(entry.icon_key or entry.icon or "")..":"..tostring(entry.label or "")
+    end
+    return table.concat(parts,"|")
+end
+
+local function update_text(ref,value)
+    if ref and type(ref.setText)=="function" then ref:setText(tostring(value or "")) end
+end
+
+function QuickPanelWidget:updateFromOptions(opts)
+    opts=type(opts)=="table" and opts or {}
+    if panel_signature(opts)~=self._signature then return false end
+    self.opts=opts
+    self._closed=false
+    self.pending_action=nil
+    update_text(self._text_refs.time,opts.time_text or os.date("%H:%M"))
+    update_text(self._text_refs.battery,opts.battery_text or "未知")
+    update_text(self._text_refs.status,opts.status_text or "")
+    for index,entry in ipairs(type(opts.buttons)=="table" and opts.buttons or {}) do
+        local refs=self._button_refs[index] or {}
+        update_text(refs.label,entry.label or entry.text or "")
+        update_text(refs.detail,(entry.detail and entry.detail~="") and entry.detail or " ")
+    end
+    return true
+end
+
+function QuickPanelWidget:init()
+    self._signature=panel_signature(self.opts)
+    self:_build()
+end
 
 function QuickPanelWidget:onTapDismiss(_, ges)
     if not (ges and ges.pos) then return false end
@@ -394,6 +454,8 @@ function QuickPanelWidget:onCloseWidget()
     self.pending_action = nil
     self._closed = true
     if live_panel == self then live_panel = nil end
+    prepared_panel=self
+    prepared_signature=self._signature
     if not self._rotation_close and region then
         UIManager:setDirty(nil, function() return "ui", region end)
     end
@@ -410,19 +472,59 @@ function QuickPanel.close()
     if live_panel and not live_panel._closed then live_panel:_close(nil, true) end
     live_panel = nil
 end
+function QuickPanel.invalidate()
+    QuickPanel.close()
+    prepared_panel=nil
+    prepared_signature=nil
+end
 function QuickPanel.show(opts)
     TransientGuard.close_all()
     local started=os.clock()
     QuickPanel.close()
-    local ok, panel = pcall(QuickPanelWidget.new, QuickPanelWidget, {opts = opts or {}})
-    local built=os.clock()
-    if not ok or not panel then
-        logger.warn("[MiuRead][QuickPanel] build failed", tostring(panel))
-        return nil, tostring(panel)
+    opts=opts or {}
+    local signature=panel_signature(opts)
+    local panel
+    local reused=false
+    if prepared_panel and prepared_signature==signature and prepared_panel:updateFromOptions(opts) then
+        panel=prepared_panel
+        reused=true
+    else
+        local ok,built=pcall(QuickPanelWidget.new,QuickPanelWidget,{opts=opts})
+        if not ok or not built then
+            logger.warn("[MiuRead][QuickPanel] build failed",tostring(built))
+            return nil,tostring(built)
+        end
+        panel=built
+        prepared_panel=panel
+        prepared_signature=signature
     end
-    live_panel = panel
-    UIManager:show(panel, "ui", panel.panel_dimen)
+    local built=os.clock()
+    panel._closed=false
+    live_panel=panel
+    local shown,show_err=pcall(UIManager.show,UIManager,panel,"ui",panel.panel_dimen)
+    if not shown and reused then
+        prepared_panel=nil
+        prepared_signature=nil
+        live_panel=nil
+        local ok,rebuilt=pcall(QuickPanelWidget.new,QuickPanelWidget,{opts=opts})
+        if ok and rebuilt then
+            panel=rebuilt
+            prepared_panel=panel
+            prepared_signature=signature
+            live_panel=panel
+            shown,show_err=pcall(UIManager.show,UIManager,panel,"ui",panel.panel_dimen)
+            reused=false
+        end
+    end
+    if not shown then
+        live_panel=nil
+        prepared_panel=nil
+        prepared_signature=nil
+        logger.warn("[MiuRead][QuickPanel] show failed",tostring(show_err or "unknown"))
+        return nil,tostring(show_err or "show failed")
+    end
     logger.info("[MiuRead][QuickPanel] build timing",
+        "reused=",tostring(reused),
         "build_ms=",tostring(math.floor((built-started)*1000+.5)),
         "submit_ms=",tostring(math.floor((os.clock()-built)*1000+.5)))
     return panel

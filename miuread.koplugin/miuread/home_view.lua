@@ -857,16 +857,32 @@ function HomeWidget:_build_header(children, m)
                 height_overflow_show_ellipsis = true,
             }), self.opts.on_account),
         HorizontalSpan:new{width = gap},
-        tappable(status_w, m.header_h, Ui.textbox(tostring(self.opts.status_line or ""),
-            status_w, m.header_h, face("smallinfofont", 10.8, 14.8), {
-                bold = true, alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_BLACK,
-                height_overflow_show_ellipsis = true,
-            }), self.opts.on_quick_panel),
+        tappable(status_w, m.header_h, CenterContainer:new{
+            dimen=Geom:new{w=status_w,h=m.header_h},
+            HorizontalGroup:new{
+                align="center",
+                Ui.icon("wifi",UiScale.dp(23,20,30),m.header_h,UiScale.dp(18,16,24),{icon_key="wifi"}),
+                HorizontalSpan:new{width=UiScale.dp(3,2,5)},
+                Ui.textbox(tostring(self.opts.status_line or ""),
+                    math.max(1,status_w-UiScale.dp(26,22,35)),m.header_h,face("smallinfofont",10.8,14.8),{
+                        bold=true,alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_BLACK,
+                        height_overflow_show_ellipsis=true,
+                    }),
+            },
+        }, self.opts.on_quick_panel),
         HorizontalSpan:new{width = gap},
-        Ui.textbox(tostring(self.opts.battery_text or "--%"), battery_w, m.header_h,
-            face("smallinfofont", 10.8, 14.8), {
-                bold = true, alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_BLACK,
-            }),
+        CenterContainer:new{
+            dimen=Geom:new{w=battery_w,h=m.header_h},
+            HorizontalGroup:new{
+                align="center",
+                Ui.icon("battery",UiScale.dp(22,19,29),m.header_h,UiScale.dp(17,15,22),{icon_key="battery"}),
+                HorizontalSpan:new{width=UiScale.dp(2,2,4)},
+                Ui.textbox(tostring(self.opts.battery_text or "--%"),math.max(1,battery_w-UiScale.dp(24,21,33)),m.header_h,
+                    face("smallinfofont",10.8,14.8),{
+                        bold=true,alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_BLACK,
+                    }),
+            },
+        },
         HorizontalSpan:new{width = gap},
         tappable(menu_w, m.header_h,
             fixed_frame(menu_w, m.header_h, {bordersize = 0, background = Blitbuffer.COLOR_WHITE},
@@ -1145,6 +1161,9 @@ function HomeWidget:update(opts, refresh_kind)
     elseif refresh_kind == "header" and self.header_dimen then previous_region = self.header_dimen:copy()
     elseif refresh_kind == "content" and self.content_dimen then previous_region = self.content_dimen:copy() end
     self.opts = opts or self.opts or {}
+    if type(self.opts.on_interaction)=="function" then
+        self._miu_resume_interaction_callback=self.opts.on_interaction
+    end
     self:_rebuild()
     self:_mark_dirty(refresh_kind or "full", previous_region)
     return self
@@ -1453,6 +1472,8 @@ function HomeView.show(opts, refresh_kind)
     end
     home_generation = home_generation + 1
     widget._miu_home_generation = home_generation
+    widget._miu_resume_interaction_callback=opts.on_interaction
+    widget._miu_resume_waiting_interaction=false
     live_widget = widget
     UIManager:show(widget, "ui", widget.dimen)
     HomeView.prune_duplicates()

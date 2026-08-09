@@ -17,9 +17,12 @@ local logger = require("logger")
 local TransientGuard = require("miuread.transient_guard")
 local Skin = require("miuread.reader_skin")
 local Ui = require("miuread.ui_components")
+local UiScale = require("miuread.ui_scale")
 
 local Screen = Device.screen
 local live_toolbar
+local prepared_toolbar
+local prepared_key
 
 local OffsetContainer = WidgetContainer:extend{x_off = 0, y_off = 0}
 function OffsetContainer:getSize() return self[1]:getSize() end
@@ -172,23 +175,25 @@ function SliderBar:onTapSlide(_, ges) return self:_set_from_position(ges, true) 
 function SliderBar:onPanSlide(_, ges) return self:_set_from_position(ges, false) end
 function SliderBar:handleEvent(event) return InputContainer.handleEvent(self, event) end
 
-local function status_item(entry, width, height, callback, hold_callback)
+local function status_item(entry, width, height, callback, hold_callback, owner, ref_key)
     entry = type(entry) == "table" and entry or {}
     local enabled = entry.enabled ~= false
     local icon_w = entry.icon and Skin.dp(31, 27, 40) or 0
     local gap = entry.icon and Skin.dp(5, 4, 7) or 0
     local text_w = math.max(1, width - icon_w - gap)
     local text_align = entry.text_align or (entry.icon and "left" or "center")
+    local label_box=Ui.textbox(tostring(entry.label or ""), text_w, height,
+        Skin.face("cfont", 10.8, 14.3, 9.2), {
+            alignment = text_align, halign = text_align,
+            bold = entry.bold ~= false or entry.alert == true,
+            fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+        })
+    if owner and ref_key and label_box and label_box[1] then owner._text_refs[ref_key]=label_box[1] end
     local content = HorizontalGroup:new{
         align = "center",
         entry.icon and icon_box(entry.icon, icon_w, height, enabled, Skin.dp(21, 18, 28)) or HorizontalSpan:new{width = 0},
         entry.icon and HorizontalSpan:new{width = gap} or HorizontalSpan:new{width = 0},
-        Ui.textbox(tostring(entry.label or ""), text_w, height,
-            Skin.face("cfont", 10.8, 14.3, 9.2), {
-                alignment = text_align, halign = text_align,
-                bold = entry.bold ~= false or entry.alert == true,
-                fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
-            }),
+        label_box,
     }
     local tap = TapBox:new{
         dimen = Geom:new{w = width, h = height},
@@ -340,7 +345,8 @@ function Toolbar:_top_status_row(root, header, x, y, width, height)
         local w = index == #entries and (width - used) or math.floor(width * weights[index] / 100)
         root[#root + 1] = OffsetContainer:new{
             x_off = x + used, y_off = y,
-            status_item(entry, w, height, callbacks[index], holds[index]),
+            status_item(entry, w, height, callbacks[index], holds[index], self,
+                ({"wifi","sync","battery","home","more"})[index]),
         }
         used = used + w
     end
@@ -353,8 +359,10 @@ function Toolbar:_title_row(root, header, x, y, width, height)
         enabled = type(header.book_callback) == "function",
         callback = function() self:_activate(header.book_callback, "当前书籍") end,
     }
-    tap[1] = centered_text(header.title or "正在阅读", width, height,
+    local title_box=centered_text(header.title or "正在阅读", width, height,
         Skin.face("cfont", 13.7, 18.0, 11.3), {bold = true})
+    if title_box and title_box[1] then self._text_refs.title=title_box[1] end
+    tap[1] = title_box
     root[#root + 1] = OffsetContainer:new{x_off = x, y_off = y, tap}
 end
 
@@ -367,15 +375,20 @@ function Toolbar:_chapter_row(root, header, x, y, width, height)
         enabled = type(header.chapter_callback) == "function",
         callback = function() self:_activate(header.chapter_callback, "章节") end,
     }
-    chapter[1] = Ui.textbox(tostring(header.chapter_label or "当前章节"), left_w, height,
+    local chapter_box=Ui.textbox(tostring(header.chapter_label or "当前章节"), left_w, height,
         Skin.face("cfont", 10.5, 13.8, 8.9), {alignment = "left", halign = "left", bold = true})
+    if chapter_box and chapter_box[1] then self._text_refs.chapter=chapter_box[1] end
+    chapter[1] = chapter_box
     local progress = TapBox:new{
         dimen = Geom:new{w = right_w, h = height},
         enabled = type(header.progress_callback) == "function",
         callback = function() self:_activate(header.progress_callback, "阅读进度") end,
     }
-    progress[1] = Ui.textbox(tostring(header.progress_label or "") .. (header.progress_label and header.progress_label ~= "" and "  ›" or ""), right_w, height,
+    local progress_text=tostring(header.progress_label or "") .. (header.progress_label and header.progress_label ~= "" and "  ›" or "")
+    local progress_box=Ui.textbox(progress_text, right_w, height,
         Skin.face("cfont", 10.3, 13.6, 8.7), {alignment = "right", halign = "right", bold = true})
+    if progress_box and progress_box[1] then self._text_refs.progress=progress_box[1] end
+    progress[1] = progress_box
     root[#root + 1] = OffsetContainer:new{x_off = x, y_off = y, HorizontalGroup:new{align = "center", chapter, progress}}
 end
 
@@ -395,13 +408,14 @@ function Toolbar:_content_row(root, entries, x, y, width, height)
     end
 end
 
-function Toolbar:_stepper(root, setting, x, y, width, height)
+function Toolbar:_stepper(root, setting, x, y, width, height, ref_key)
     setting = type(setting) == "table" and setting or {}
     local label_w = math.floor(width * .29)
     local button_w = math.max(Skin.dp(42, 36, 54), math.floor(width * .17))
     local value_w = math.max(1, width - label_w - button_w * 2)
     local face = Skin.face("cfont", 10.8, 14.2, 9.1)
     local value_widget, value_container = dynamic_value(setting.value or "", value_w, height, face, true)
+    if ref_key then self._text_refs[ref_key]=value_widget end
 
     local label_tap = TapBox:new{
         dimen = Geom:new{w = label_w, h = height},
@@ -435,8 +449,8 @@ function Toolbar:_typeset_row(root, typeset, x, y, width, height)
     local page_w = math.floor(width * .22)
     local left = width - page_w
     local half = math.floor(left / 2)
-    self:_stepper(root, typeset.font or {}, x, y, half, height)
-    self:_stepper(root, typeset.spacing or {}, x + half, y, left - half, height)
+    self:_stepper(root, typeset.font or {}, x, y, half, height, "font_value")
+    self:_stepper(root, typeset.spacing or {}, x + half, y, left - half, height, "spacing_value")
     local page = typeset.page or {}
     local tap = TapBox:new{
         dimen = Geom:new{w = page_w, h = height},
@@ -498,6 +512,8 @@ function Toolbar:_light_row(root, setting, x, y, width, height)
         end,
     }
     slider.refresh_dimen=Geom:new{x=x,y=y,w=width,h=height}
+    local slider_key=tostring(setting.icon or "frontlight")
+    self._sliders[slider_key]=slider
 
     local function adjust(callback, direction)
         if type(callback) ~= "function" then return end
@@ -636,9 +652,65 @@ function Toolbar:_build_content()
     self[1] = root
 end
 
+function Toolbar:_signature(opts)
+    opts=type(opts)=="table" and opts or {}
+    return table.concat({
+        opts.frontlight and "f1" or "f0",
+        opts.warmth and "w1" or "w0",
+        tostring(#(type(opts.actions)=="table" and opts.actions or {})),
+        tostring(#(type(opts.device_actions)=="table" and opts.device_actions or {})),
+        tostring(Screen:getWidth()),tostring(Screen:getHeight()),
+        tostring(UiScale.getDisplayMode and UiScale.getDisplayMode() or "standard"),
+        tostring(UiScale.getFontName and UiScale.getFontName() or ""),
+    },"|")
+end
+
+local function set_ref(ref,value)
+    if ref and type(ref.setText)=="function" then ref:setText(tostring(value or "")) end
+end
+
+function Toolbar:updateFromOptions(opts)
+    opts=type(opts)=="table" and opts or {}
+    if self:_signature(opts)~=self._layout_signature then return false end
+    self.opts=opts
+    self.closed=false
+    self.action_locked=false
+    self.pending_action=nil
+    local header=type(opts.header)=="table" and opts.header or {}
+    set_ref(self._text_refs.wifi,header.wifi_label or "Wi-Fi")
+    set_ref(self._text_refs.sync,header.sync_label or "同步")
+    set_ref(self._text_refs.battery,header.battery_label or "")
+    set_ref(self._text_refs.home,header.home_label or "首页")
+    set_ref(self._text_refs.more,header.more_label or "更多")
+    set_ref(self._text_refs.title,header.title or "正在阅读")
+    set_ref(self._text_refs.chapter,header.chapter_label or "当前章节")
+    local progress=tostring(header.progress_label or "")
+    if progress~="" then progress=progress.."  ›" end
+    set_ref(self._text_refs.progress,progress)
+    local typeset=type(opts.typeset)=="table" and opts.typeset or {}
+    set_ref(self._text_refs.font_value,typeset.font and typeset.font.value or "")
+    set_ref(self._text_refs.spacing_value,typeset.spacing and typeset.spacing.value or "")
+    if self._sliders.frontlight and opts.frontlight then
+        self._sliders.frontlight.value=tonumber(opts.frontlight.value) or self._sliders.frontlight.value
+        if self._sliders.frontlight.value_widget then
+            self._sliders.frontlight.value_widget:setText(tostring(math.floor(self._sliders.frontlight.value+.5)))
+        end
+    end
+    if self._sliders.warmth and opts.warmth then
+        self._sliders.warmth.value=tonumber(opts.warmth.value) or self._sliders.warmth.value
+        if self._sliders.warmth.value_widget then
+            self._sliders.warmth.value_widget:setText(tostring(math.floor(self._sliders.warmth.value+.5)))
+        end
+    end
+    return true
+end
+
 function Toolbar:init()
     self.opts = self.opts or {}
     self.action_locked = false
+    self._text_refs={}
+    self._sliders={}
+    self._layout_signature=self:_signature(self.opts)
     self:_build_content()
     self.ges_events = {
         TapDismiss = {GestureRange:new{ges = "tap", range = self.dimen}},
@@ -670,6 +742,7 @@ function Toolbar:onCloseWidget()
     self.pending_action = nil
     self.closed = true
     if live_toolbar == self then live_toolbar = nil end
+    if self.cache_key then prepared_toolbar=self; prepared_key=self.cache_key end
     if region then UIManager:setDirty(nil, function() return "ui", region end) end
     if action then
         UIManager:scheduleIn(.04, function()
@@ -684,16 +757,69 @@ function M.close()
     if live_toolbar and not live_toolbar.closed then live_toolbar:_close(nil, true) end
     live_toolbar = nil
 end
-function M.show(opts)
+function M.invalidate()
+    M.close()
+    prepared_toolbar=nil
+    prepared_key=nil
+end
+function M.prepare(opts,key)
+    key=tostring(key or "reader")
+    if prepared_toolbar and prepared_key==key and prepared_toolbar:updateFromOptions(opts or {}) then
+        return prepared_toolbar
+    end
+    local ok,toolbar=pcall(Toolbar.new,Toolbar,{opts=opts or {}})
+    if not ok or not toolbar then return nil,tostring(toolbar) end
+    toolbar.cache_key=key
+    toolbar.closed=true
+    prepared_toolbar=toolbar
+    prepared_key=key
+    return toolbar
+end
+function M.show(opts,key)
     TransientGuard.close_all()
     local started=os.clock()
     M.close()
-    local ok, toolbar = pcall(Toolbar.new, Toolbar, {opts = opts or {}})
+    key=tostring(key or "reader")
+    local toolbar
+    local reused=false
+    if prepared_toolbar and prepared_key==key and prepared_toolbar:updateFromOptions(opts or {}) then
+        toolbar=prepared_toolbar
+        reused=true
+    else
+        local ok,built=pcall(Toolbar.new,Toolbar,{opts=opts or {}})
+        if not ok or not built then return nil,tostring(built) end
+        toolbar=built
+        toolbar.cache_key=key
+        prepared_toolbar=toolbar
+        prepared_key=key
+    end
     local built=os.clock()
-    if not ok or not toolbar then return nil, tostring(toolbar) end
-    live_toolbar = toolbar
-    UIManager:show(toolbar, "ui", toolbar.panel_dimen)
+    toolbar.closed=false
+    live_toolbar=toolbar
+    local shown,show_err=pcall(UIManager.show,UIManager,toolbar,"ui",toolbar.panel_dimen)
+    if not shown and reused then
+        prepared_toolbar=nil
+        prepared_key=nil
+        live_toolbar=nil
+        local ok,rebuilt=pcall(Toolbar.new,Toolbar,{opts=opts or {}})
+        if ok and rebuilt then
+            toolbar=rebuilt
+            toolbar.cache_key=key
+            prepared_toolbar=toolbar
+            prepared_key=key
+            live_toolbar=toolbar
+            shown,show_err=pcall(UIManager.show,UIManager,toolbar,"ui",toolbar.panel_dimen)
+            reused=false
+        end
+    end
+    if not shown then
+        live_toolbar=nil
+        prepared_toolbar=nil
+        prepared_key=nil
+        return nil,tostring(show_err or "show failed")
+    end
     logger.info("[MiuRead][ReaderToolbar] build timing",
+        "reused=",tostring(reused),
         "build_ms=",tostring(math.floor((built-started)*1000+.5)),
         "submit_ms=",tostring(math.floor((os.clock()-built)*1000+.5)))
     return toolbar

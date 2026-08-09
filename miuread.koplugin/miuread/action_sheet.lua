@@ -24,6 +24,7 @@ local UiScale = require("miuread.ui_scale")
 
 local Screen = Device.screen
 local live_sheet
+local prepared_sheets = {}
 local MAX_PRIMARY_ACTIONS = 6
 
 local function clock_ms()
@@ -232,11 +233,20 @@ function SheetWidget:_card(action, width, height, seed)
         }}
     end
 
-    local card = light_card(width, height, {
-        padding = pad,
-        danger = action.danger == true,
-        seed = seed,
-    }, content)
+    local card
+    if self.opts and self.opts.simple_cards==true then
+        card=fixed_frame(width,height,{
+            bordersize=UiScale.line("thin"),padding=pad,
+            radius=UiScale.radius(7,5,11),background=Blitbuffer.COLOR_WHITE,
+            color=action.danger and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+        },content)
+    else
+        card = light_card(width, height, {
+            padding = pad,
+            danger = action.danger == true,
+            seed = seed,
+        }, content)
+    end
     return tappable(width, height, card, function()
         if not enabled then return end
         self:_close(action.callback)
@@ -328,6 +338,39 @@ local function normalized_anchor(anchor)
     return Geom:new{x = x, y = y, w = math.max(1, w or 1), h = math.max(1, h or 1)}
 end
 
+local function sheet_signature(opts)
+    opts = type(opts) == "table" and opts or {}
+    local anchor = normalized_anchor(opts.anchor)
+    local parts = {
+        tostring(Screen:getWidth()), tostring(Screen:getHeight()),
+        tostring(UiScale.getDisplayMode and UiScale.getDisplayMode() or "standard"),
+        tostring(UiScale.getFontName and UiScale.getFontName() or ""),
+        tostring(opts.title or ""), tostring(opts.subtitle or ""),
+        tostring(opts.width_ratio or ""), tostring(opts.columns or ""),
+        tostring(opts.simple_cards == true), tostring(opts.wide_last == true),
+        tostring(opts.preferred_direction or ""),
+        anchor and table.concat({anchor.x, anchor.y, anchor.w, anchor.h}, ",") or "center",
+    }
+    for _, action in ipairs(type(opts.actions) == "table" and opts.actions or {}) do
+        if type(action) == "table" and action.hidden ~= true then
+            parts[#parts + 1] = table.concat({
+                tostring(action.icon or ""), tostring(action.label or action.text or ""),
+                tostring(action.detail or ""), tostring(action.enabled ~= false),
+                tostring(action.submenu == true), tostring(action.danger == true),
+            }, "~")
+        end
+    end
+    for _, action in ipairs(type(opts.footer_actions) == "table" and opts.footer_actions or {}) do
+        if type(action) == "table" and action.hidden ~= true then
+            parts[#parts + 1] = "F:" .. tostring(action.label or action.text or "") .. ":" .. tostring(action.enabled ~= false)
+        end
+    end
+    if type(opts.footer_action) == "table" then
+        parts[#parts + 1] = "F1:" .. tostring(opts.footer_action.label or opts.footer_action.text or "") .. ":" .. tostring(opts.footer_action.enabled ~= false)
+    end
+    return table.concat(parts, "|")
+end
+
 function SheetWidget:_build()
     self._build_started_ms = clock_ms()
     local metrics = UiScale.metrics()
@@ -366,7 +409,8 @@ function SheetWidget:_build()
     local has_subtitle = tostring(self.opts.subtitle or "") ~= ""
     local title_h = has_title and UiScale.dp(has_subtitle and 32 or 29, has_subtitle and 29 or 26, has_subtitle and 44 or 39) or 0
     local subtitle_h = has_subtitle and UiScale.dp(21, 19, 29) or 0
-    local card_h = UiScale.dp(58, 53, 79)
+    local requested_columns=math.max(1,math.min(3,math.floor(tonumber(self.opts.columns) or 0)))
+    local card_h = requested_columns==3 and UiScale.dp(64,58,84) or UiScale.dp(58,53,79)
     local footer_action = type(self.opts.footer_action) == "table" and self.opts.footer_action or nil
     local footer_actions = type(self.opts.footer_actions) == "table" and self.opts.footer_actions or nil
     local has_footer_actions = footer_actions and #footer_actions > 0
@@ -376,10 +420,16 @@ function SheetWidget:_build()
         actions[#actions + 1] = {icon = "×", label = tostring(self.opts.close_label or "关闭"), close_only = true}
         count = #actions
     end
-    local columns = count <= 1 and 1 or 2
+    local columns
+    if tonumber(self.opts.columns) then
+        columns=math.max(1,math.min(3,math.floor(tonumber(self.opts.columns))))
+        columns=math.min(columns,math.max(1,count))
+    else
+        columns=count<=1 and 1 or 2
+    end
     local wide_last = self.opts.wide_last == true and columns == 2 and count % 2 == 1
     local rows = math.max(1, math.ceil(count / columns))
-    local card_w = columns == 1 and inner_w or math.floor((inner_w - gap) / 2)
+    local card_w = columns == 1 and inner_w or math.floor((inner_w - gap * (columns - 1)) / columns)
     local header_h = title_h + subtitle_h
     local content_h = header_h + (header_h > 0 and count > 0 and gap or 0)
         + rows * card_h + math.max(0, rows - 1) * gap
@@ -545,6 +595,10 @@ function SheetWidget:onCloseWidget()
     local action = self.pending_action
     self.pending_action = nil
     if live_sheet == self then live_sheet = nil end
+    local cache_key = self.opts and tostring(self.opts.cache_key or "") or ""
+    if cache_key ~= "" and self._cache_signature then
+        prepared_sheets[cache_key] = {signature = self._cache_signature, sheet = self}
+    end
     if region then UIManager:setDirty(nil, function() return "ui", region end) end
     if action then
         UIManager:scheduleIn(.04, function()
@@ -635,20 +689,51 @@ function ActionSheet.close()
     if live_sheet and not live_sheet._closed then live_sheet:_close() end
     live_sheet = nil
 end
+function ActionSheet.invalidate(cache_key)
+    if cache_key then prepared_sheets[tostring(cache_key)] = nil else prepared_sheets = {} end
+end
 function ActionSheet.show(opts)
     TransientGuard.close_all()
     ActionSheet.close()
     opts = opts or {}
-    local ok, sheet = pcall(SheetWidget.new, SheetWidget, {opts = opts})
-    if not ok or not sheet then
-        return show_fallback(opts, sheet)
+    local cache_key = tostring(opts.cache_key or "")
+    local signature = cache_key ~= "" and sheet_signature(opts) or nil
+    local cached = cache_key ~= "" and prepared_sheets[cache_key] or nil
+    local sheet, reused
+    if cached and cached.signature == signature and cached.sheet then
+        sheet = cached.sheet
+        sheet.opts = opts
+        sheet._closed = false
+        sheet.pending_action = nil
+        reused = true
+    else
+        local ok, built = pcall(SheetWidget.new, SheetWidget, {opts = opts})
+        if not ok or not built then return show_fallback(opts, built) end
+        sheet = built
+        sheet._cache_signature = signature
+        if cache_key ~= "" then prepared_sheets[cache_key] = {signature = signature, sheet = sheet} end
+        reused = false
     end
     live_sheet = sheet
     local shown, show_err = pcall(UIManager.show, UIManager, sheet, "ui", sheet.bubble_dimen or sheet.panel_dimen)
+    if not shown and reused then
+        prepared_sheets[cache_key] = nil
+        live_sheet = nil
+        local ok, rebuilt = pcall(SheetWidget.new, SheetWidget, {opts = opts})
+        if ok and rebuilt then
+            rebuilt._cache_signature = signature
+            prepared_sheets[cache_key] = {signature = signature, sheet = rebuilt}
+            live_sheet = rebuilt
+            shown, show_err = pcall(UIManager.show, UIManager, rebuilt, "ui", rebuilt.bubble_dimen or rebuilt.panel_dimen)
+            sheet = rebuilt
+        end
+    end
     if not shown then
         live_sheet = nil
+        if cache_key ~= "" then prepared_sheets[cache_key] = nil end
         return show_fallback(opts, show_err)
     end
+    if cache_key ~= "" then logger.info("[MiuRead][ActionSheet] cache", "key=", cache_key, "reused=", tostring(reused == true)) end
     return sheet
 end
 return ActionSheet
