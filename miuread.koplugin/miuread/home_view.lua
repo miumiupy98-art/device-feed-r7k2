@@ -96,12 +96,13 @@ local function background(width, height)
     return fixed_frame(width, height, {background = Blitbuffer.COLOR_WHITE})
 end
 
-local TapBox = InputContainer:extend{dimen = nil, callback = nil, hold_callback = nil}
+local TapBox = InputContainer:extend{dimen = nil, callback = nil, hold_callback = nil, _hold_handled = false}
 function TapBox:init()
     self.dimen = self.dimen or Geom:new{w = 1, h = 1}
     self.ges_events = {
         TapSelect = {GestureRange:new{ges = "tap", range = self.dimen}},
         HoldSelect = {GestureRange:new{ges = "hold", range = self.dimen}},
+        HoldReleaseSelect = {GestureRange:new{ges = "hold_release", range = self.dimen}},
     }
 end
 function TapBox:getSize() return Geom:new{w = self.dimen.w, h = self.dimen.h} end
@@ -110,6 +111,10 @@ function TapBox:paintTo(bb, x, y)
     if self[1] then self[1]:paintTo(bb, x, y) end
 end
 function TapBox:onTapSelect()
+    if self._hold_handled then
+        self._hold_handled = false
+        return true
+    end
     local now=os.clock()
     if now<(tonumber(self._miu_tap_block_until) or 0) then return true end
     self._miu_tap_block_until=now+.20
@@ -117,8 +122,17 @@ function TapBox:onTapSelect()
     return true
 end
 function TapBox:onHoldSelect()
+    self._hold_handled = self.hold_callback ~= nil
     if self.hold_callback then self.hold_callback(self.dimen and self.dimen:copy() or nil) end
     return self.hold_callback ~= nil
+end
+function TapBox:onHoldReleaseSelect()
+    if self._hold_handled then
+        self._hold_handled = false
+        self._miu_tap_block_until = os.clock() + .20
+        return true
+    end
+    return false
 end
 function TapBox:handleEvent(event)
     -- Child cards only own taps. Let swipes reach HomeWidget first so the

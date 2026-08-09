@@ -5522,35 +5522,164 @@ function Plugin:_show_home_sync_popup(anchor)
     }
 end
 
-function Plugin:_show_home_settings_popup(anchor)
+function Plugin:_show_home_search_popup(anchor)
     ActionSheet.show{
-        cache_key="home_settings",
+        cache_key="home_search",
         anchor=anchor,
         preferred_direction="below",
-        width_ratio=.72,
-        title="觅阅设置",
-        subtitle="常用设置",
-        columns=1,
-        simple_cards=true,
+        width_ratio=.58,
+        title="搜索",
+        subtitle="从主页直接查找或浏览书籍",
         actions={
-            {icon="▦",label="首页与书架",detail="布局 书架与快捷入口",submenu=true,callback=function()
-                self:_show_standalone_menu("首页与书架",self:display_settings_menu())
-            end},
-            {icon="A",label="阅读界面",detail="显示与快捷控制",submenu=true,callback=function()
-                self:_show_standalone_menu("阅读界面",self:reader_quick_panel_settings_menu())
-            end},
-            {icon="✎",label="评论、划线与想法",detail="评论显示与本地批注",submenu=true,callback=function()
-                self:_show_standalone_menu("评论 划线与想法",PluginSettings.comments(self))
-            end},
-            {icon="◷",label="时间与时区",detail="时间来源与地区显示",submenu=true,callback=function()
-                self:_show_standalone_menu("时间与时区",self:time_display_settings_menu())
-            end},
-            {icon="i",label="更新与关于",detail="版本 更新通道与说明",submenu=true,callback=function()
-                self:_show_standalone_menu("更新与关于",PluginSettings.update_about(self))
-            end},
-            {icon="⚙",label="工具与维护",detail="修复 清理与诊断",submenu=true,callback=function()
-                self:_show_standalone_menu("工具与维护",self:maintenance_menu())
-            end},
+            {icon="⌕",label="搜索书籍",detail="按书名或作者查找",callback=function() self:show_home_search_dialog() end},
+            {icon="▦",label="全部书籍",detail="打开完整书架",callback=function() self:show_home_all_books() end},
+        },
+    }
+end
+
+function Plugin:_show_home_frontlight_popup(anchor)
+    local enabled=self:_reader_frontlight_enabled()
+    local value=math.floor((tonumber(self:_reader_frontlight_value()) or 0)+.5)
+    ActionSheet.show{
+        cache_key="home_frontlight",
+        anchor=anchor,
+        preferred_direction="below",
+        width_ratio=.60,
+        title="前光",
+        subtitle="当前亮度 "..tostring(value),
+        actions={
+            {icon="☼",label="亮度与色温",detail="打开完整前光调节",callback=function() self:_home_frontlight() end},
+            {icon=enabled and "○" or "●",label=enabled and "关闭前光" or "开启前光",detail="快速切换前光",callback=function() self:_reader_toggle_frontlight() end},
+            {icon="◐",label="切换夜间模式",detail="反转阅读显示",callback=function() self:_home_toggle_night() end},
+        },
+        wide_last=true,
+    }
+end
+
+function Plugin:_show_home_settings_center()
+    return self:_show_standalone_menu("觅阅设置",{
+        {text="首页与书架",post_text="布局 书架与快捷入口",sub_item_table_func=function() return self:display_settings_menu() end},
+        {text="阅读界面",post_text="显示与快捷控制",sub_item_table_func=function() return self:reader_quick_panel_settings_menu() end},
+        {text="评论、划线与想法",post_text="评论显示与本地批注",sub_item_table_func=function() return PluginSettings.comments(self) end},
+        {text="时间与时区",post_text="时间来源与地区显示",sub_item_table_func=function() return self:time_display_settings_menu() end},
+        {text="更新与关于",post_text="版本 更新通道与说明",sub_item_table_func=function() return PluginSettings.update_about(self) end},
+        {text="工具与维护",post_text="修复 清理与诊断",sub_item_table_func=function() return self:maintenance_menu() end},
+    },{page_size=6})
+end
+
+function Plugin:_show_home_settings_popup(anchor)
+    ActionSheet.show{
+        cache_key="home_settings_shortcut",
+        anchor=anchor,
+        preferred_direction="below",
+        width_ratio=.58,
+        title="觅阅设置",
+        subtitle="快捷入口",
+        actions={
+            {icon="⚙",label="打开觅阅设置",detail="进入完整设置中心",callback=function() self:_show_home_settings_center() end},
+            {icon="▦",label="主页自定义",detail="调整快捷栏与下滑工具栏",callback=function() self:show_home_customization() end},
+        },
+    }
+end
+
+function Plugin:_show_home_all_books_popup(anchor)
+    ActionSheet.show{
+        cache_key="home_all_books",
+        anchor=anchor,preferred_direction="below",width_ratio=.58,
+        title="全部书籍",subtitle="浏览完整书架",
+        actions={
+            {icon="▦",label="打开全部书籍",detail="查看当前所有书籍",callback=function() self:show_home_all_books() end},
+            {icon="◷",label="阅读历史",detail="查看最近阅读记录",callback=function() self:show_home_reading_history() end},
+        },
+    }
+end
+
+function Plugin:_show_home_history_popup(anchor)
+    ActionSheet.show{
+        cache_key="home_history",
+        anchor=anchor,preferred_direction="below",width_ratio=.58,
+        title="阅读历史",subtitle="最近阅读与完整书架",
+        actions={
+            {icon="◷",label="打开阅读历史",detail="查看最近阅读记录",callback=function() self:show_home_reading_history() end},
+            {icon="▦",label="全部书籍",detail="返回完整书架浏览",callback=function() self:show_home_all_books() end},
+        },
+    }
+end
+
+function Plugin:_show_home_file_manager_popup(anchor)
+    ActionSheet.show{
+        cache_key="home_file_manager",
+        anchor=anchor,preferred_direction="below",width_ratio=.58,
+        title="文件管理",subtitle="本地文件入口",
+        actions={
+            {icon="▤",label="打开 KOReader 文件管理",detail="进入原生文件浏览器",callback=function() self:_home_close_to_native(true) end},
+            {icon="▦",label="本地书库",detail="查看觅阅本地书籍",callback=function() self:show_home_local_library() end},
+        },
+    }
+end
+
+function Plugin:_show_home_screenshot_popup(anchor)
+    ActionSheet.show{
+        cache_key="home_screenshot",
+        anchor=anchor,preferred_direction="below",width_ratio=.58,
+        title="截图",subtitle="屏幕操作",
+        actions={
+            {icon="▣",label="开始截图",detail="进入截图模式",callback=function() ScreenshotMode.start(self,anchor) end},
+            {icon="▤",label="全屏刷新",detail="清除墨水屏残影",callback=function() self:_home_full_refresh() end},
+        },
+    }
+end
+
+function Plugin:_home_visible_action_neighbor(key,direction)
+    local home=self:_home_preferences()
+    local order=home.action_order or HOME_ACTION_ITEM_ORDER
+    local items=home.action_items or {}
+    local index
+    for i,name in ipairs(order) do if name==key then index=i; break end end
+    if not index then return nil end
+    local step=direction<0 and -1 or 1
+    local i=index+step
+    while i>=1 and i<=#order do
+        if items[order[i]]==true then return order[i] end
+        i=i+step
+    end
+    return nil
+end
+
+function Plugin:_home_move_visible_action(key,direction)
+    local home,preferences=self:_home_preferences()
+    local order=home.action_order or U.copy(HOME_ACTION_ITEM_ORDER)
+    local items=home.action_items or {}
+    local index,target
+    for i,name in ipairs(order) do if name==key then index=i; break end end
+    if not index then return false end
+    local step=direction<0 and -1 or 1
+    local i=index+step
+    while i>=1 and i<=#order do
+        if items[order[i]]==true then target=i; break end
+        i=i+step
+    end
+    if not target then return false end
+    order[index],order[target]=order[target],order[index]
+    home.action_order=order
+    self:_save_home_preferences(home,preferences)
+    if HomeView.is_shown() then self:_refresh_home_view(nil,"content") end
+    return true
+end
+
+function Plugin:_show_home_action_manage_popup(key,label,anchor)
+    local can_left=self:_home_visible_action_neighbor(key,-1)~=nil
+    local can_right=self:_home_visible_action_neighbor(key,1)~=nil
+    ActionSheet.show{
+        cache_key="home_action_manage_"..tostring(key),
+        anchor=anchor,preferred_direction="below",width_ratio=.62,
+        title=tostring(label or HOME_ACTION_LABELS[key] or "快捷项"),
+        subtitle="长按管理主页快捷栏",
+        actions={
+            {icon="←",label="向左移动",detail="与左侧快捷项交换",enabled=can_left,callback=function() self:_home_move_visible_action(key,-1) end},
+            {icon="→",label="向右移动",detail="与右侧快捷项交换",enabled=can_right,callback=function() self:_home_move_visible_action(key,1) end},
+            {icon="−",label="隐藏此快捷项",detail="可在主页自定义中恢复",callback=function() self:_home_toggle_group_item("action",key) end},
+            {icon="⚙",label="快捷栏设置",detail="显示 隐藏与完整排序",callback=function() self:_show_standalone_menu("主页快捷栏",self:home_action_settings_menu()) end},
         },
     }
 end
@@ -5587,7 +5716,7 @@ function Plugin:_home_book_delete_state(book)
     }
 end
 
-function Plugin:_show_home_delete_book_popup(book)
+function Plugin:_show_home_delete_book_popup(book,anchor)
     local state=self:_home_book_delete_state(book)
     if not state then self:info("这本书没有可删除的本地记录") return false end
     local current_label="未识别"
@@ -5619,6 +5748,7 @@ function Plugin:_show_home_delete_book_popup(book)
         callback=function() self:downloaded_book_menu(state.book_id) end,
     }
     ActionSheet.show{
+        anchor=anchor,
         preferred_direction="above",
         width_ratio=.66,
         title="删除书籍 · "..tostring(book.title or "书籍"),
@@ -5627,6 +5757,17 @@ function Plugin:_show_home_delete_book_popup(book)
         footer_action={label="取消",callback=function() end},
     }
     return true
+end
+
+function Plugin:_show_home_local_book_more(book,anchor)
+    ActionSheet.show{
+        anchor=anchor,preferred_direction="above",width_ratio=.62,
+        title=tostring(book.title or "本地书籍"),subtitle="更多书籍操作",
+        actions={
+            {icon="▤",label="在文件管理中查看",detail="打开 KOReader 文件浏览器",callback=function() self:_home_close_to_native(true) end},
+            {icon="−",label="从觅阅书架隐藏",detail="保留本地文件",callback=function() self:_home_hide_local_book(book) end},
+        },
+    }
 end
 
 function Plugin:_home_hold_book(book,anchor)
@@ -5692,10 +5833,9 @@ function Plugin:_home_hold_book(book,anchor)
                 {icon="▶",label="打开书籍",detail="继续阅读",callback=function() self:_home_open_local(book) end},
                 {icon="i",label="查看详情",detail="文件、进度和图书信息",callback=function() self:_home_local_book_details(book) end},
                 {icon="↻",label="更新书籍信息",detail="重新提取并尝试网络补全",callback=function() self:_home_refresh_one_book_metadata(book,true) end},
-                {icon="▤",label="在文件管理中查看",detail="打开 KOReader 文件浏览器",callback=function() self:_home_close_to_native(true) end},
-                {icon="−",label="从觅阅书架隐藏",detail="保留本地文件",callback=function() self:_home_hide_local_book(book) end},
                 {icon="!",label="删除本地文件",detail="删除后无法通过觅阅恢复",danger=true,callback=function() self:_home_delete_local_book(book) end},
             },
+            footer_action={label="更多书籍操作  ›",callback=function() self:_show_home_local_book_more(book,anchor) end},
         }
         return
     end
@@ -5704,6 +5844,20 @@ function Plugin:_home_hold_book(book,anchor)
     self:_home_attach_local_record(target)
     local record=id~="" and self:_preferred_record(id) or nil
     local available=record and record.file and U.file_exists(record.file)
+    local primary_actions={
+        {icon=available and "▶" or "⇩",label=available and "打开书籍" or "下载书籍",
+            detail=available and "继续阅读" or "加入下载任务",callback=function()
+                if available then self:_home_open_miuread(target) else self:choose_download(target,nil,false) end
+            end},
+        {icon="i",label="查看详情",detail="书籍简介和出版信息",callback=function() self:book_details(target) end},
+        {icon="↻",label="更新书籍信息",detail="微信读书详情与网络补全",callback=function() self:_home_refresh_one_book_metadata(target,true) end},
+    }
+    if available then
+        primary_actions[3]={icon="✚",label="修复这本书",detail="检查正文、目录和生成记录",callback=function() self:_home_repair_book(target) end}
+        primary_actions[4]={icon="⌫",label="删除书籍",detail="选择删除当前或全部版本",danger=true,callback=function()
+            self:_show_home_delete_book_popup(target,anchor)
+        end}
+    end
     ActionSheet.show{
         anchor=anchor,
         preferred_direction="above",
@@ -5711,19 +5865,7 @@ function Plugin:_home_hold_book(book,anchor)
         title=tostring(target.title or "书籍"),
         subtitle=U.trim(tostring(target.author or ""))~="" and tostring(target.author)
             or (available and "已下载" or "尚未下载"),
-        actions={
-            {icon=available and "▶" or "⇩",label=available and "打开书籍" or "下载书籍",
-                detail=available and "继续阅读" or "加入下载任务",callback=function()
-                    if available then self:_home_open_miuread(target) else self:choose_download(target,nil,false) end
-                end},
-            {icon="i",label="查看详情",detail="书籍简介和出版信息",callback=function() self:book_details(target) end},
-            {icon="↻",label="更新书籍信息",detail="微信读书详情与网络补全",callback=function() self:_home_refresh_one_book_metadata(target,true) end},
-            {icon="✚",label="修复这本书",detail="检查正文、目录和生成记录",callback=function() self:_home_repair_book(target) end},
-            {icon="⇩",label="重新生成／下载",detail="重新选择下载版本",callback=function() self:choose_download(target,nil,false) end},
-            {icon="⌫",label="删除书籍",detail=available and "选择删除当前或全部版本" or "查看本地下载记录",danger=true,callback=function()
-                self:_show_home_delete_book_popup(target)
-            end},
-        },
+        actions=primary_actions,
         footer_action={label="更多书籍操作  ›",callback=function() self:book_menu(target) end},
     }
 end
@@ -5743,20 +5885,24 @@ function Plugin:_home_action_entries()
     elseif sync_summary.total>0 then sync_badge=sync_summary.total>99 and "99+" or tostring(sync_summary.total) end
 
     local definitions={
-        refresh={icon="↻",icon_key="refresh",label="刷新",callback=function() self:_home_manual_refresh() end,hold_callback=function(anchor) self:_show_home_refresh_popup(anchor) end},
-        search={icon="⌕",icon_key="search",label="搜索",callback=function() self:show_home_search_dialog() end},
+        refresh={icon="↻",icon_key="refresh",label="刷新",callback=function(anchor) self:_show_home_refresh_popup(anchor) end},
+        search={icon="⌕",icon_key="search",label="搜索",callback=function(anchor) self:_show_home_search_popup(anchor) end},
         downloads={icon="⇩",icon_key="download",label="下载",badge=download_badge,
-            callback=function(anchor) self:_show_home_download_popup(anchor) end,
-            hold_callback=function() self:show_downloads() end},
-        sync={icon="⇅",icon_key="sync",label="同步",badge=sync_badge,callback=function() self:_sync_home_pending() end,hold_callback=function(anchor) self:_show_home_sync_popup(anchor) end},
-        miuread_settings={icon="⚙",icon_key="settings",label="觅阅设置",callback=function(anchor) self:_show_home_settings_popup(anchor) end,hold_callback=function(anchor) self:_show_home_settings_popup(anchor) end},
-        all_books={icon="▦",label="全部书籍",callback=function() self:show_home_all_books() end},
-        history={icon="◷",label="阅读历史",callback=function() self:show_home_reading_history() end},
-        file_manager={icon="▤",label="文件管理",callback=function() self:_home_close_to_native(true) end},
-        screenshot={icon="▣",label="截图",callback=function(anchor) ScreenshotMode.start(self,anchor) end},
+            callback=function(anchor) self:_show_home_download_popup(anchor) end},
+        sync={icon="⇅",icon_key="sync",label="同步",badge=sync_badge,callback=function(anchor) self:_show_home_sync_popup(anchor) end},
+        miuread_settings={icon="⚙",icon_key="settings",label="觅阅设置",callback=function(anchor) self:_show_home_settings_popup(anchor) end},
+        all_books={icon="▦",label="全部书籍",callback=function(anchor) self:_show_home_all_books_popup(anchor) end},
+        history={icon="◷",label="阅读历史",callback=function(anchor) self:_show_home_history_popup(anchor) end},
+        file_manager={icon="▤",label="文件管理",callback=function(anchor) self:_show_home_file_manager_popup(anchor) end},
+        screenshot={icon="▣",label="截图",callback=function(anchor) self:_show_home_screenshot_popup(anchor) end},
     }
     if Device:hasFrontlight() then
-        definitions.frontlight={icon="☼",icon_key="frontlight",label="前光",callback=function() self:_home_frontlight() end,hold_callback=function() self:_home_frontlight() end}
+        definitions.frontlight={icon="☼",icon_key="frontlight",label="前光",callback=function(anchor) self:_show_home_frontlight_popup(anchor) end}
+    end
+    for key,entry in pairs(definitions) do
+        local item_key=key
+        local item_label=entry.label
+        entry.hold_callback=function(anchor) self:_show_home_action_manage_popup(item_key,item_label,anchor) end
     end
     local entries={}
     local used={}

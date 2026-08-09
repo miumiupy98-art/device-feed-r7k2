@@ -60,6 +60,30 @@ local function fixed_frame(width, height, options, content)
     }
 end
 
+-- Clean chat-bubble pointer. It uses the same black outline and white fill as
+-- the panel and overlaps the panel border slightly so the tail reads as one
+-- shape with the panel. The pointer is only created for anchored sheets.
+local BubblePointer = Widget:extend{width = 20, height = 10, direction = "up"}
+function BubblePointer:getSize() return Geom:new{w = self.width, h = self.height} end
+function BubblePointer:paintTo(bb, x, y)
+    if not bb or type(bb.paintRect) ~= "function" then return end
+    local w = math.max(9, math.floor(tonumber(self.width) or 20))
+    local h = math.max(5, math.min(18, math.floor(tonumber(self.height) or 10)))
+    local t = math.max(1, UiScale.line("thin"))
+    local denom = math.max(1, h - 1)
+    for row = 0, h - 1 do
+        local step = self.direction == "down" and (h - 1 - row) or row
+        local span = math.max(1, math.floor(1 + (w - 1) * step / denom))
+        if span % 2 == 0 then span = span + 1 end
+        span = math.min(w, span)
+        local sx = x + math.floor((w - span) / 2)
+        bb:paintRect(sx, y + row, span, 1, Blitbuffer.COLOR_BLACK)
+        if span > t * 2 + 1 then
+            bb:paintRect(sx + t, y + row, span - t * 2, 1, Blitbuffer.COLOR_WHITE)
+        end
+    end
+end
+
 local TapBox = InputContainer:extend{dimen = nil, callback = nil}
 function TapBox:init()
     self.dimen = self.dimen or Geom:new{w = 1, h = 1}
@@ -394,23 +418,36 @@ function SheetWidget:_build()
     local anchor = normalized_anchor(self.opts.anchor)
     local x = math.floor((sw - panel_w) / 2)
     local y = math.floor((sh - panel_h) / 2)
-    local anchor_gap=UiScale.dp(5,4,8)
+    local pointer_w = UiScale.dp(22, 18, 30)
+    local pointer_h = UiScale.dp(10, 8, 14)
+    local pointer_overlap = math.max(1, UiScale.line("thin") + 1)
+    local pointer_direction, pointer_x, pointer_y
     if anchor then
         local center_x = anchor.x + anchor.w / 2
         x = math.floor(clamp(center_x - panel_w / 2, outer_margin, sw - outer_margin - panel_w) + .5)
-        local below_y = anchor.y + anchor.h + anchor_gap
+        local below_y = anchor.y + anchor.h
         local below_space = sh - outer_margin - below_y
-        local above_y = anchor.y - anchor_gap - panel_h
-        local above_space = anchor.y - outer_margin - anchor_gap
+        local above_space = anchor.y - outer_margin
         local prefer = tostring(self.opts.preferred_direction or "")
-        if prefer ~= "above" and below_space >= panel_h then
-            y = below_y
-        elseif above_space >= panel_h then
-            y = above_y
-        elseif below_space >= panel_h then
-            y = below_y
+        local need = panel_h + pointer_h - pointer_overlap
+        local place_below = (prefer ~= "above" and below_space >= need)
+            or (above_space < need and below_space >= need)
+        local place_above = not place_below and above_space >= need
+        if place_below then
+            pointer_direction = "up"
+            pointer_y = below_y
+            y = pointer_y + pointer_h - pointer_overlap
+        elseif place_above then
+            pointer_direction = "down"
+            y = anchor.y - panel_h - pointer_h + pointer_overlap
+            pointer_y = y + panel_h - pointer_overlap
         else
             y = math.floor(clamp(anchor.y + anchor.h / 2 - panel_h / 2, outer_margin, sh - outer_margin - panel_h) + .5)
+        end
+        if pointer_direction then
+            pointer_x = math.floor(clamp(center_x - pointer_w / 2,
+                x + UiScale.dp(18, 14, 28),
+                x + panel_w - pointer_w - UiScale.dp(18, 14, 28)) + .5)
         end
     else
         x = math.floor(clamp(x, outer_margin, sw - outer_margin - panel_w) + .5)
@@ -420,12 +457,22 @@ function SheetWidget:_build()
     self.dimen = Geom:new{x = 0, y = 0, w = sw, h = sh}
     self.panel_dimen = Geom:new{x = x, y = y, w = panel_w, h = panel_h}
     self.bubble_dimen = self.panel_dimen:copy()
+    if pointer_direction then
+        self.bubble_dimen = self.bubble_dimen:combine(Geom:new{x = pointer_x, y = pointer_y, w = pointer_w, h = pointer_h})
+    end
     self.ges_events = {
         TapDismiss = {GestureRange:new{ges = "tap", range = self.dimen}},
         SwipeDismiss = {GestureRange:new{ges = "swipe", range = self.dimen}},
     }
     local layers = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
     layers[#layers + 1] = OffsetContainer:new{x_off = x, y_off = y, panel}
+    if pointer_direction then
+        layers[#layers + 1] = OffsetContainer:new{
+            x_off = pointer_x,
+            y_off = pointer_y,
+            BubblePointer:new{width = pointer_w, height = pointer_h, direction = pointer_direction},
+        }
+    end
     self[1] = layers
     logger.info("[MiuRead][ActionSheet] built", "actions=", tostring(count), "ms=", tostring(clock_ms() - self._build_started_ms))
 end
