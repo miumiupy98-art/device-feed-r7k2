@@ -5960,8 +5960,32 @@ function Plugin:_show_home_settings_center()
     },{page_size=6})
 end
 
-function Plugin:_show_home_settings_popup(_anchor)
-    return self:_show_home_settings_center()
+function Plugin:_show_home_settings_popup(anchor)
+    local actions={
+        {icon="▦",label="首页与书架",detail="布局 书架与快捷入口",callback=function()
+            self:_show_standalone_menu("首页与书架",self:display_settings_menu(),{anchor=anchor})
+        end},
+        {icon="Aa",label="阅读界面",detail="显示与快捷控制",callback=function()
+            self:_show_standalone_menu("阅读界面",self:reader_quick_panel_settings_menu(),{anchor=anchor})
+        end},
+        {icon="✎",label="评论与批注",detail="评论 划线与想法",callback=function()
+            self:_show_standalone_menu("评论、划线与想法",PluginSettings.comments(self),{anchor=anchor})
+        end},
+        {icon="◷",label="时间与时区",detail="时间来源与地区显示",callback=function()
+            self:_show_standalone_menu("时间与时区",self:time_display_settings_menu(),{anchor=anchor})
+        end},
+        {icon="↺",label="更新与关于",detail="版本 更新通道与说明",callback=function()
+            self:_show_standalone_menu("更新与关于",PluginSettings.update_about(self),{anchor=anchor})
+        end},
+        {icon="⚙",label="工具与维护",detail="修复 清理与诊断",callback=function()
+            self:_show_standalone_menu("工具与维护",self:maintenance_menu(),{anchor=anchor})
+        end},
+    }
+    return ActionSheet.show{
+        cache_key="home_settings",
+        anchor=anchor,preferred_direction="below",width_ratio=.78,columns=2,
+        title="觅阅设置",subtitle="常用设置与维护",actions=actions,
+    }
 end
 
 function Plugin:_show_home_all_books_popup(anchor)
@@ -6263,7 +6287,7 @@ function Plugin:_show_home_local_book_more(book,anchor)
             {icon="▤",label="在文件管理中查看",detail="打开 KOReader 文件浏览器",callback=function() self:_home_close_to_native(true) end},
             {icon="−",label="从觅阅书架隐藏",detail="保留本地文件",callback=function() self:_home_hide_local_book(book) end},
         },
-        footer_action={label="‹ 返回书籍操作",callback=function() self:_home_hold_book(book,anchor) end},
+        footer_action={label="返回书籍操作",callback=function() self:_home_hold_book(book,anchor) end},
     }
 end
 
@@ -6287,7 +6311,7 @@ function Plugin:_show_home_remote_book_more(book,anchor)
         anchor=anchor,preferred_direction="above",width_ratio=.66,
         title=tostring(target.title or "书籍"),subtitle="更多书籍操作",
         actions=actions,wide_last=(#actions%2==1),
-        footer_action={label="‹ 返回书籍操作",callback=function() self:_home_hold_book(target,anchor) end},
+        footer_action={label="返回书籍操作",callback=function() self:_home_hold_book(target,anchor) end},
     }
 end
 
@@ -6353,7 +6377,7 @@ function Plugin:_home_hold_book(book,anchor)
                 {icon="!",label="删除本地文件",detail="删除后无法通过觅阅恢复",danger=true,callback=function() self:_home_delete_local_book(book,anchor) end},
             },
             wide_last=true,
-            footer_action={label="更多书籍操作  ›",callback=function() self:_show_home_local_book_more(book,anchor) end},
+            footer_action={label="更多书籍操作",callback=function() self:_show_home_local_book_more(book,anchor) end},
         }
         return
     end
@@ -6382,7 +6406,7 @@ function Plugin:_home_hold_book(book,anchor)
         subtitle=U.trim(tostring(target.author or ""))~="" and tostring(target.author)
             or (available and "已下载" or "尚未下载"),
         actions=primary_actions,wide_last=(#primary_actions%2==1),
-        footer_action={label="更多书籍操作  ›",callback=function() self:_show_home_remote_book_more(target,anchor) end},
+        footer_action={label="更多书籍操作",callback=function() self:_show_home_remote_book_more(target,anchor) end},
     }
 end
 
@@ -6409,7 +6433,7 @@ function Plugin:_home_action_entries()
         sync={icon="⇅",icon_key="sync",label="同步",badge=sync_badge,callback=function(anchor)
             self:_sync_home_pending(); self:_show_home_quick_notice(anchor,"正在同步","待处理内容已提交")
         end},
-        miuread_settings={icon="⚙",icon_key="settings",label="觅阅设置",callback=function() self:_show_home_settings_center() end},
+        miuread_settings={icon="⚙",icon_key="settings",label="觅阅设置",callback=function(anchor) self:_show_home_settings_popup(anchor) end},
         all_books={icon="▦",label="全部书籍",callback=function() self:show_home_all_books() end},
         history={icon="◷",label="阅读历史",callback=function() self:show_home_reading_history() end},
         file_manager={icon="▤",label="文件管理",callback=function(anchor) self:_show_home_file_manager_popup(anchor) end},

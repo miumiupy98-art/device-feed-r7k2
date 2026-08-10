@@ -8,7 +8,6 @@ local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local LeftContainer = require("ui/widget/container/leftcontainer")
-local LineWidget = require("ui/widget/linewidget")
 local OverlapGroup = require("ui/widget/overlapgroup")
 local TextBoxWidget = require("ui/widget/textboxwidget")
 local TextWidget = require("ui/widget/textwidget")
@@ -202,22 +201,10 @@ end
 function SheetWidget:_footer(action, width, height)
     if type(action) ~= "table" then return nil end
     local enabled = action.enabled ~= false
-    local layers = OverlapGroup:new{
-        dimen = Geom:new{w = width, h = height},
-        allow_mirroring = false,
-    }
-    layers[#layers + 1] = OffsetContainer:new{
-        x_off = 0,
-        y_off = 0,
-        LineWidget:new{
-            background = Blitbuffer.COLOR_GRAY,
-            dimen = Geom:new{w = width, h = math.max(1, UiScale.line("thin"))},
-        },
-    }
-    layers[#layers + 1] = CenterContainer:new{
+    local content = CenterContainer:new{
         dimen = Geom:new{w = width, h = height},
         TextWidget:new{
-            text = tostring(action.label or action.text or "更多操作  ›"),
+            text = tostring(action.label or action.text or "更多操作"),
             face = UiScale.face("cfont", 9.8, 13.8, 8.4),
             bold = true,
             fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
@@ -229,7 +216,7 @@ function SheetWidget:_footer(action, width, height)
             if enabled then self:_close(action.callback) end
         end,
     }
-    tap[1] = layers
+    tap[1] = content
     return tap
 end
 
@@ -268,13 +255,7 @@ function SheetWidget:_footer_group(actions, width, height)
         row[#row + 1] = tap
         if index < #visible then row[#row + 1] = HorizontalSpan:new{width = gap} end
     end
-    local layers=OverlapGroup:new{dimen=Geom:new{w=width,h=height},allow_mirroring=false}
-    layers[#layers+1]=LineWidget:new{
-        background=Blitbuffer.COLOR_GRAY,
-        dimen=Geom:new{w=width,h=math.max(1,UiScale.line("thin"))},
-    }
-    layers[#layers+1]=CenterContainer:new{dimen=Geom:new{w=width,h=height},row}
-    return layers
+    return CenterContainer:new{dimen=Geom:new{w=width,h=height},row}
 end
 
 local function normalized_anchor(anchor)
@@ -325,8 +306,8 @@ function SheetWidget:_build()
     local footer_action = type(self.opts.footer_action) == "table" and self.opts.footer_action or nil
     local footer_actions = type(self.opts.footer_actions) == "table" and self.opts.footer_actions or nil
     local has_footer_actions = footer_actions and #footer_actions > 0
-    local footer_h = (footer_action or has_footer_actions) and UiScale.dp(43, 39, 57) or 0
-    local footer_gap_h = footer_h > 0 and UiScale.dp(17, 14, 24) or 0
+    local footer_h = (footer_action or has_footer_actions) and UiScale.dp(39, 35, 52) or 0
+    local footer_gap_h = footer_h > 0 and UiScale.dp(8, 7, 12) or 0
     local show_close = self.opts.show_close == true
     if show_close and count < MAX_PRIMARY_ACTIONS then
         actions[#actions + 1] = {icon = "×", label = tostring(self.opts.close_label or "关闭"), close_only = true}
