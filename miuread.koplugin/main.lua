@@ -4319,6 +4319,79 @@ function Plugin:download_reader_policy_menu()
     return rows
 end
 
+function Plugin:_download_network_mode()
+    return tostring((self.store:preferences() or {}).download_network_mode or "auto")=="ipv4" and "ipv4" or "auto"
+end
+
+function Plugin:_download_network_mode_label()
+    return self:_download_network_mode()=="ipv4" and "IPv4" or "自动"
+end
+
+function Plugin:_set_download_network_mode(mode,quiet)
+    mode=tostring(mode or "auto")=="ipv4" and "ipv4" or "auto"
+    local preferences=self.store:preferences()
+    preferences.download_network_mode=mode
+    self.store:save_preferences(preferences)
+    local active=self.download_task and self.download_task:busy()
+    if active then
+        local ok,err=self.download_task:set_network_mode(mode)
+        if not ok then
+            logger.warn("[MiuRead][Download] active network mode switch unavailable",tostring(err))
+            if quiet~=true then self:toast("设置已保存，将从下一次下载生效",3) end
+            return false
+        end
+    end
+    if quiet~=true then
+        self:toast(mode=="ipv4" and "下载网络已切换为 IPv4" or "下载网络已恢复自动选择",3)
+    end
+    return true
+end
+
+function Plugin:download_network_mode_menu()
+    return {
+        {text="自动（推荐）",radio=true,checked_func=function() return self:_download_network_mode()=="auto" end,callback=function() self:_set_download_network_mode("auto") end},
+        {text="仅 IPv4",radio=true,checked_func=function() return self:_download_network_mode()=="ipv4" end,callback=function() self:_set_download_network_mode("ipv4") end},
+    }
+end
+
+function Plugin:_show_download_ipv4_suggestion(runtime,state)
+    if not runtime or runtime.network_prompted==true then return end
+    runtime.network_prompted=true
+    -- Mark the current task as already prompted before showing the dialog.
+    -- The worker keeps downloading, and a UI transition/restart cannot turn
+    -- the same detection into repeated prompts. Choosing IPv4 below overwrites
+    -- this task-local silent marker immediately.
+    if self.download_task and self.download_task:busy() then
+        self.download_task:dismiss_network_suggestion()
+    end
+    local auto=tonumber(state and state.network_auto_seconds)
+    local ipv4=tonumber(state and state.network_ipv4_seconds)
+    local comparison=""
+    if auto and ipv4 then
+        comparison="\n\n自动线路约 "..string.format("%.1f",auto).." 秒，IPv4 约 "..string.format("%.1f",ipv4).." 秒。"
+    end
+    local dialog
+    dialog=ButtonDialog:new{
+        title="检测到 IPv4 下载更快\n\n当前下载多次响应较慢。觅阅已对同一服务器进行了两组网络对照，两组测试中 IPv4 都明显更快。"..comparison.."\n\n是否切换到 IPv4？",
+        title_align="center",
+        buttons={
+            {{text="切换 IPv4",callback=function()
+                UIManager:close(dialog)
+                local switched=self:_set_download_network_mode("ipv4",true)
+                if switched then
+                    self:status_toast("下载网络","已切换为 IPv4，当前下载从下一次请求开始使用",4)
+                else
+                    self:status_toast("下载网络","IPv4 设置已保存，将从下一次下载生效",4)
+                end
+            end}},
+            {{text="继续当前网络",callback=function()
+                UIManager:close(dialog)
+            end}},
+        },
+    }
+    UIManager:show(dialog)
+end
+
 function Plugin:show_home_layout_dialog()
     local home=self:_home_preferences()
     local function choose(style)
@@ -12521,6 +12594,11 @@ function Plugin:_on_download_progress(runtime,state)
     if self:_download_dialog_is_shown(runtime) then
         runtime.dialog:set_state(state)
     end
+    if state and state.network_ipv4_suggested==true
+        and state.stage~="package" and state.stage~="done" and state.stage~="error"
+        and state.stage~="cancelled" then
+        self:_show_download_ipv4_suggestion(runtime,state)
+    end
     self:_write_download_state("active",self:_active_download_payload(runtime,state),false)
     local home_percent=self:_download_percent(state)
     local home_mark=math.floor(home_percent/10)*10
@@ -13312,6 +13390,7 @@ function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
     end
     local prefs=self.store:preferences()
     if opt.images==nil then opt.images=prefs.images end
+    opt.network_mode=tostring(prefs.download_network_mode or "auto")=="ipv4" and "ipv4" or "auto"
     opt.active_document_path=self:_current_document_path()
     local runtime={book=U.copy(b),options=U.copy(opt),last_state={stage="prepare",current=0,total=1,percent=0,chapter=b.title or ""},background=start_in_background==true,dialog=nil,started_at=os.time(),open_after=open_after==true,done=done,notified_milestones={}}
     self._download_runtime=runtime
@@ -16133,6 +16212,7 @@ function Plugin:download_settings_menu()
     local policy_label=policy=="allow" and "允许后台下载" or (policy=="after_reading" and "退出阅读后下载" or "每次询问")
     local items={
         {text="阅读时下载策略",post_text=policy_label,sub_item_table_func=function() return self:download_reader_policy_menu() end},
+        {text="下载网络",post_text=self:_download_network_mode_label(),sub_item_table_func=function() return self:download_network_mode_menu() end},
         {text="下载关键进度提示",checked_func=function() return self.store:preferences().download_notice_enabled~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("download_notice_enabled") end},
         {text="下载完成提醒",checked_func=function() return self.store:preferences().download_complete_notice~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("download_complete_notice") end},
     }

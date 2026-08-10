@@ -88,6 +88,42 @@ function DownloadTask:_control_pause_path()
     return path~="" and path or nil
 end
 
+function DownloadTask:_control_network_path()
+    local task=self:_control_descriptor()
+    local path=type(task)=="table" and tostring(task.network_path or "") or ""
+    return path~="" and path or nil
+end
+
+function DownloadTask:set_network_mode(mode)
+    mode=tostring(mode or "auto")=="ipv4" and "ipv4" or "auto"
+    local path=self:_control_network_path()
+    if not path then return false,"当前下载任务不支持网络模式切换" end
+    local wrote,err=U.atomic_write(path,mode,true)
+    if not wrote then return false,tostring(err or "无法写入网络模式") end
+    if self.job then
+        self.job.network_mode=mode
+        self.job.restart_options=self.job.restart_options or {}
+        self.job.restart_options.network_mode=mode
+        self.job.restart_options.network_suggestion_silent=nil
+    end
+    logger.info("[MiuRead][DownloadTask] network mode updated",
+        "mode=",mode,"shared=",tostring(self.job==nil))
+    return true
+end
+
+function DownloadTask:dismiss_network_suggestion()
+    local path=self:_control_network_path()
+    if not path then return false end
+    local wrote=U.atomic_write(path,"auto_silent",true)==true
+    if wrote and self.job then
+        self.job.restart_options=self.job.restart_options or {}
+        self.job.restart_options.network_mode="auto"
+        self.job.restart_options.network_suggestion_silent=true
+    end
+    if wrote then logger.info("[MiuRead][DownloadTask] IPv4 suggestion dismissed for current task") end
+    return wrote
+end
+
 function DownloadTask:_marker_reasons(path)
     local reasons={}
     path=path or self:_control_pause_path()
@@ -277,7 +313,8 @@ function DownloadTask:descriptor()
     return {
         pid=job.pid,progress_path=job.progress_path,result_path=job.result_path,
         recovery_path=job.recovery_path,diagnostic_path=job.diagnostic_path,
-        cancel_path=job.cancel_path,pause_path=job.pause_path,worker_settings_path=job.worker_settings_path,
+        cancel_path=job.cancel_path,pause_path=job.pause_path,network_path=job.network_path,
+        worker_settings_path=job.worker_settings_path,
         started_at=job.started_at,owner_token=self.owner_token,task_token=job.task_token,
         restart_count=tonumber(job.restart_count) or 0,
     }
@@ -448,6 +485,7 @@ function DownloadTask:_finish(job, forced_error)
     if job.recovery_path then os.remove(job.recovery_path) end
     os.remove(job.cancel_path)
     if job.pause_path then os.remove(job.pause_path) end
+    if job.network_path then os.remove(job.network_path) end
     if job.worker_settings_path then os.remove(job.worker_settings_path) end
     if self:_owns_job() then os.remove(self.owner_path) end
     self.job = nil
@@ -467,6 +505,15 @@ function DownloadTask:_restart_interrupted(job)
     end
     local book=serializable_copy(job.restart_book)
     local options=serializable_copy(job.restart_options or {}) or {}
+    local network_control=job.network_path and U.read_file(job.network_path,true) or nil
+    network_control=tostring(network_control or ""):match("^%s*([%w_%-]+)")
+    if network_control=="ipv4" then
+        options.network_mode="ipv4"
+        options.network_suggestion_silent=nil
+    elseif network_control=="auto_silent" then
+        options.network_mode="auto"
+        options.network_suggestion_silent=true
+    end
     local on_progress,on_done=job.on_progress,job.on_done
     local state=U.copy(job.last_progress_state or {})
     state.stage="restart"
@@ -487,6 +534,7 @@ function DownloadTask:_restart_interrupted(job)
     if job.recovery_path then os.remove(job.recovery_path) end
     os.remove(job.cancel_path)
     if job.pause_path then os.remove(job.pause_path) end
+    if job.network_path then os.remove(job.network_path) end
     if job.worker_settings_path then os.remove(job.worker_settings_path) end
     if self:_owns_job() then os.remove(self.owner_path) end
     self.job=nil
@@ -667,7 +715,8 @@ function DownloadTask:attach(descriptor,on_progress,on_done,restart_book,restart
     self.job={
         pid=pid,progress_path=descriptor.progress_path,result_path=descriptor.result_path,
         recovery_path=recovery_path,diagnostic_path=diagnostic_path,
-        cancel_path=descriptor.cancel_path,pause_path=descriptor.pause_path,worker_settings_path=descriptor.worker_settings_path,
+        cancel_path=descriptor.cancel_path,pause_path=descriptor.pause_path,network_path=descriptor.network_path,
+        worker_settings_path=descriptor.worker_settings_path,
         on_progress=on_progress,on_done=on_done,last_progress_raw=nil,last_progress_state=nil,
         last_progress_at=nil,last_keepalive=0,started_at=descriptor.started_at,dead_seen_at=nil,
         unknown_seen_at=nil,waiting_notified=false,rechecking_notified=false,
@@ -730,6 +779,7 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
     local diagnostic_path = self.store.temp_dir .. "/download-diagnostic-" .. stamp .. ".txt"
     local cancel_path = self.store.temp_dir .. "/download-cancel-" .. stamp
     local pause_path = self.store.temp_dir .. "/download-pause-" .. stamp .. ".json"
+    local network_path = self.store.temp_dir .. "/download-network-" .. stamp
     local worker_settings_path = self.store.temp_dir .. "/download-settings-" .. stamp .. ".lua"
     self.store:flush()
     local copied, copy_error = U.copy_file(self.store.settings_path, worker_settings_path)
@@ -742,7 +792,15 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
     clean_options.reader_active_path="/tmp/miuread-reader-active.flag"
     clean_options.reader_busy_path="/tmp/miuread-reader-busy.until"
     clean_options.pause_path=pause_path
+    clean_options.network_mode=tostring(clean_options.network_mode or "auto")=="ipv4" and "ipv4" or "auto"
+    clean_options.network_mode_path=network_path
     clean_options.performance_mode_path=Config.LIGHTWEIGHT_MODE_FLAG
+    local initial_network_control=clean_options.network_suggestion_silent==true and "auto_silent" or clean_options.network_mode
+    local network_written,network_error=U.atomic_write(network_path,initial_network_control,true)
+    if not network_written then
+        os.remove(worker_settings_path)
+        return false,"无法建立下载网络控制状态："..tostring(network_error or "未知错误")
+    end
     local start_auth=self.store:auth()
     local start_account=type(start_auth.account)=="table" and start_auth.account or {}
     local auth_snapshot={
@@ -767,6 +825,8 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
         local UChild = require("miuread.util")
         local LoggerChild = require("logger")
         local current_stage="bootstrap"
+        local last_emitted_state={}
+        local network_suggestion_detail
 
         local function write_direct(path,data)
             local file,open_error=io.open(path,"wb")
@@ -829,8 +889,22 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
         local function emit(state)
             state = state or {}
             current_stage=tostring(state.stage or current_stage)
+            if network_suggestion_detail then
+                local control=UChild.read_file(network_path,true)
+                control=tostring(control or ""):match("^%s*([%w_%-]+)") or "auto"
+                if control=="ipv4" or control=="auto_silent" then
+                    network_suggestion_detail=nil
+                else
+                    state.network_ipv4_suggested=true
+                    state.network_auto_seconds=tonumber(network_suggestion_detail.auto_seconds)
+                    state.network_ipv4_seconds=tonumber(network_suggestion_detail.ipv4_seconds)
+                    state.network_gain_seconds=tonumber(network_suggestion_detail.gain_seconds)
+                    state.network_trigger_baseline=tonumber(network_suggestion_detail.trigger_baseline)
+                end
+            end
             state.task_token = task_token
             state.updated_at = os.time()
+            last_emitted_state=serializable_copy(state) or {}
             local wrote,write_error=write_json(progress_path,state,"progress")
             if not wrote then LoggerChild.warn("[MiuRead][DownloadTask] progress write failed",tostring(write_error)) end
             return wrote
@@ -861,6 +935,10 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                     isolated = true,
                 }
                 local http = Http:new(store)
+                http:set_download_network_policy{
+                    mode=clean_options.network_mode,
+                    mode_path=network_path,
+                }
                 local reader = Reader:new(http, store)
                 local api = Api:new(http, store, reader)
                 local library = Library:new(api, http, store)
@@ -891,6 +969,10 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                         rate_limit_code = tostring(code or ""),
                         wait_seconds = tonumber(remaining),
                     }
+                end
+                http.on_network_suggestion = function(detail)
+                    network_suggestion_detail=serializable_copy(detail or {}) or {}
+                    emit(serializable_copy(last_emitted_state) or {})
                 end
                 emit{stage = "prepare", current = 0, total = 1, chapter = clean_book.title or "",
                     message = "正在准备下载"}
@@ -989,6 +1071,7 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
     if not ok or not pid then
         os.remove(worker_settings_path)
         os.remove(pause_path)
+        os.remove(network_path)
         return false, tostring(err or pid or "无法启动下载子进程")
     end
 
@@ -1000,6 +1083,8 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
         diagnostic_path = diagnostic_path,
         cancel_path = cancel_path,
         pause_path = pause_path,
+        network_path = network_path,
+        network_mode = clean_options.network_mode,
         worker_settings_path = worker_settings_path,
         on_progress = on_progress,
         on_done = on_done,

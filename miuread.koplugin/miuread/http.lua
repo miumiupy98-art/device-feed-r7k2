@@ -5,6 +5,8 @@ local ok_https, https = pcall(require, "ssl.https")
 local ok_socket, socket = pcall(require, "socket")
 local ok_lfs, lfs = pcall(require, "lfs")
 local Json = require("miuread.json")
+local Config = require("miuread.config")
+local NetworkPolicy = require("miuread.network_policy")
 local Cookies = require("miuread.cookies")
 local Protocol = require("miuread.protocol")
 local Util = require("miuread.util")
@@ -66,6 +68,29 @@ local function clock_now()
     return os.time()
 end
 
+local function probe_origin(url)
+    local scheme, host = tostring(url or ""):match("^(https?)://([^/]+)")
+    if not scheme or not host then return nil end
+    return scheme .. "://" .. host .. "/"
+end
+
+local function discard_sink()
+    return function() return 1 end
+end
+
+local function ipv4_tcp_factory()
+    if not (ok_socket and socket and type(socket.tcp4) == "function") then
+        return nil, "IPv4 socket unavailable"
+    end
+    local conn, err = socket.tcp4()
+    if not conn then return nil, err end
+    if type(conn.settimeout) == "function" then
+        pcall(conn.settimeout, conn, tonumber(socketutil.block_timeout) or 15, "b")
+        pcall(conn.settimeout, conn, tonumber(socketutil.total_timeout) or 35, "t")
+    end
+    return conn
+end
+
 local function body_rate_limit(text)
     text = tostring(text or "")
     if text == "" or #text > 32768 or not text:match("^%s*[%[{]") then return nil end
@@ -102,6 +127,91 @@ function Http:new(store)
         shared_rate_limit_path = base~="" and (base.."/weread-rate-limit.json") or nil,
         shared_pacing_path = base~="" and (base.."/weread-pacing.json") or nil,
     }, self)
+end
+
+function Http:set_download_network_policy(options)
+    self.network_policy = NetworkPolicy:new(options or {})
+    return self.network_policy
+end
+
+function Http:_transport_request(transport, request, force_ipv4)
+    if force_ipv4~=true then return pcall(transport.request, request) end
+    if not (ok_socket and socket and type(socket.tcp4)=="function") then
+        logger.warn("[MiuRead][NetworkPolicy] IPv4-only socket unavailable; keeping automatic networking")
+        return pcall(transport.request, request)
+    end
+    local previous_tcp=socket.tcp
+    socket.tcp=ipv4_tcp_factory
+    local called,ok,code,headers,status=pcall(transport.request,request)
+    socket.tcp=previous_tcp
+    return called,ok,code,headers,status
+end
+
+function Http:_probe_once(url, force_ipv4)
+    local transport
+    if tostring(url):match("^https:") then
+        transport=ok_https and https or (ok_http and http or nil)
+    else
+        transport=ok_http and http or nil
+    end
+    if not transport or type(transport.request)~="function" then return nil end
+    if force_ipv4 and not (self.network_policy and self.network_policy:ipv4_available(socket)) then return nil end
+
+    socketutil:set_timeout(
+        tonumber(Config.DOWNLOAD_NETWORK_PROBE_BLOCK_TIMEOUT) or 4,
+        tonumber(Config.DOWNLOAD_NETWORK_PROBE_TOTAL_TIMEOUT) or 6)
+    local started=clock_now()
+    local called,ok,code=self:_transport_request(transport,{
+        url=url,
+        method="HEAD",
+        headers={
+            ["User-Agent"]=self.user_agent,
+            ["Accept"]="*/*",
+            ["Connection"]="close",
+        },
+        sink=discard_sink(),
+    },force_ipv4==true)
+    local elapsed=clock_now()-started
+    socketutil:reset_timeout()
+    if not called or not tonumber(code) then
+        logger.info("[MiuRead][NetworkPolicy] probe unavailable",
+            "family=",force_ipv4 and "ipv4" or "auto",
+            "status=",tostring(code or ok or "network"))
+        return nil
+    end
+    return math.max(0,elapsed),tonumber(code)
+end
+
+function Http:_verify_ipv4_advantage(current_url, trigger)
+    local policy=self.network_policy
+    if not policy or policy:current_mode()~="auto" or not policy:ipv4_available(socket) then return end
+    local url=probe_origin(current_url)
+    if not url then return end
+
+    -- Two reversed-order pairs are deliberate. Both pairs must independently
+    -- show the same IPv4 advantage, so a server/CDN recovery between probes
+    -- cannot by itself trigger the compatibility prompt.
+    local auto1=self:_probe_once(url,false)
+    local ipv41=self:_probe_once(url,true)
+    if not auto1 or not ipv41 or not policy:probe_is_promising(auto1,ipv41) then return end
+    local ipv42=self:_probe_once(url,true)
+    local auto2=self:_probe_once(url,false)
+    if not auto2 or not ipv42 or not policy:probe_is_promising(auto2,ipv42) then return end
+
+    local confirmed=policy:confirm_probes({auto1,auto2},{ipv41,ipv42})
+    if not confirmed or type(self.on_network_suggestion)~="function" then return end
+    confirmed.trigger_baseline=trigger and trigger.baseline or nil
+    local ok,err=pcall(self.on_network_suggestion,confirmed)
+    if not ok then logger.warn("[MiuRead][NetworkPolicy] suggestion callback failed",tostring(err)) end
+end
+
+function Http:_observe_download_network(url, delay, code)
+    local policy=self.network_policy
+    if not policy or not is_weread_url(url) then return end
+    code=tonumber(code)
+    if not code or code<200 or code>=400 then return end
+    local trigger=policy:observe(delay)
+    if trigger then self:_verify_ipv4_advantage(url,trigger) end
 end
 
 function Http:_pacing_path(scope)
@@ -366,17 +476,32 @@ function Http:_request_once(opt)
             return nil, nil, nil, current, "HTTP transport unavailable"
         end
         self:_pace(current, opt)
-        local called, ok, code, resp_headers, status = pcall(transport.request, {
+        local first_data_at
+        local sink=function(chunk,err)
+            if chunk then
+                if not first_data_at then first_data_at=clock_now() end
+                chunks[#chunks+1]=chunk
+            end
+            return 1
+        end
+        local request_started=clock_now()
+        local force_ipv4=self.network_policy and self.network_policy:should_force_ipv4() or false
+        local called, ok, code, resp_headers, status = self:_transport_request(transport, {
             url = current,
             method = method,
             headers = headers,
             source = body and ltn12.source.string(body) or nil,
-            sink = ltn12.sink.table(chunks),
-        })
+            sink = sink,
+        }, force_ipv4)
+        local request_finished=clock_now()
         socketutil:reset_timeout()
         if not called then return nil, nil, nil, current, tostring(ok) end
         local text = table.concat(chunks)
         code = tonumber(code)
+        if code and self.network_policy then
+            local response_delay=(first_data_at or request_finished)-request_started
+            self:_observe_download_network(current,response_delay,code)
+        end
         if not code then return text, nil, resp_headers, current, tostring(status or ok) end
 
         local set_cookie = hget(resp_headers, "set-cookie")

@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.3.0-beta.31",
+    VERSION = "4.3.0-beta.32",
     SCHEMA = 111,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -57,6 +57,19 @@ local C = {
     AUTH_NOTICE_FAILURE_THRESHOLD = 2,
     DOWNLOAD_AUTO_RESTARTS = 2,
     DOWNLOAD_DIAGNOSTIC_KEEP = 3,
+
+    -- Download networking stays automatic by default. A compatibility prompt
+    -- is considered only after several genuinely slow responses, then confirmed
+    -- with paired automatic/IPv4 probes against the same host.
+    DOWNLOAD_NETWORK_IGNORE_INITIAL_REQUESTS = 1,
+    DOWNLOAD_NETWORK_SAMPLE_WINDOW = 4,
+    DOWNLOAD_NETWORK_SLOW_REQUIRED = 3,
+    DOWNLOAD_NETWORK_SLOW_RESPONSE_SECONDS = 3,
+    DOWNLOAD_NETWORK_PROBE_BLOCK_TIMEOUT = 4,
+    DOWNLOAD_NETWORK_PROBE_TOTAL_TIMEOUT = 6,
+    DOWNLOAD_NETWORK_PROBE_AUTO_MIN_SECONDS = 2,
+    DOWNLOAD_NETWORK_IPV4_MAX_RATIO = 0.50,
+    DOWNLOAD_NETWORK_IPV4_MIN_GAIN_SECONDS = 1,
     READ_REPORT_AUTH_RETRY_DELAYS = {120, 300, 900, 1800},
     READ_REPORT_CONTEXT_RETRY_DELAYS = {60, 120, 300, 900},
 }
