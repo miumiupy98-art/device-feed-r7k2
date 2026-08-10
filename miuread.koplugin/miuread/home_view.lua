@@ -1420,9 +1420,16 @@ function HomeView.park()
     live_widget._miu_resume_waiting_interaction=false
     return true
 end
-function HomeView.unpark(skip_dirty)
+function HomeView.unpark(skip_dirty,opts)
     if not HomeView.is_shown() then return false end
+    opts=type(opts)=="table" and opts or {}
     live_widget._miu_input_suspended=false
+    if type(opts.on_interaction)=="function" then
+        live_widget._miu_resume_interaction_callback=opts.on_interaction
+        live_widget._miu_resume_waiting_interaction=true
+        live_widget._miu_last_interaction_at=0
+    end
+    if live_widget._metrics_cache then live_widget:_register_top_swipe(live_widget._metrics_cache) end
     if skip_dirty~=true then UIManager:setDirty(live_widget,"ui") end
     return true
 end

@@ -365,6 +365,8 @@ function Plugin:init()
     -- Every touch extends a short quiet window; visible metadata/cover work is
     -- resumed only after that window expires.
     self._home_ui_quiet_until=0
+    self._home_post_reader_protect_until=0
+    self._home_modal_cooldown_until=0
     self._home_ui_resume_task=nil
     self._home_visible_metadata_targets={}
     self._home_visible_cover_targets={}
@@ -2610,9 +2612,29 @@ function Plugin:_home_background_blocked()
         or self:_page_transition_active()
 end
 
+function Plugin:_home_modal_surface_active()
+    local stack=UIManager._window_stack or {}
+    for index=#stack,1,-1 do
+        local window=stack[index]
+        local widget=window and window.widget or nil
+        if widget and widget._miuread_modal_surface==true
+            and widget._miuread_recovery_surface~=true
+            and UIManager:isWidgetShown(widget) then
+            self._home_modal_cooldown_until=math.max(
+                tonumber(self._home_modal_cooldown_until) or 0,monotonic_wall_time()+2.6)
+            return true
+        end
+    end
+    return false
+end
+
 function Plugin:_home_ui_busy()
-    return self:_home_background_blocked()
-        or os.clock() < (tonumber(self._home_ui_quiet_until) or 0)
+    local now=monotonic_wall_time()
+    if self:_home_background_blocked() then return true end
+    if self:_home_modal_surface_active() then return true end
+    return now < (tonumber(self._home_ui_quiet_until) or 0)
+        or now < (tonumber(self._home_post_reader_protect_until) or 0)
+        or now < (tonumber(self._home_modal_cooldown_until) or 0)
 end
 
 function Plugin:_home_resume_visible_work_after_idle()
@@ -2620,26 +2642,63 @@ function Plugin:_home_resume_visible_work_after_idle()
     local task
     task=function()
         if self._home_ui_resume_task~=task then return end
-        local remain=(tonumber(self._home_ui_quiet_until) or 0)-os.clock()
+        if not HomeView.is_shown() or self:_active_reader_ui() then
+            self._home_ui_resume_task=nil
+            return
+        end
+        local now=monotonic_wall_time()
+        if self:_home_modal_surface_active() then
+            UIManager:scheduleIn(.45,task)
+            return
+        end
+        local deadline=math.max(
+            tonumber(self._home_ui_quiet_until) or 0,
+            tonumber(self._home_post_reader_protect_until) or 0,
+            tonumber(self._home_modal_cooldown_until) or 0)
+        local remain=deadline-now
         if remain>0 then
             UIManager:scheduleIn(math.max(.20,remain+.08),task)
             return
         end
+        if self:_home_background_blocked() then
+            UIManager:scheduleIn(.45,task)
+            return
+        end
         self._home_ui_resume_task=nil
-        if not HomeView.is_shown() or self:_active_reader_ui() or self:_home_background_blocked() then return end
         local metadata=self._home_visible_metadata_targets or {}
         local covers=self._home_visible_cover_targets or {}
         self:_home_schedule_local_metadata(metadata)
         self:_home_schedule_remote_covers(covers)
-        UIManager:scheduleIn(.70,function()
+        UIManager:scheduleIn(.85,function()
             if HomeView.is_shown() and not self:_active_reader_ui() and not self:_home_ui_busy() then
                 self:_home_schedule_cover_derivatives(covers)
             end
         end)
-        if self.download_task then self.download_task:resume("home_interaction") end
+        if self.download_task then
+            self.download_task:resume("home_interaction")
+            self.download_task:resume("page_transition")
+        end
+        logger.info("[MiuRead][HomePerf] background released after interaction")
     end
     self._home_ui_resume_task=task
     UIManager:scheduleIn(.35,task)
+end
+
+function Plugin:_home_enter_post_reader_priority_window(seconds,reason)
+    if not HomeView.is_shown() then return false end
+    local duration=math.max(4.0,tonumber(seconds) or 4.0)
+    self._home_post_reader_protect_until=math.max(
+        tonumber(self._home_post_reader_protect_until) or 0,monotonic_wall_time()+duration)
+    self._home_metadata_generation=(tonumber(self._home_metadata_generation) or 0)+1
+    self._home_cover_generation=(tonumber(self._home_cover_generation) or 0)+1
+    self._home_cover_render_generation=(tonumber(self._home_cover_render_generation) or 0)+1
+    if self.home_metadata_async and self.home_metadata_async:busy() then self.home_metadata_async:cancel("post-reader priority") end
+    if self.home_cover_async and self.home_cover_async:busy() then self.home_cover_async:cancel("post-reader priority") end
+    if self.cover_render_async and self.cover_render_async:busy() then self.cover_render_async:cancel("post-reader priority") end
+    self:_home_resume_visible_work_after_idle()
+    logger.info("[MiuRead][HomePerf] post-reader priority window",
+        "seconds=",tostring(duration),"reason=",tostring(reason or "reader closed"))
+    return true
 end
 
 function Plugin:_home_bump_interaction_generation()
@@ -2649,7 +2708,7 @@ function Plugin:_home_bump_interaction_generation()
 end
 
 function Plugin:_home_note_interaction(first,kind)
-    self._home_ui_quiet_until=math.max(tonumber(self._home_ui_quiet_until) or 0,os.clock()+1.35)
+    self._home_ui_quiet_until=math.max(tonumber(self._home_ui_quiet_until) or 0,monotonic_wall_time()+2.2)
     self:_home_bump_interaction_generation()
     -- Stop optional visible-book work immediately; it can be restarted from
     -- cached targets after the user has been idle for a moment.
@@ -3268,6 +3327,40 @@ function Plugin:_home_apply_rendered_cover_path(book_id,path)
     return changed,hero_changed,sections
 end
 
+function Plugin:_home_cover_target_fresh(target,inputs)
+    target=tostring(target or "")
+    if target=="" or lfs.attributes(target,"mode")~="file" then return false end
+    if (tonumber(U.file_size(target) or 0) or 0)<=0 then return false end
+    local target_mtime=tonumber(lfs.attributes(target,"modification") or 0) or 0
+    if target_mtime<=0 then return false end
+    local found=false
+    for _,raw in ipairs(inputs or {}) do
+        local path=tostring(raw or "")
+        if path~="" and path~=target and lfs.attributes(path,"mode")=="file" then
+            found=true
+            local source_mtime=tonumber(lfs.attributes(path,"modification") or 0) or 0
+            if source_mtime<=0 or source_mtime>target_mtime then return false end
+        end
+    end
+    return found
+end
+
+function Plugin:_home_cover_input_stamp(inputs)
+    local parts={}
+    for _,raw in ipairs(inputs or {}) do
+        local path=tostring(raw or "")
+        if path~="" and lfs.attributes(path,"mode")=="file" then
+            parts[#parts+1]=table.concat({
+                path,
+                tostring(tonumber(lfs.attributes(path,"modification") or 0) or 0),
+                tostring(tonumber(U.file_size(path) or 0) or 0),
+            },"|")
+        end
+    end
+    table.sort(parts)
+    return table.concat(parts,"+")
+end
+
 function Plugin:_home_schedule_cover_derivatives(books)
     if self:_home_ui_busy() then
         self._home_resume_pending_work=self._home_resume_pending_work or {}
@@ -3276,6 +3369,7 @@ function Plugin:_home_schedule_cover_derivatives(books)
     end
     if not self.cover_render_async or not self.cover_render_async:available() then return false end
 
+    local check_started=monotonic_wall_time()
     local sw,sh=Device.screen:getWidth(),Device.screen:getHeight()
     if sw<=0 or sh<=0 then return false end
     local thumb_w=math.max(240,math.min(420,math.floor(sw*.34+.5)))
@@ -3291,10 +3385,13 @@ function Plugin:_home_schedule_cover_derivatives(books)
         if type(book)=="table" then
             local id=self:_home_cover_render_id(book)
             if id and not seen[id] then
-                local sources={}
+                local sources,source_seen={},{}
                 local function add(path)
                     path=tostring(path or "")
-                    if path~="" and lfs.attributes(path,"mode")=="file" then sources[#sources+1]=path end
+                    if path~="" and not source_seen[path] and lfs.attributes(path,"mode")=="file" then
+                        source_seen[path]=true
+                        sources[#sources+1]=path
+                    end
                 end
                 add(book.cover_path)
                 local stored=(book.bookId or book.book_id) and self.store:book(tostring(book.bookId or book.book_id)) or nil
@@ -3304,16 +3401,25 @@ function Plugin:_home_schedule_cover_derivatives(books)
                 local file=tostring(book.file or (record and record.file) or "")
                 if #sources>0 or (file~="" and U.file_exists(file)) then
                     seen[id]=true
+                    local inputs={}
+                    for _,path in ipairs(sources) do inputs[#inputs+1]=path end
+                    if file~="" and U.file_exists(file) and not source_seen[file] then inputs[#inputs+1]=file end
+                    local home_target=render_dir.."/"..U.id_name(id).."-home1-"..tostring(thumb_w).."x"..tostring(thumb_h)..".png"
+                    local lock_target=(hero_id~="" and id==hero_id)
+                        and (lock_dir.."/"..U.id_name(id).."-fill3-"..tostring(sw).."x"..tostring(sh)..".png") or nil
                     items[#items+1]={
                         id=id,
                         sources=sources,
+                        inputs=inputs,
+                        input_stamp=self:_home_cover_input_stamp(inputs),
                         file=file,
                         source_dir=source_dir,
-                        home_target=render_dir.."/"..U.id_name(id).."-home1-"..tostring(thumb_w).."x"..tostring(thumb_h)..".png",
+                        home_target=home_target,
                         home_w=thumb_w,home_h=thumb_h,
-                        lock_target=(hero_id~="" and id==hero_id)
-                            and (lock_dir.."/"..U.id_name(id).."-fill3-"..tostring(sw).."x"..tostring(sh)..".png") or nil,
+                        lock_target=lock_target,
                         lock_w=sw,lock_h=sh,
+                        home_fresh=self:_home_cover_target_fresh(home_target,inputs),
+                        lock_fresh=not lock_target or self:_home_cover_target_fresh(lock_target,inputs),
                     }
                     if #items>=10 then break end
                 end
@@ -3322,9 +3428,49 @@ function Plugin:_home_schedule_cover_derivatives(books)
     end
     if #items==0 then return false end
 
-    local signature_parts={tostring(sw),tostring(sh),tostring(thumb_w),tostring(thumb_h),hero_id}
+    local worker_items={}
+    local fresh_count=0
+    local fast_changed=false
+    local fast_hero_changed=false
+    local fast_sections={}
     for _,item in ipairs(items) do
-        signature_parts[#signature_parts+1]=table.concat({tostring(item.id),tostring(item.home_target),tostring(item.lock_target or "")},"|")
+        if item.home_fresh then
+            fresh_count=fresh_count+1
+            local changed,is_hero,sections=self:_home_apply_rendered_cover_path(item.id,item.home_target)
+            fast_changed=fast_changed or changed
+            fast_hero_changed=fast_hero_changed or is_hero
+            for section in pairs(sections or {}) do fast_sections[section]=true end
+        end
+        if item.lock_target and item.lock_fresh then
+            local current_hero_id=tostring(self:_home_cover_render_id(self._home_hero) or "")
+            if current_hero_id~="" and item.id==current_hero_id then
+                HOME_SESSION.screensaver_file=item.lock_target
+                local current=HomeView.current()
+                if current and current.opts then current.opts.screensaver_file=item.lock_target end
+            end
+        end
+        if not (item.home_fresh and item.lock_fresh) then worker_items[#worker_items+1]=item end
+    end
+
+    if fast_changed and HomeView.is_shown() and not self:_active_reader_ui() then
+        for section in pairs(fast_sections) do self:_home_bump_section_revision(section) end
+        local active=self._home_active_section or "account"
+        if fast_hero_changed then self:_home_schedule_render_refresh("content")
+        elseif fast_sections[active] then self:_home_apply_section(active) end
+    end
+
+    if #worker_items==0 then
+        logger.info("[MiuRead][CoverRender] visible cache reused",
+            "fresh=",tostring(fresh_count),
+            "check_ms=",tostring(math.floor((monotonic_wall_time()-check_started)*1000+.5)))
+        return false
+    end
+
+    local signature_parts={tostring(sw),tostring(sh),tostring(thumb_w),tostring(thumb_h),hero_id}
+    for _,item in ipairs(worker_items) do
+        signature_parts[#signature_parts+1]=table.concat({
+            tostring(item.id),tostring(item.home_target),tostring(item.lock_target or ""),tostring(item.input_stamp or "")
+        },"|")
     end
     local request_signature=table.concat(signature_parts,";")
     local now_clock=os.time()
@@ -3337,7 +3483,9 @@ function Plugin:_home_schedule_cover_derivatives(books)
             retry=function()
                 if self._home_cover_render_retry_task~=retry then return end
                 self._home_cover_render_retry_task=nil
-                if HomeView.is_shown() and not self:_active_reader_ui() then self:_home_schedule_cover_derivatives(books) end
+                if HomeView.is_shown() and not self:_active_reader_ui() and not self:_home_ui_busy() then
+                    self:_home_schedule_cover_derivatives(books)
+                end
             end
             self._home_cover_render_retry_task=retry
             UIManager:scheduleIn(.8,retry)
@@ -3348,7 +3496,6 @@ function Plugin:_home_schedule_cover_derivatives(books)
     self._home_cover_render_inflight_signature=request_signature
     self._home_cover_render_generation=(tonumber(self._home_cover_render_generation) or 0)+1
     local generation=self._home_cover_render_generation
-    local worker_items=items
     local worker=function()
         local CoverRender=require("miuread.cover_render")
         local LocalMetadataChild=require("miuread.local_metadata")
@@ -3383,6 +3530,10 @@ function Plugin:_home_schedule_cover_derivatives(books)
         return out
     end
 
+    logger.info("[MiuRead][CoverRender] worker scheduled",
+        "pending=",tostring(#worker_items),"fresh=",tostring(fresh_count),
+        "check_ms=",tostring(math.floor((monotonic_wall_time()-check_started)*1000+.5)))
+    local render_started=monotonic_wall_time()
     local started=self.cover_render_async:run("home-cover-render",worker,function(result)
         if self._home_cover_render_inflight_signature==request_signature then
             self._home_cover_render_inflight_signature=nil
@@ -3419,7 +3570,9 @@ function Plugin:_home_schedule_cover_derivatives(books)
             if hero_changed then self:_home_schedule_render_refresh("content")
             elseif changed_sections[active] then self:_home_apply_section(active) end
         end
-        logger.info("[MiuRead][CoverRender] visible cache ready","count=",tostring(#result.value))
+        logger.info("[MiuRead][CoverRender] visible cache ready",
+            "rendered=",tostring(#result.value),"fresh=",tostring(fresh_count),
+            "elapsed_ms=",tostring(math.floor((monotonic_wall_time()-render_started)*1000+.5)))
     end,55)
     if started~=true and self._home_cover_render_inflight_signature==request_signature then
         self._home_cover_render_inflight_signature=nil
@@ -10461,7 +10614,14 @@ function Plugin:_finish_page_transition(delay,reason)
         self._page_transition_release_task=nil
         HOME_SESSION.page_transition_state="idle"
         self._page_transition_state="idle"
-        if self.download_task then self.download_task:resume("page_transition") end
+        if self.download_task then
+            if HomeView.is_shown() and not self:_active_reader_ui() and self:_home_ui_busy() then
+                logger.info("[MiuRead][HomePerf] download resume deferred after transition")
+                self:_home_resume_visible_work_after_idle()
+            else
+                self.download_task:resume("page_transition")
+            end
+        end
         logger.info("[MiuRead][Transition] complete",tostring(reason or "surface ready"),
             "generation=",tostring(generation))
     end
@@ -10629,7 +10789,9 @@ function Plugin:_complete_reader_close(generation,reason)
 
     local shown=false
     if HomeView.is_shown() then
-        HomeView.unpark(true)
+        HomeView.unpark(true,{
+            on_interaction=function(first,kind) self:_home_note_interaction(first,kind) end,
+        })
         HomeView.raise(true)
         UIManager:setDirty(HomeView.current(),"ui")
         shown=true
@@ -10654,11 +10816,17 @@ function Plugin:_complete_reader_close(generation,reason)
     self:_set_foreground("home")
     self:_close_reader_recovery_surface()
     self:_release_reader_transition_guard("home restored after stable close")
+    self:_home_enter_post_reader_priority_window(4.0,"stable reader close")
     self:_finish_page_transition(.18,"home restored after stable close")
     self:_resume_pending_post_reader_work("home restored after stable close",2.0)
     READER_CLOSE.state="completed"
     logger.info("[MiuRead][ReaderClose] home restored",
         "generation=",tostring(generation),"reason=",tostring(reason or READER_CLOSE.reason or "close"))
+    local requested_clock=tonumber(READER_CLOSE.requested_clock) or 0
+    if requested_clock>0 then
+        logger.info("[MiuRead][ReaderClosePerf] return complete",
+            "elapsed_ms=",tostring(math.floor((monotonic_wall_time()-requested_clock)*1000+.5)))
+    end
     self:_clear_reader_return(generation,"home restored")
     return true
 end
@@ -10907,6 +11075,7 @@ end
 
 function Plugin:_ensure_filemanager_base(file,opts)
     opts=type(opts)=="table" and opts or {}
+    local perf_started=monotonic_wall_time()
     local ok,FileManager=pcall(require,"apps/filemanager/filemanager")
     if not ok or not FileManager then return false end
     if FileManager.instance then
@@ -10923,7 +11092,9 @@ function Plugin:_ensure_filemanager_base(file,opts)
     local target=tostring(file or HOME_RETURN_FILE or "")
     local dir=target~="" and target:match("^(.*)/[^/]+$") or nil
     local selected=target~="" and target or nil
+    local show_started=monotonic_wall_time()
     local shown,err=xpcall(function() FileManager:showFiles(dir,selected) end,debug.traceback)
+    local show_ms=math.floor((monotonic_wall_time()-show_started)*1000+.5)
     if not shown then
         logger.warn("[MiuRead][Home] failed to recreate FileManager base",tostring(err))
         return false
@@ -10943,6 +11114,9 @@ function Plugin:_ensure_filemanager_base(file,opts)
         logger.info("[MiuRead][Home] FileManager base concealed below MiuRead home")
     end
     logger.info("[MiuRead][Home] FileManager base ready")
+    logger.info("[MiuRead][ReaderClosePerf] FileManager base created",
+        "show_ms=",tostring(show_ms),
+        "total_ms=",tostring(math.floor((monotonic_wall_time()-perf_started)*1000+.5)))
     return true
 end
 
@@ -11005,7 +11179,9 @@ function Plugin:_restore_home_after_reader_close(attempt,generation)
         -- FileManager provides KOReader's docless services and gesture manager,
         -- but it must stay below the MiuRead root. Restore the parked surface
         -- with one bounded UI repaint instead of rebuilding and full-refreshing.
-        HomeView.unpark(true)
+        HomeView.unpark(true,{
+            on_interaction=function(first,kind) self:_home_note_interaction(first,kind) end,
+        })
         HomeView.raise(true)
         UIManager:setDirty(HomeView.current(),"ui")
         HOME_READER_ORIGIN=false
@@ -11015,6 +11191,7 @@ function Plugin:_restore_home_after_reader_close(attempt,generation)
         self:_set_foreground("home")
         self:_close_reader_recovery_surface()
         self:_release_reader_transition_guard("home already visible")
+        self:_home_enter_post_reader_priority_window(4.0,"home revealed")
         self:_finish_page_transition(.18,"home revealed")
         self:_resume_pending_post_reader_work("home revealed",2.0)
         HOME_SESSION.home_restore_active=false
@@ -11045,6 +11222,7 @@ function Plugin:_restore_home_after_reader_close(attempt,generation)
         self:_set_foreground("home")
         self:_close_reader_recovery_surface()
         self:_release_reader_transition_guard("home restored")
+        self:_home_enter_post_reader_priority_window(4.0,"home rebuilt")
         self:_finish_page_transition(.18,"home rebuilt")
         self:_resume_pending_post_reader_work("home restored",2.0)
     else
@@ -17029,6 +17207,10 @@ function Plugin:_run_post_reader_work(generation)
     local ok_fm,FileManager=pcall(require,"apps/filemanager/filemanager")
     if not HomeView.is_shown() and not (ok_fm and FileManager and FileManager.instance) then
         logger.info("[MiuRead][Download] post-reader work waiting for stable surface",phase)
+        return reschedule(.8)
+    end
+    if HomeView.is_shown() and self:_home_ui_busy() then
+        logger.info("[MiuRead][Download] post-reader work yielded to active home",phase)
         return reschedule(.8)
     end
 
