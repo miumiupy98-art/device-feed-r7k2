@@ -165,6 +165,34 @@ READER_CLOSE.close_attempts=tonumber(READER_CLOSE.close_attempts) or 0
 READER_CLOSE.close_command_sent_at=tonumber(READER_CLOSE.close_command_sent_at) or 0
 READER_CLOSE.foreground_stop_attempted=READER_CLOSE.foreground_stop_attempted==true
 READER_CLOSE.native_fallback_attempted=READER_CLOSE.native_fallback_attempted==true
+
+-- CloseDocument is not always a user-visible exit. KOReader may tear down and
+-- recreate ReaderUI while changing orientation, resuming or rebuilding the
+-- document. Keep that observation separate from the explicit ReaderClose state
+-- so an internal rebuild can never start MiuRead's Home/FileManager transition.
+local READER_REBUILD=rawget(_G,"__MIUREAD_READER_REBUILD")
+if type(READER_REBUILD)~="table" then
+    READER_REBUILD={
+        state="idle",generation=0,session_generation=0,reader_file=nil,
+        started_at=0,started_clock=0,max_wait=0,reason=nil,owner=nil,
+        recent_book=nil,recent_started_at=0,recent_count=0,safe_until=0,
+        pending_width=nil,pending_height=nil,pending_rotation=nil,
+    }
+    rawset(_G,"__MIUREAD_READER_REBUILD",READER_REBUILD)
+end
+READER_REBUILD.generation=tonumber(READER_REBUILD.generation) or 0
+READER_REBUILD.session_generation=tonumber(READER_REBUILD.session_generation) or 0
+READER_REBUILD.started_at=tonumber(READER_REBUILD.started_at) or 0
+READER_REBUILD.started_clock=tonumber(READER_REBUILD.started_clock) or 0
+READER_REBUILD.max_wait=tonumber(READER_REBUILD.max_wait) or 0
+READER_REBUILD.recent_started_at=tonumber(READER_REBUILD.recent_started_at) or 0
+READER_REBUILD.recent_count=tonumber(READER_REBUILD.recent_count) or 0
+READER_REBUILD.safe_until=tonumber(READER_REBUILD.safe_until) or 0
+local function reader_rebuild_active()
+    local state=tostring(READER_REBUILD.state or "idle")
+    return state=="pending" or state=="suspended_pending"
+end
+
 HOME_SESSION.home_interaction_generation=tonumber(HOME_SESSION.home_interaction_generation) or 0
 HOME_SESSION.post_reader_work_interaction_generation=tonumber(HOME_SESSION.post_reader_work_interaction_generation) or 0
 local function reader_close_active()
@@ -560,6 +588,11 @@ function Plugin:init()
     self._home_resume_pending_work=nil
     self._home_resume_started_clock=nil
     self._home_resume_sleep_seconds=0
+    self._home_resume_surface_task=nil
+    self._reader_rebuild_task=nil
+    self._reader_dimension_event_count=0
+    self._reader_dimension_last_event_clock=0
+    self._resume_lifecycle_generation=0
     if HOME_SESSION.page_transition_state==nil then HOME_SESSION.page_transition_state="idle" end
     if HOME_SESSION.page_transition_generation==nil then HOME_SESSION.page_transition_generation=0 end
     self._page_transition_state=tostring(HOME_SESSION.page_transition_state or "idle")
@@ -2924,37 +2957,68 @@ function Plugin:_home_begin_resume(slept)
     local generation=self._home_resume_generation
     self._home_resume_started_clock=os.clock()
     self._home_resume_sleep_seconds=math.max(0,tonumber(slept) or 0)
+    HOME_SESSION.last_resume_clock=monotonic_wall_time()
 
-    logger.info("[MiuRead][Resume] event received",
-        "generation=",tostring(generation),"slept=",tostring(self._home_resume_sleep_seconds))
-    local raised=HomeView.resume{
-        on_interaction=function(first,kind)
-            self:_home_resume_interaction(generation,first,kind)
-        end,
-    }
-    if not raised then
-        self._home_resume_barrier=false
-        self.sync:on_resume(slept)
-        self:_schedule_home_startup(.12)
-        logger.warn("[MiuRead][Resume] existing home unavailable; startup scheduled")
-        return false
+    if self._home_resume_surface_task then
+        UIManager:unschedule(self._home_resume_surface_task)
+        self._home_resume_surface_task=nil
     end
 
-    -- The existing widget is raised and dirtied without rebuilding it. Old
-    -- scans, cover callbacks and shelf refreshes were invalidated on suspend,
-    -- so this is the next bounded UI operation after wake.
-    UIManager:nextTick(function()
-        if generation~=self._home_resume_generation or self._home_suspended==true then return end
+    local long_safe=self._home_resume_sleep_seconds>=7200
+    logger.info("[MiuRead][Resume] event received",
+        "generation=",tostring(generation),"slept=",tostring(self._home_resume_sleep_seconds),
+        "mode=",long_safe and "long_safe_restore" or "normal")
+
+    -- Do not touch UIManager's window ordering in the Resume callback. Kindle
+    -- may still be restoring the framebuffer and orientation at that point.
+    -- Wait for two identical geometry samples, then repaint/rebuild only the
+    -- already-shown Home surface via public widget operations.
+    local last_w,last_h,last_rotation,stable,attempts=nil,nil,nil,0,0
+    local task
+    task=function()
+        if self._home_resume_surface_task~=task
+            or generation~=self._home_resume_generation
+            or self._home_suspended==true or HOME_SESSION.suspended==true then return end
+        attempts=attempts+1
+        local sw,sh=Device.screen:getWidth(),Device.screen:getHeight()
+        local rotation=Device.screen.getRotationMode and Device.screen:getRotationMode() or nil
+        if sw==last_w and sh==last_h and rotation==last_rotation then
+            stable=stable+1
+        else
+            last_w,last_h,last_rotation,stable=sw,sh,rotation,0
+        end
+        if stable<1 and attempts<7 then
+            UIManager:scheduleIn(.12,task)
+            return
+        end
+        self._home_resume_surface_task=nil
+        local raised=HomeView.resume{
+            rebuild_visual=long_safe,
+            on_interaction=function(first,kind)
+                self:_home_resume_interaction(generation,first,kind)
+            end,
+        }
+        if not raised then
+            self._home_resume_barrier=false
+            self.sync:on_resume(slept)
+            self:_schedule_home_startup(.12)
+            logger.warn("[MiuRead][Resume] existing home unavailable; startup scheduled")
+            return
+        end
         self._home_resume_first_frame=true
         local elapsed=math.floor((os.clock()-self._home_resume_started_clock)*1000+.5)
-        logger.info("[MiuRead][Resume] first surface released","ms=",tostring(elapsed))
+        logger.info("[MiuRead][Resume] first surface released",
+            "ms=",tostring(elapsed),"samples=",tostring(attempts),
+            "mode=",long_safe and "long_safe_restore" or "normal")
         UIManager:scheduleIn(.10,function()
             if generation==self._home_resume_generation and self._home_suspended~=true then
                 self.sync:on_resume(slept)
             end
         end)
-        self:_home_schedule_resume_background(3.5,generation)
-    end)
+        self:_home_schedule_resume_background(long_safe and 4.2 or 3.5,generation)
+    end
+    self._home_resume_surface_task=task
+    UIManager:scheduleIn(.12,task)
     return true
 end
 
@@ -16743,21 +16807,301 @@ end
 function Plugin:on_sync_record_missing()
     logger.dbg("[MiuRead][Sync] external EPUB ignored")
 end
+function Plugin:_reader_rebuild_cancel(reason,clear_shared)
+    local owner=READER_REBUILD.owner
+    if owner and owner._reader_rebuild_task then
+        pcall(UIManager.unschedule,UIManager,owner._reader_rebuild_task)
+        owner._reader_rebuild_task=nil
+    end
+    if self._reader_rebuild_task then
+        UIManager:unschedule(self._reader_rebuild_task)
+        self._reader_rebuild_task=nil
+    end
+    READER_REBUILD.generation=(tonumber(READER_REBUILD.generation) or 0)+1
+    if clear_shared~=false then
+        READER_REBUILD.state="idle"
+        READER_REBUILD.session_generation=0
+        READER_REBUILD.reader_file=nil
+        READER_REBUILD.started_at=0
+        READER_REBUILD.started_clock=0
+        READER_REBUILD.max_wait=0
+        READER_REBUILD.reason=nil
+        READER_REBUILD.owner=nil
+        READER_REBUILD.pending_width=nil
+        READER_REBUILD.pending_height=nil
+        READER_REBUILD.pending_rotation=nil
+    end
+    if reason then logger.info("[MiuRead][Lifecycle] rebuild watcher cancelled",tostring(reason)) end
+    return true
+end
+
+function Plugin:_prepare_reader_disappearance(reason)
+    if self._reader_checkpoint_dirty==true then
+        self:_flush_reader_checkpoint(reason or "reader_disappeared",true)
+    end
+    self:_mark_reader_busy(4)
+    self:_close_active_thought_popup(reason or "reader disappeared")
+    if ThoughtNativePopup and type(ThoughtNativePopup.cleanup)=="function" then
+        pcall(ThoughtNativePopup.cleanup)
+    end
+    if self._reader_checkpoint_task then
+        UIManager:unschedule(self._reader_checkpoint_task)
+        self._reader_checkpoint_task=nil
+    end
+    if self._local_annotation_snapshot_task then
+        UIManager:unschedule(self._local_annotation_snapshot_task)
+        self._local_annotation_snapshot_task=nil
+    end
+    if self._reader_sync_ready_task then
+        UIManager:unschedule(self._reader_sync_ready_task)
+        self._reader_sync_ready_task=nil
+    end
+    self:_cancel_network_waits()
+    if self.repair_async and self.repair_async.job and self.repair_async.job.label=="book-migration-check" then
+        self.repair_async:cancel(reason or "reader disappeared")
+        if self.annotation_async then self.annotation_async:cancel(reason or "reader disappeared") end
+    end
+    self._repair_prompt_open=false
+    self:_teardown_thought_tap()
+    self._progress_prompted_book_id=nil
+    self._progress_check_running=false
+    return true
+end
+
+function Plugin:_finalize_reader_instance_close(closing_path,session_generation,options)
+    options=type(options)=="table" and options or {}
+    local explicit_return=options.explicit_return==true
+    local document_switch=options.document_switch==true
+    closing_path=normalized_reader_file(closing_path)
+        or normalized_reader_file(HOME_SESSION.reader_session_file)
+        or normalized_reader_file(HOME_READER_FILE)
+    session_generation=tonumber(session_generation) or tonumber(HOME_SESSION.reader_session_generation) or 0
+
+    self:_prepare_reader_disappearance(options.reason or "document closed")
+    if self.sync then self.sync:on_close() end
+
+    -- A confirmed switch has a new ReaderUI already alive. Never clear shared
+    -- reader markers or start Home/post-reader work from the old plugin instance.
+    if document_switch then
+        logger.info("[MiuRead][Lifecycle] previous reader finalized after document switch",
+            "book=",tostring(closing_path or ""),"session=",tostring(session_generation))
+        return true
+    end
+
+    if self._reader_active_path then os.remove(self._reader_active_path) end
+    if self._reader_busy_path then
+        local busy_path=self._reader_busy_path
+        UIManager:scheduleIn(4,function() os.remove(busy_path) end)
+    end
+    self:_schedule_post_reader_work("document closed",1.4)
+    sync_home_session()
+    HOME_SESSION.reader_session_active=false
+
+    if explicit_return then
+        HOME_SESSION.opening_file=nil
+        HOME_SESSION.opening_at=0
+    end
+
+    if self:_home_enabled() and HOME_READER_ORIGIN and not HOME_SESSION_SUPPRESSED
+        and not HOME_NATIVE_VISIT and not HOME_EXITING then
+        self:_set_foreground("reader_transition")
+        if explicit_return then
+            READER_CLOSE.close_event_received=true
+            if READER_CLOSE.state~="native_surface_waiting" then READER_CLOSE.state="document_closed" end
+            self._miuread_return_requested=false
+            logger.info("[MiuRead][ReaderClose] CloseDocument received",
+                "generation=",tostring(READER_CLOSE.generation))
+            self:_schedule_reader_return_finish(READER_CLOSE.generation,.10,"explicit close document")
+        else
+            self:_schedule_reader_close_settle(closing_path,session_generation,"confirmed document close")
+        end
+    else
+        self:_set_foreground("native")
+        UIManager:scheduleIn(.12,function()
+            if self:_reader_lifecycle_state()~="closed" then return end
+            if self:_filemanager_instance() or self:_ensure_filemanager_base(closing_path) then
+                if ReaderTransitionGuard.is_shown() then
+                    self:_release_reader_transition_guard("native surface restored")
+                end
+                UIManager:setDirty(nil,"ui")
+                self:_finish_page_transition(.8,"native surface restored")
+            else
+                self:_finish_page_transition(0,"native restore failed")
+                self:_show_reader_recovery_surface("KOReader 文件管理器未能恢复")
+            end
+        end)
+    end
+    return true
+end
+
+function Plugin:_finish_reader_rebuild_candidate(generation,reason)
+    if generation~=(tonumber(READER_REBUILD.generation) or 0)
+        or not reader_rebuild_active() then return false end
+    if HOME_SESSION.suspended==true or self._miuread_suspended==true then
+        READER_REBUILD.state="suspended_pending"
+        self._reader_rebuild_task=nil
+        return false
+    end
+    local active=self:_active_reader_ui()
+    if active and active.document then
+        local current=normalized_reader_file(self:_reader_file(active))
+        local expected=normalized_reader_file(READER_REBUILD.reader_file)
+        if current and expected and current==expected then
+            local elapsed=math.floor((monotonic_wall_time()-(tonumber(READER_REBUILD.started_clock) or monotonic_wall_time()))*1000+.5)
+            logger.info("[MiuRead][Lifecycle] reader rebuild completed",
+                "same_book=true","session=",tostring(READER_REBUILD.session_generation or 0),
+                "ms=",tostring(math.max(0,elapsed)))
+            self:_reader_rebuild_cancel("same reader returned",true)
+            return true
+        end
+        local old_owner=READER_REBUILD.owner
+        local old_path=READER_REBUILD.reader_file
+        local old_session=READER_REBUILD.session_generation
+        self:_reader_rebuild_cancel("different reader returned",true)
+        if old_owner and type(old_owner._finalize_reader_instance_close)=="function" then
+            pcall(old_owner._finalize_reader_instance_close,old_owner,old_path,old_session,
+                {document_switch=true,reason="reader switched during rebuild candidate"})
+        end
+        return true
+    end
+
+    local elapsed=math.max(0,monotonic_wall_time()-(tonumber(READER_REBUILD.started_clock) or monotonic_wall_time()))
+    if elapsed<(tonumber(READER_REBUILD.max_wait) or 2.4) then
+        local task
+        task=function()
+            if self._reader_rebuild_task~=task then return end
+            self._reader_rebuild_task=nil
+            self:_finish_reader_rebuild_candidate(generation,reason)
+        end
+        self._reader_rebuild_task=task
+        UIManager:scheduleIn(elapsed<1.0 and .18 or .28,task)
+        return false
+    end
+
+    local old_path=READER_REBUILD.reader_file
+    local old_session=READER_REBUILD.session_generation
+    self:_reader_rebuild_cancel("candidate confirmed closed",true)
+    logger.info("[MiuRead][Lifecycle] rebuild candidate became real close",
+        "book=",tostring(old_path or ""),"wait_ms=",tostring(math.floor(elapsed*1000+.5)))
+    return self:_finalize_reader_instance_close(old_path,old_session,
+        {reason=reason or "rebuild candidate timeout"})
+end
+
+function Plugin:_start_reader_rebuild_candidate(closing_path,session_generation,reason)
+    self:_reader_rebuild_cancel(nil,true)
+    local now=monotonic_wall_time()
+    local path=normalized_reader_file(closing_path)
+        or normalized_reader_file(HOME_SESSION.reader_session_file)
+        or normalized_reader_file(HOME_READER_FILE)
+    if path and READER_REBUILD.recent_book==path and now-(tonumber(READER_REBUILD.recent_started_at) or 0)<=10 then
+        READER_REBUILD.recent_count=(tonumber(READER_REBUILD.recent_count) or 0)+1
+    else
+        READER_REBUILD.recent_book=path
+        READER_REBUILD.recent_count=1
+    end
+    READER_REBUILD.recent_started_at=now
+    if READER_REBUILD.recent_count>=3 then READER_REBUILD.safe_until=now+15 end
+
+    READER_REBUILD.generation=(tonumber(READER_REBUILD.generation) or 0)+1
+    local generation=READER_REBUILD.generation
+    READER_REBUILD.state="pending"
+    READER_REBUILD.session_generation=tonumber(session_generation) or tonumber(HOME_SESSION.reader_session_generation) or 0
+    READER_REBUILD.reader_file=path
+    READER_REBUILD.started_at=os.time()
+    READER_REBUILD.started_clock=now
+    READER_REBUILD.reason=tostring(reason or "CloseDocument without explicit return")
+    READER_REBUILD.owner=self
+
+    local recent_dimension=now-(tonumber(HOME_SESSION.last_dimension_event_clock) or 0)<=5
+    local recent_resume=now-(tonumber(HOME_SESSION.last_resume_clock) or 0)<=8
+    local fuse=(tonumber(READER_REBUILD.safe_until) or 0)>now
+    READER_REBUILD.max_wait=fuse and 5.5 or ((recent_dimension or recent_resume) and 4.2 or 2.4)
+    self:_set_foreground("reader")
+    logger.info("[MiuRead][Lifecycle] rebuild candidate",
+        "book=",tostring(path or ""),"session=",tostring(READER_REBUILD.session_generation),
+        "recent_dimensions=",tostring(recent_dimension),"recent_resume=",tostring(recent_resume),
+        "fuse=",tostring(fuse),"deadline_ms=",tostring(math.floor(READER_REBUILD.max_wait*1000+.5)))
+
+    local task
+    task=function()
+        if self._reader_rebuild_task~=task then return end
+        self._reader_rebuild_task=nil
+        self:_finish_reader_rebuild_candidate(generation,READER_REBUILD.reason)
+    end
+    self._reader_rebuild_task=task
+    UIManager:scheduleIn(.22,task)
+    return true
+end
+
+function Plugin:_reader_rebuild_ready_state()
+    if not reader_rebuild_active() then return false,false end
+    local ready_path=normalized_reader_file(self:_current_document_path())
+    local expected=normalized_reader_file(READER_REBUILD.reader_file)
+    if ready_path and expected and ready_path==expected then
+        local preserved_session=tonumber(READER_REBUILD.session_generation) or tonumber(HOME_SESSION.reader_session_generation) or 0
+        local elapsed=math.floor((monotonic_wall_time()-(tonumber(READER_REBUILD.started_clock) or monotonic_wall_time()))*1000+.5)
+        self:_reader_rebuild_cancel("ReaderReady same book",true)
+        HOME_SESSION.reader_session_generation=preserved_session
+        HOME_SESSION.reader_session_active=true
+        HOME_SESSION.reader_session_file=ready_path
+        logger.info("[MiuRead][Lifecycle] reader returned",
+            "same_book=true","preserved_session=",tostring(preserved_session),
+            "ms=",tostring(math.max(0,elapsed)))
+        return true,true
+    end
+    local old_owner=READER_REBUILD.owner
+    local old_path=READER_REBUILD.reader_file
+    local old_session=READER_REBUILD.session_generation
+    self:_reader_rebuild_cancel("ReaderReady different book",true)
+    if old_owner and type(old_owner._finalize_reader_instance_close)=="function" then
+        pcall(old_owner._finalize_reader_instance_close,old_owner,old_path,old_session,
+            {document_switch=true,reason="different ReaderReady"})
+    end
+    logger.info("[MiuRead][Lifecycle] reader returned","same_book=false",
+        "old=",tostring(old_path or ""),"new=",tostring(ready_path or ""))
+    return true,false
+end
+
 function Plugin:onReaderReady()
     HOME_SESSION.home_restore_generation=(tonumber(HOME_SESSION.home_restore_generation) or 0)+1
     HOME_SESSION.home_restore_active=false
+
+    local ready_path=normalized_reader_file(self:_current_document_path())
+    -- If the same Reader unexpectedly reappears while an explicit Home return
+    -- is already in progress, do not cancel that user request. Close the
+    -- transiently recreated Reader again and keep the existing close watchdog.
+    if reader_close_active() and HOME_SESSION.return_requested==true
+        and ready_path and normalized_reader_file(READER_CLOSE.reader_file)==ready_path then
+        logger.warn("[MiuRead][Lifecycle] reader reappeared during explicit return",
+            "generation=",tostring(READER_CLOSE.generation),"book=",tostring(ready_path))
+        READER_CLOSE.state="reader_closing"
+        READER_CLOSE.close_event_received=false
+        self:_set_foreground("reader_transition")
+        self:_ensure_reader_transition_guard("reader reappeared during explicit return")
+        self:_schedule_reader_return_finish(READER_CLOSE.generation,.08,"reader reappeared")
+        UIManager:nextTick(function()
+            if reader_close_active() and HOME_SESSION.return_requested==true then
+                self:_request_reader_close(READER_CLOSE.generation,"reappeared during explicit return")
+            end
+        end)
+        return
+    end
+
+    local had_candidate,preserve_session=self:_reader_rebuild_ready_state()
     self:_cancel_reader_close_settle("reader ready")
     if READER_CLOSE.state~="idle" then
         self:_clear_reader_return(READER_CLOSE.generation,"reader ready cancelled stale return")
         self:_finish_page_transition(1.0,"reader ready")
-    else
+    elseif not preserve_session then
         HOME_SESSION.return_requested=false
         HOME_SESSION.return_session_generation=0
         HOME_SESSION.return_request_file=nil
     end
-    HOME_SESSION.reader_session_generation=(tonumber(HOME_SESSION.reader_session_generation) or 0)+1
+    if not preserve_session then
+        HOME_SESSION.reader_session_generation=(tonumber(HOME_SESSION.reader_session_generation) or 0)+1
+    end
     HOME_SESSION.reader_session_active=true
-    HOME_SESSION.reader_session_file=normalized_reader_file(self:_current_document_path())
+    HOME_SESSION.reader_session_file=ready_path
     self._reader_session_generation=HOME_SESSION.reader_session_generation
     local ready_session=self._reader_session_generation
     self._home_reader_transition=false
@@ -16770,7 +17114,8 @@ function Plugin:onReaderReady()
     -- seconds. Three seconds is enough to protect the first interactions; the
     -- idle gate below keeps extending the delay while the user is active.
     self:_mark_reader_busy(3)
-    logger.info("[MiuRead][Sync] reader ready","session=",tostring(self._reader_session_generation or 0))
+    logger.info("[MiuRead][Sync] reader ready","session=",tostring(self._reader_session_generation or 0),
+        "rebuild=",tostring(had_candidate==true),"preserved=",tostring(preserve_session==true))
     -- ReaderUI already paints its first page. Avoid a second forced full-screen
     -- refresh, which was the visible extra flash after opening a book.
     self:_finish_page_transition(1.2,"reader first page")
@@ -16834,58 +17179,113 @@ function Plugin:onReaderReady()
         HomeData.quick_device_state(true)
     end
     UIManager:scheduleIn(1.8,device_task)
+    if had_candidate then
+        UIManager:scheduleIn(.18,function()
+            if self.ui and self.ui.document
+                and tonumber(HOME_SESSION.reader_session_generation or 0)==ready_session
+                and not reader_close_active() then self:onSetDimensions() end
+        end)
+    end
 end
 function Plugin:onSetDimensions()
-    self:_close_miuread_transients()
-    if reader_close_active() then
-        logger.info("[MiuRead][Navigation] dimensions deferred during reader close",
-            tostring(READER_CLOSE.state))
+    local now=monotonic_wall_time()
+    HOME_SESSION.last_dimension_event_clock=now
+    self._reader_dimension_last_event_clock=now
+    self._reader_dimension_event_count=(tonumber(self._reader_dimension_event_count) or 0)+1
+    local sw,sh=Device.screen:getWidth(),Device.screen:getHeight()
+    local rotation=Device.screen.getRotationMode and Device.screen:getRotationMode() or nil
+
+    if HOME_SESSION.suspended==true or self._miuread_suspended==true then
+        READER_REBUILD.pending_width,READER_REBUILD.pending_height=sw,sh
+        READER_REBUILD.pending_rotation=rotation
         return true
     end
-    self:_cancel_reader_close_settle("dimensions changed")
-    if READER_CLOSE.state=="completed" or READER_CLOSE.state=="failed" then
-        self:_clear_reader_return(READER_CLOSE.generation,"dimensions changed after close")
+    if reader_close_active() then
+        HOME_SESSION.pending_dimension_width=sw
+        HOME_SESSION.pending_dimension_height=sh
+        HOME_SESSION.pending_dimension_rotation=rotation
+        logger.info("[MiuRead][Rotation] deferred during reader close",
+            "state=",tostring(READER_CLOSE.state),"size=",tostring(sw).."x"..tostring(sh))
+        return true
     end
-    if self.ui and self.ui.document then
-        self:_set_foreground("reader")
-        self._reader_dimension_generation=(tonumber(self._reader_dimension_generation) or 0)+1
-        local generation=self._reader_dimension_generation
-        if self._reader_dimension_task then
-            UIManager:unschedule(self._reader_dimension_task)
+    if reader_rebuild_active() then
+        READER_REBUILD.pending_width,READER_REBUILD.pending_height=sw,sh
+        READER_REBUILD.pending_rotation=rotation
+        logger.info("[MiuRead][Rotation] deferred during reader rebuild",
+            "size=",tostring(sw).."x"..tostring(sh))
+        return true
+    end
+
+    if not (self.ui and self.ui.document) then
+        -- HomeWidget owns Home geometry. Avoid a second plugin-level rebuild.
+        return true
+    end
+
+    self:_set_foreground("reader")
+    self._reader_dimension_generation=(tonumber(self._reader_dimension_generation) or 0)+1
+    local generation=self._reader_dimension_generation
+    local event_count=self._reader_dimension_event_count
+    if self._reader_dimension_task then
+        UIManager:unschedule(self._reader_dimension_task)
+        self._reader_dimension_task=nil
+    end
+    logger.info("[MiuRead][Rotation] event","generation=",tostring(generation),
+        "size=",tostring(sw).."x"..tostring(sh),"rotation=",tostring(rotation))
+
+    local last_w,last_h,last_rotation,stable,attempts=nil,nil,nil,0,0
+    local task
+    task=function()
+        if self._reader_dimension_task~=task or generation~=self._reader_dimension_generation then return end
+        if HOME_SESSION.suspended==true or self._miuread_suspended==true then
             self._reader_dimension_task=nil
+            return
         end
-        local last_w,last_h,stable,attempts=nil,nil,0,0
-        local task
-        task=function()
-            if self._reader_dimension_task~=task or generation~=self._reader_dimension_generation then return end
-            attempts=attempts+1
-            local sw,sh=Device.screen:getWidth(),Device.screen:getHeight()
-            local rotation=Device.screen.getRotationMode and Device.screen:getRotationMode() or nil
-            if sw==last_w and sh==last_h then stable=stable+1 else last_w,last_h,stable=sw,sh,0 end
-            if stable>=1 or attempts>=8 then
-                self._reader_dimension_task=nil
-                if self.ui and self.ui.document and HOME_SESSION.suspended~=true then
-                    local changed=sw~=self._reader_dimension_width or sh~=self._reader_dimension_height
-                        or rotation~=self._reader_dimension_rotation
-                    self._reader_dimension_width,self._reader_dimension_height=sw,sh
-                    self._reader_dimension_rotation=rotation
-                    if changed then
-                        ReaderToolbar.invalidate()
-                        self:_reset_reader_toolbar_state_cache()
-                        self:_schedule_reader_toolbar_state_refresh(nil,.08)
-                        self:_install_reader_menu_bridge()
-                        self:_install_reader_quick_panel_zone()
-                        UIManager:setDirty("all","full")
-                    end
-                end
-                return
-            end
-            UIManager:scheduleIn(.08,task)
+        if reader_close_active() or reader_rebuild_active() then
+            self._reader_dimension_task=nil
+            HOME_SESSION.pending_dimension_width=Device.screen:getWidth()
+            HOME_SESSION.pending_dimension_height=Device.screen:getHeight()
+            HOME_SESSION.pending_dimension_rotation=Device.screen.getRotationMode and Device.screen:getRotationMode() or nil
+            return
         end
-        self._reader_dimension_task=task
-        UIManager:scheduleIn(.06,task)
+        attempts=attempts+1
+        local cw,ch=Device.screen:getWidth(),Device.screen:getHeight()
+        local cr=Device.screen.getRotationMode and Device.screen:getRotationMode() or nil
+        if cw==last_w and ch==last_h and cr==last_rotation then
+            stable=stable+1
+        else
+            last_w,last_h,last_rotation,stable=cw,ch,cr,0
+        end
+        if stable<2 and attempts<8 then
+            UIManager:scheduleIn(.12,task)
+            return
+        end
+        self._reader_dimension_task=nil
+        if not (self.ui and self.ui.document) then return end
+        local changed=cw~=self._reader_dimension_width or ch~=self._reader_dimension_height
+            or cr~=self._reader_dimension_rotation
+        self._reader_dimension_width,self._reader_dimension_height=cw,ch
+        self._reader_dimension_rotation=cr
+        if changed then
+            self:_close_miuread_transients()
+            ReaderToolbar.invalidate()
+            self:_reset_reader_toolbar_state_cache()
+            self:_schedule_reader_toolbar_state_refresh(nil,.10)
+            -- Menu method bridges are geometry-independent; only the gesture
+            -- zone needs to be rebound after a real size commit.
+            self:_install_reader_quick_panel_zone()
+            local reader=self:_active_reader_ui()
+            UIManager:setDirty(reader or nil,"full")
+        end
+        logger.info("[MiuRead][Rotation] committed",
+            "generation=",tostring(generation),"coalesced=",tostring(math.max(1,(tonumber(self._reader_dimension_event_count) or event_count)-event_count+1)),
+            "samples=",tostring(attempts),"changed=",tostring(changed),
+            "size=",tostring(cw).."x"..tostring(ch),"rotation=",tostring(cr))
     end
+    self._reader_dimension_task=task
+    UIManager:scheduleIn(.30,task)
+    return true
 end
+
 function Plugin:onScreenResize() return self:onSetDimensions() end
 function Plugin:onRotation() return self:onSetDimensions() end
 function Plugin:onPageUpdate(page)
@@ -17270,6 +17670,22 @@ function Plugin:onSuspend()
     end
     self:_close_miuread_transients()
     self:_cancel_reader_close_settle("suspend")
+    if self._home_resume_surface_task then
+        UIManager:unschedule(self._home_resume_surface_task)
+        self._home_resume_surface_task=nil
+    end
+    if reader_rebuild_active() then
+        local owner=READER_REBUILD.owner
+        if owner and owner._reader_rebuild_task then
+            pcall(UIManager.unschedule,UIManager,owner._reader_rebuild_task)
+            owner._reader_rebuild_task=nil
+        end
+        if owner and owner~=self and owner.sync and type(owner.sync.on_suspend)=="function" then
+            pcall(owner.sync.on_suspend,owner.sync)
+        end
+        READER_REBUILD.state="suspended_pending"
+    end
+    if HomeView.suspend then HomeView.suspend() end
     if READER_CLOSE.state=="idle" then
         HOME_SESSION.return_requested=false
         HOME_SESSION.return_session_generation=0
@@ -17297,6 +17713,8 @@ function Plugin:onSuspend()
     end
     self:_mark_reader_busy(10)
     self._suspended_at=os.time()
+    logger.info("[MiuRead][Suspend] lifecycle timers cancelled",
+        "rebuild=",tostring(reader_rebuild_active()),"rotation=true","resume=true")
     self.sync:on_suspend()
 end
 function Plugin:onResume()
@@ -17315,8 +17733,26 @@ function Plugin:onResume()
     self:_mark_reader_busy(5)
     local slept=self._suspended_at and os.time()-self._suspended_at or 0
     self._suspended_at=nil
+    HOME_SESSION.last_resume_clock=monotonic_wall_time()
+    self._resume_lifecycle_generation=(tonumber(self._resume_lifecycle_generation) or 0)+1
+    local resume_generation=self._resume_lifecycle_generation
 
     local reader_active=self.ui and self.ui.document
+    if reader_rebuild_active() then
+        if reader_active then
+            self:_reader_rebuild_ready_state()
+        else
+            local owner=READER_REBUILD.owner
+            if owner and type(owner._finish_reader_rebuild_candidate)=="function" then
+                READER_REBUILD.state="pending"
+                local generation=READER_REBUILD.generation
+                UIManager:scheduleIn(.35,function()
+                    if resume_generation~=self._resume_lifecycle_generation or HOME_SESSION.suspended==true then return end
+                    pcall(owner._finish_reader_rebuild_candidate,owner,generation,"resume rebuild re-evaluation")
+                end)
+            end
+        end
+    end
     if close_pending then
         self:_ensure_reader_transition_guard("resume during reader close")
         self:_schedule_download_resume_after_wake(3.5)
@@ -17340,7 +17776,11 @@ function Plugin:onResume()
         -- Restore the already-built surface and its input ranges first.  Shelf
         -- refresh, scans, covers and metadata remain behind the interaction
         -- barrier until the page has been released and idle.
-        self:_home_begin_resume(slept)
+        UIManager:nextTick(function()
+            if resume_generation~=self._resume_lifecycle_generation
+                or HOME_SESSION.suspended==true or self._miuread_suspended==true then return end
+            self:_home_begin_resume(slept)
+        end)
         UIManager:scheduleIn(1.0,function()
             if HomeView.is_shown() and not self:_active_reader_ui() then
                 self:_resume_pending_post_reader_work("resume home",2.0)
@@ -17539,99 +17979,54 @@ function Plugin:_schedule_post_reader_work(reason,delay,phase)
 end
 
 function Plugin:onCloseDocument()
-    if tostring(HOME_SESSION.page_transition_state or "")~="closing_reader" then
-        self:_begin_page_transition("closing_reader")
-    end
-    self:_ensure_reader_transition_guard("close document")
-    if self._reader_checkpoint_dirty==true then
-        self:_flush_reader_checkpoint("close_document",true)
-    end
-    self:_mark_reader_busy(6)
-    self:_close_active_thought_popup("document closed")
-    if ThoughtNativePopup and type(ThoughtNativePopup.cleanup)=="function" then
-        pcall(ThoughtNativePopup.cleanup)
-    end
-    if self._reader_checkpoint_task then
-        UIManager:unschedule(self._reader_checkpoint_task)
-        self._reader_checkpoint_task=nil
-    end
-    if self._local_annotation_snapshot_task then
-        UIManager:unschedule(self._local_annotation_snapshot_task)
-        self._local_annotation_snapshot_task=nil
-    end
-    if READER_CLOSE.state=="idle" then self._home_reader_transition=false end
-    local closing_path=tostring(self:_current_document_path() or "")
-    local opening_path=tostring(HOME_SESSION.opening_file or "")
-    -- During switchDocument the old ReaderUI closes while the target book is
-    -- still opening. Keep that target guard until the new ReaderReady event.
-    if opening_path=="" or opening_path==closing_path then
-        HOME_SESSION.opening_file=nil
-        HOME_SESSION.opening_at=0
-    end
-    self:_cancel_network_waits()
-    if self.repair_async and self.repair_async.job and self.repair_async.job.label=="book-migration-check" then
-        self.repair_async:cancel("document closed")
-        if self.annotation_async then self.annotation_async:cancel("document closed") end
-    end
-    self._repair_prompt_open=false
-    if self._reader_active_path then os.remove(self._reader_active_path) end
-    -- Keep the worker paused just long enough for the bookshelf to become
-    -- responsive, then release the marker. Uploading the final reading tail is
-    -- already delegated to the lightweight service and never awaited here.
-    if self._reader_busy_path then
-        local busy_path=self._reader_busy_path
-        UIManager:scheduleIn(4,function() os.remove(busy_path) end)
-    end
-    if self._reader_sync_ready_task then
-        UIManager:unschedule(self._reader_sync_ready_task)
-        self._reader_sync_ready_task=nil
-    end
-    self:_teardown_thought_tap(); self._progress_prompted_book_id=nil; self._progress_check_running=false; self.sync:on_close()
-    -- Keep post-close work pending until a non-reading surface is available.
-    -- Opening another book quickly no longer drops installation or queue work.
-    self:_schedule_post_reader_work("document closed",1.4)
-    sync_home_session()
-    HOME_SESSION.reader_session_active=false
+    local closing_path=normalized_reader_file(self:_current_document_path())
+        or normalized_reader_file(HOME_SESSION.reader_session_file)
+        or normalized_reader_file(HOME_READER_FILE)
+    local opening_path=normalized_reader_file(HOME_SESSION.opening_file)
     local session_generation=tonumber(HOME_SESSION.reader_session_generation) or 0
-    local explicit_return=READER_CLOSE.state~="idle"
+    local explicit_return=reader_close_active()
         and (self._miuread_return_requested==true or HOME_SESSION.return_requested==true)
-    if explicit_return then
+    sync_home_session()
+    local expected_close=HOME_EXPECTED_CLOSE or HOME_EXITING
+        or HOME_SESSION.expected_close==true or HOME_SESSION.exiting==true or UIManager._exit_code~=nil
+
+    -- Preserve a genuine switch target. It is distinct from an unexplained
+    -- disappearance of the current ReaderUI.
+    local switching_document=opening_path and closing_path and opening_path~=closing_path
+    if not switching_document and (opening_path==nil or opening_path==closing_path) then
         HOME_SESSION.opening_file=nil
         HOME_SESSION.opening_at=0
     end
-    if self:_home_enabled() and HOME_READER_ORIGIN and not HOME_SESSION_SUPPRESSED
-        and not HOME_NATIVE_VISIT and not HOME_EXITING then
-        self:_set_foreground("reader_transition")
-        if explicit_return then
-            READER_CLOSE.close_event_received=true
-            if READER_CLOSE.state~="native_surface_waiting" then READER_CLOSE.state="document_closed" end
-            self._miuread_return_requested=false
-            logger.info("[MiuRead][ReaderClose] CloseDocument received",
-                "generation=",tostring(READER_CLOSE.generation))
-            self:_schedule_reader_return_finish(READER_CLOSE.generation,.10,"explicit close document")
-        else
-            -- CloseDocument may be an internal switch or rebuild. Start the
-            -- same lifecycle watcher; ReaderReady cancels it if a document
-            -- comes back before a stable native surface is observed.
-            self:_schedule_reader_close_settle(closing_path,session_generation,"document closed")
+
+    if explicit_return or expected_close then
+        if tostring(HOME_SESSION.page_transition_state or "")~="closing_reader" and not expected_close then
+            self:_begin_page_transition("closing_reader")
         end
-    else
-        self:_set_foreground("native")
-        UIManager:scheduleIn(.12,function()
-            if self:_reader_lifecycle_state()~="closed" then return end
-            if self:_filemanager_instance() or self:_ensure_filemanager_base(closing_path) then
-                if ReaderTransitionGuard.is_shown() then
-                    self:_release_reader_transition_guard("native surface restored")
-                end
-                UIManager:setDirty(nil,"ui")
-                self:_finish_page_transition(.8,"native surface restored")
-            else
-                self:_finish_page_transition(0,"native restore failed")
-                self:_show_reader_recovery_surface("KOReader 文件管理器未能恢复")
-            end
-        end)
+        if not expected_close then self:_ensure_reader_transition_guard("close document") end
+        self:_reader_rebuild_cancel("explicit/expected close",true)
+        return self:_finalize_reader_instance_close(closing_path,session_generation,
+            {explicit_return=explicit_return,reason=expected_close and "expected document close" or "explicit document close"})
     end
+
+    if switching_document then
+        self:_reader_rebuild_cancel("explicit document switch",true)
+        self:_prepare_reader_disappearance("document switch")
+        if self.sync then self.sync:on_close() end
+        logger.info("[MiuRead][Lifecycle] document switch observed",
+            "old=",tostring(closing_path or ""),"new=",tostring(opening_path or ""))
+        return true
+    end
+
+    -- No MiuRead/Home request exists. Treat this first as an internal ReaderUI
+    -- rebuild candidate and stay out of Home/FileManager lifecycle until KOReader
+    -- either returns a Reader or the bounded deadline proves it really closed.
+    self:_prepare_reader_disappearance("reader rebuild candidate")
+    logger.info("[MiuRead][Lifecycle] document disappeared","cause=unknown",
+        "book=",tostring(closing_path or ""),"session=",tostring(session_generation))
+    return self:_start_reader_rebuild_candidate(closing_path,session_generation,
+        "CloseDocument without explicit return")
 end
+
 function Plugin:onFlushSettings()
     self:_mark_ui_preferences_flushed()
     if self._reader_checkpoint_task then

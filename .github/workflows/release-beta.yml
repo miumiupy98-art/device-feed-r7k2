@@ -1,7 +1,9 @@
 name: Release beta full package
 
 on:
-  workflow_dispatch:
+  push:
+    tags:
+      - "v*.*.*-beta.*"
 
 permissions:
   contents: write
@@ -14,15 +16,15 @@ jobs:
   release-beta:
     runs-on: ubuntu-latest
     env:
-      SOURCE_BRANCH: main
-      MANIFEST_NAME: update-beta.json
       RELEASE_CHANNEL: beta
+      CHANNEL_TAG: beta-channel
+      MANIFEST_NAME: update-beta.json
 
     steps:
-      - name: Check out main
+      - name: Check out tagged source
         uses: actions/checkout@v6
         with:
-          ref: main
+          ref: ${{ github.ref }}
           fetch-depth: 0
 
       - name: Read and validate beta identity
@@ -30,10 +32,12 @@ jobs:
         run: |
           set -euo pipefail
 
+          test "${GITHUB_REF_TYPE:-}" = "tag"
           test -d miuread.koplugin
           test -f miuread.koplugin/main.lua
           test -f miuread.koplugin/_meta.lua
           test -f miuread.koplugin/miuread/config.lua
+          test -s CHANGELOG.md
           test -s LICENSE
           test -s NOTICE
           test -s THIRD_PARTY_NOTICES
@@ -45,68 +49,112 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
+          import os
           import re
           import sys
 
-          config_path = Path("miuread.koplugin/miuread/config.lua")
-          meta_path = Path("miuread.koplugin/_meta.lua")
-          config = config_path.read_text(encoding="utf-8")
-          meta = meta_path.read_text(encoding="utf-8")
+          tag = os.environ.get("GITHUB_REF_NAME", "")
+          match = re.fullmatch(r"v([0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+)", tag)
+          if not match:
+              print(f"::error::无效的内测 tag：{tag}")
+              sys.exit(1)
+          version = match.group(1)
 
+          config = Path("miuread.koplugin/miuread/config.lua").read_text(encoding="utf-8")
+          meta = Path("miuread.koplugin/_meta.lua").read_text(encoding="utf-8")
           version_pattern = r"[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+"
           config_version = re.search(
-              r'\bVERSION\s*=\s*["\'](' + version_pattern + r')["\']',
-              config,
+              r'\bVERSION\s*=\s*["\'](' + version_pattern + r')["\']', config
           )
           meta_version = re.search(
-              r'\bversion\s*=\s*["\'](' + version_pattern + r')["\']',
-              meta,
+              r'\bversion\s*=\s*["\'](' + version_pattern + r')["\']', meta
           )
+          if not config_version or not meta_version:
+              print("::error::无法读取 config.lua 或 _meta.lua 的内测版本号。")
+              sys.exit(1)
+          if config_version.group(1) != version or meta_version.group(1) != version:
+              print(
+                  "::error::tag、config.lua 与 _meta.lua 版本不一致："
+                  f"tag={version}, config={config_version.group(1)}, meta={meta_version.group(1)}"
+              )
+              sys.exit(1)
+
           channel = re.search(r'\bUPDATE_CHANNEL\s*=\s*["\']([^"\']+)["\']', config)
           label = re.search(r'\bUPDATE_CHANNEL_LABEL\s*=\s*["\']([^"\']+)["\']', config)
-
-          if not config_version or not meta_version:
-              print("::error::内测版本号必须类似 3.1.0-beta.2。")
-              sys.exit(1)
-          if config_version.group(1) != meta_version.group(1):
-              print("::error::config.lua 与 _meta.lua 的版本号不一致。")
-              sys.exit(1)
           if not channel or channel.group(1) != "beta":
               print("::error::插件不是内测通道。")
               sys.exit(1)
           if not label or label.group(1) != "内测通道":
               print("::error::内测通道名称配置错误。")
               sys.exit(1)
-          manifest = re.search(r'\bUPDATE_MANIFEST\s*=\s*["\']([^"\']+)["\']', config)
+
           expected_manifest = (
-              "https://raw.githubusercontent.com/miumiupy98-art/"
-              "device-feed-r7k2/main/update-beta.json"
+              "https://github.com/miumiupy98-art/device-feed-r7k2/"
+              "releases/download/beta-channel/update-beta.json"
           )
+          manifest = re.search(r'\bUPDATE_MANIFEST\s*=\s*["\']([^"\']+)["\']', config)
           if not manifest or manifest.group(1) != expected_manifest:
-              print("::error::内测更新清单地址配置错误。")
+              print("::error::内测更新清单主地址配置错误。")
               sys.exit(1)
 
-          version = config_version.group(1)
-          changelog = Path(f"CHANGELOG-{version}.txt")
-          if not changelog.is_file() or not changelog.read_text(encoding="utf-8").strip():
-              print(f"::error::缺少当前版本更新说明：{changelog}")
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          lines = changelog.splitlines()
+          start = None
+          end = len(lines)
+          heading = f"## {version}"
+          for index, line in enumerate(lines):
+              if line == heading or line.startswith(heading + " - "):
+                  start = index + 1
+                  break
+          if start is None:
+              print(f"::error::CHANGELOG.md 缺少 {version}。")
+              sys.exit(1)
+          for index in range(start, len(lines)):
+              if lines[index].startswith("## "):
+                  end = index
+                  break
+          body = "\n".join(lines[start:end]).strip()
+          if not body:
+              print(f"::error::CHANGELOG.md 中 {version} 没有更新内容。")
               sys.exit(1)
 
-          notes = changelog.read_text(encoding="utf-8").strip()
-          lines = [line.strip() for line in notes.splitlines() if line.strip()]
-          if len(lines) > 4 or len(notes) > 180:
-              print("::error::更新说明必须保持简短，最多 4 行且不超过 180 个字符。")
-              sys.exit(1)
-          for char in notes:
-              code = ord(char)
-              if char == "\n" or 0x20 <= code <= 0x7E or 0x4E00 <= code <= 0x9FFF:
-                  continue
-              print(f"::error::更新说明包含不适合设备弹窗显示的字符：U+{code:04X}")
+          bullets = []
+          for line in lines[start:end]:
+              text = line.strip()
+              if text.startswith("- "):
+                  text = text[2:].strip()
+                  if text:
+                      bullets.append(text)
+          if not bullets:
+              print(f"::error::CHANGELOG.md 中 {version} 至少需要一条列表项。")
               sys.exit(1)
 
+          summary_lines = []
+          remaining = 180
+          for text in bullets[:4]:
+              if remaining <= 0:
+                  break
+              separator = 1 if summary_lines else 0
+              available = remaining - separator
+              if available <= 0:
+                  break
+              if len(text) > available:
+                  if available >= 4:
+                      text = text[: available - 3].rstrip() + "..."
+                  else:
+                      text = text[:available]
+              summary_lines.append(text)
+              remaining -= len(text) + separator
+          summary = "\n".join(summary_lines).strip()
+          if not summary:
+              print("::error::无法生成设备更新摘要。")
+              sys.exit(1)
+
+          Path("release-notes.md").write_text(body + "\n", encoding="utf-8")
+          Path("update-summary.txt").write_text(summary + "\n", encoding="utf-8")
           Path("release.env").write_text(
               f"VERSION={version}\n"
-              f"RELEASE_TAG=v{version}\n"
+              f"RELEASE_TAG={tag}\n"
               f"PACKAGE_NAME=miuread-v{version}-full.zip\n",
               encoding="utf-8",
           )
@@ -154,7 +202,12 @@ jobs:
           output = Path("dist") / package_name
           fixed_time = (2020, 1, 1, 0, 0, 0)
 
-          excluded_names = {".DS_Store", "miuread.lua", "settings.reader.lua", "NON_COMMERCIAL_NOTICE.txt"}
+          excluded_names = {
+              ".DS_Store",
+              "miuread.lua",
+              "settings.reader.lua",
+              "NON_COMMERCIAL_NOTICE.txt",
+          }
           excluded_suffixes = {".md", ".epub", ".log"}
 
           def excluded(path):
@@ -176,11 +229,7 @@ jobs:
                   archive.writestr(info, b"")
 
               files = sorted(
-                  [
-                      path
-                      for path in root.rglob("*")
-                      if path.is_file() and not excluded(path)
-                  ],
+                  [path for path in root.rglob("*") if path.is_file() and not excluded(path)],
                   key=lambda path: path.as_posix(),
               )
               for path in files:
@@ -195,7 +244,7 @@ jobs:
               f"https://github.com/{repo}/releases/download/"
               f"v{version}/{package_name}"
           )
-          notes = Path(f"CHANGELOG-{version}.txt").read_text(encoding="utf-8").strip()
+          summary = Path("update-summary.txt").read_text(encoding="utf-8").strip()
           manifest = {
               "version": version,
               "name": f"觅阅 · 微信读书助手 {version} 内测版",
@@ -210,8 +259,8 @@ jobs:
               ],
               "size": len(payload),
               "sha256": hashlib.sha256(payload).hexdigest(),
-              "summary": notes,
-              "notes": notes,
+              "summary": summary,
+              "notes": summary,
           }
           Path("dist/update-beta.json").write_text(
               json.dumps(manifest, ensure_ascii=True, indent=2) + "\n",
@@ -235,7 +284,7 @@ jobs:
 
           package = Path("dist") / os.environ["PACKAGE_NAME"]
           manifest = json.loads(Path("dist/update-beta.json").read_text(encoding="utf-8"))
-          notes = Path(f"CHANGELOG-{os.environ['VERSION']}.txt").read_text(encoding="utf-8").strip()
+          summary = Path("update-summary.txt").read_text(encoding="utf-8").strip()
           required = {
               "miuread.koplugin/_meta.lua",
               "miuread.koplugin/main.lua",
@@ -270,8 +319,10 @@ jobs:
               errors.append("更新清单版本错误")
           if manifest.get("channel") != "beta":
               errors.append("更新清单通道错误")
-          if manifest.get("notes") != notes or manifest.get("summary") != notes:
-              errors.append("线上更新摘要未使用当前 CHANGELOG")
+          if manifest.get("notes") != summary or manifest.get("summary") != summary:
+              errors.append("线上更新摘要错误")
+          if len(summary.splitlines()) > 4 or len(summary) > 180:
+              errors.append("设备更新摘要超过 4 行或 180 个字符")
           if manifest.get("size") != package.stat().st_size:
               errors.append("更新清单文件大小错误")
           if manifest.get("sha256") != hashlib.sha256(package.read_bytes()).hexdigest():
@@ -292,41 +343,28 @@ jobs:
           set -euo pipefail
 
           FILE="dist/$PACKAGE_NAME"
-          NOTES_FILE="CHANGELOG-$VERSION.txt"
+          NOTES_FILE="release-notes.md"
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            while IFS= read -r asset; do
-              [ -n "$asset" ] || continue
-              gh release delete-asset "$RELEASE_TAG" "$asset" --yes
-            done < <(
-              gh release view "$RELEASE_TAG" \
-                --json assets \
-                --jq '.assets[].name'
-            )
+            gh release delete-asset "$RELEASE_TAG" "$PACKAGE_NAME" --yes >/dev/null 2>&1 || true
             gh release upload "$RELEASE_TAG" "$FILE"
             gh release edit "$RELEASE_TAG" \
-              --target main \
               --title "觅阅 · 微信读书助手 $VERSION 内测版" \
               --notes-file "$NOTES_FILE" \
               --prerelease \
               --latest=false
           else
             gh release create "$RELEASE_TAG" "$FILE" \
-              --target main \
+              --verify-tag \
               --title "觅阅 · 微信读书助手 $VERSION 内测版" \
               --notes-file "$NOTES_FILE" \
               --prerelease \
               --latest=false
           fi
 
-          mapfile -t ASSETS < <(
-            gh release view "$RELEASE_TAG" \
-              --json assets \
-              --jq '.assets[].name'
-          )
-          if [ "${#ASSETS[@]}" -ne 1 ] || [ "${ASSETS[0]}" != "$PACKAGE_NAME" ]; then
-            printf '%s\n' "${ASSETS[@]}"
-            echo "::error::Release 中应只保留 $PACKAGE_NAME。"
+          COUNT="$(gh release view "$RELEASE_TAG" --json assets --jq '[.assets[] | select(.name == env.PACKAGE_NAME)] | length')"
+          if [ "$COUNT" != "1" ]; then
+            echo "::error::Release 中应有且只有一个 $PACKAGE_NAME。"
             exit 1
           fi
 
@@ -352,30 +390,48 @@ jobs:
             sleep 5
           done
           if [ "$success" != "1" ]; then
-            echo "::error::Release 下载地址尚不可用或校验失败；不会更新内测版清单。"
+            echo "::error::Release 下载地址尚不可用或校验失败；不会更新 Beta 清单。"
             exit 1
           fi
 
-      - name: Publish beta manifest
+      - name: Publish fixed beta channel manifest
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          CONTENT="$(base64 -w 0 dist/update-beta.json)"
-          API_PATH="repos/$GITHUB_REPOSITORY/contents/update-beta.json"
-          CURRENT_SHA="$(gh api "$API_PATH?ref=main" --jq '.sha' 2>/dev/null || true)"
-
-          if [ -n "$CURRENT_SHA" ]; then
-            gh api --method PUT "$API_PATH" \
-              -f message="Update update-beta.json to $RELEASE_TAG" \
-              -f content="$CONTENT" \
-              -f branch="main" \
-              -f sha="$CURRENT_SHA" >/dev/null
+          if gh release view "$CHANNEL_TAG" >/dev/null 2>&1; then
+            gh release delete-asset "$CHANNEL_TAG" "$MANIFEST_NAME" --yes >/dev/null 2>&1 || true
+            gh release upload "$CHANNEL_TAG" "dist/$MANIFEST_NAME"
+            gh release edit "$CHANNEL_TAG" \
+              --title "MiuRead Beta Update Channel" \
+              --notes "Machine-readable update manifest for MiuRead Beta. Do not install this release directly." \
+              --prerelease \
+              --latest=false
           else
-            gh api --method PUT "$API_PATH" \
-              -f message="Add update-beta.json for $RELEASE_TAG" \
-              -f content="$CONTENT" \
-              -f branch="main" >/dev/null
+            gh release create "$CHANNEL_TAG" "dist/$MANIFEST_NAME" \
+              --target "$GITHUB_SHA" \
+              --title "MiuRead Beta Update Channel" \
+              --notes "Machine-readable update manifest for MiuRead Beta. Do not install this release directly." \
+              --prerelease \
+              --latest=false
+          fi
+
+          URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$CHANNEL_TAG/$MANIFEST_NAME"
+          success=0
+          for attempt in $(seq 1 12); do
+            rm -f dist/public-manifest.json
+            if curl --fail --location --silent --show-error \
+                --connect-timeout 20 --max-time 60 \
+                --output dist/public-manifest.json "$URL" && \
+                cmp -s "dist/$MANIFEST_NAME" dist/public-manifest.json; then
+              success=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$success" != "1" ]; then
+            echo "::error::固定 Beta 更新清单尚不可用或内容校验失败。"
+            exit 1
           fi

@@ -1,0 +1,6 @@
+请删除仓库根目录：
+CHANGELOG-4.3.0-beta.27.txt
+
+说明：
+- 以后不再创建 CHANGELOG-版本号.txt，统一维护 CHANGELOG.md。
+- legacy/cookie.lua 与 legacy/crypto.lua 不需要上传；它们在本次整理中没有真实代码变化。

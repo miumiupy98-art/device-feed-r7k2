@@ -1329,35 +1329,75 @@ function HomeWidget:_close_rotation_transients()
     end
 end
 
+function HomeWidget:_capture_pending_dimensions()
+    self._pending_screen_w=Screen:getWidth()
+    self._pending_screen_h=Screen:getHeight()
+    self._pending_rotation=Screen.getRotationMode and Screen:getRotationMode() or nil
+    self._pending_dimension_refresh=true
+    return true
+end
+
+function HomeWidget:_commit_pending_dimensions(force_rebuild)
+    local sw,sh=Screen:getWidth(),Screen:getHeight()
+    local rotation=Screen.getRotationMode and Screen:getRotationMode() or nil
+    self._pending_screen_w,self._pending_screen_h=sw,sh
+    self._pending_rotation=rotation
+    local changed=force_rebuild==true or sw~=self._last_screen_w or sh~=self._last_screen_h
+        or rotation~=self._last_rotation
+    self._pending_dimension_refresh=false
+    if not changed then return false end
+    self:_close_rotation_transients()
+    self:_clear_inactive_section_cache()
+    self:_rebuild()
+    return true
+end
+
 function HomeWidget:_schedule_dimension_refresh()
     self._dimension_refresh_generation = (tonumber(self._dimension_refresh_generation) or 0) + 1
     local generation = self._dimension_refresh_generation
-    if self._dimension_refresh_task then UIManager:unschedule(self._dimension_refresh_task) end
-    self:_close_rotation_transients()
-    local last_w, last_h, stable, attempts = nil, nil, 0, 0
-    -- Rotation and the final framebuffer size may arrive as separate events.
-    -- Keep only the newest settle task and rebuild once after the size is stable.
+    if self._dimension_refresh_task then
+        UIManager:unschedule(self._dimension_refresh_task)
+        self._dimension_refresh_task=nil
+    end
+    self:_capture_pending_dimensions()
+
+    -- Parked Home and the lock-screen path must stay completely passive. The
+    -- latest geometry is applied once, immediately before Home becomes active.
+    if self._miu_input_suspended==true or self._miu_device_suspended==true then
+        return true
+    end
+
+    local last_w,last_h,last_rotation,stable,attempts=nil,nil,nil,0,0
     local task
     task=function()
         if self._miu_closed or self._dimension_refresh_task~=task
             or generation ~= self._dimension_refresh_generation then return end
-        attempts = attempts + 1
-        local sw, sh = Screen:getWidth(), Screen:getHeight()
-        local rotation=Screen.getRotationMode and Screen:getRotationMode() or nil
-        if sw == last_w and sh == last_h then stable = stable + 1
-        else last_w, last_h, stable = sw, sh, 0 end
-        if stable >= 1 or attempts >= 8 then
+        if self._miu_input_suspended==true or self._miu_device_suspended==true then
             self._dimension_refresh_task=nil
-            if sw == self._last_screen_w and sh == self._last_screen_h and rotation==self._last_rotation then return end
-            self:_clear_inactive_section_cache()
-            self:_rebuild()
-            UIManager:setDirty(self, "full")
+            self:_capture_pending_dimensions()
             return
         end
-        UIManager:scheduleIn(.08, task)
+        attempts=attempts+1
+        local sw,sh=Screen:getWidth(),Screen:getHeight()
+        local rotation=Screen.getRotationMode and Screen:getRotationMode() or nil
+        if sw==last_w and sh==last_h and rotation==last_rotation then
+            stable=stable+1
+        else
+            last_w,last_h,last_rotation,stable=sw,sh,rotation,0
+        end
+        if stable<2 and attempts<8 then
+            UIManager:scheduleIn(.12,task)
+            return
+        end
+        self._dimension_refresh_task=nil
+        local changed=self:_commit_pending_dimensions(false)
+        if changed then UIManager:setDirty(self,"full") end
+        logger.info("[MiuRead][Rotation] home committed",
+            "samples=",tostring(attempts),"changed=",tostring(changed),
+            "size=",tostring(sw).."x"..tostring(sh),"rotation=",tostring(rotation))
     end
     self._dimension_refresh_task=task
-    UIManager:scheduleIn(.06, task)
+    UIManager:scheduleIn(.30,task)
     return true
 end
 function HomeWidget:onScreenResize() return self:_schedule_dimension_refresh() end
@@ -1420,9 +1460,22 @@ function HomeView.park()
     live_widget._miu_resume_waiting_interaction=false
     return true
 end
+function HomeView.suspend()
+    if not HomeView.is_shown() then return false end
+    live_widget._miu_device_suspended=true
+    live_widget._dimension_refresh_generation=(tonumber(live_widget._dimension_refresh_generation) or 0)+1
+    if live_widget._dimension_refresh_task then
+        UIManager:unschedule(live_widget._dimension_refresh_task)
+        live_widget._dimension_refresh_task=nil
+    end
+    live_widget:_capture_pending_dimensions()
+    return true
+end
 function HomeView.unpark(skip_dirty,opts)
     if not HomeView.is_shown() then return false end
     opts=type(opts)=="table" and opts or {}
+    live_widget._miu_device_suspended=false
+    local rebuilt=live_widget:_commit_pending_dimensions(false)
     live_widget._miu_input_suspended=false
     if type(opts.on_interaction)=="function" then
         live_widget._miu_resume_interaction_callback=opts.on_interaction
@@ -1430,7 +1483,8 @@ function HomeView.unpark(skip_dirty,opts)
         live_widget._miu_last_interaction_at=0
     end
     if live_widget._metrics_cache then live_widget:_register_top_swipe(live_widget._metrics_cache) end
-    if skip_dirty~=true then UIManager:setDirty(live_widget,"ui") end
+    if skip_dirty~=true then UIManager:setDirty(live_widget,rebuilt and "full" or "ui")
+    elseif rebuilt then UIManager:setDirty(live_widget,"full") end
     return true
 end
 -- FileManager is recreated after ReaderUI closes so KOReader's docless
@@ -1468,17 +1522,19 @@ end
 function HomeView.resume(opts)
     if not HomeView.is_shown() then return false end
     opts=opts or {}
+    live_widget._miu_device_suspended=false
+    local rebuilt=live_widget:_commit_pending_dimensions(opts.rebuild_visual==true)
     live_widget._miu_input_suspended=false
     live_widget._miu_resume_interaction_callback=opts.on_interaction
     live_widget._miu_resume_waiting_interaction=true
     live_widget._miu_last_interaction_at=0
     if live_widget._metrics_cache then live_widget:_register_top_swipe(live_widget._metrics_cache) end
-    HomeView.raise(true)
-    -- Do not call update() or _rebuild() here.  Repaint the existing surface so
-    -- wake-up work is bounded and every current TapBox remains attached.
-    UIManager:setDirty(live_widget,"full")
+    -- Resume never reorders UIManager._window_stack. If the long-sleep visual
+    -- geometry is stale, rebuild this existing widget in place and repaint it.
+    UIManager:setDirty(live_widget,rebuilt and "full" or "ui")
     return true
 end
+
 function HomeView.close(full_refresh)
     HomeView.prune_duplicates()
     if live_widget and not live_widget._miu_closed then UIManager:close(live_widget) end
