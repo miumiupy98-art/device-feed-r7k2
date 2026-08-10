@@ -165,6 +165,8 @@ READER_CLOSE.close_attempts=tonumber(READER_CLOSE.close_attempts) or 0
 READER_CLOSE.close_command_sent_at=tonumber(READER_CLOSE.close_command_sent_at) or 0
 READER_CLOSE.foreground_stop_attempted=READER_CLOSE.foreground_stop_attempted==true
 READER_CLOSE.native_fallback_attempted=READER_CLOSE.native_fallback_attempted==true
+HOME_SESSION.home_interaction_generation=tonumber(HOME_SESSION.home_interaction_generation) or 0
+HOME_SESSION.post_reader_work_interaction_generation=tonumber(HOME_SESSION.post_reader_work_interaction_generation) or 0
 local function reader_close_active()
     local state=tostring(READER_CLOSE.state or "idle")
     return state~="idle" and state~="completed" and state~="failed"
@@ -527,7 +529,7 @@ function Plugin:init()
     self._home_refresh_debounce_generation=0
     self._home_state_save_generation=0
     self._home_state_save_pending=false
-    self._home_interaction_generation=0
+    self._home_interaction_generation=tonumber(HOME_SESSION.home_interaction_generation) or 0
     self._home_data_revision=0
     self._home_section_revisions={account=0,generated=0,["local"]=0,mp=0}
     self._home_directory_generation=0
@@ -2640,9 +2642,15 @@ function Plugin:_home_resume_visible_work_after_idle()
     UIManager:scheduleIn(.35,task)
 end
 
+function Plugin:_home_bump_interaction_generation()
+    HOME_SESSION.home_interaction_generation=(tonumber(HOME_SESSION.home_interaction_generation) or 0)+1
+    self._home_interaction_generation=HOME_SESSION.home_interaction_generation
+    return self._home_interaction_generation
+end
+
 function Plugin:_home_note_interaction(first,kind)
     self._home_ui_quiet_until=math.max(tonumber(self._home_ui_quiet_until) or 0,os.clock()+1.35)
-    self._home_interaction_generation=(tonumber(self._home_interaction_generation) or 0)+1
+    self:_home_bump_interaction_generation()
     -- Stop optional visible-book work immediately; it can be restarted from
     -- cached targets after the user has been idle for a moment.
     self._home_metadata_generation=(tonumber(self._home_metadata_generation) or 0)+1
@@ -2800,7 +2808,7 @@ end
 
 function Plugin:_home_resume_interaction(generation,first,kind)
     if generation~=self._home_resume_generation or self._home_suspended==true then return end
-    self._home_interaction_generation=(tonumber(self._home_interaction_generation) or 0)+1
+    self:_home_bump_interaction_generation()
     local elapsed=self._home_resume_started_clock and math.floor((os.clock()-self._home_resume_started_clock)*1000+.5) or -1
     if first then
         logger.info("[MiuRead][Resume] first interaction",
@@ -3136,7 +3144,7 @@ function Plugin:_home_change_page(delta)
     local target=math.max(1,math.min(total,current+(tonumber(delta) or 0)))
     if target==current then return true end
     home.page_by_section[section]=target
-    self._home_interaction_generation=(tonumber(self._home_interaction_generation) or 0)+1
+    self:_home_bump_interaction_generation()
     self:_save_home_preferences_deferred(home,preferences)
     return self:_home_apply_section(section)
 end
@@ -3192,7 +3200,7 @@ function Plugin:_set_home_section(section)
     local home,preferences=self:_home_preferences()
     if home.active_section==section and self._home_active_section==section then return end
     home.active_section=section
-    self._home_interaction_generation=(tonumber(self._home_interaction_generation) or 0)+1
+    self:_home_bump_interaction_generation()
     self:_save_home_preferences_deferred(home,preferences)
     if self:_home_apply_section(section) then
         logger.info("[MiuRead][Home] section updated partial",tostring(section))
@@ -4927,7 +4935,7 @@ function Plugin:_home_set_local_inline_location(path,root_path)
     home.local_inline_root=LocalLibrary.normalize(root_path or "")
     home.page_by_section=type(home.page_by_section)=="table" and home.page_by_section or {}
     home.page_by_section["local"]=1
-    self._home_interaction_generation=(tonumber(self._home_interaction_generation) or 0)+1
+    self:_home_bump_interaction_generation()
     self:_save_home_preferences_deferred(home,preferences)
 end
 
@@ -9229,8 +9237,8 @@ function Plugin:_show_reader_sync_panel(back_callback)
                 }},
                 {title="自动同步",rows={
                     {label="阅读进度",value=sync.progress_enabled~=false and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_progress_sync() end},
-                    {label="阅读时间",value=sync.time_enabled==true and "已开启" or "已关闭",value_bold=true,callback=function() self:toggle_time_sync() end},
-                    {label="成功提醒",value=self:_sync_success_notice_enabled() and "已开启" or "已关闭",keep_open=true,callback=function() self:toggle_sync_success_notice() end},
+                    {label="阅读时间",value=sync.time_enabled==true and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_time_sync() end},
+                    {label="成功提醒",value=self:_sync_success_notice_enabled() and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_sync_success_notice() end},
                 }},
                 {title="诊断",rows={
                     {icon="diagnostics",label="同步诊断",value="检查与修复",callback=function() self:_show_reader_sync_diagnostics_panel(return_to_sync) end},
@@ -10646,8 +10654,8 @@ function Plugin:_complete_reader_close(generation,reason)
     self:_set_foreground("home")
     self:_close_reader_recovery_surface()
     self:_release_reader_transition_guard("home restored after stable close")
-    self:_resume_pending_post_reader_work("home restored after stable close",.45)
-    self:_finish_page_transition(.8,"home restored after stable close")
+    self:_finish_page_transition(.18,"home restored after stable close")
+    self:_resume_pending_post_reader_work("home restored after stable close",2.0)
     READER_CLOSE.state="completed"
     logger.info("[MiuRead][ReaderClose] home restored",
         "generation=",tostring(generation),"reason=",tostring(reason or READER_CLOSE.reason or "close"))
@@ -11007,8 +11015,8 @@ function Plugin:_restore_home_after_reader_close(attempt,generation)
         self:_set_foreground("home")
         self:_close_reader_recovery_surface()
         self:_release_reader_transition_guard("home already visible")
-        self:_resume_pending_post_reader_work("home revealed",.45)
-        self:_finish_page_transition(.8,"home revealed")
+        self:_finish_page_transition(.18,"home revealed")
+        self:_resume_pending_post_reader_work("home revealed",2.0)
         HOME_SESSION.home_restore_active=false
         return true
     end
@@ -11037,8 +11045,8 @@ function Plugin:_restore_home_after_reader_close(attempt,generation)
         self:_set_foreground("home")
         self:_close_reader_recovery_surface()
         self:_release_reader_transition_guard("home restored")
-        self:_resume_pending_post_reader_work("home restored",.45)
-        self:_finish_page_transition(.8,"home rebuilt")
+        self:_finish_page_transition(.18,"home rebuilt")
+        self:_resume_pending_post_reader_work("home restored",2.0)
     else
         self:_set_navigation_state("recovering","home creation failed")
         self:_finish_page_transition(0,"home creation recovery required")
@@ -12479,10 +12487,26 @@ function Plugin:_install_pending_record(book_id,kind,chapter_uid,record)
 end
 
 function Plugin:_install_pending_downloads(notify)
+    -- Most reader closes have nothing to install. Avoid a full settings reload,
+    -- integrity check and backup cycle on that hot path. A freshly opened Store
+    -- already reflects disk state; download completion also updates this Store
+    -- before requesting installation.
+    local cached_pending=self.store:pending_installs()
+    if type(cached_pending)~="table" or #cached_pending==0 then return false end
+
+    local perf_started=monotonic_wall_time()
     local current=tostring(self:_current_document_path() or "")
+    local reload_started=monotonic_wall_time()
     self.store:reload()
+    local reload_ms=math.floor((monotonic_wall_time()-reload_started)*1000+.5)
+    local prune_started=monotonic_wall_time()
     local pending=self.store:prune_pending_installs()
-    if #pending==0 then return false end
+    local prune_ms=math.floor((monotonic_wall_time()-prune_started)*1000+.5)
+    if #pending==0 then
+        logger.info("[MiuRead][Download] pending install check",
+            "pending=0","reload_ms=",tostring(reload_ms),"prune_ms=",tostring(prune_ms))
+        return false
+    end
     local installed_records={}
     for _,item in ipairs(pending) do
         local book_id=tostring(item.book_id or "")
@@ -12559,8 +12583,16 @@ function Plugin:_install_pending_downloads(notify)
             else text=installed>1 and "多个新版本已安装" or "新版本已安装" end
             self:status_toast("觅阅",text,4)
         end
+        logger.info("[MiuRead][Download] pending install timing",
+            "pending=",tostring(#pending),"installed=",tostring(installed),
+            "reload_ms=",tostring(reload_ms),"prune_ms=",tostring(prune_ms),
+            "total_ms=",tostring(math.floor((monotonic_wall_time()-perf_started)*1000+.5)))
         return true
     end
+    logger.info("[MiuRead][Download] pending install timing",
+        "pending=",tostring(#pending),"installed=0",
+        "reload_ms=",tostring(reload_ms),"prune_ms=",tostring(prune_ms),
+        "total_ms=",tostring(math.floor((monotonic_wall_time()-perf_started)*1000+.5)))
     return false
 end
 
@@ -16892,7 +16924,7 @@ function Plugin:onResume()
         self:_home_begin_resume(slept)
         UIManager:scheduleIn(1.0,function()
             if HomeView.is_shown() and not self:_active_reader_ui() then
-                self:_resume_pending_post_reader_work("resume home",.35)
+                self:_resume_pending_post_reader_work("resume home",2.0)
             end
         end)
         return
@@ -16934,6 +16966,14 @@ function Plugin:onResume()
         end,{minimum_delay=6,max_wait=75,interval=3})
     end
 end
+function Plugin:_post_reader_work_needed()
+    local pending=self.store:pending_installs()
+    if type(pending)=="table" and #pending>0 then return "install",#pending end
+    local queue=self.store:download_queue()
+    if type(queue)=="table" and #queue>0 then return "queue",#queue end
+    return nil,0
+end
+
 function Plugin:_resume_pending_post_reader_work(reason,delay)
     local phase=tostring(HOME_SESSION.post_reader_work_phase or "")
     if phase=="" or self._post_reader_work_task then return false end
@@ -16942,7 +16982,7 @@ function Plugin:_resume_pending_post_reader_work(reason,delay)
     if not HomeView.is_shown() and not (ok_fm and FileManager and FileManager.instance) then
         return false
     end
-    return self:_schedule_post_reader_work(reason or "surface ready",delay or .35)
+    return self:_schedule_post_reader_work(reason or "surface ready",delay or 2.0,phase)
 end
 
 function Plugin:_run_post_reader_work(generation)
@@ -16953,6 +16993,19 @@ function Plugin:_run_post_reader_work(generation)
         HOME_SESSION.post_reader_work_deferred_phase=nil
         return true
     end
+
+    local function reschedule(delay)
+        local task
+        task=function()
+            if self._post_reader_work_task~=task then return end
+            self._post_reader_work_task=nil
+            self:_run_post_reader_work(generation)
+        end
+        self._post_reader_work_task=task
+        UIManager:scheduleIn(math.max(.25,tonumber(delay) or .8),task)
+        return false
+    end
+
     if self:_active_reader_ui() or ReaderTransitionGuard.is_shown() then
         -- Do not poll while the user is reading. The next stable home/native
         -- surface or CloseDocument event resumes this exact pending phase.
@@ -16962,51 +17015,87 @@ function Plugin:_run_post_reader_work(generation)
         end
         return false
     end
+
+    -- Returning to the bookshelf is latency-sensitive. Never let install or
+    -- queue maintenance run before the page-transition barrier has released.
+    if tostring(HOME_SESSION.page_transition_state or "idle")~="idle" then
+        if tostring(HOME_SESSION.post_reader_work_deferred_phase or "")~="transition:"..phase then
+            logger.info("[MiuRead][Download] post-reader work waiting for transition",phase)
+            HOME_SESSION.post_reader_work_deferred_phase="transition:"..phase
+        end
+        return reschedule(.7)
+    end
+
     local ok_fm,FileManager=pcall(require,"apps/filemanager/filemanager")
     if not HomeView.is_shown() and not (ok_fm and FileManager and FileManager.instance) then
         logger.info("[MiuRead][Download] post-reader work waiting for stable surface",phase)
-        local task
-        task=function()
-            if self._post_reader_work_task~=task then return end
-            self._post_reader_work_task=nil
-            self:_run_post_reader_work(generation)
-        end
-        self._post_reader_work_task=task
-        UIManager:scheduleIn(.8,task)
-        return false
+        return reschedule(.8)
     end
+
+    -- If the user touched the restored home after this work was queued, yield
+    -- once more. This prevents a background install/check from stealing the
+    -- first interaction after returning from a book.
+    local interaction_generation=tonumber(HOME_SESSION.home_interaction_generation) or 0
+    local scheduled_generation=tonumber(HOME_SESSION.post_reader_work_interaction_generation) or 0
+    if interaction_generation~=scheduled_generation then
+        HOME_SESSION.post_reader_work_interaction_generation=interaction_generation
+        logger.info("[MiuRead][Download] post-reader work yielded to home interaction",phase)
+        return reschedule(1.5)
+    end
+
+    HOME_SESSION.post_reader_work_deferred_phase=nil
+    local phase_started=monotonic_wall_time()
     if phase=="install" then
-        HOME_SESSION.post_reader_work_deferred_phase=nil
         local ok,err=pcall(self._install_pending_downloads,self,true)
         if not ok then logger.warn("[MiuRead][Download] pending install failed",tostring(err)) end
-        HOME_SESSION.post_reader_work_phase="queue"
-        local task
-        task=function()
-            if self._post_reader_work_task~=task then return end
-            self._post_reader_work_task=nil
-            self:_run_post_reader_work(generation)
+        local queue=self.store:download_queue()
+        if type(queue)=="table" and #queue>0 then
+            HOME_SESSION.post_reader_work_phase="queue"
+            HOME_SESSION.post_reader_work_interaction_generation=tonumber(HOME_SESSION.home_interaction_generation) or 0
+            logger.info("[MiuRead][Download] post-reader phase complete",
+                "phase=install","ms=",tostring(math.floor((monotonic_wall_time()-phase_started)*1000+.5)),
+                "next=queue")
+            return reschedule(.8)
         end
-        self._post_reader_work_task=task
-        UIManager:scheduleIn(.5,task)
+        HOME_SESSION.post_reader_work_phase=nil
+        logger.info("[MiuRead][Download] post-reader phase complete",
+            "phase=install","ms=",tostring(math.floor((monotonic_wall_time()-phase_started)*1000+.5)),
+            "next=none")
         return true
     end
     if phase=="queue" then
-        HOME_SESSION.post_reader_work_deferred_phase=nil
         local ok,err=pcall(self._start_next_queued_download,self)
         if not ok then logger.warn("[MiuRead][Download] queued start failed",tostring(err)) end
         HOME_SESSION.post_reader_work_phase=nil
+        logger.info("[MiuRead][Download] post-reader phase complete",
+            "phase=queue","ms=",tostring(math.floor((monotonic_wall_time()-phase_started)*1000+.5)),
+            "next=none")
         return true
     end
-    HOME_SESSION.post_reader_work_deferred_phase=nil
     HOME_SESSION.post_reader_work_phase=nil
     return true
 end
 
-function Plugin:_schedule_post_reader_work(reason,delay)
-    if not HOME_SESSION.post_reader_work_phase then
-        HOME_SESSION.post_reader_work_phase="install"
+function Plugin:_schedule_post_reader_work(reason,delay,phase)
+    phase=tostring(phase or HOME_SESSION.post_reader_work_phase or "")
+    if phase=="" then
+        local needed=self:_post_reader_work_needed()
+        phase=tostring(needed or "")
     end
+    if phase=="" then
+        HOME_SESSION.post_reader_work_phase=nil
+        HOME_SESSION.post_reader_work_deferred_phase=nil
+        if self._post_reader_work_task then
+            UIManager:unschedule(self._post_reader_work_task)
+            self._post_reader_work_task=nil
+        end
+        logger.info("[MiuRead][Download] post-reader work skipped",tostring(reason or "close"),"nothing pending")
+        return false
+    end
+
+    HOME_SESSION.post_reader_work_phase=phase
     HOME_SESSION.post_reader_work_deferred_phase=nil
+    HOME_SESSION.post_reader_work_interaction_generation=tonumber(HOME_SESSION.home_interaction_generation) or 0
     HOME_SESSION.post_reader_work_generation=(tonumber(HOME_SESSION.post_reader_work_generation) or 0)+1
     self._post_reader_work_generation=HOME_SESSION.post_reader_work_generation
     local generation=self._post_reader_work_generation
@@ -17021,8 +17110,8 @@ function Plugin:_schedule_post_reader_work(reason,delay)
         self:_run_post_reader_work(generation)
     end
     self._post_reader_work_task=task
-    UIManager:scheduleIn(math.max(0,tonumber(delay) or .8),task)
-    logger.info("[MiuRead][Download] post-reader work scheduled",tostring(reason or "close"),tostring(HOME_SESSION.post_reader_work_phase))
+    UIManager:scheduleIn(math.max(0,tonumber(delay) or 2.0),task)
+    logger.info("[MiuRead][Download] post-reader work scheduled",tostring(reason or "close"),phase)
     return true
 end
 

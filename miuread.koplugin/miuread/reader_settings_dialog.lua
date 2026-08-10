@@ -134,7 +134,9 @@ function Dialog:_row_widget(row, width, height)
     local icon = tostring(row.icon or "")
     local value = tostring(row.value or row.detail or "")
     if row.checked == true then value = value ~= "" and (value .. "  ✓") or "✓" end
-    local arrow = row.arrow ~= false and row.callback ~= nil and row.keep_open ~= true
+    -- Reader settings stay visually flat by default. A chevron is shown only
+    -- when a caller explicitly requests one for a true child-page affordance.
+    local arrow = row.arrow == true and row.callback ~= nil
     local icon_w = icon ~= "" and Skin.dp(28, 23, 38) or 0
     local arrow_w = arrow and Skin.dp(17, 14, 23) or 0
     local value_w = value ~= "" and math.max(Skin.dp(74, 58, 102), math.floor(width * .28)) or 0

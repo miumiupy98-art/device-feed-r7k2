@@ -1596,7 +1596,8 @@ local function filename_key(path)
     local name=tostring(basename(path) or ""):lower()
     -- Treat harmless spacing differences around the variant suffix as the same
     -- filename, but only relink when the match is unique.
-    return name:gsub("[%s　]+", "")
+    name=name:gsub("%s+", "")
+    return name:gsub("　", "")
 end
 
 local function identity_from_blob(blob,identity)
@@ -1657,7 +1658,8 @@ local function metadata_key(value)
     text=text:gsub("%.epub$","")
     text=text:gsub("%s*%[[^%]]-%]%s*$","")
     text=text:gsub("%s*【.-】%s*$","")
-    text=text:gsub("[%s%c%p　]+","")
+    text=text:gsub("[%s%c%p]+","")
+    text=text:gsub("　","")
     for _,mark in ipairs({"，","。","！","？","：","；","“","”","‘","’","《","》","〈","〉","（","）","【","】","·","—","…"}) do
         text=text:gsub(mark,"",1e6)
     end

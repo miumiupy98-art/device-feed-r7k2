@@ -127,11 +127,15 @@ local function clean_notes(value)
     local text=tostring(value or "")
     if not U.is_valid_utf8(text) or U.contains_replacement_char(text) then return nil end
     text=text:gsub("\r\n","\n"):gsub("\r","\n")
-    text=text:gsub("[•●▪◦]","-")
+    -- Lua patterns operate on bytes, so a UTF-8 character class such as
+    -- [•●▪◦] can corrupt unrelated multibyte text. Replace each symbol as a
+    -- complete string instead.
+    text=text:gsub("•","-"):gsub("●","-"):gsub("▪","-"):gsub("◦","-")
     text=text:gsub("：",":"):gsub("，",","):gsub("。","."):gsub("、",",")
     text=text:gsub("“",""):gsub("”",""):gsub("‘",""):gsub("’","")
     text=text:gsub("—","-"):gsub("–","-"):gsub("·","-")
     text=text:gsub("[%z\1-\8\11\12\14-\31]","")
+    if not U.is_valid_utf8(text) or U.contains_replacement_char(text) then return nil end
     local lines={}
     for line in text:gmatch("[^\n]+") do
         line=line:gsub("^%s+",""):gsub("%s+$","")
