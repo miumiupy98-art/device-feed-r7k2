@@ -6,7 +6,7 @@ local lfs = require("libs/libkoreader-lfs")
 local Thoughts = {}
 
 local POPUP_CACHE_LIMIT = 8
-local POPUP_CACHE_VERSION = "2"
+local POPUP_CACHE_VERSION = "3"
 local popup_cache = {}
 local popup_cache_order = {}
 
@@ -22,6 +22,26 @@ local function cache_trim(cache, order, limit)
         local expired = table.remove(order, 1)
         cache[expired] = nil
     end
+end
+
+
+local function group_content_signature(group)
+    if type(group) ~= "table" then return "empty" end
+    -- Keep the cache identity local to this exact comment group. A whole-book
+    -- SQLite mtime changes whenever any chapter is updated, which used to
+    -- invalidate unrelated visible comments. Lua hashes this immutable string
+    -- internally, avoiding an extra pure-Lua cryptographic digest on a tap.
+    local parts = {}
+    for _, item in ipairs(group.texts or {}) do
+        parts[#parts + 1] = table.concat({
+            tostring(item.review_id or item.reviewId or ""),
+            tostring(item.author or ""),
+            tostring(item.abstract or ""),
+            tostring(item.content or ""),
+            tostring(tonumber(item.likes or 0) or 0),
+        }, "\31")
+    end
+    return table.concat(parts, "\30")
 end
 
 local function file_signature(path)
@@ -454,8 +474,8 @@ end
 function Thoughts.popup_parts_cached(store, book_id, chapter_uid, range, group, token)
     token = type(token) == "table" and token or {}
     local path = tostring(token.path or Thoughts.cache_path(store, book_id, chapter_uid))
-    local signature = tostring(token.signature or file_signature(path) or "missing")
-    local key = table.concat({POPUP_CACHE_VERSION, path, signature, tostring(range or "")}, "|")
+    local signature = group_content_signature(group)
+    local key = table.concat({POPUP_CACHE_VERSION, "html", tostring(book_id or ""), tostring(chapter_uid or ""), tostring(range or ""), signature}, "|")
     local cached = popup_cache[key]
     if cached then
         cache_touch(popup_cache_order, key)
@@ -499,18 +519,18 @@ end
 function Thoughts.native_parts_cached(store, book_id, chapter_uid, range, group, token)
     token = type(token) == "table" and token or {}
     local path = tostring(token.path or Thoughts.cache_path(store, book_id, chapter_uid))
-    local signature = tostring(token.signature or file_signature(path) or "missing")
-    local key = table.concat({POPUP_CACHE_VERSION, "native", path, signature, tostring(range or "")}, "|")
+    local signature = group_content_signature(group)
+    local key = table.concat({POPUP_CACHE_VERSION, "native", tostring(book_id or ""), tostring(chapter_uid or ""), tostring(range or ""), signature}, "|")
     local cached = popup_cache[key]
     if cached and cached.native == true then
         cache_touch(popup_cache_order, key)
-        return cached.source, cached.comments, cached.count, true
+        return cached.source, cached.comments, cached.count, true, signature
     end
     local source, comments, count = Thoughts.native_parts(group)
     popup_cache[key] = {native=true, source=source, comments=comments, count=count}
     cache_touch(popup_cache_order, key)
     cache_trim(popup_cache, popup_cache_order, POPUP_CACHE_LIMIT)
-    return source, comments, count, false
+    return source, comments, count, false, signature
 end
 
 function Thoughts.plain_text(group)

@@ -368,6 +368,11 @@ function Plugin:init()
     self._home_post_reader_protect_until=0
     self._home_modal_cooldown_until=0
     self._home_ui_resume_task=nil
+    -- Ordinary UI preferences are written into LuaSettings immediately but
+    -- their flash flush is coalesced. Critical auth/download/session state
+    -- continues to use Store:set() and remains synchronous.
+    self._ui_preferences_save_pending=false
+    self._ui_preferences_save_generation=0
     self._home_visible_metadata_targets={}
     self._home_visible_cover_targets={}
     self._reader_quick_panel_pending=false
@@ -470,6 +475,9 @@ function Plugin:init()
         disable_fallback=true})
     self.repair_async=Async:new(self.store,{poll_interval=.35,allow_android=true})
     self.annotation_async=Async:new(self.store,{poll_interval=.30,allow_android=true,disable_fallback=true})
+    -- Update manifest/package network I/O must never occupy the UI loop.
+    -- Installation itself stays foreground because it replaces the live plugin tree.
+    self.updater_async=Async:new(self.store,{poll_interval=.30,allow_android=true,disable_fallback=true})
     -- Summary scans may touch one SQLite cache per annotated book. Keep them
     -- out of every home tap and pull-down path.
     self.sync_summary_async=Async:new(self.store,{poll_interval=.45,allow_android=true,disable_fallback=true})
@@ -2305,6 +2313,34 @@ function Plugin:_home_preferences()
     return home,preferences
 end
 
+function Plugin:_save_ui_preferences(preferences,reason,delay)
+    preferences=preferences or self.store:preferences()
+    if not self.store.save_preferences_deferred then
+        self.store:save_preferences(preferences)
+        return true
+    end
+    self.store:save_preferences_deferred(preferences)
+    self._ui_preferences_save_pending=true
+    self._ui_preferences_save_generation=(tonumber(self._ui_preferences_save_generation) or 0)+1
+    local generation=self._ui_preferences_save_generation
+    UIManager:scheduleIn(math.max(.35,tonumber(delay) or 1.35),function()
+        if generation~=(tonumber(self._ui_preferences_save_generation) or 0)
+            or self._ui_preferences_save_pending~=true then return end
+        self._ui_preferences_save_pending=false
+        self.store:flush()
+        logger.info("[MiuRead][UIState] preferences saved after idle",
+            "reason=",tostring(reason or "ui"))
+    end)
+    return true
+end
+
+function Plugin:_mark_ui_preferences_flushed()
+    if self._ui_preferences_save_pending~=true then return false end
+    self._ui_preferences_save_generation=(tonumber(self._ui_preferences_save_generation) or 0)+1
+    self._ui_preferences_save_pending=false
+    return true
+end
+
 function Plugin:_save_home_preferences(home,preferences)
     preferences=preferences or self.store:preferences()
     preferences.home_ui=home
@@ -2770,6 +2806,10 @@ function Plugin:_home_freeze_for_suspend()
     if self.home_cover_async then self.home_cover_async:cancel("device suspended") end
     if self.cover_render_async then self.cover_render_async:cancel("device suspended") end
     if self.annotation_async then self.annotation_async:cancel("device suspended") end
+    if self.updater_async then
+        self.updater_async:cancel("device suspended")
+        self._auto_update_check_running=false
+    end
     if self.sync_summary_async then self.sync_summary_async:cancel("device suspended") end
     self:_home_unschedule_task("_home_sync_summary_task")
     if self.shelf_async and self._home_resume_pending_work.remote then self.shelf_async:cancel("device suspended") end
@@ -8528,7 +8568,7 @@ function Plugin:_set_thoughts_enabled(enabled)
     local p=self.store:preferences(); p.thoughts=p.thoughts or {}
     if (p.thoughts.enabled~=false)==enabled then return true end
     p.thoughts.enabled=enabled
-    self.store:save_preferences(p)
+    self:_save_ui_preferences(p,"thoughts_enabled")
     local current=self.sync and self.sync.current or nil
     local record=current and current.record or {}
     local variant=tostring(current and (current.variant or record.variant) or "")
@@ -8565,7 +8605,7 @@ function Plugin:_set_thought_font_size(level)
     level=allowed[tostring(level or "")] and tostring(level) or "standard"
     local p=self.store:preferences(); p.thoughts=p.thoughts or {}
     p.thoughts.font=level
-    self.store:save_preferences(p)
+    self:_save_ui_preferences(p,"thought_font")
     self:_refresh_thought_display(p.thoughts)
     self:toast("评论字号已设为："..self:_thought_font_size_label(),2)
     return true
@@ -8583,7 +8623,7 @@ end
 function Plugin:_toggle_thought_follow_body_font()
     local p=self.store:preferences(); p.thoughts=p.thoughts or {}
     p.thoughts.follow_body_font=p.thoughts.follow_body_font~=true
-    self.store:save_preferences(p)
+    self:_save_ui_preferences(p,"thought_font_follow")
     self:_refresh_thought_display(p.thoughts)
     return true
 end
@@ -9110,7 +9150,7 @@ function Plugin:_show_reader_annotation_panel(back_callback)
     -- Refresh only the local mirror when the user explicitly opens this panel.
     -- No network/range work runs during a normal highlight gesture or page turn.
     self:_capture_local_annotation_snapshot("annotation_panel")
-    local current=self:_current_book_record()
+    local current=(self.sync and self.sync:record()) or self:_current_book_record()
     local book_id=current and current.book and tostring(current.book.book_id or current.book.bookId or "") or ""
     local summary=book_id~="" and LocalAnnotationDatabase.summary(self.store,book_id) or nil
     summary=type(summary)=="table" and summary or {
@@ -13810,7 +13850,7 @@ end
 function Plugin:toggle_sync_success_notice()
     local p=self.store:preferences(); p.sync=p.sync or {}
     p.sync.success_notice_enabled=not (p.sync.success_notice_enabled~=false)
-    self.store:save_preferences(p)
+    self:_save_ui_preferences(p,"sync_success_notice")
     self:status_toast("同步成功提醒",p.sync.success_notice_enabled and "已开启" or "已关闭",3)
 end
 function Plugin:_show_auto_sync_success(text)
@@ -14126,7 +14166,8 @@ function Plugin:toggle_time_sync(confirmed)
         })
         return
     end
-    local p=self.store:preferences(); p.sync.time_enabled=not p.sync.time_enabled; self.store:save_preferences(p)
+    local p=self.store:preferences(); p.sync.time_enabled=not p.sync.time_enabled
+    self:_save_ui_preferences(p,"time_sync_toggle")
     if p.sync.time_enabled then
         local record=self.sync:record()
         if record and p.sync.progress_enabled~=false and not self.sync:is_current_verified() then
@@ -14165,7 +14206,8 @@ function Plugin:toggle_progress_sync(confirmed)
         })
         return
     end
-    local p=self.store:preferences(); p.sync.progress_enabled=not (p.sync.progress_enabled~=false); p.sync.pull_on_open=p.sync.progress_enabled; self.store:save_preferences(p)
+    local p=self.store:preferences(); p.sync.progress_enabled=not (p.sync.progress_enabled~=false); p.sync.pull_on_open=p.sync.progress_enabled
+    self:_save_ui_preferences(p,"progress_sync_toggle")
     local r=self.sync:record()
     if p.sync.progress_enabled then
         self.sync:clear_verified("progress_sync_enabled")
@@ -15963,7 +16005,8 @@ function Plugin:_update_preferences()
     return p,p.update
 end
 function Plugin:_save_update_preferences(update)
-    local p=self.store:preferences(); p.update=U.merge(p.update or {},update or {}); self.store:save_preferences(p)
+    local p=self.store:preferences(); p.update=U.merge(p.update or {},update or {})
+    self:_save_ui_preferences(p,"update_preferences")
 end
 function Plugin:_update_interval_label(seconds)
     seconds=tonumber(seconds) or Config.AUTO_UPDATE_INTERVAL
@@ -16123,14 +16166,53 @@ function Plugin:_present_update(manifest,automatic)
     end
     text=text.."\n\n是否下载并安装"
     UIManager:show(ConfirmBox:new{text=text,ok_text="下载并安装",ok_callback=function()
-        self:online("install",function()
-            local path=self.updater:download(manifest)
-            local ok,err=self.updater:install(path,manifest)
-            if ok then self:_after_update_installed(manifest)
-            else self:info("更新失败：\n"..tostring(err)) end
-        end)
+        if not self:is_online() then self:info("当前网络不可用"); return end
+        if not self.updater_async or not self.updater_async:available() then
+            self:info("当前环境无法在后台下载安装包，请稍后重试。")
+            return
+        end
+        if self.updater_async:busy() then self:toast("更新任务正在进行",2); return end
+        self:status_toast("更新","正在后台下载并校验安装包……",4)
+        local started,err=self.updater_async:run("update-download",function()
+            return self.updater:download(manifest)
+        end,function(result)
+            if not result or result.ok~=true or tostring(result.value or "")=="" then
+                self:info("更新下载失败：\n"..tostring(result and result.error or "后台下载失败"))
+                return
+            end
+            local path=tostring(result.value)
+            self:status_toast("更新","安装包校验完成，正在安装……",4)
+            UIManager:nextTick(function()
+                local ok,install_err=self.updater:install(path,manifest)
+                if ok then self:_after_update_installed(manifest)
+                else self:info("更新失败：\n"..tostring(install_err)) end
+            end)
+        end,210)
+        if not started then self:info("无法启动更新下载：\n"..tostring(err or "后台任务不可用")) end
     end})
 end
+function Plugin:_run_update_check(automatic,on_done)
+    if not self.updater_async or not self.updater_async:available() then
+        return false,"后台更新检查不可用"
+    end
+    if self.updater_async:busy() then
+        return false,"已有更新任务正在运行"
+    end
+    local started,err=self.updater_async:run(automatic and "auto-update-check" or "update-check",function()
+        local manifest,check_err=self.updater:check()
+        if not manifest then error(tostring(check_err or "无法读取更新清单")) end
+        return manifest
+    end,function(result)
+        if result and result.ok==true and type(result.value)=="table" then
+            if on_done then on_done(result.value,nil) end
+        else
+            if on_done then on_done(nil,tostring(result and result.error or "后台更新检查失败")) end
+        end
+    end,70)
+    if not started then return false,tostring(err or "后台任务不可用") end
+    return true
+end
+
 function Plugin:maybe_auto_check_update(force)
     local _,update=self:_update_preferences()
     if not force and update.auto_check==false then return false end
@@ -16140,13 +16222,12 @@ function Plugin:maybe_auto_check_update(force)
     local last=tonumber(update.last_attempt_at) or 0
     if not force and now-last<interval then return false end
     if not self:is_online() then return false end
+    if self.updater_async and self.updater_async:busy() then return false end
     self._auto_update_check_running=true
     update.last_attempt_at=now
     self:_save_update_preferences(update)
-    UIManager:scheduleIn(.05,self:safe("auto-update",function()
-        local ok,manifest,err=pcall(self.updater.check,self.updater)
+    local started,start_err=self:_run_update_check(true,function(manifest,err)
         self._auto_update_check_running=false
-        if not ok then err=manifest; manifest=nil end
         local _,fresh=self:_update_preferences()
         if manifest then
             fresh.last_success_at=os.time()
@@ -16157,15 +16238,19 @@ function Plugin:maybe_auto_check_update(force)
             fresh.last_attempt_at=os.time()-math.max(0,interval-(Config.AUTO_UPDATE_RETRY_INTERVAL or 21600))
             self:_save_update_preferences(fresh)
         end
-    end))
-    return true
+    end)
+    if not started then
+        self._auto_update_check_running=false
+        logger.warn("[MiuRead][Updater] passive check not started",tostring(start_err or "unknown"))
+    end
+    return started
 end
 function Plugin:check_update(automatic)
     if automatic then return self:maybe_auto_check_update(true) end
-    self:online("update",function()
-        self:status_toast("更新","正在检查"..tostring(Config.UPDATE_CHANNEL_LABEL).."版本……",3)
-        local ok,manifest,err=pcall(self.updater.check,self.updater)
-        if not ok then err=manifest; manifest=nil end
+    if not self:is_online() then self:info("当前网络不可用"); return false end
+    if self.updater_async and self.updater_async:busy() then self:toast("更新任务正在进行",2); return false end
+    self:status_toast("更新","正在后台检查"..tostring(Config.UPDATE_CHANNEL_LABEL).."版本……",3)
+    local started,start_err=self:_run_update_check(false,function(manifest,err)
         local _,update=self:_update_preferences()
         update.last_attempt_at=os.time()
         if manifest then update.last_success_at=os.time() end
@@ -16173,6 +16258,8 @@ function Plugin:check_update(automatic)
         if not manifest then self:info("检查更新失败：\n"..tostring(err)); return end
         self:_present_update(manifest,false)
     end)
+    if not started then self:info("无法启动后台更新检查：\n"..tostring(start_err or "后台任务不可用")) end
+    return started
 end
 function Plugin:show_about()
     local memory_note=""
@@ -16425,23 +16512,28 @@ function Plugin:_open_thought_info(info,generation)
     local started=monotonic_wall_time()
     local popup,notice
     local ok,unexpected=xpcall(function()
-        self:_write_thought_popup_marker("lookup",info)
+        -- The tap marker already proves a popup was active if KOReader exits
+        -- abnormally. Keep intermediate stages in the log instead of rewriting
+        -- the same flash file several times during one visible tap.
+        local lookup_started=monotonic_wall_time()
         local group,err,token=Thoughts.find(self.store,info.book_id,info.chapter_uid,info.range)
+        local lookup_ms=math.floor((monotonic_wall_time()-lookup_started)*1000+.5)
         if not group then notice=tostring(err or "没有想法内容"); return end
         local prefs=self.store:preferences().thoughts or {}
         local function on_close() self:_finish_thought_popup(generation) end
-        self:_write_thought_popup_marker("build",info,{mode="native_rounded_paged_swipe"})
-        local source,comments,count,native_cache_hit=Thoughts.native_parts_cached(
+        local parts_started=monotonic_wall_time()
+        local source,comments,count,native_cache_hit,native_signature=Thoughts.native_parts_cached(
             self.store,info.book_id,info.chapter_uid,info.range,group,token
         )
+        local parts_ms=math.floor((monotonic_wall_time()-parts_started)*1000+.5)
         if tostring(source or "")=="" and #(comments or {})==0 then notice="没有想法内容"; return end
+        local show_started=monotonic_wall_time()
         popup=ThoughtNativePopup.show{
             source_text=source,
             comments=comments,
             cache_key=table.concat({
                 tostring(info.book_id or ""), tostring(info.chapter_uid or ""),
-                tostring(info.range or ""), tostring(token and token.path or ""),
-                tostring(token and token.signature or ""),
+                tostring(info.range or ""), tostring(native_signature or ""),
             }, "|"),
             font_size=self:_thought_font_size(prefs.font),
             font_name=self:_thought_font_name(prefs),
@@ -16453,6 +16545,7 @@ function Plugin:_open_thought_info(info,generation)
                 self:info("评论显示失败，窗口已安全关闭。当前阅读位置不会丢失。")
             end,
         }
+        local show_ms=math.floor((monotonic_wall_time()-show_started)*1000+.5)
         local elapsed_ms=math.floor((monotonic_wall_time()-started)*1000+.5)
         logger.info("[MiuRead][ThoughtPopup] opened",
             "mode=","native_rounded_paged_swipe",
@@ -16461,10 +16554,12 @@ function Plugin:_open_thought_info(info,generation)
             "source=",token and token.index_hit and "compact_index" or "chapter_cache",
             "cache=",token and token.cache_hit and "hit" or "miss",
             "native_cache=",native_cache_hit and "hit" or "miss",
+            "lookup_ms=",tostring(lookup_ms),
+            "parts_ms=",tostring(parts_ms),
+            "show_ms=",tostring(show_ms),
             "elapsed_ms=",tostring(elapsed_ms))
         if not popup then error("评论窗口未能加入界面") end
         self._thought_popup=popup
-        self:_write_thought_popup_marker("visible",info,{elapsed_ms=elapsed_ms})
         self:_record_performance("thought_popup",elapsed_ms)
         if token and token.index_hit~=true then
             UIManager:scheduleIn(.2,function() self:_schedule_current_book_repair_check(nil,true) end)
@@ -16899,7 +16994,7 @@ function Plugin:sync_local_annotations_now(force_diagnostic)
     return true
 end
 
-function Plugin:_local_annotation_chapter_context(item,current,kind,reason)
+function Plugin:_local_annotation_chapter_context(item,current,kind,reason,prepared)
     if type(current)~="table" then return {} end
     local record=type(current.record)=="table" and current.record or {}
     local book=type(current.book)=="table" and current.book or {}
@@ -16920,15 +17015,16 @@ function Plugin:_local_annotation_chapter_context(item,current,kind,reason)
         }
     end
 
-    local chapter_map=type(record.chapter_map)=="table" and record.chapter_map
-        or (type(book.catalog)=="table" and book.catalog or {})
+    prepared=type(prepared)=="table" and prepared or {}
+    local chapter_map=type(prepared.chapter_map)=="table" and prepared.chapter_map
+        or (type(record.chapter_map)=="table" and record.chapter_map
+        or (type(book.catalog)=="table" and book.catalog or {}))
     if #chapter_map==0 then
         return {selected_text=selected,context_before=before,context_after=after,anchor_text=anchor}
     end
 
-    local toc=self.ui and self.ui.toc or nil
+    local toc=prepared.toc or (self.ui and self.ui.toc or nil)
     local toc_index
-    if toc and type(toc.fillToc)=="function" then pcall(toc.fillToc,toc) end
 
     -- Prefer the annotation XPointer: for rolling documents it identifies the
     -- real spine position more precisely than an estimated rendered page.
@@ -16943,12 +17039,24 @@ function Plugin:_local_annotation_chapter_context(item,current,kind,reason)
         local ok,value=pcall(toc.getTocIndexByPage,toc,page)
         if ok then toc_index=tonumber(value) end
     end
-    local toc_rows=toc and type(toc.toc)=="table" and toc.toc or {}
+    local toc_rows=type(prepared.toc_rows)=="table" and prepared.toc_rows
+        or (toc and type(toc.toc)=="table" and toc.toc or {})
     if page and not toc_index then
-        local best=-math.huge
-        for index,entry in ipairs(toc_rows) do
-            local p=tonumber(entry.page or entry.pageno)
-            if p and p<=page and p>=best then best=p; toc_index=index end
+        local page_rows=type(prepared.toc_page_rows)=="table" and prepared.toc_page_rows or nil
+        if page_rows and #page_rows>0 then
+            local lo,hi,best=1,#page_rows,nil
+            while lo<=hi do
+                local mid=math.floor((lo+hi)/2)
+                if page_rows[mid].page<=page then best=page_rows[mid].index; lo=mid+1
+                else hi=mid-1 end
+            end
+            toc_index=best
+        else
+            local best=-math.huge
+            for index,entry in ipairs(toc_rows) do
+                local p=tonumber(entry.page or entry.pageno)
+                if p and p<=page and p>=best then best=p; toc_index=index end
+            end
         end
     end
 
@@ -16965,25 +17073,62 @@ end
 
 function Plugin:_capture_local_annotation_snapshot(reason)
     if not (self.ui and self.ui.document) then return false end
-    local current=self:_current_book_record()
+    local total_started=monotonic_wall_time()
+    -- During reading Sync already owns the current book record. Avoid a full
+    -- Store:reload() before every local snapshot; only fall back when the
+    -- reader has not established a sync record yet.
+    local current=(self.sync and self.sync:record()) or self:_current_book_record()
     local book_id=current and current.book and tostring(current.book.book_id or current.book.bookId or "") or ""
     if book_id=="" then return false end
     local annotations=(self.ui.annotation and self.ui.annotation.annotations)
         or (self.ui.bookmark and self.ui.bookmark.bookmarks) or {}
+
+    local record=type(current.record)=="table" and current.record or {}
+    local book=type(current.book)=="table" and current.book or {}
+    local chapter_map=type(record.chapter_map)=="table" and record.chapter_map
+        or (type(book.catalog)=="table" and book.catalog or {})
+    local prepared={chapter_map=chapter_map,toc_prepare_ms=0}
+    if tostring(record.chapter_uid or "")=="" and #chapter_map>0 then
+        local toc_started=monotonic_wall_time()
+        local toc=self.ui and self.ui.toc or nil
+        if toc and type(toc.fillToc)=="function" then pcall(toc.fillToc,toc) end
+        local toc_rows=toc and type(toc.toc)=="table" and toc.toc or {}
+        local page_rows={}
+        for index,entry in ipairs(toc_rows) do
+            local page=tonumber(entry.page or entry.pageno)
+            if page then page_rows[#page_rows+1]={page=page,index=index} end
+        end
+        table.sort(page_rows,function(a,b)
+            if a.page==b.page then return a.index<b.index end
+            return a.page<b.page
+        end)
+        prepared.toc=toc
+        prepared.toc_rows=toc_rows
+        prepared.toc_page_rows=page_rows
+        prepared.toc_prepare_ms=math.floor((monotonic_wall_time()-toc_started)*1000+.5)
+    end
+
+    local snapshot_started=monotonic_wall_time()
     local ok,result=xpcall(function()
         return LocalAnnotationDatabase.snapshot(self.store,book_id,annotations,current.path,function(item,kind)
-            return self:_local_annotation_chapter_context(item,current,kind,reason)
+            return self:_local_annotation_chapter_context(item,current,kind,reason,prepared)
         end)
     end,debug.traceback)
+    local snapshot_ms=math.floor((monotonic_wall_time()-snapshot_started)*1000+.5)
+    local total_ms=math.floor((monotonic_wall_time()-total_started)*1000+.5)
     if ok and result then
         logger.info("[MiuRead][LocalAnnotations] snapshot saved",
             "book=",book_id,"count=",tostring(result.count or 0),
+            "toc_ms=",tostring(prepared.toc_prepare_ms or 0),
+            "snapshot_ms=",tostring(snapshot_ms),
+            "total_ms=",tostring(total_ms),
             "reason=",tostring(reason or "quiet"))
         return true
     end
     logger.warn("[MiuRead][LocalAnnotations] snapshot failed",
-        "book=",book_id,"reason=",tostring(reason or "quiet"),
-        tostring(result))
+        "book=",book_id,"toc_ms=",tostring(prepared.toc_prepare_ms or 0),
+        "snapshot_ms=",tostring(snapshot_ms),"total_ms=",tostring(total_ms),
+        "reason=",tostring(reason or "quiet"),tostring(result))
     return false
 end
 
@@ -17392,6 +17537,7 @@ function Plugin:onCloseDocument()
     end
 end
 function Plugin:onFlushSettings()
+    self:_mark_ui_preferences_flushed()
     if self._reader_checkpoint_task then
         UIManager:unschedule(self._reader_checkpoint_task)
         self._reader_checkpoint_task=nil
