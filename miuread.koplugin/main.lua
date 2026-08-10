@@ -396,6 +396,8 @@ function Plugin:init()
     self._home_post_reader_protect_until=0
     self._home_modal_cooldown_until=0
     self._home_ui_resume_task=nil
+    self._home_manual_metadata_retry_task=nil
+    self._home_pending_network_metadata_key=nil
     -- Ordinary UI preferences are written into LuaSettings immediately but
     -- their flash flush is coalesced. Critical auth/download/session state
     -- continues to use Store:set() and remains synchronous.
@@ -2738,6 +2740,12 @@ function Plugin:_home_resume_visible_work_after_idle()
         local covers=self._home_visible_cover_targets or {}
         self:_home_schedule_local_metadata(metadata)
         self:_home_schedule_remote_covers(covers)
+        local pending_network_key=self._home_pending_network_metadata_key
+        self._home_pending_network_metadata_key=nil
+        if pending_network_key and self._home_hero
+            and self:_home_network_metadata_key(self._home_hero)==pending_network_key then
+            self:_home_schedule_network_metadata(self._home_hero,false)
+        end
         UIManager:scheduleIn(.85,function()
             if HomeView.is_shown() and not self:_active_reader_ui() and not self:_home_ui_busy() then
                 self:_home_schedule_cover_derivatives(covers)
@@ -2823,6 +2831,8 @@ function Plugin:_home_freeze_for_suspend()
     self:_home_unschedule_task("_home_refresh_task")
     self:_home_unschedule_task("_home_render_refresh_task")
     self:_home_unschedule_task("_home_resume_background_task")
+    self:_home_unschedule_task("_home_manual_metadata_retry_task")
+    self._home_pending_network_metadata_key=nil
     self._home_refresh_debounce_generation=(tonumber(self._home_refresh_debounce_generation) or 0)+1
     self._home_render_refresh_generation=(tonumber(self._home_render_refresh_generation) or 0)+1
     self._home_scan_generation=(tonumber(self._home_scan_generation) or 0)+1
@@ -5720,7 +5730,9 @@ function Plugin:_home_refresh_one_book_metadata(book,network_too)
         end
     end
     local network_started=false
-    if network_too~=false then network_started=self:_home_schedule_network_metadata(book,true)==true end
+    if network_too~=false then
+        network_started=self:_home_schedule_network_metadata(book,true,false,nil,true)==true
+    end
     if local_changed then self:_refresh_home_view(network_started and "本地信息已更新，正在网络补全" or "书籍信息已更新","content")
     elseif network_started then self:toast("正在从网络补全书籍信息…",2)
     elseif path=="" or not U.file_exists(path) then
@@ -5854,26 +5866,31 @@ function Plugin:_home_refresh_current_network_metadata(book)
     end
 
     self:toast("正在更新这本书的信息和封面…",2)
-    local state={metadata_done=false,metadata_ok=false,cover_done=false,cover_ok=false,finished=false}
+    local state={metadata_done=false,metadata_ok=false,metadata_partial=false,cover_done=false,cover_ok=false,finished=false}
     local function finish()
         if state.finished or not state.metadata_done or not state.cover_done then return end
         state.finished=true
         if state.metadata_ok and state.cover_ok then
-            self:toast("书籍信息和封面已更新",2)
+            self:toast(state.metadata_partial
+                and "封面和书籍信息已刷新，部分资料暂未找到"
+                or "书籍信息和封面已更新",2)
         elseif state.cover_ok then
-            self:toast("封面已更新，网络书籍信息暂未补全",2)
+            self:toast("封面已更新，网络书籍信息更新失败",2)
         elseif state.metadata_ok then
-            self:toast("书籍信息已更新，封面更新失败",2)
+            self:toast(state.metadata_partial
+                and "书籍信息已刷新，部分资料暂未找到；封面更新失败"
+                or "书籍信息已更新，封面更新失败",2)
         else
             self:toast("当前书籍更新失败，请稍后重试",2)
         end
     end
 
-    local metadata_started=self:_home_schedule_network_metadata(book,true,true,function(ok)
+    local metadata_started=self:_home_schedule_network_metadata(book,true,true,function(ok,_,detail)
         state.metadata_done=true
         state.metadata_ok=ok==true
+        state.metadata_partial=type(detail)=="table" and detail.partial==true
         finish()
-    end)==true
+    end,true)==true
     if not metadata_started then state.metadata_done=true end
 
     local cover_started=self:_home_force_refresh_current_cover(book,function(ok)
@@ -6620,6 +6637,8 @@ function Plugin:_home_stop_background(reason)
     self:_flush_home_preferences()
     self._home_resume_generation=(tonumber(self._home_resume_generation) or 0)+1
     self:_home_unschedule_task("_home_resume_background_task")
+    self:_home_unschedule_task("_home_manual_metadata_retry_task")
+    self._home_pending_network_metadata_key=nil
     self._home_resume_barrier=false
     self._home_suspended=false
     self._home_scan_generation=(tonumber(self._home_scan_generation) or 0)+1
@@ -6967,6 +6986,32 @@ local function home_network_patch_has_data(patch)
     return false
 end
 
+local HOME_NETWORK_DETAIL_FIELDS={"description","category","publisher","published_date","isbn"}
+
+local function home_network_patch_field_count(patch)
+    if type(patch)~="table" then return 0 end
+    local count=0
+    for _,key in ipairs({"title","author","description","category","publisher","published_date","language","isbn","pages"}) do
+        if U.trim(tostring(patch[key] or ""))~="" then count=count+1 end
+    end
+    return count
+end
+
+local function home_network_missing_fields(book,patch)
+    book=type(book)=="table" and book or {}
+    patch=type(patch)=="table" and patch or {}
+    local missing={}
+    for _,key in ipairs(HOME_NETWORK_DETAIL_FIELDS) do
+        local value=patch[key]
+        if value==nil or value=="" then value=book[key] end
+        if key=="description" and U.trim(tostring(value or ""))=="" then
+            value=book.intro or book.summary
+        end
+        if U.trim(tostring(value or ""))=="" then missing[#missing+1]=key end
+    end
+    return missing
+end
+
 function Plugin:_home_merge_network_patch(book,patch)
     if type(book)~="table" or type(patch)~="table" then return false end
     local changed=false
@@ -7016,13 +7061,70 @@ function Plugin:_home_save_network_metadata(book,patch,completed)
     return count>0
 end
 
-function Plugin:_home_schedule_network_metadata(book,force,silent,on_done)
-    if self:_home_ui_busy() then
-        self._home_resume_pending_work=self._home_resume_pending_work or {}
-        self._home_resume_pending_work.metadata=true
+function Plugin:_home_queue_manual_network_metadata(book,force,silent,on_done)
+    if self._home_manual_metadata_retry_task then
+        logger.info("[MiuRead][HomeMetadata] manual request already queued",
+            "book=",tostring(book and (book.bookId or book.book_id) or ""))
         return false
     end
-    if type(book)~="table" or not HomeView.is_shown() then return false end
+    local deadline=monotonic_wall_time()+12
+    local task
+    task=function()
+        if self._home_manual_metadata_retry_task~=task then return end
+        if not HomeView.is_shown() or self:_active_reader_ui() then
+            self._home_manual_metadata_retry_task=nil
+            logger.info("[MiuRead][HomeMetadata] manual queue cancelled", "reason=home_hidden")
+            if on_done then on_done(false,nil,{error="home_hidden"}) end
+            return
+        end
+        if not self:is_online() then
+            self._home_manual_metadata_retry_task=nil
+            logger.info("[MiuRead][HomeMetadata] manual queue cancelled", "reason=offline")
+            if on_done then on_done(false,nil,{error="offline"}) end
+            return
+        end
+        local blocked=self:_home_background_blocked()
+        local busy=self.home_metadata_async and self.home_metadata_async:busy()
+        if blocked or busy then
+            if monotonic_wall_time()<deadline then
+                UIManager:scheduleIn(.25,task)
+                return
+            end
+            self._home_manual_metadata_retry_task=nil
+            logger.warn("[MiuRead][HomeMetadata] manual queue timed out",
+                "book=",tostring(book and (book.bookId or book.book_id) or ""),
+                "blocked=",tostring(blocked),"busy=",tostring(busy))
+            if on_done then on_done(false,nil,{error="worker_busy_timeout"}) end
+            return
+        end
+        self._home_manual_metadata_retry_task=nil
+        local started=self:_home_schedule_network_metadata(book,force,silent,on_done,true)
+        if not started and on_done then on_done(false,nil,{error="retry_start_failed"}) end
+    end
+    self._home_manual_metadata_retry_task=task
+    UIManager:scheduleIn(.18,task)
+    logger.info("[MiuRead][HomeMetadata] manual request queued",
+        "book=",tostring(book and (book.bookId or book.book_id) or ""))
+    return true
+end
+
+function Plugin:_home_schedule_network_metadata(book,force,silent,on_done,explicit)
+    explicit=explicit==true
+    if type(book)~="table" or not HomeView.is_shown() or self:_active_reader_ui() then return false end
+    if explicit then
+        -- A user-requested metadata refresh must not be rejected by the quiet
+        -- window created by that very tap. It still yields to real lifecycle
+        -- transitions/suspend and stays on the background worker.
+        if self:_home_background_blocked() then
+            return self:_home_queue_manual_network_metadata(book,force,silent,on_done)
+        end
+    elseif self:_home_ui_busy() then
+        self._home_resume_pending_work=self._home_resume_pending_work or {}
+        self._home_resume_pending_work.metadata=true
+        local pending_key=self:_home_network_metadata_key(book)
+        if pending_key~="" then self._home_pending_network_metadata_key=pending_key end
+        return false
+    end
     local home=self:_home_preferences()
     if home.network_metadata==false and force~=true then return false end
     local key=self:_home_network_metadata_key(book)
@@ -7037,10 +7139,18 @@ function Plugin:_home_schedule_network_metadata(book,force,silent,on_done)
         end
         return false
     end
-    if not self:is_online() or not self.home_metadata_async or self.home_metadata_async:busy()
-        or not self.home_metadata_async:available() then return false end
+    if not self:is_online() or not self.home_metadata_async or not self.home_metadata_async:available() then return false end
+    if self.home_metadata_async:busy() then
+        if explicit then return self:_home_queue_manual_network_metadata(book,force,silent,on_done) end
+        return false
+    end
     local candidate=U.copy(book)
     local id=tostring(candidate.bookId or candidate.book_id or "")
+    if self._home_pending_network_metadata_key==key then self._home_pending_network_metadata_key=nil end
+    if explicit then
+        logger.info("[MiuRead][HomeMetadata] manual requested",
+            "book=",id~="" and id or key)
+    end
     local started,err=self.home_metadata_async:run("home-network-metadata",function()
         local patch={}
         if id~="" and not Protocol.is_mp_account(id) then
@@ -7075,10 +7185,12 @@ function Plugin:_home_schedule_network_metadata(book,force,silent,on_done)
         return patch
     end,function(result)
         if not result or result.ok~=true then
-            logger.warn("[MiuRead][Home] network metadata unavailable",tostring(result and result.error or "unknown"))
+            logger.warn("[MiuRead][HomeMetadata] network metadata unavailable",
+                "book=",id~="" and id or key,
+                "error=",tostring(result and result.error or "unknown"))
             if not cached_completed then self:_home_save_network_metadata(candidate,{},false) end
             if force==true and silent~=true then self:toast("网络图书信息更新失败，请稍后重试",2) end
-            if on_done then on_done(false) end
+            if on_done then on_done(false,nil,{error=tostring(result and result.error or "unknown")}) end
             return
         end
         local patch=type(result.value)=="table" and result.value or {}
@@ -7087,18 +7199,44 @@ function Plugin:_home_schedule_network_metadata(book,force,silent,on_done)
             for k,v in pairs(cached.patch) do if v~=nil and v~="" then saved_patch[k]=v end end
         end
         for k,v in pairs(patch) do if v~=nil and v~="" then saved_patch[k]=v end end
-        local completed=home_network_patch_has_data(saved_patch)
-        self:_home_save_network_metadata(candidate,saved_patch,completed)
+        local found=home_network_patch_has_data(saved_patch)
+        self:_home_save_network_metadata(candidate,saved_patch,found)
         if self._home_hero and self:_home_network_metadata_key(self._home_hero)==key then
             local changed=self:_home_merge_network_patch(self._home_hero,patch)
             if changed and HomeView.is_shown() then self:_home_schedule_render_refresh("content") end
         end
+        local missing=home_network_missing_fields(candidate,saved_patch)
+        local detail={
+            partial=found and #missing>0,
+            complete=found and #missing==0,
+            missing=missing,
+            fields=home_network_patch_field_count(saved_patch),
+            source=tostring(saved_patch.metadata_source or patch.metadata_source or "unknown"),
+        }
+        logger.info("[MiuRead][HomeMetadata] completed",
+            "book=",id~="" and id or key,
+            "found=",tostring(found),
+            "fields=",tostring(detail.fields),
+            "source=",detail.source,
+            "missing=",#missing>0 and table.concat(missing,",") or "none")
         if force==true and silent~=true then
-            self:toast(completed and "当前书籍的网络信息已更新" or "暂未找到可补全的网络信息",2)
+            if not found then
+                self:toast("暂未找到可补全的网络信息",2)
+            elseif #missing>0 then
+                self:toast("网络书籍信息已刷新，部分资料暂未找到",2)
+            else
+                self:toast("当前书籍的网络信息已更新",2)
+            end
         end
-        if on_done then on_done(completed,patch) end
+        if on_done then on_done(found,patch,detail) end
     end,35)
-    if not started then logger.warn("[MiuRead][Home] network metadata worker not started",tostring(err)) end
+    if not started then
+        logger.warn("[MiuRead][HomeMetadata] network metadata worker not started",
+            "book=",id~="" and id or key,"error=",tostring(err))
+        if explicit and self.home_metadata_async and self.home_metadata_async:busy() then
+            return self:_home_queue_manual_network_metadata(book,force,silent,on_done)
+        end
+    end
     return started==true
 end
 
@@ -15579,7 +15717,9 @@ function Plugin:_toggle_home_network_metadata()
     local home,preferences=self:_home_preferences()
     home.network_metadata=home.network_metadata==false
     self:_save_home_preferences(home,preferences)
-    if home.network_metadata and self._home_hero then self:_home_schedule_network_metadata(self._home_hero,false) end
+    if home.network_metadata and self._home_hero then
+        self:_home_schedule_network_metadata(self._home_hero,true,true,nil,true)
+    end
     self:toast(home.network_metadata and "已开启网络补全图书信息" or "已关闭网络补全图书信息",2)
 end
 
