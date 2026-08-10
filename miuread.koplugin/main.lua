@@ -4181,6 +4181,12 @@ function Plugin:_reader_preferences()
     if reader.show_status~=false then reader.show_status=false; changed=true end
     if reader.show_recent~=false then reader.show_recent=false; changed=true end
     if type(reader.recent_actions)~="table" or #reader.recent_actions>0 then reader.recent_actions={}; changed=true end
+    if reader.edge_guard_enabled==nil then reader.edge_guard_enabled=true; changed=true end
+    local edge_percent=tonumber(reader.edge_guard_percent)
+    if edge_percent~=5 and edge_percent~=10 and edge_percent~=15 and edge_percent~=20 then
+        reader.edge_guard_percent=10
+        changed=true
+    end
 
     local fixed_order={"toc","progress","search","back","font","spacing","page","comments","bookmark","highlight","thought","sync"}
     local fixed_items={toc=true,progress=true,search=true,back=true,font=true,spacing=true,page=true,comments=true,bookmark=true,highlight=true,thought=true,sync=true}
@@ -4222,6 +4228,29 @@ function Plugin:_save_reader_preferences(reader,preferences)
     preferences=preferences or self.store:preferences()
     preferences.reader_ui=reader
     self.store:save_preferences(preferences)
+end
+
+function Plugin:_reader_edge_guard_state()
+    local reader=self:_reader_preferences()
+    local percent=tonumber(reader.edge_guard_percent) or 10
+    if percent~=5 and percent~=10 and percent~=15 and percent~=20 then percent=10 end
+    return reader.edge_guard_enabled~=false,percent
+end
+
+function Plugin:_reader_toggle_edge_guard()
+    local reader,preferences=self:_reader_preferences()
+    reader.edge_guard_enabled=reader.edge_guard_enabled==false
+    self:_save_reader_preferences(reader,preferences)
+    return reader.edge_guard_enabled~=false
+end
+
+function Plugin:_reader_set_edge_guard_percent(percent)
+    percent=tonumber(percent)
+    if percent~=5 and percent~=10 and percent~=15 and percent~=20 then return false end
+    local reader,preferences=self:_reader_preferences()
+    reader.edge_guard_percent=percent
+    self:_save_reader_preferences(reader,preferences)
+    return true
 end
 
 function Plugin:reader_quick_panel_settings_menu()
@@ -10240,22 +10269,61 @@ function Plugin:show_reader_control_center(initial_category)
     return true
 end
 
+function Plugin:_show_reader_edge_guard_panel(back_callback)
+    ReaderSettingsDialog.show{
+        title="边缘翻页防误触",
+        subtitle="左右边缘点击优先翻页，避免划线评论抢占翻页操作",
+        on_back=back_callback or function() self:show_reader_quick_panel() end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        sections=function()
+            local enabled,percent=self:_reader_edge_guard_state()
+            local rows={
+                {label="边缘翻页防误触",value=enabled and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function()
+                    self:_reader_toggle_edge_guard()
+                end},
+            }
+            local range_rows={}
+            for _,value in ipairs({5,10,15,20}) do
+                local selected=value
+                range_rows[#range_rows+1]={
+                    label=tostring(selected).."%",
+                    value=selected==10 and "推荐" or "左右各占屏幕宽度",
+                    value_bold=percent==selected,
+                    checked=percent==selected,
+                    enabled=enabled,
+                    keep_open=true,
+                    callback=function() self:_reader_set_edge_guard_percent(selected) end,
+                }
+            end
+            return {
+                {title="状态",rows=rows},
+                {title="保护范围",rows=range_rows},
+            }
+        end,
+    }
+    return true
+end
+
 function Plugin:_reader_quick_definitions()
+    local edge_enabled=self:_reader_edge_guard_state()
     return {
         toc={key="toc",icon="toc",label="目录",callback=function() self:_show_reader_toc(function() self:show_reader_quick_panel() end) end},
         progress={key="progress",icon="progress",label="进度",callback=function() self:_show_reader_progress_control(function() self:show_reader_quick_panel() end) end},
-        search={key="search",icon="search",label="搜索",callback=function() self:_reader_show_search(function() self:show_reader_quick_panel() end) end},
-        back={key="back",icon="undo",label="回到阅读处",callback=function() self:_reader_go_back_location() end},
+        search={key="search",icon="search",label="搜索",icon_scale=.94,callback=function() self:_reader_show_search(function() self:show_reader_quick_panel() end) end},
+        back={key="back",icon="undo",label="回到阅读",icon_scale=.98,callback=function() self:_reader_go_back_location() end},
         font={key="font",icon="font",label="字体",callback=function() self:_show_reader_font_panel(function() self:show_reader_quick_panel() end) end},
         spacing={key="spacing",icon="line-spacing",label="行距",callback=function() self:_show_reader_spacing_panel(function() self:show_reader_quick_panel() end) end},
         page={key="page",icon="display",label="页面",callback=function() self:_show_reader_page_panel(function() self:show_reader_quick_panel() end) end},
-        comments={key="comments",icon="comment",label="评论",active=self:_thoughts_enabled(),callback=function()
+        comments={key="comments",icon="comment",label="评论",icon_scale=1.16,icon_nudge_y=-1,active=self:_thoughts_enabled(),callback=function()
             self:_show_reader_comment_settings(function() self:show_reader_quick_panel() end)
         end,hold_callback=function()
             self:_toggle_thoughts_enabled()
             UIManager:scheduleIn(.05,function() self:show_reader_quick_panel() end)
         end},
-        annotations={key="annotations",icon="highlight",label="批注",callback=function() self:_show_reader_annotation_panel(function() self:show_reader_quick_panel() end) end},
+        annotations={key="annotations",icon="highlight",label="批注",icon_scale=1.28,icon_nudge_y=-2,callback=function() self:_show_reader_annotation_panel(function() self:show_reader_quick_panel() end) end},
+        edge_guard={key="edge_guard",icon=edge_enabled and "edge-guard" or "edge-guard-off",label="防误触",icon_scale=1.02,active=edge_enabled,callback=function()
+            self:_show_reader_edge_guard_panel(function() self:show_reader_quick_panel() end)
+        end},
         sync={key="sync",icon="sync",label="同步",callback=function() self:_show_reader_sync_panel(function() self:show_reader_quick_panel() end) end},
     }
 end
@@ -10278,6 +10346,7 @@ function Plugin:_reader_quick_panel_options()
         definitions.back,
         definitions.annotations,
         definitions.comments,
+        definitions.edge_guard,
     }
 
     local typeset={
@@ -16763,10 +16832,46 @@ function Plugin:_show_thought_href(href)
     return true
 end
 
+function Plugin:_thought_edge_page_turn(ges)
+    local enabled,percent=self:_reader_edge_guard_state()
+    if not enabled then return false end
+    local pos=ges and ges.pos
+    local x=pos and tonumber(pos.x)
+    local width=Device.screen and Device.screen:getWidth()
+    if not x or not width or width<=0 then return false end
+
+    local ratio=math.max(.05,math.min(.20,(tonumber(percent) or 10)/100))
+    local inverse=self.ui and self.ui.view and self.ui.view.inverse_reading_order==true
+    local diff
+    if x<=width*ratio then
+        diff=inverse and 1 or -1
+    elseif x>=width*(1-ratio) then
+        diff=inverse and -1 or 1
+    else
+        return false
+    end
+
+    -- Keep KOReader's own tap-turn preference authoritative. The guard only
+    -- resolves a collision between an edge annotation link and a page turn.
+    if _G.G_reader_settings and type(G_reader_settings.nilOrFalse)=="function"
+        and not G_reader_settings:nilOrFalse("page_turns_disable_tap") then
+        return false
+    end
+    if not self.ui or type(self.ui.handleEvent)~="function" then return false end
+
+    local ok,handled=pcall(self.ui.handleEvent,self.ui,Event:new("GotoViewRel",diff))
+    if not ok or handled~=true then return false end
+    self:_mark_reader_busy(2)
+    logger.dbg("[MiuRead][ThoughtPopup] edge annotation tap converted to page turn",
+        "percent=",tostring(percent),"direction=",diff<0 and "backward" or "forward")
+    return true
+end
+
 function Plugin:_on_thought_tap(ges)
     if not self.ui or not self.ui.link or not self.ui.link.getLinkFromGes then return false end
     local ok,link=pcall(self.ui.link.getLinkFromGes,self.ui.link,ges); if not ok or not link then return false end
     local href=extract_thought_href(link,{},0); if not href then return false end
+    if self:_thought_edge_page_turn(ges) then return true end
     return self:_show_thought_href(href)
 end
 function Plugin:_setup_thought_tap()

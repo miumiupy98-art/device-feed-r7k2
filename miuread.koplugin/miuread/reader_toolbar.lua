@@ -219,12 +219,22 @@ end
 local function plain_action_item(entry, width, height, activate, hold_activate)
     entry = type(entry) == "table" and entry or {}
     local enabled = entry.enabled ~= false
+    -- The first reader action row mixes several SVG silhouettes. Give every
+    -- icon the same canvas, then compensate only for each glyph's intrinsic
+    -- whitespace so their visible strokes share one baseline and visual size.
     local icon_h = math.floor(height * .60)
     local label_h = math.max(1, height - icon_h)
-    local icon_size = math.min(Skin.dp(31, 27, 40), math.floor(icon_h * .80))
+    local base_icon_size = math.min(Skin.dp(31, 27, 40), math.floor(icon_h * .80))
+    local icon_scale = math.max(.75, math.min(1.35, tonumber(entry.icon_scale) or 1))
+    local icon_size = math.min(math.floor(icon_h * .94), math.floor(base_icon_size * icon_scale + .5))
+    local icon_widget = icon_box(entry.icon or entry.icon_key, width, icon_h, enabled, icon_size)
+    local nudge = tonumber(entry.icon_nudge_y) or 0
+    if nudge ~= 0 then
+        icon_widget = OffsetContainer:new{x_off = 0, y_off = math.floor(nudge), icon_widget}
+    end
     local content = VerticalGroup:new{
         align = "center",
-        icon_box(entry.icon or entry.icon_key, width, icon_h, enabled, icon_size),
+        icon_widget,
         centered_text(entry.label or "", width, label_h,
             Skin.face("cfont", 10.4, 13.8, 8.8), {
                 bold = entry.active == true,

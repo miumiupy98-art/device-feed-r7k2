@@ -35,6 +35,7 @@ local MAP = {
     ["□"] = "current-book", ["current-book"] = "current-book",
     ["▯"] = "bookmark", bookmark = "bookmark",
     comment = "comment", highlight = "highlight", thought = "thought", ["line-spacing"] = "line-spacing",
+    ["edge-guard"] = "edge-guard", ["edge-guard-off"] = "edge-guard-off",
     ["◐"] = "sleep", ["☾"] = "sleep", sleep = "sleep",
     ["→"] = "page-jump", ["page-jump"] = "page-jump",
     ["↶"] = "undo", undo = "undo",
