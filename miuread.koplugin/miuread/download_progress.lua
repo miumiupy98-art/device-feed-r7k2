@@ -11,6 +11,7 @@ local ProgressWidget = require("ui/widget/progresswidget")
 local Size = require("ui/size")
 local TextBoxWidget = require("ui/widget/textboxwidget")
 local UIManager = require("ui/uimanager")
+local logger = require("logger")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local U = require("miuread.util")
@@ -18,11 +19,23 @@ local U = require("miuread.util")
 local Screen = Device.screen
 
 local DownloadProgress = InputContainer:extend{
+    name = "miuread_download_progress",
     title = "MiuRead",
     _miuread_transient = true,
+    _miuread_modal_surface = true,
+    _miuread_download_progress = true,
+    covers_fullscreen = true,
+    stop_events_propagation = true,
     on_cancel = nil,
     on_background = nil,
+    on_close = nil,
 }
+
+local function widget_is_shown(widget)
+    if not widget then return false end
+    local ok, shown = pcall(UIManager.isWidgetShown, UIManager, widget)
+    return ok and shown == true
+end
 
 function DownloadProgress:handleEvent(event)
     return GestureBridge.handle(InputContainer, self, event)
@@ -38,6 +51,9 @@ end
 function DownloadProgress:init()
     self.dimen = Screen:getSize()
     self.cancelled = false
+    self.closed = false
+    self._close_reason = nil
+    self._close_notified = false
 
     local frame_width = math.floor(Screen:getWidth() * 0.82)
     local frame_height = math.floor(Screen:getHeight() * 0.60)
@@ -143,11 +159,20 @@ local function clean_status(value, limit)
     return text
 end
 
+function DownloadProgress:is_shown()
+    return widget_is_shown(self)
+end
+
 function DownloadProgress:_redraw()
+    -- A background download can keep publishing progress after this surface was
+    -- retired by a page transition or another modal. Never dirty a detached
+    -- widget: on e-ink that can leave the old white frame as a "ghost" box.
+    if self.closed or not self:is_shown() then return false end
     local target = (self.frame and self.frame.dimen) or self.dimen
     UIManager:setDirty(self, function()
         return "fast", target
     end)
+    return true
 end
 
 function DownloadProgress:set_state(state)
@@ -201,12 +226,72 @@ function DownloadProgress:set_state(state)
     self:_redraw()
 end
 
-function DownloadProgress:show()
-    UIManager:show(self, "ui")
+function DownloadProgress:onShow()
+    self.closed = false
+    UIManager:setDirty(self, function()
+        return "ui", (self.frame and self.frame.dimen) or self.dimen
+    end)
 end
 
-function DownloadProgress:close()
+function DownloadProgress:onCloseWidget()
+    if self._close_notified then return end
+    self._close_notified = true
+    self.closed = true
+    local region = self.frame and self.frame.dimen and self.frame.dimen:copy() or nil
+    -- Force the newly exposed surface to repaint the exact frame area. This is
+    -- intentionally stronger than the progress widget's normal fast refresh.
+    if region then
+        UIManager:setDirty(nil, function() return "ui", region end)
+    end
+    local callback = self.on_close
+    self.on_close = nil
+    if callback then
+        local ok, err = pcall(callback, self, self._close_reason or "external")
+        if not ok then logger.warn("[MiuRead][DownloadUI] close callback failed", tostring(err)) end
+    end
+end
+
+function DownloadProgress:show()
+    if self:is_shown() then return true end
+    self.closed = false
+    self._close_notified = false
+    self._close_reason = nil
+    UIManager:show(self, "ui")
+    return self:is_shown()
+end
+
+function DownloadProgress:close(reason)
+    self._close_reason = tostring(reason or "explicit")
+    if not self:is_shown() then
+        self.closed = true
+        return false
+    end
     UIManager:close(self, "ui")
+    return true
+end
+
+-- Remove any detached/orphaned progress surface before a new one is shown.
+-- Runtime state is deliberately not stored here; the download task owns that.
+function DownloadProgress.close_orphans(except)
+    local closed = 0
+    local seen = {}
+    local stack = UIManager._window_stack or {}
+    for index = #stack, 1, -1 do
+        local window = stack[index]
+        local widget = window and window.widget or nil
+        if widget and widget ~= except and not seen[widget]
+            and widget._miuread_download_progress == true and widget_is_shown(widget) then
+            seen[widget] = true
+            widget._close_reason = "orphan_replaced"
+            local ok, err = pcall(UIManager.close, UIManager, widget, "ui")
+            if ok then
+                closed = closed + 1
+            else
+                logger.warn("[MiuRead][DownloadUI] orphan close failed", tostring(err))
+            end
+        end
+    end
+    return closed
 end
 
 return DownloadProgress

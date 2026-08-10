@@ -12229,11 +12229,27 @@ local DOWNLOAD_STAGE_LABELS={
     images="处理图片",package="生成 EPUB",restart="断点恢复",done="下载完成",error="下载失败",
     cancelled="下载已取消",
 }
+function Plugin:_download_dialog_is_shown(runtime)
+    runtime=runtime or self._download_runtime
+    local dialog=runtime and runtime.dialog or nil
+    if not dialog then return false end
+    local ok,shown=pcall(UIManager.isWidgetShown,UIManager,dialog)
+    if ok and shown==true then return true end
+    -- The widget may have been retired by a reader transition, suspend, resize
+    -- or generic transient cleanup. A stale Lua reference must never be treated
+    -- as a visible progress surface.
+    if runtime.dialog==dialog then runtime.dialog=nil end
+    logger.info("[MiuRead][DownloadUI] stale dialog reference cleared",
+        "background=",tostring(runtime.background==true))
+    return false
+end
 function Plugin:_on_download_progress(runtime,state)
     if self._download_runtime~=runtime then return end
     runtime.last_state=U.copy(state or {})
     runtime.task=self.download_task and self.download_task:descriptor() or runtime.task
-    if runtime.dialog then runtime.dialog:set_state(state) end
+    if self:_download_dialog_is_shown(runtime) then
+        runtime.dialog:set_state(state)
+    end
     self:_write_download_state("active",self:_active_download_payload(runtime,state),false)
     local home_percent=self:_download_percent(state)
     local home_mark=math.floor(home_percent/10)*10
@@ -12271,7 +12287,7 @@ function Plugin:_finish_download_runtime(runtime,result)
     local done=runtime.done
     local open_after=runtime.open_after==true
     local was_background=runtime.background==true
-    self:_close_download_dialog()
+    self:_close_download_dialog("finished")
     if self.download_task then self.download_task:set_backgrounded(false) end
     self._download_runtime=nil
     if not result or result.ok~=true then
@@ -12530,38 +12546,94 @@ function Plugin:_active_download_payload(runtime,state)
         task=U.copy(task),
     }
 end
-function Plugin:_close_download_dialog()
+function Plugin:_close_download_dialog(reason)
     local runtime=self._download_runtime
-    if not runtime or not runtime.dialog then return end
+    if not runtime or not runtime.dialog then return false end
     local dialog=runtime.dialog
     runtime.dialog=nil
-    pcall(function() dialog:close() end)
+    local shown=false
+    local ok_shown,value=pcall(UIManager.isWidgetShown,UIManager,dialog)
+    if ok_shown then shown=value==true end
+    local ok,err=true,nil
+    if shown then
+        ok,err=pcall(dialog.close,dialog,reason or "programmatic")
+        if not ok then
+            logger.warn("[MiuRead][DownloadUI] dialog close failed",tostring(err))
+            ok,err=pcall(UIManager.close,UIManager,dialog,"ui")
+        end
+    end
+    logger.info("[MiuRead][DownloadUI] dialog retired",
+        "reason=",tostring(reason or "programmatic"),
+        "shown=",tostring(shown),"ok=",tostring(ok))
+    return ok
 end
 function Plugin:_send_download_to_background()
     local runtime=self._download_runtime
     if not runtime or not self.download_task or not self.download_task:busy() then return end
     runtime.background=true
-    self:_close_download_dialog()
-    self.download_task:set_backgrounded(true)
+    if self.download_task then self.download_task:set_backgrounded(true) end
+    self:_close_download_dialog("background")
     self:_write_download_state("active",self:_active_download_payload(runtime,runtime.last_state),true)
     self:status_toast("觅阅",tostring(runtime.book.title or "未命名").."已转入后台下载",3)
 end
 function Plugin:_show_active_download_dialog()
     local runtime=self._download_runtime
     if not runtime or not self.download_task or not self.download_task:busy() then self:show_download_status(); return end
-    if runtime.dialog then return end
-    runtime.background=false
-    self.download_task:set_backgrounded(false)
+
+    -- A non-nil reference is not proof that KOReader still shows the widget.
+    -- If it is genuinely visible, keep the single instance and just make sure
+    -- no newer MiuRead modal is covering it. Otherwise discard the stale ref.
+    if self:_download_dialog_is_shown(runtime) then
+        TransientGuard.close_all(runtime.dialog)
+        UIManager:setDirty(runtime.dialog,"ui")
+        logger.info("[MiuRead][DownloadUI] existing dialog reused")
+        return
+    end
+
+    TransientGuard.close_all()
+    local orphan_count=DownloadProgress.close_orphans and DownloadProgress.close_orphans() or 0
+    if orphan_count>0 then
+        logger.warn("[MiuRead][DownloadUI] orphan surfaces removed",tostring(orphan_count))
+    end
+
     local dialog
     dialog=DownloadProgress:new{
         title="正在下载《"..tostring(runtime.book.title or "未命名").."》",
         on_cancel=function() if self.download_task then self.download_task:cancel() end end,
         on_background=function() self:_send_download_to_background() end,
+        on_close=function(widget,reason)
+            if self._download_runtime~=runtime then return end
+            if runtime.dialog==widget then runtime.dialog=nil end
+            local busy=self.download_task and self.download_task:busy() or false
+            if busy and runtime.background~=true and reason~="finished" and reason~="cancelled" then
+                -- Any external retirement (reader transition, suspend, resize,
+                -- another MiuRead modal) means the task continues in background.
+                runtime.background=true
+                if self.download_task then self.download_task:set_backgrounded(true) end
+                self:_write_download_state("active",self:_active_download_payload(runtime,runtime.last_state),true)
+            end
+            logger.info("[MiuRead][DownloadUI] closed",
+                "reason=",tostring(reason),"busy=",tostring(busy),
+                "background=",tostring(runtime.background==true))
+        end,
     }
     runtime.dialog=dialog
-    dialog:show()
+    local shown=dialog:show()==true
+    if not shown then
+        if runtime.dialog==dialog then runtime.dialog=nil end
+        runtime.background=true
+        self.download_task:set_backgrounded(true)
+        logger.warn("[MiuRead][DownloadUI] show failed; task kept in background")
+        self:status_toast("下载","进度窗口未能打开，下载仍在后台继续",3)
+        return
+    end
+    runtime.background=false
+    self.download_task:set_backgrounded(false)
     if runtime.last_state then dialog:set_state(runtime.last_state) end
     self:_write_download_state("active",self:_active_download_payload(runtime,runtime.last_state),true)
+    logger.info("[MiuRead][DownloadUI] shown",
+        "book=",tostring(runtime.book and runtime.book.bookId or ""),
+        "percent=",tostring(self:_download_percent(runtime.last_state)))
 end
 function Plugin:_merge_download_result(result,book,opt)
     self.store:reload()
