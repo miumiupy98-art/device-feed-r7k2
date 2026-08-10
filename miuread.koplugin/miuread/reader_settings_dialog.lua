@@ -139,7 +139,7 @@ function Dialog:_row_widget(row, width, height)
     local arrow = row.arrow == true and row.callback ~= nil
     local icon_w = icon ~= "" and Skin.dp(28, 23, 38) or 0
     local arrow_w = arrow and Skin.dp(17, 14, 23) or 0
-    local value_w = value ~= "" and math.max(Skin.dp(74, 58, 102), math.floor(width * .28)) or 0
+    local value_w = value ~= "" and math.max(Skin.dp(88, 72, 118), math.floor(width * .32)) or 0
     local gap = Skin.dp(4, 3, 6)
     local label_w = math.max(1, width - pad * 2 - icon_w - value_w - arrow_w
         - gap * ((icon_w > 0 and 1 or 0) + (value_w > 0 and 1 or 0) + (arrow_w > 0 and 1 or 0)))
@@ -164,7 +164,7 @@ function Dialog:_row_widget(row, width, height)
     if value_w > 0 then
         row_content[#row_content + 1] = HorizontalSpan:new{width = gap}
         row_content[#row_content + 1] = Ui.textbox(value, value_w, inner_h,
-            Skin.face("smallinfofont", 8.8, 11.7, 7.5), {
+            Skin.face("cfont", 10.0, 13.3, 8.5), {
                 bold = row.value_bold == true, alignment = "right", halign = "right",
                 fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_DARK_GRAY,
             })

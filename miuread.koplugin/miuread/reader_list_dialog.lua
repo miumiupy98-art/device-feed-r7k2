@@ -125,7 +125,7 @@ function Dialog:_row_widget(item, width, height)
     local pad = Skin.dp(7, 6, 10)
     local icon_w = tostring(item.icon or "") ~= "" and Skin.dp(31, 27, 41) or 0
     local value = tostring(item.value or item.post_text or "")
-    local value_w = value ~= "" and math.max(Skin.dp(68, 58, 92), math.floor(width * .22)) or 0
+    local value_w = value ~= "" and math.max(Skin.dp(92, 76, 126), math.floor(width * .30)) or 0
     local arrow = item.arrow ~= false and item.callback ~= nil and item.keep_open ~= true
     local arrow_w = arrow and Skin.dp(15, 13, 20) or 0
     local gap = Skin.dp(5, 4, 7)
@@ -167,7 +167,7 @@ function Dialog:_row_widget(item, width, height)
     row[#row + 1] = text_layers
     if value_w > 0 then
         row[#row + 1] = HorizontalSpan:new{width = gap}
-        row[#row + 1] = Ui.textbox(value, value_w, height - pad * 2, Skin.face("smallinfofont", 9.5, 12.6, 8.1), {
+        row[#row + 1] = Ui.textbox(value, value_w, height - pad * 2, Skin.face("cfont", 10.5, 13.9, 8.9), {
             bold = item.value_bold == true or item.checked == true,
             alignment = "right", halign = "right",
             fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
@@ -350,7 +350,7 @@ function Dialog:_build_content()
                 self:_pager_button("back", prev_w, pager_h, function()
                     if self.page > 1 then self.page = self.page - 1; self:_rebuild() end
                 end, self.page > 1),
-                Ui.textbox(tostring(self.page).." / "..tostring(pages), page_w, pager_h, Skin.face("smallinfofont", 8.8, 11.7, 7.5), {
+                Ui.textbox(tostring(self.page).." / "..tostring(pages), page_w, pager_h, Skin.face("cfont", 10.0, 13.3, 8.5), {
                     alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_DARK_GRAY,
                 }),
                 self:_pager_button("chevron-right", next_w, pager_h, function()

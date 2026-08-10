@@ -109,7 +109,7 @@ function Center:_row_widget(item, width, height)
     local arrow = item.arrow ~= false and item.callback ~= nil
     local icon_w = Skin.dp(34, 28, 46)
     local arrow_w = arrow and Skin.dp(18, 15, 24) or 0
-    local value_w = value ~= "" and math.max(Skin.dp(82, 66, 118), math.floor(width * .31)) or 0
+    local value_w = value ~= "" and math.max(Skin.dp(94, 78, 128), math.floor(width * .34)) or 0
     local gap = Skin.dp(5, 4, 7)
     local label_w = math.max(1, width - pad * 2 - icon_w - value_w - arrow_w
         - gap * ((value_w > 0 and 1 or 0) + (arrow_w > 0 and 1 or 0)))
@@ -125,7 +125,7 @@ function Center:_row_widget(item, width, height)
     if value_w > 0 then
         row[#row + 1] = HorizontalSpan:new{width = gap}
         row[#row + 1] = Ui.textbox(value, value_w, inner_h,
-            Skin.face("smallinfofont", 8.9, 11.8, 7.6), {
+            Skin.face("cfont", 10.0, 13.3, 8.5), {
                 bold = item.value_bold == true, alignment = "right", halign = "right",
                 fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_DARK_GRAY,
             })
