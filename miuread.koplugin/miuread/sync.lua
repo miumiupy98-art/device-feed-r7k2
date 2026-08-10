@@ -9,6 +9,7 @@ local Protocol = require("miuread.protocol")
 local Http = require("miuread.http")
 local ReadReportWorker = require("miuread.legacy_adapter_worker")
 local BookIntegrity = require("miuread.book_integrity")
+local PrecisePosition = require("miuread.precise_position")
 local U = require("miuread.util")
 
 local Sync = {}
@@ -19,6 +20,28 @@ local CONTEXT_MAX_AGE = 15 * 60
 local READ_REPORT_SERVICE_VERSION = 14
 local FIRST_REPORT_DELAY = 10
 local FINAL_REPORT_MIN_SECONDS = 10
+local PRECISE_POSITION_LEAD_SECONDS = 12
+local READER_BUSY_PATH = "/tmp/miuread-reader-busy.until"
+
+local function reader_interaction_busy(host)
+    if type(host) == "table" then
+        if type(host._reader_background_idle) == "function" then
+            local ok, idle = pcall(host._reader_background_idle, host)
+            if ok then return idle ~= true end
+        end
+        if (tonumber(host._reader_busy_until or 0) or 0) > os.time() then return true end
+    end
+    local raw = U.read_file(READER_BUSY_PATH, true)
+    return (tonumber(raw or 0) or 0) > os.time()
+end
+
+local function report_ratio_from_position(position)
+    position = type(position) == "table" and position or {}
+    if position.standalone == true and tonumber(position.chapter_percent) ~= nil then
+        return U.clamp(tonumber(position.chapter_percent) / 100, 0, 1)
+    end
+    return U.clamp((tonumber(position.progress) or 0) / 100, 0, 1)
+end
 
 local function response_confirmation(value, depth, path, seen)
     if type(value) ~= "table" or (depth or 0) > 6 then return false end
@@ -357,6 +380,7 @@ function Sync:new(reader, api, store, host, async, identity_async)
         daemon_restart_count=0, auth_recovery_busy=false, auth_recovery_at=0,
         auto_repair_busy=false, daemon_auth_retry_at=0, auth_transitioning=false,
         control_write_task=nil, session_started_at=0,
+        precise_position_cache={}, precise_due_refreshed=0,
         record_generation=0, record_retry_task=nil, record_checked_path=nil,
         time_enabled=(store:preferences().sync or {}).time_enabled==true,
         controller_token=tostring(os.time()) .. "-" .. tostring(math.random(100000, 999999)),
@@ -507,6 +531,58 @@ function Sync:local_position(ratio)
     position.epub_percent = math.floor(U.clamp(ratio, 0, 1) * 100 + .5)
     position.chapter_percent = tonumber(position.chapter_percent) or position.epub_percent
     return position
+end
+
+function Sync:_precision_catalog(record)
+    local standalone_uid = record and record.record and record.record.chapter_uid
+    if standalone_uid ~= nil and tostring(standalone_uid) ~= "" then
+        local context = self.daemon_context
+        if not (type(context) == "table" and context.catalog_complete == true
+            and type(context.chapters) == "table" and #context.chapters > 0) then
+            local session = self.store:session(record.book.book_id) or {}
+            local auth = self.store:auth()
+            if tostring(session.report_login_session_id or "") == tostring(auth.login_session_id or "") then
+                context = type(session.legacy_report_context) == "table" and session.legacy_report_context or nil
+            end
+        end
+        if type(context) == "table" and context.catalog_complete == true
+            and type(context.chapters) == "table" and #context.chapters > 0 then
+            return context.chapters
+        end
+    end
+    local catalog = record and record.book and record.book.catalog
+    return type(catalog) == "table" and catalog or {}
+end
+
+function Sync:_position_for_report(ratio, precise)
+    local fallback = self:local_position(ratio)
+    if precise ~= true then return fallback end
+    local record = self:record()
+    local ui = self.host and self.host.ui or nil
+    if not record or not ui or not ui.document then return fallback end
+    self.precise_position_cache = type(self.precise_position_cache) == "table"
+        and self.precise_position_cache or {}
+    local position, err = PrecisePosition.locate(
+        ui, record, self:_precision_catalog(record), self.precise_position_cache)
+    if position then
+        position.epub_percent = math.floor(U.clamp(tonumber(ratio) or self:local_ratio() or 0, 0, 1) * 100 + .5)
+        logger.info("[MiuRead][Progress] precise position",
+            "book=", tostring(record.book and record.book.book_id or ""),
+            "chapter=", tostring(position.chapter_uid or "-"),
+            "offset=", tostring(position.offset or "-"),
+            "progress=", string.format("%.3f", tonumber(position.progress) or 0),
+            "ms=", tostring(position.precision_ms or 0),
+            "cache=", tostring(position.precision_cache_hit == true))
+        return position
+    end
+    if type(fallback) == "table" then
+        fallback.position_basis = fallback.position_basis or fallback.source or "page_ratio"
+        fallback.precision_fallback = tostring(err or "precision_unavailable")
+    end
+    logger.info("[MiuRead][Progress] precise position fallback",
+        "book=", tostring(record.book and record.book.book_id or ""),
+        "reason=", tostring(err or "unknown"))
+    return fallback
 end
 
 function Sync:jump_remote(remote)
@@ -1192,7 +1268,7 @@ function Sync:upload(elapsed, callback, options)
     legacy_book.book_id = book_id
     legacy_book.title = record.book.title
     self:_decorate_legacy_context(legacy_book, record)
-    local position_snapshot=self:local_position(ratio)
+    local position_snapshot=self:_position_for_report(ratio,options.precise_position==true or options.progress_only==true)
     self:_save_local_snapshot(book_id,position_snapshot)
     if type(position_snapshot)~="table" or position_snapshot.safe~=true or position_snapshot.progress==nil
         or tostring(position_snapshot.chapter_uid or "")=="" then
@@ -1210,7 +1286,7 @@ function Sync:upload(elapsed, callback, options)
     legacy_book.local_chapter_word_count=position_snapshot.chapter_word_count
     legacy_book.progress=position_snapshot.progress
     legacy_book.core_map_hash=core_hash
-    local report_ratio=U.clamp((tonumber(position_snapshot.progress) or 0)/100,0,1)
+    local report_ratio=report_ratio_from_position(position_snapshot)
 
     self.busy, self.state, self.last_attempt = true, options.progress_only and "progress_uploading" or "uploading", os.time()
     self.last_stage = options.progress_only and "主动提交阅读进度" or "调用兼容阅读时间上传链路"
@@ -1428,7 +1504,7 @@ function Sync:upload(elapsed, callback, options)
 end
 
 function Sync:upload_progress(callback)
-    return self:upload(0,callback,{silent=true,progress_only=true})
+    return self:upload(0,callback,{silent=true,progress_only=true,precise_position=true})
 end
 
 function Sync:_notify_failure()
@@ -1687,6 +1763,7 @@ function Sync:_write_daemon_control(active, immediate, extra)
     daemon = self.daemon
     if not daemon then return false end
     extra = type(extra) == "table" and extra or {}
+    local precise_position = extra._precise_position == true
 
     local function write_now()
         self.control_write_task = nil
@@ -1707,7 +1784,7 @@ function Sync:_write_daemon_control(active, immediate, extra)
         local position=nil
         local record=self:record()
         if record and book_id~="" and tostring(record.book.book_id or "")==book_id then
-            position=self:local_position()
+            position=self:_position_for_report(nil,precise_position)
             if type(position)=="table" and position.safe==true then
                 self:_save_local_snapshot(book_id,position)
             else
@@ -1723,18 +1800,22 @@ function Sync:_write_daemon_control(active, immediate, extra)
             book_id = book_id,
             core_map_hash = tostring(d.core_map_hash or existing.core_map_hash or ""),
             record_generation = tonumber(d.record_generation or existing.record_generation or 0) or 0,
-            progress_ratio = position and (tonumber(position.progress or 0)/100)
+            progress_ratio = position and report_ratio_from_position(position)
                 or tonumber(existing.progress_ratio) or 0,
             local_chapter_uid = position and position.chapter_uid or existing.local_chapter_uid,
             local_chapter_idx = position and position.chapter_index or existing.local_chapter_idx,
             local_chapter_offset = position and (position.chapter_offset or position.offset) or existing.local_chapter_offset,
             local_chapter_word_count = position and position.chapter_word_count or existing.local_chapter_word_count,
             position_source = position and position.source or existing.position_source,
+            position_basis = position and position.position_basis or existing.position_basis,
+            position_precision_ms = position and position.precision_ms or existing.position_precision_ms,
             position_safe = position and true or existing.position_safe==true,
             last_activity = tonumber(self.last_activity) or os.time(),
             updated_at = os.time(),
         }
-        for key, value in pairs(extra) do control[key] = value end
+        for key, value in pairs(extra) do
+            if key ~= "_precise_position" then control[key] = value end
+        end
         -- Never activate a reporting interval without a current, safe position.
         if control.active and (not position or tostring(control.local_chapter_uid or "")=="") then
             control.active=false
@@ -2034,6 +2115,20 @@ function Sync:_import_daemon_status(force)
     end
 end
 
+function Sync:_maybe_refresh_precise_position()
+    local daemon = self.daemon
+    if not daemon or daemon.active ~= true or self.suspended then return false end
+    local due = tonumber(self.next_due or 0) or 0
+    if due <= 0 or tonumber(self.precise_due_refreshed or 0) == due then return false end
+    if due - os.time() > PRECISE_POSITION_LEAD_SECONDS then return false end
+    if reader_interaction_busy(self.host) then return false end
+    -- Refresh once shortly before the child report. Page turns themselves keep
+    -- their existing memory-only path and never parse chapter text.
+    local wrote = self:_write_daemon_control(true, true, {_precise_position=true})
+    self.precise_due_refreshed = due
+    return wrote == true
+end
+
 function Sync:_schedule_daemon_poll(delay)
     if self.daemon_poll or not self.daemon then return end
     local task
@@ -2043,6 +2138,7 @@ function Sync:_schedule_daemon_poll(delay)
         local daemon = self.daemon
         if not daemon then return end
         self:_import_daemon_status(false)
+        self:_maybe_refresh_precise_position()
         if not process_alive(daemon.pid) then
             local was_active = daemon.active
             logger.warn("[MiuRead][ReadReport] lightweight service exited unexpectedly")
@@ -2160,6 +2256,7 @@ function Sync:_start_daemon(reason)
     ) + 1
     daemon.generation = self.daemon_generation
     daemon.active = true
+    self.precise_due_refreshed = 0
     daemon.book_id = book_id
     daemon.final_book_id = nil
     daemon.final_flush_pending = false
@@ -2477,6 +2574,8 @@ function Sync:on_reader_ready()
     self.last_error = nil
     self.progress_hold = false
     self.daemon_context = nil
+    self.precise_position_cache = {}
+    self.precise_due_refreshed = 0
     self.verified_book_id = nil
     self.verified_at = 0
     self.verified_local_percent = nil
@@ -2577,6 +2676,8 @@ function Sync:on_close()
     self:stop_fast("close", duplicate and 0 or self:_final_elapsed(true))
     self.current = nil
     self.record_checked_path = nil
+    self.precise_position_cache = {}
+    self.precise_due_refreshed = 0
 end
 
 function Sync:invalidate_login_session(reason)
