@@ -281,6 +281,13 @@ if type(NATIVE_MENU_GUARD)~="table" then
 end
 local DIRECT_MENU_INSERTED=false
 local SCREENSAVER_PATCHED=false
+local HOME_OWNER_KEY="__MIUREAD_HOME_OWNER"
+
+local function home_owner()
+    local owner=rawget(_G,HOME_OWNER_KEY)
+    if type(owner)=="table" and owner._runtime_mode=="desktop" then return owner end
+    return nil
+end
 
 local function install_home_screensaver_patch()
     if SCREENSAVER_PATCHED then return true end
@@ -314,6 +321,51 @@ local function install_home_screensaver_patch()
             target=tostring(HOME_SESSION.screensaver_file or "")
             use_home_target=target~=""
         end
+
+        -- Preserve KOReader's native path whenever ReaderUI/FileManager still
+        -- exists.  beta.34 only intervenes in the exact beta.33 gap where the
+        -- parked MiuRead home is visible after ReaderUI has closed and before a
+        -- FileManager instance exists.  Kindle calls Screensaver:setup/show
+        -- before the normal Suspend broadcast, so without this fallback recent
+        -- KOReader versions return early and never establish screen_saver_mode.
+        local ReaderUI=require("apps/reader/readerui")
+        local FileManager=require("apps/filemanager/filemanager")
+        local native_ui=ReaderUI.instance or FileManager.instance
+        if not native_ui and args.n==0 and HomeView.is_shown() and current then
+            local owner=home_owner()
+            if HomeView.suspend then pcall(HomeView.suspend) end
+            if owner and type(owner._home_freeze_for_suspend)=="function" then
+                local frozen,freeze_err=pcall(owner._home_freeze_for_suspend,owner)
+                if not frozen then
+                    logger.warn("[MiuRead][Suspend] screensaver prefreeze failed",tostring(freeze_err))
+                end
+            end
+
+            manager.ui=(owner and owner.ui) or current
+            manager.show_message=false
+            manager.prefix=""
+            manager.event_message=nil
+            manager.overlay_message=nil
+            manager.image=nil
+            manager.image_file=nil
+            manager.screensaver_background="white"
+
+            if use_home_target and target~="" and lfs.attributes(target,"mode")=="file" then
+                manager.screensaver_type="cover"
+                manager.image_file=target
+                logger.info("[MiuRead][Suspend] screensaver home fallback",
+                    "native_ui=false","target=true","prefrozen=",tostring(owner~=nil))
+            else
+                -- No valid MiuRead cover is available.  Keep the already-painted
+                -- home surface instead of inventing a new fallback image; show()
+                -- will still mark the device as being in screen-saver mode.
+                manager.screensaver_type="disable"
+                logger.info("[MiuRead][Suspend] screensaver home fallback",
+                    "native_ui=false","target=false","prefrozen=",tostring(owner~=nil))
+            end
+            return
+        end
+
         if use_home_target and target~="" and lfs.attributes(target,"mode")=="file" then
             local saved=snapshot()
             G_reader_settings:saveSetting("screensaver_type","document_cover")
@@ -2745,9 +2797,17 @@ end
 
 function Plugin:_home_resume_visible_work_after_idle()
     if self._home_ui_resume_task then UIManager:unschedule(self._home_ui_resume_task) end
+    if self._home_suspended==true or HOME_SESSION.suspended==true then
+        self._home_ui_resume_task=nil
+        return false
+    end
     local task
     task=function()
         if self._home_ui_resume_task~=task then return end
+        if self._home_suspended==true or HOME_SESSION.suspended==true then
+            self._home_ui_resume_task=nil
+            return
+        end
         if not HomeView.is_shown() or self:_active_reader_ui() then
             self._home_ui_resume_task=nil
             return
@@ -2855,17 +2915,22 @@ function Plugin:_home_freeze_for_suspend()
     self._home_resume_generation=(tonumber(self._home_resume_generation) or 0)+1
     self._home_resume_started_clock=nil
 
+    local cover_retry_pending=self._home_cover_render_retry_task~=nil
     self._home_resume_pending_work={
         scan=self._home_refreshing==true or (self.home_async and self.home_async:busy()) or false,
         remote=self._home_remote_refreshing==true or (self.shelf_async and self.shelf_async:busy()) or false,
         metadata=(self.home_metadata_async and self.home_metadata_async:busy()) or false,
-        covers=(self.home_cover_async and self.home_cover_async:busy()) or false,
+        covers=(self.home_cover_async and self.home_cover_async:busy())
+            or (self.cover_render_async and self.cover_render_async:busy())
+            or cover_retry_pending or false,
     }
     if self._home_refresh_pending_kind then self:_home_defer_refresh_kind(self._home_refresh_pending_kind) end
 
     self:_home_unschedule_task("_home_refresh_task")
     self:_home_unschedule_task("_home_render_refresh_task")
     self:_home_unschedule_task("_home_resume_background_task")
+    self:_home_unschedule_task("_home_ui_resume_task")
+    self:_home_unschedule_task("_home_cover_render_retry_task")
     self:_home_unschedule_task("_home_manual_metadata_retry_task")
     self._home_pending_network_metadata_key=nil
     self._home_refresh_debounce_generation=(tonumber(self._home_refresh_debounce_generation) or 0)+1
@@ -8512,6 +8577,10 @@ function Plugin:_schedule_reader_interaction_resume(target)
     task=function()
         if self._reader_interaction_resume_task~=task
             or generation~=self._reader_interaction_resume_generation then return end
+        if self._miuread_suspended==true or HOME_SESSION.suspended==true then
+            self._reader_interaction_resume_task=nil
+            return
+        end
         local now=os.time()
         local deadline=math.max(tonumber(target) or 0,tonumber(self._reader_busy_until or 0) or 0)
         if deadline>now then
@@ -8620,6 +8689,10 @@ function Plugin:_schedule_reader_toolbar_state_refresh(page,delay)
     local task
     task=function()
         if self._reader_toolbar_state_task~=task then return end
+        if self._miuread_suspended==true or HOME_SESSION.suspended==true then
+            self._reader_toolbar_state_task=nil
+            return
+        end
         if not self:_reader_background_idle() then
             UIManager:scheduleIn(.35,task)
             return
@@ -11505,6 +11578,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         return false
     end
     self._home_view=view
+    rawset(_G,HOME_OWNER_KEY,self)
     self:_set_foreground("home")
     self._home_refresh_pending=false
     if active=="local" then
@@ -17597,6 +17671,7 @@ function Plugin:onReaderReady()
     UIManager:scheduleIn(.60,task)
     local device_task
     device_task=function()
+        if self._miuread_suspended==true or HOME_SESSION.suspended==true then return end
         if not (self.ui and self.ui.document) or reader_close_active()
             or tonumber(HOME_SESSION.reader_session_generation or 0)~=ready_session then return end
         if not self:_reader_background_idle() then UIManager:scheduleIn(.75,device_task); return end
@@ -18135,6 +18210,24 @@ function Plugin:onSuspend()
         UIManager:unschedule(self._download_resume_task)
         self._download_resume_task=nil
     end
+    -- No interaction/helper timer is allowed to wake or poll background work
+    -- after Suspend has taken ownership.  Clear the temporary reader pause only
+    -- after the stronger suspend pause is installed, so resume starts cleanly.
+    self._reader_interaction_resume_generation=(tonumber(self._reader_interaction_resume_generation) or 0)+1
+    if self._reader_interaction_resume_task then
+        UIManager:unschedule(self._reader_interaction_resume_task)
+        self._reader_interaction_resume_task=nil
+    end
+    if self.download_task then self.download_task:resume("reader_interaction") end
+    if self._reader_toolbar_state_task then
+        UIManager:unschedule(self._reader_toolbar_state_task)
+        self._reader_toolbar_state_task=nil
+    end
+    if self._post_reader_work_task then
+        UIManager:unschedule(self._post_reader_work_task)
+        self._post_reader_work_task=nil
+        HOME_SESSION.post_reader_work_deferred_phase="suspend:"..tostring(HOME_SESSION.post_reader_work_phase or "")
+    end
     self:_mark_reader_busy(10)
     self._suspended_at=os.time()
     logger.info("[MiuRead][Suspend] lifecycle timers cancelled",
@@ -18272,6 +18365,10 @@ function Plugin:_run_post_reader_work(generation)
     if generation~=(tonumber(HOME_SESSION.post_reader_work_generation) or 0) then return false end
     self._post_reader_work_task=nil
     local phase=tostring(HOME_SESSION.post_reader_work_phase or "")
+    if self._miuread_suspended==true or HOME_SESSION.suspended==true then
+        if phase~="" then HOME_SESSION.post_reader_work_deferred_phase="suspend:"..phase end
+        return false
+    end
     if phase=="" then
         HOME_SESSION.post_reader_work_deferred_phase=nil
         return true
