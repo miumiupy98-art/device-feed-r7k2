@@ -152,6 +152,7 @@ function Service.run(job)
     local last_report_at = 0
     local last_flush_seq = 0
     local consecutive_failures = 0
+    local consecutive_unconfirmed = 0
     local blocked = false
 
     local function reader_busy_until()
@@ -233,6 +234,11 @@ function Service.run(job)
             wr_ticket = auth.wr_ticket or "",
             wr_wrpa = auth.wr_wrpa or "",
             allow_renewal = false,
+            -- Never replay an uncertain interval. After two consecutive missing
+            -- confirmations, refresh the current book context while sending the
+            -- next fresh interval. This repairs stale report context without
+            -- double-counting time that WeRead may already have accepted.
+            force_context = consecutive_unconfirmed >= 2,
         }
         local attempted_at = os.time()
         local ok, result = pcall(Adapter.run, report_job)
@@ -257,15 +263,18 @@ function Service.run(job)
             local kind = result.accepted and nil or (uncertain and "unconfirmed" or classify_error(result.error_kind,result.error))
             if result.accepted then
                 consecutive_failures = 0
+                consecutive_unconfirmed = 0
                 blocked = false
             elseif uncertain then
                 -- Do not replay this elapsed interval: WeRead may already have
                 -- accepted it. Keep the service alive and continue with the
                 -- next fresh interval instead of escalating to book repair.
                 consecutive_failures = 0
+                consecutive_unconfirmed = consecutive_unconfirmed + 1
                 blocked = false
             else
                 consecutive_failures = consecutive_failures + 1
+                consecutive_unconfirmed = 0
                 blocked = kind == "authentication"
             end
             out.generation = generation
@@ -278,6 +287,8 @@ function Service.run(job)
                 or retry_delay(kind, consecutive_failures, interval)
             out.retry_delay = delay
             out.consecutive_failures = consecutive_failures
+            out.unconfirmed_count = consecutive_unconfirmed
+            out.context_refresh_requested = report_job.force_context == true or nil
             out.attempted_at = attempted_at
             out.completed_at = completed_at
             out.elapsed_seconds = elapsed
@@ -296,6 +307,7 @@ function Service.run(job)
         end
 
         consecutive_failures = consecutive_failures + 1
+        consecutive_unconfirmed = 0
         local kind=classify_error(nil,result)
         blocked = kind == "authentication"
         local delay = retry_delay(kind, consecutive_failures, interval)
@@ -355,6 +367,7 @@ function Service.run(job)
                 last_flush_seq = 0
                 last_control_state = nil
                 consecutive_failures = 0
+                consecutive_unconfirmed = 0
                 blocked = false
                 if tostring(loaded.action or "")=="reset_auth" then
                     book={}

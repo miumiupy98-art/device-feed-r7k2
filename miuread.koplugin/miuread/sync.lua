@@ -931,17 +931,22 @@ function Sync:_record_report_issue(book_id, kind, err, options)
     local context_failures=tonumber(session.report_context_failures) or 0
 
     if kind=="unconfirmed" then
+        local unconfirmed_count=(tonumber(session.consecutive_unconfirmed) or 0)+1
         self.last_error=nil
         self.last_error_kind=nil
         self.consecutive_failures=0
         self.state=self.progress_hold and "verification_required" or "waiting"
-        self.last_stage="微信读书未明确确认本次请求，后续继续同步"
+        self.last_stage=unconfirmed_count>=3
+            and "云端连续未确认，正在刷新当前书籍同步状态"
+            or "微信读书未明确确认本次请求，后续继续同步"
         self.store:save_session(book_id,{
             last_unconfirmed=err,
             last_unconfirmed_at=os.time(),
+            consecutive_unconfirmed=unconfirmed_count,
             last_error=false,
             consecutive_failures=0,
             report_state="unconfirmed",
+            report_recovery_state=unconfirmed_count>=3 and "refreshing_context" or nil,
             pending_report_seconds=0,
         })
         self:_clear_noncontext_repair_flag(book_id,session,"unconfirmed_response")
@@ -1099,7 +1104,9 @@ function Sync:repair_current(callback)
             sync_repair_error=nil,
             sync_repair_at=nil,
             consecutive_failures=0,
+            consecutive_unconfirmed=0,
             report_context_failures=0,
+            report_recovery_state=false,
             report_state="ok",
             last_error=false,
             sync_repaired_at=os.time(),
@@ -1450,6 +1457,8 @@ function Sync:upload(elapsed, callback, options)
             synckey=response_synckey(response) or legacy_context.synckey or session.synckey,
             last_error=false,
             consecutive_failures=0,
+            consecutive_unconfirmed=0,
+            report_recovery_state=false,
             last_path=value.path,
             last_attempts=attempts_count,
             last_response_summary=self.last_response_summary,
@@ -2003,7 +2012,9 @@ function Sync:_import_daemon_status(force)
                 last_error=false,
                 last_error_kind=false,
                 consecutive_failures=0,
+                consecutive_unconfirmed=0,
                 report_context_failures=0,
+                report_recovery_state=false,
                 report_state="ok",
                 last_upload=self.last_upload,
                 last_elapsed=tonumber(status.elapsed_seconds),
@@ -2039,12 +2050,16 @@ function Sync:_import_daemon_status(force)
         self.last_stage=final_flush and "关闭前阅读时间未获明确回执" or "本次阅读时间未获明确回执，后续继续"
         if status_book_id~="" then
             local saved=self.store:session(status_book_id) or {}
+            local unconfirmed_count=math.max(1,tonumber(status.unconfirmed_count) or ((tonumber(saved.consecutive_unconfirmed) or 0)+1))
             self.store:save_session(status_book_id,{
                 last_unconfirmed=tostring(status.error or status.response_summary or "微信读书未明确确认"),
                 last_unconfirmed_at=tonumber(status.completed_at) or os.time(),
+                last_response_summary=status.response_summary or status.error,
+                consecutive_unconfirmed=unconfirmed_count,
                 last_error=false,
                 consecutive_failures=0,
                 report_state="unconfirmed",
+                report_recovery_state=status.context_refresh_requested==true and "refreshing_context" or nil,
                 pending_report_seconds=0,
             })
             self:_clear_noncontext_repair_flag(status_book_id,saved,"daemon_unconfirmed")
@@ -2057,7 +2072,10 @@ function Sync:_import_daemon_status(force)
             if not daemon.active then daemon.book_id=nil end
         else
             logger.info("[MiuRead][ReadReport] service response unconfirmed; continuing",
-                "book=",status_book_id,"next_due=",tostring(status.next_due or "-"))
+                "book=",status_book_id,"count=",tostring(status.unconfirmed_count or 1),
+                "context_refresh=",tostring(status.context_refresh_requested==true),
+                "summary=",tostring(status.response_summary or status.error or "-"),
+                "next_due=",tostring(status.next_due or "-"))
         end
         self:_persist_daemon_session(force or final_flush,status_book_id~="" and status_book_id or nil)
         if final_flush and stamp then self.store:mark_read_report_consumed(stamp) end

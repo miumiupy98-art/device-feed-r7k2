@@ -571,6 +571,7 @@ function Worker.run(job)
         return finish(settings, book, {
             ok = true,
             result = confirmation(result),
+            response_summary = result_summary(result),
             path = job.force_context == true and "manual_repair" or "initial",
             position = first_position,
             payload_public = first_public,
@@ -584,6 +585,7 @@ function Worker.run(job)
             uncertain = true,
             error = first_error,
             error_kind = "unconfirmed",
+            response_summary = first_error,
             result = confirmation(result),
             position = first_position,
             payload_public = first_public,

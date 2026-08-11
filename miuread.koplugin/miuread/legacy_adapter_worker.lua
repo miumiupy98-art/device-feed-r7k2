@@ -135,9 +135,10 @@ function Adapter.run(job)
         wr_ticket = result.wr_ticket,
         wr_wrpa_changed = result.wr_wrpa_changed == true,
         wr_wrpa = result.wr_wrpa,
-        response_summary = result.ok == true and "succ=1 (compatibility path)"
+        response_summary = result.response_summary
+            or (result.ok == true and "succ=1 (compatibility path)"
             or (result.uncertain == true and ("unconfirmed: " .. tostring(result.error or "no explicit acknowledgement"))
-            or tostring(result.error or "compatibility path rejected")),
+            or tostring(result.error or "compatibility path rejected"))),
         attempts = { { stage = tostring(result.path or "compatibility") } },
         payload_public = merge({ compatibility_path = true }, result.payload_public or {}),
         meta = result.meta,

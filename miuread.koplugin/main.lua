@@ -1558,6 +1558,41 @@ function Plugin:_prepare_shelf_rows(rows)
     return rows
 end
 
+function Plugin:_home_mutate_book_rows(book_id,mutator)
+    book_id=tostring(book_id or "")
+    if book_id=="" or type(mutator)~="function" then return false end
+    local changed=false
+    for _,section in pairs(self._home_sections or {}) do
+        for _,book in ipairs(section.rows or {}) do
+            if tostring(book.bookId or book.book_id or "")==book_id then
+                mutator(book)
+                changed=true
+            end
+        end
+    end
+    return changed
+end
+
+function Plugin:_home_update_download_card(runtime,state)
+    local book_id=tostring(runtime and runtime.book and runtime.book.bookId or state and state.book_id or "")
+    if book_id=="" then return false end
+    local ratio=math.max(0,math.min(1,self:_download_percent(state)/100))
+    local changed=self:_home_mutate_book_rows(book_id,function(book)
+        book.download_active=true
+        book.download_progress=ratio
+        book.download_status=nil
+        book.status_text=self:_shelf_status_text(book)
+    end)
+    if changed and HomeView.is_shown() and not self:_active_reader_ui() then
+        local updated=HomeView.update_book(book_id)
+        logger.info("[MiuRead][HomeDownload] card update",
+            "book=",book_id,"percent=",tostring(math.floor(ratio*100+.5)),
+            "visible=",tostring(updated==true))
+        return updated==true
+    end
+    return false
+end
+
 function Plugin:_flush_cover_index()
     if self._cover_index_flush_task then
         UIManager:unschedule(self._cover_index_flush_task)
@@ -3476,6 +3511,7 @@ function Plugin:_home_cover_input_stamp(inputs)
 end
 
 function Plugin:_home_schedule_cover_derivatives(books)
+    if self._download_runtime~=nil then return false end
     if self:_home_ui_busy() then
         self._home_resume_pending_work=self._home_resume_pending_work or {}
         self._home_resume_pending_work.covers=true
@@ -3547,12 +3583,14 @@ function Plugin:_home_schedule_cover_derivatives(books)
     local fast_changed=false
     local fast_hero_changed=false
     local fast_sections={}
+    local fast_ids={}
     for _,item in ipairs(items) do
         if item.home_fresh then
             fresh_count=fresh_count+1
             local changed,is_hero,sections=self:_home_apply_rendered_cover_path(item.id,item.home_target)
             fast_changed=fast_changed or changed
             fast_hero_changed=fast_hero_changed or is_hero
+            if changed then fast_ids[item.id]=true end
             for section in pairs(sections or {}) do fast_sections[section]=true end
         end
         if item.lock_target and item.lock_fresh then
@@ -3569,8 +3607,10 @@ function Plugin:_home_schedule_cover_derivatives(books)
     if fast_changed and HomeView.is_shown() and not self:_active_reader_ui() then
         for section in pairs(fast_sections) do self:_home_bump_section_revision(section) end
         local active=self._home_active_section or "account"
-        if fast_hero_changed then self:_home_schedule_render_refresh("content")
-        elseif fast_sections[active] then self:_home_apply_section(active) end
+        if fast_hero_changed then self:_home_schedule_render_refresh("content") end
+        if fast_sections[active] then
+            for id in pairs(fast_ids) do HomeView.update_book(id) end
+        end
     end
 
     if #worker_items==0 then
@@ -3591,6 +3631,11 @@ function Plugin:_home_schedule_cover_derivatives(books)
     if self._home_cover_render_inflight_signature==request_signature then return false end
     if self._home_cover_render_last_signature==request_signature
         and now_clock-(tonumber(self._home_cover_render_last_clock) or 0)<5 then return false end
+    if self._home_cover_render_failed_signature==request_signature
+        and now_clock-(tonumber(self._home_cover_render_failed_clock) or 0)<600 then
+        logger.info("[MiuRead][CoverRender] retry cooled down","seconds=600")
+        return false
+    end
     if self.cover_render_async:busy() then
         if not self._home_cover_render_retry_task then
             local retry
@@ -3654,19 +3699,31 @@ function Plugin:_home_schedule_cover_derivatives(books)
         end
         if generation~=self._home_cover_render_generation then return end
         if not result or result.ok~=true or type(result.value)~="table" then
+            self._home_cover_render_failed_signature=request_signature
+            self._home_cover_render_failed_clock=os.time()
             if result and result.error then logger.warn("[MiuRead][CoverRender] worker failed",U.first_line(result.error,120)) end
             return
         end
+        self._home_cover_render_failed_signature=nil
+        self._home_cover_render_failed_clock=0
         self._home_cover_render_last_signature=request_signature
         self._home_cover_render_last_clock=os.time()
+        if self._download_runtime~=nil then
+            -- Rendering may have started just before a download. Keep the files,
+            -- but do not touch the visible shelf until the download finishes.
+            logger.info("[MiuRead][CoverRender] visible apply deferred during download")
+            return
+        end
         local any_changed=false
         local hero_changed=false
         local changed_sections={}
+        local changed_ids={}
         for _,entry in ipairs(result.value) do
             if entry.home_path and lfs.attributes(entry.home_path,"mode")=="file" then
                 local changed,is_hero,sections=self:_home_apply_rendered_cover_path(entry.id,entry.home_path)
                 any_changed=any_changed or changed
                 hero_changed=hero_changed or is_hero
+                if changed then changed_ids[entry.id]=true end
                 for section in pairs(sections or {}) do changed_sections[section]=true end
             end
             if entry.lock_path and lfs.attributes(entry.lock_path,"mode")=="file" then
@@ -3681,8 +3738,10 @@ function Plugin:_home_schedule_cover_derivatives(books)
         if any_changed and HomeView.is_shown() and not self:_active_reader_ui() then
             for section in pairs(changed_sections) do self:_home_bump_section_revision(section) end
             local active=self._home_active_section or "account"
-            if hero_changed then self:_home_schedule_render_refresh("content")
-            elseif changed_sections[active] then self:_home_apply_section(active) end
+            if hero_changed then self:_home_schedule_render_refresh("content") end
+            if changed_sections[active] then
+                for id in pairs(changed_ids) do HomeView.update_book(id) end
+            end
         end
         logger.info("[MiuRead][CoverRender] visible cache ready",
             "rendered=",tostring(#result.value),"fresh=",tostring(fresh_count),
@@ -7314,6 +7373,7 @@ function Plugin:_home_schedule_network_metadata(book,force,silent,on_done,explic
 end
 
 function Plugin:_home_schedule_local_metadata(books)
+    if self._download_runtime~=nil then return false end
     if self:_home_ui_busy() then
         self._home_resume_pending_work=self._home_resume_pending_work or {}
         self._home_resume_pending_work.metadata=true
@@ -7336,19 +7396,36 @@ function Plugin:_home_schedule_local_metadata(books)
     end
     if #queue==0 then return false end
 
-    local index,changed_any=1,false
+    local index=1
+    local hero_changed=false
+    local changed_book_keys={}
     local cache_dir=self:_home_local_metadata_dir()
     local function finish()
-        if changed_any and generation==self._home_metadata_generation and HomeView.is_shown() then
+        if generation~=self._home_metadata_generation or not HomeView.is_shown() then return end
+        if hero_changed then
+            -- The recent-reading card lives in the static upper body. Only a
+            -- real change to that card may rebuild the content region.
             self:_home_schedule_render_refresh("content")
+            return
         end
+        for key in pairs(changed_book_keys) do HomeView.update_book(key) end
     end
     local function apply_metadata(item,metadata,err)
         if generation~=self._home_metadata_generation then return end
         if metadata then
             local visible_changed=item.book and LocalMetadata.merge(item.book,metadata) or false
-            local cache_changed=self:_home_update_local_cache(item.file,metadata)
-            if visible_changed or cache_changed then changed_any=true end
+            self:_home_update_local_cache(item.file,metadata)
+            if visible_changed then
+                local item_id=tostring(item.book and (item.book.bookId or item.book.book_id) or "")
+                local item_key=item_id~="" and item_id or ("file:"..tostring(item.file or ""))
+                local hero=self._home_hero
+                local hero_id=tostring(hero and (hero.bookId or hero.book_id) or "")
+                local hero_file=tostring(hero and hero.file or "")
+                local is_hero=(item_id~="" and hero_id==item_id)
+                    or (item_id=="" and hero_id=="" and hero_file~="" and hero_file==tostring(item.file or ""))
+                if is_hero then hero_changed=true
+                elseif item_key~="file:" then changed_book_keys[item_key]=true end
+            end
         elseif err then
             logger.warn("[MiuRead][Home] local metadata unavailable",tostring(item.file),tostring(err))
         end
@@ -7356,6 +7433,7 @@ function Plugin:_home_schedule_local_metadata(books)
     end
     local function next_book()
         if generation~=self._home_metadata_generation or not HomeView.is_shown() or self:_active_reader_ui() then return end
+        if self._download_runtime~=nil then return end
         if self:_home_ui_busy() then UIManager:scheduleIn(.45,next_book); return end
         local item=queue[index]
         if not item then finish(); return end
@@ -7388,6 +7466,7 @@ function Plugin:_home_schedule_local_metadata(books)
 end
 
 function Plugin:_home_schedule_remote_covers(books)
+    if self._download_runtime~=nil then return false end
     if self:_home_ui_busy() then
         self._home_resume_pending_work=self._home_resume_pending_work or {}
         self._home_resume_pending_work.covers=true
@@ -7409,9 +7488,11 @@ function Plugin:_home_schedule_remote_covers(books)
     if #queue==0 or not self.home_cover_async then return end
     local index,changed_count=1,0
     local changed_sections={}
+    local changed_ids={}
     local rendered_books={}
     local hero_changed=false
     local function mark_changed(book_id)
+        changed_ids[tostring(book_id or "")]=true
         local hero_id=tostring(self._home_hero and (self._home_hero.bookId or self._home_hero.book_id) or "")
         if hero_id==book_id then hero_changed=true end
         for key,section in pairs(self._home_sections or {}) do
@@ -7425,15 +7506,18 @@ function Plugin:_home_schedule_remote_covers(books)
     end
     local function apply_batch()
         if generation~=self._home_cover_generation or not HomeView.is_shown() or self:_active_reader_ui() then return end
+        if self._download_runtime~=nil then return end
         if changed_count<=0 then return end
         for section in pairs(changed_sections) do self:_home_bump_section_revision(section) end
         local active=self._home_active_section or "account"
         if hero_changed then
-            -- The recent-reading card belongs to the static body. Rebuild the
-            -- content once after the whole cover batch instead of once per book.
+            -- The recent-reading card belongs to the static body. Rebuild that
+            -- content only when the hero itself changed. Shelf cards are updated
+            -- independently below so unrelated covers never blink.
             self:_home_schedule_render_refresh("content")
-        elseif changed_sections[active] then
-            self:_home_apply_section(active)
+        end
+        if changed_sections[active] then
+            for id in pairs(changed_ids) do HomeView.update_book(id) end
         end
         logger.info("[MiuRead][HomeCoverBatch] applied",
             "changed=",tostring(changed_count),"hero=",tostring(hero_changed),
@@ -7455,6 +7539,7 @@ function Plugin:_home_schedule_remote_covers(books)
     end
     local function next_cover()
         if generation~=self._home_cover_generation or not HomeView.is_shown() or self:_active_reader_ui() then return end
+        if self._download_runtime~=nil then return end
         if self:_home_ui_busy() then UIManager:scheduleIn(.45,next_cover); return end
         if self.home_cover_async:busy() then UIManager:scheduleIn(.3,next_cover); return end
         local item=queue[index]
@@ -11189,7 +11274,11 @@ end
 function Plugin:_complete_reader_close(generation,reason)
     if generation~=(tonumber(READER_CLOSE.generation) or 0) or READER_CLOSE.state=="idle" then return false end
     local snapshot=self:_reader_close_snapshot()
-    if snapshot.lifecycle~="closed" or not snapshot.filemanager then return false end
+    -- MiuRead keeps its rendered home parked under ReaderUI. Once ReaderUI has
+    -- actually left the stack, that existing home can be restored immediately;
+    -- FileManager is no longer a prerequisite for the visible return path.
+    if snapshot.lifecycle~="closed" then return false end
+    if not snapshot.filemanager and not HomeView.is_shown() then return false end
     READER_CLOSE.state="home_restoring"
     self:_ensure_reader_transition_guard("stable reader close")
     self:_close_miuread_transients()
@@ -11262,8 +11351,8 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     HOME_SESSION_SUPPRESSED=false
     HOME_NATIVE_VISIT=false
     HOME_EXPECTED_CLOSE=false
-    -- The visual home is removed while ReaderUI owns the screen, but the
-    -- reader-origin token must survive so an explicit return can rebuild it.
+    -- The rendered home stays parked under ReaderUI. Keep the reader-origin
+    -- token until ReaderUI has actually left so an explicit return can raise it.
     if not self:_active_reader_ui() then
         HOME_READER_ORIGIN=false
         HOME_READER_FILE=nil
@@ -11859,6 +11948,13 @@ function Plugin:_finish_reader_return(generation,reason)
         self:_reader_close_poll_state("reader_leaving_stack",
             snapshot.document_present and "document still attached" or "document released")
         return self:_schedule_reader_return_finish(generation,reader_close_poll_delay("closing",elapsed),"reader closing")
+    end
+
+    if HomeView.is_shown() then
+        READER_CLOSE.state="home_restoring"
+        READER_CLOSE.stable_samples=1
+        self:_reader_close_poll_state("home_surface_ready","restoring parked MiuRead home")
+        return self:_complete_reader_close(generation,reason or "parked home ready")
     end
 
     if snapshot.filemanager then
@@ -12601,12 +12697,10 @@ function Plugin:_on_download_progress(runtime,state)
     end
     self:_write_download_state("active",self:_active_download_payload(runtime,state),false)
     local home_percent=self:_download_percent(state)
-    local home_mark=math.floor(home_percent/10)*10
-    local home_stage=tostring(state and state.stage or "")
-    if runtime.home_progress_mark~=home_mark or runtime.home_progress_stage~=home_stage then
+    local home_mark=math.floor(home_percent/5)*5
+    if runtime.home_progress_mark~=home_mark then
         runtime.home_progress_mark=home_mark
-        runtime.home_progress_stage=home_stage
-        self:_notify_home_data_changed("section")
+        self:_home_update_download_card(runtime,state)
     end
     if state and state.stage=="rate_limit" then
         local wait=tonumber(state.wait_seconds) or 0
@@ -14319,9 +14413,14 @@ function Plugin:sync_diagnostics_menu()
         {text="测试上传 30 秒阅读时间",callback=function()
             if not self.sync:record() then self:info("请先打开一本觅阅下载的书籍。") return end
             self:status_toast("阅读时间测试","正在上传 30 秒……",3)
-            self.sync:test_upload(function(ok,result)
-                if ok then self:status_toast("阅读时间测试","30 秒已成功上传",4)
-                else self:info("阅读时间测试失败\n\n"..tostring(result or "未知错误")) end
+            self.sync:test_upload(function(ok,result,position,value)
+                if ok then
+                    self:status_toast("阅读时间测试","30 秒已成功上传",4)
+                elseif type(value)=="table" and (value.uncertain==true or tostring(value.error_kind or "")=="unconfirmed") then
+                    self:status_toast("阅读时间测试","已提交，等待微信读书确认",5)
+                else
+                    self:info("阅读时间测试失败\n\n"..tostring(result or "未知错误"))
+                end
             end)
         end},
         {text="查看详细错误",callback=function() self:show_sync_status(true) end},

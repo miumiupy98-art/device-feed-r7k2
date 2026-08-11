@@ -69,8 +69,15 @@ local function write_png(canvas, target)
     os.remove(tmp)
     local ok, err = pcall(canvas.writePNG, canvas, tmp)
     if not ok then os.remove(tmp); return nil, err end
-    os.remove(target)
+    -- POSIX rename replaces the old file atomically. Keep the old cover visible
+    -- until the new PNG is complete so the UI never observes a missing-image
+    -- window (the checkerboard/blank-cover flash seen on Kindle).
     local renamed, rename_err = os.rename(tmp, target)
+    if not renamed then
+        -- Conservative fallback for filesystems that refuse replacement.
+        os.remove(target)
+        renamed, rename_err = os.rename(tmp, target)
+    end
     if not renamed then os.remove(tmp); return nil, rename_err or "rename failed" end
     return target
 end

@@ -958,6 +958,15 @@ function HomeWidget:_grid_geometry(m, width, available_h, count, force_rows)
     return columns, rows, col_gap, row_gap, card_w, card_h
 end
 
+local function shelf_book_key(book)
+    if type(book) ~= "table" then return "" end
+    local id = tostring(book.bookId or book.book_id or "")
+    if id ~= "" then return id end
+    local file = tostring(book.file or "")
+    if file ~= "" then return "file:" .. file end
+    return ""
+end
+
 function HomeWidget:_render_grid(children, m, x, y, width, height, books, on_open, on_hold, force_rows)
     if #books == 0 then return 0 end
     local columns, rows, col_gap, row_gap, card_w, card_h = self:_grid_geometry(m, width, height, #books, force_rows)
@@ -971,10 +980,17 @@ function HomeWidget:_render_grid(children, m, x, y, width, height, books, on_ope
         local row = math.floor(slot / columns)
         local col = slot % columns
         local item_w = folder and (card_w * 2 + col_gap) or card_w
-        self:_add(children,
-            x + col * (card_w + col_gap),
-            y + row * (card_h + row_gap),
-            shelf_book_card(book, item_w, card_h, on_open, on_hold))
+        local item_x = x + col * (card_w + col_gap)
+        local item_y = y + row * (card_h + row_gap)
+        self:_add(children,item_x,item_y,shelf_book_card(book, item_w, card_h, on_open, on_hold))
+        if self._building_shelf_slots and not folder then
+            local key=shelf_book_key(book)
+            if key~="" then
+                self._building_shelf_slots[key]={
+                    parent=children,index=#children,x=item_x,y=item_y,w=item_w,h=card_h,book=book,
+                }
+            end
+        end
         slot = slot + weight
     end
     return rows * card_h + math.max(0, rows - 1) * row_gap
@@ -1116,13 +1132,14 @@ function HomeWidget:_clear_inactive_section_cache()
     self._section_cache_clock=0
 end
 
-function HomeWidget:_remember_section_layer(cache_id,layer,region)
+function HomeWidget:_remember_section_layer(cache_id,layer,region,slots)
     if not cache_id or not layer then return end
     self._section_layer_cache=type(self._section_layer_cache)=="table" and self._section_layer_cache or {}
     self._section_cache_clock=(tonumber(self._section_cache_clock) or 0)+1
     self._section_layer_cache[cache_id]={
         layer=layer,
         region=region and region:copy() or nil,
+        slots=slots,
         used=self._section_cache_clock,
     }
     local count=0
@@ -1163,11 +1180,15 @@ function HomeWidget:_rebuild()
     children[#children + 1] = static_body_layer
     self._static_body_layer = static_body_layer
     local section_layer = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
+    self._building_shelf_slots={}
     self:_build_sections(section_layer, m, compact, "section")
+    local section_slots=self._building_shelf_slots
+    self._building_shelf_slots=nil
     children[#children + 1] = section_layer
     self._section_layer = section_layer
+    self._section_book_slots=section_slots
     self._section_layer_index = #children
-    self:_remember_section_layer(self:_section_cache_id(self.opts),section_layer,self.section_dimen)
+    self:_remember_section_layer(self:_section_cache_id(self.opts),section_layer,self.section_dimen,section_slots)
     local previous = self[1]
     self[1] = children
     if previous and previous ~= children and previous.free then pcall(previous.free, previous) end
@@ -1241,18 +1262,26 @@ function HomeWidget:updateSection(opts)
     local cached=cache_id and cache[cache_id] or nil
     local section_layer=cached and cached.layer or nil
     local cache_hit=section_layer~=nil
+    local section_slots
     if not section_layer then
         section_layer = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
+        self._building_shelf_slots={}
         self:_build_sections(section_layer, m, tostring(self.opts.layout_style or "standard") == "compact", "section")
-        self:_remember_section_layer(cache_id,section_layer,self.section_dimen)
-    elseif cached.region then
-        self.section_dimen=cached.region:copy()
-        self._section_cache_clock=(tonumber(self._section_cache_clock) or 0)+1
-        cached.used=self._section_cache_clock
+        section_slots=self._building_shelf_slots
+        self._building_shelf_slots=nil
+        self:_remember_section_layer(cache_id,section_layer,self.section_dimen,section_slots)
+    else
+        section_slots=cached.slots
+        if cached.region then
+            self.section_dimen=cached.region:copy()
+            self._section_cache_clock=(tonumber(self._section_cache_clock) or 0)+1
+            cached.used=self._section_cache_clock
+        end
     end
     local old = root[self._section_layer_index]
     root[self._section_layer_index] = section_layer
     self._section_layer = section_layer
+    self._section_book_slots=section_slots
     -- Old layers stay alive in the bounded cache. They are freed on eviction,
     -- full rebuild or home close, so switching back does not recreate covers.
     self:_mark_dirty("section", previous_region)
@@ -1260,6 +1289,37 @@ function HomeWidget:updateSection(opts)
         "key=",tostring(cache_id or "none"),"cache_hit=",tostring(cache_hit),
         "ms=",tostring(math.floor((os.clock()-started)*1000+.5)))
     return self
+end
+
+
+function HomeWidget:updateBook(book_id)
+    local key=tostring(book_id or "")
+    if key=="" then return false end
+    local slots=type(self._section_book_slots)=="table" and self._section_book_slots or {}
+    local slot=slots[key]
+    if not slot or not slot.parent or not slot.index then return false end
+    local book
+    for _,candidate in ipairs(self.opts.shelf_books or {}) do
+        if shelf_book_key(candidate)==key then book=candidate; break end
+    end
+    if not book then return false end
+    local old=slot.parent[slot.index]
+    local replacement=OffsetContainer:new{
+        x_off=slot.x,y_off=slot.y,
+        shelf_book_card(book,slot.w,slot.h,self.opts.on_open_book,self.opts.on_hold_book),
+    }
+    slot.parent[slot.index]=replacement
+    slot.book=book
+    if old and old~=replacement and old.free then pcall(old.free,old) end
+    local safety=UiScale.dp(3,2,5)
+    local x=math.max(0,slot.x-safety)
+    local y=math.max(0,slot.y-safety)
+    local right=math.min(Screen:getWidth(),slot.x+slot.w+safety)
+    local bottom=math.min(Screen:getHeight(),slot.y+slot.h+safety)
+    local region=Geom:new{x=x,y=y,w=math.max(1,right-x),h=math.max(1,bottom-y)}
+    UIManager:setDirty(self,function() return "ui",region end)
+    logger.info("[MiuRead][HomeBook] updated", "book=",key,"w=",tostring(slot.w),"h=",tostring(slot.h))
+    return true
 end
 
 function HomeWidget:init()
@@ -1556,6 +1616,12 @@ function HomeView.update_section(opts)
     local ok, err = pcall(live_widget.updateSection, live_widget, opts or {})
     if not ok then logger.warn("[MiuRead][Home] section update failed", tostring(err)); return false end
     return true
+end
+function HomeView.update_book(book_id)
+    if not HomeView.is_shown() or not live_widget.updateBook then return false end
+    local ok, updated = pcall(live_widget.updateBook, live_widget, book_id)
+    if not ok then logger.warn("[MiuRead][Home] book update failed", tostring(updated)); return false end
+    return updated==true
 end
 function HomeView.show(opts, refresh_kind)
     opts = opts or {}

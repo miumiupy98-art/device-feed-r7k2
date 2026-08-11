@@ -164,10 +164,30 @@ local function write_cover(bb, cache_dir, filepath)
     if not bb or type(bb.writePNG) ~= "function" then return nil end
     U.mkdir(cache_dir)
     local destination = cover_cache_path(cache_dir, filepath)
-    local ok, err = pcall(bb.writePNG, bb, destination)
-    if not ok or not file_exists(destination) then
+    -- A stable local book must keep a stable cover file. Rewriting an identical
+    -- PNG changes its mtime, which used to invalidate MiuRead's thumbnail cache
+    -- and made an idle e-ink shelf repaint itself.
+    if file_exists(destination) then
+        local source_mtime=tonumber(lfs.attributes(filepath,"modification") or 0) or 0
+        local cover_mtime=tonumber(lfs.attributes(destination,"modification") or 0) or 0
+        if source_mtime>0 and cover_mtime>=source_mtime then return destination end
+    end
+    local tmp=destination..".tmp"
+    os.remove(tmp)
+    local ok, err = pcall(bb.writePNG, bb, tmp)
+    if not ok or not file_exists(tmp) then
         logger.warn("[MiuRead][LocalMetadata] cover write failed", tostring(filepath), tostring(err))
+        os.remove(tmp)
+        return nil
+    end
+    local renamed,rename_err=os.rename(tmp,destination)
+    if not renamed then
         os.remove(destination)
+        renamed,rename_err=os.rename(tmp,destination)
+    end
+    if not renamed or not file_exists(destination) then
+        logger.warn("[MiuRead][LocalMetadata] cover replace failed", tostring(filepath), tostring(rename_err))
+        os.remove(tmp)
         return nil
     end
     return destination
@@ -412,8 +432,8 @@ function LocalMetadata.needs_refresh(book, full)
     if full then
         if tonumber(book.metadata_extractor_version or 0) < METADATA_EXTRACTOR_VERSION then return true end
         if book.metadata_complete ~= true then return true end
-        local description = trim(book.description or book.intro or book.summary)
-        if description == "" then return true end
+        -- Missing optional metadata is a valid completed result. A book that
+        -- genuinely has no description/ISBN/etc. must not be reopened forever.
         if book.cover_path and not file_exists(book.cover_path) then return true end
         return false
     end
