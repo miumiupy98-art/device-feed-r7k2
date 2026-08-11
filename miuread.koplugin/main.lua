@@ -3035,7 +3035,7 @@ function Plugin:_home_schedule_stale_checks(delay)
             return
         end
         if self:_home_ui_busy() then
-            UIManager:scheduleIn(.75,task)
+            UIManager:scheduleIn(self:_lightweight_enabled() and 1.2 or .75,task)
             return
         end
         self._home_stale_check_task=nil
@@ -3044,7 +3044,9 @@ function Plugin:_home_schedule_stale_checks(delay)
         if self._home_active_section=="local" then self:_home_scan_local(false) end
     end
     self._home_stale_check_task=task
-    UIManager:scheduleIn(math.max(.8,tonumber(delay) or 4.5),task)
+    local minimum=self:_lightweight_enabled()
+        and (tonumber(Config.LIGHTWEIGHT_HOME_IDLE_DELAY) or 6) or .8
+    UIManager:scheduleIn(math.max(minimum,tonumber(delay) or 4.5),task)
     return true
 end
 
@@ -3519,8 +3521,11 @@ function Plugin:_home_refresh_remote(force,user_requested)
     local _,_,updated_at=self.library:cached()
     local now=os.time()
     local age=math.max(0,now-(tonumber(updated_at) or 0))
+    local shelf_ttl=self:_lightweight_enabled()
+        and (tonumber(Config.LIGHTWEIGHT_HOME_REMOTE_TTL) or 30*60)
+        or HOME_SHELF_REFRESH_TTL
     if force~=true then
-        if age<HOME_SHELF_REFRESH_TTL then return false end
+        if age<shelf_ttl then return false end
         if now-(tonumber(self._home_remote_auto_attempt_at) or 0)<HOME_REMOTE_AUTO_RETRY then return false end
     end
     if not self:logged_in() then
@@ -3895,6 +3900,9 @@ function Plugin:_home_schedule_cover_derivatives(books)
         return false
     end
     if not self.cover_render_async or not self.cover_render_async:available() then return false end
+    local lightweight=self:_lightweight_enabled()
+    local derivative_limit=lightweight and (tonumber(Config.LIGHTWEIGHT_DERIVATIVE_COVER_QUEUE) or 1) or math.huge
+    local derivative_gap=lightweight and (tonumber(Config.LIGHTWEIGHT_DERIVATIVE_GAP) or 1.0) or .8
 
     local check_started=monotonic_wall_time()
     local sw,sh=Device.screen:getWidth(),Device.screen:getHeight()
@@ -3978,7 +3986,9 @@ function Plugin:_home_schedule_cover_derivatives(books)
                 if current and current.opts then current.opts.screensaver_file=item.lock_target end
             end
         end
-        if not (item.home_fresh and item.lock_fresh) then worker_items[#worker_items+1]=item end
+        if not (item.home_fresh and item.lock_fresh) and #worker_items<derivative_limit then
+            worker_items[#worker_items+1]=item
+        end
     end
 
     if fast_changed and HomeView.is_shown() and not self:_active_reader_ui() then
@@ -4013,7 +4023,11 @@ function Plugin:_home_schedule_cover_derivatives(books)
         logger.info("[MiuRead][CoverRender] retry cooled down","seconds=600")
         return false
     end
-    if self.cover_render_async:busy() then
+    local competing=lightweight and (
+        (self.home_metadata_async and self.home_metadata_async:busy())
+        or (self.home_cover_async and self.home_cover_async:busy())
+    )
+    if self.cover_render_async:busy() or competing then
         if not self._home_cover_render_retry_task then
             local retry
             retry=function()
@@ -4024,7 +4038,7 @@ function Plugin:_home_schedule_cover_derivatives(books)
                 end
             end
             self._home_cover_render_retry_task=retry
-            UIManager:scheduleIn(.8,retry)
+            UIManager:scheduleIn(derivative_gap,retry)
         end
         return false
     end
@@ -4122,7 +4136,15 @@ function Plugin:_home_schedule_cover_derivatives(books)
         end
         logger.info("[MiuRead][CoverRender] visible cache ready",
             "rendered=",tostring(#result.value),"fresh=",tostring(fresh_count),
-            "elapsed_ms=",tostring(math.floor((monotonic_wall_time()-render_started)*1000+.5)))
+            "elapsed_ms=",tostring(math.floor((monotonic_wall_time()-render_started)*1000+.5)),
+            "lightweight=",tostring(lightweight))
+        if lightweight and HomeView.is_shown() and not self:_active_reader_ui() then
+            UIManager:scheduleIn(derivative_gap,function()
+                if HomeView.is_shown() and not self:_active_reader_ui() and not self:_home_ui_busy() then
+                    self:_home_schedule_cover_derivatives(books)
+                end
+            end)
+        end
     end,55)
     if started~=true and self._home_cover_render_inflight_signature==request_signature then
         self._home_cover_render_inflight_signature=nil
@@ -7354,7 +7376,10 @@ function Plugin:_home_scan_local(force)
     if force~=true then
         local cached=self:_home_local_cache()
         local scanned_at=tonumber(cached and cached.scanned_at or 0) or 0
-        if scanned_at>0 and os.time()-scanned_at<HOME_LOCAL_CACHE_TTL then return false end
+        local local_ttl=self:_lightweight_enabled()
+            and (tonumber(Config.LIGHTWEIGHT_HOME_LOCAL_TTL) or 60*60)
+            or HOME_LOCAL_CACHE_TTL
+        if scanned_at>0 and os.time()-scanned_at<local_ttl then return false end
     end
     if self:_home_background_blocked() or self:_active_reader_ui() then return false end
     local roots=self:_home_local_roots(true)
@@ -7921,6 +7946,9 @@ function Plugin:_home_schedule_local_metadata(books)
         return false
     end
     if not HomeView.is_shown() then return false end
+    local lightweight=self:_lightweight_enabled()
+    local queue_limit=lightweight and (tonumber(Config.LIGHTWEIGHT_LOCAL_METADATA_QUEUE) or 3) or 6
+    local metadata_gap=lightweight and (tonumber(Config.LIGHTWEIGHT_METADATA_GAP) or .75) or .22
     self._home_metadata_generation=(tonumber(self._home_metadata_generation) or 0)+1
     local generation=self._home_metadata_generation
     local queue,seen={},{}
@@ -7932,7 +7960,7 @@ function Plugin:_home_schedule_local_metadata(books)
             queue[#queue+1]={file=filepath,book=book}
             -- Prioritise only what the user can see now. Remaining covers are
             -- picked up on later pages instead of blocking the home screen.
-            if #queue>=6 then break end
+            if #queue>=queue_limit then break end
         end
     end
     if #queue==0 then return false end
@@ -7972,11 +8000,11 @@ function Plugin:_home_schedule_local_metadata(books)
     local function next_book()
         if generation~=self._home_metadata_generation or not HomeView.is_shown() or self:_active_reader_ui() then return end
         if self._download_runtime~=nil then return end
-        if self:_home_ui_busy() then UIManager:scheduleIn(.45,next_book); return end
+        if self:_home_ui_busy() then UIManager:scheduleIn(math.max(.45,metadata_gap),next_book); return end
         local item=queue[index]
         if not item then finish(); return end
         if self.home_metadata_async and self.home_metadata_async:available() then
-            if self.home_metadata_async:busy() then UIManager:scheduleIn(.35,next_book); return end
+            if self.home_metadata_async:busy() then UIManager:scheduleIn(math.max(.35,metadata_gap),next_book); return end
             local filepath=item.file
             local started=self.home_metadata_async:run("home-local-metadata",function()
                 local Metadata=require("miuread.local_metadata")
@@ -7988,7 +8016,7 @@ function Plugin:_home_schedule_local_metadata(books)
                 else
                     apply_metadata(item,nil,result and result.error or "后台提取失败")
                 end
-                if queue[index] then UIManager:scheduleIn(.22,next_book) else finish() end
+                if queue[index] then UIManager:scheduleIn(metadata_gap,next_book) else finish() end
             end,45)
             if not started then UIManager:scheduleIn(.4,next_book) end
             return
@@ -7997,9 +8025,9 @@ function Plugin:_home_schedule_local_metadata(books)
         -- only one visible book per tick and stop immediately when reading starts.
         local metadata,err=LocalMetadata.read(item.file,cache_dir,{open_document=true,use_bim=true})
         apply_metadata(item,metadata,err)
-        if queue[index] then UIManager:scheduleIn(.35,next_book) else finish() end
+        if queue[index] then UIManager:scheduleIn(math.max(.35,metadata_gap),next_book) else finish() end
     end
-    UIManager:scheduleIn(.8,next_book)
+    UIManager:scheduleIn(lightweight and math.max(1.2,metadata_gap*2) or .8,next_book)
     return true
 end
 
@@ -8010,6 +8038,10 @@ function Plugin:_home_schedule_remote_covers(books)
         self._home_resume_pending_work.covers=true
         return false
     end
+    local lightweight=self:_lightweight_enabled()
+    local queue_limit=lightweight and (tonumber(Config.LIGHTWEIGHT_REMOTE_COVER_QUEUE) or 4) or 10
+    local cover_gap=lightweight and (tonumber(Config.LIGHTWEIGHT_COVER_GAP) or .65) or .08
+    local derivative_gap=lightweight and (tonumber(Config.LIGHTWEIGHT_DERIVATIVE_GAP) or 1.0) or .75
     self._home_cover_generation=(tonumber(self._home_cover_generation) or 0)+1
     local generation=self._home_cover_generation
     self._home_cover_inflight=type(self._home_cover_inflight)=="table" and self._home_cover_inflight or {}
@@ -8020,7 +8052,7 @@ function Plugin:_home_schedule_remote_covers(books)
             and book.cover and book.cover~="" and not book.cover_path then
             seen[id]=true
             queue[#queue+1]={bookId=id,cover=book.cover,book=book}
-            if #queue>=10 then break end
+            if #queue>=queue_limit then break end
         end
     end
     if #queue==0 or not self.home_cover_async then return end
@@ -8067,7 +8099,7 @@ function Plugin:_home_schedule_remote_covers(books)
             UIManager:scheduleIn(.35,apply_batch)
         end
         if #rendered_books>0 and generation==self._home_cover_generation then
-            UIManager:scheduleIn(.75,function()
+            UIManager:scheduleIn(derivative_gap,function()
                 if generation==self._home_cover_generation and HomeView.is_shown() and not self:_active_reader_ui() then
                     self:_home_schedule_cover_derivatives(rendered_books)
                 end
@@ -8077,8 +8109,12 @@ function Plugin:_home_schedule_remote_covers(books)
     local function next_cover()
         if generation~=self._home_cover_generation or not HomeView.is_shown() or self:_active_reader_ui() then return end
         if self._download_runtime~=nil then return end
-        if self:_home_ui_busy() then UIManager:scheduleIn(.45,next_cover); return end
-        if self.home_cover_async:busy() then UIManager:scheduleIn(.3,next_cover); return end
+        if self:_home_ui_busy() then UIManager:scheduleIn(math.max(.45,cover_gap),next_cover); return end
+        if lightweight and self.home_metadata_async and self.home_metadata_async:busy() then
+            UIManager:scheduleIn(math.max(.5,cover_gap),next_cover)
+            return
+        end
+        if self.home_cover_async:busy() then UIManager:scheduleIn(math.max(.3,cover_gap),next_cover); return end
         local item=queue[index]
         if not item then finish(); return end
         if self._home_cover_inflight[item.bookId] then
@@ -8133,15 +8169,16 @@ function Plugin:_home_schedule_remote_covers(books)
                 logger.warn("[MiuRead][Home] cover download failed",tostring(item.bookId),U.first_line(result.error,120))
             end
             index=index+1
-            if queue[index] then UIManager:scheduleIn(.08,next_cover) else finish() end
+            if queue[index] then UIManager:scheduleIn(cover_gap,next_cover) else finish() end
         end,background and 35 or 14)
         if not started then
             if self._home_cover_inflight[item.bookId]==generation then self._home_cover_inflight[item.bookId]=nil end
-            UIManager:scheduleIn(.35,next_cover)
+            UIManager:scheduleIn(math.max(.35,cover_gap),next_cover)
         end
     end
-    logger.info("[MiuRead][HomeCoverBatch] queued","count=",tostring(#queue))
-    UIManager:scheduleIn(.12,next_cover)
+    logger.info("[MiuRead][HomeCoverBatch] queued","count=",tostring(#queue),
+        "lightweight=",tostring(lightweight))
+    UIManager:scheduleIn(lightweight and math.max(.8,cover_gap) or .12,next_cover)
 end
 
 function Plugin:_home_open_miuread(book)
@@ -8164,12 +8201,15 @@ end
 function Plugin:_home_schedule_local_shelf_metadata(rows,view)
     self._home_metadata_generation=(tonumber(self._home_metadata_generation) or 0)+1
     local generation=self._home_metadata_generation
+    local lightweight=self:_lightweight_enabled()
+    local queue_limit=lightweight and (tonumber(Config.LIGHTWEIGHT_LOCAL_METADATA_QUEUE) or 3) or 8
+    local metadata_gap=lightweight and (tonumber(Config.LIGHTWEIGHT_METADATA_GAP) or .75) or .25
     local queue={}
     for _,book in ipairs(rows or {}) do
         if not (book.local_folder==true or book.kind=="folder")
             and book.file and LocalMetadata.needs_refresh(book,true) then
             queue[#queue+1]=book
-            if #queue>=8 then break end
+            if #queue>=queue_limit then break end
         end
     end
     if #queue==0 then return false end
@@ -8197,7 +8237,7 @@ function Plugin:_home_schedule_local_shelf_metadata(rows,view)
         local book=queue[index]
         if not book then finish(); return end
         if self.home_metadata_async and self.home_metadata_async:available() then
-            if self.home_metadata_async:busy() then UIManager:scheduleIn(.35,next_book); return end
+            if self.home_metadata_async:busy() then UIManager:scheduleIn(math.max(.35,metadata_gap),next_book); return end
             local filepath=book.file
             local started=self.home_metadata_async:run("shelf-local-metadata",function()
                 local Metadata=require("miuread.local_metadata")
@@ -8209,16 +8249,16 @@ function Plugin:_home_schedule_local_shelf_metadata(rows,view)
                 else
                     apply_metadata(book,nil,result and result.error or "后台提取失败")
                 end
-                if queue[index] then UIManager:scheduleIn(.25,next_book) else finish() end
+                if queue[index] then UIManager:scheduleIn(metadata_gap,next_book) else finish() end
             end,45)
             if not started then UIManager:scheduleIn(.4,next_book) end
             return
         end
         local metadata,err=LocalMetadata.read(book.file,cache_dir,{open_document=true,use_bim=true})
         apply_metadata(book,metadata,err)
-        if queue[index] then UIManager:scheduleIn(.4,next_book) else finish() end
+        if queue[index] then UIManager:scheduleIn(math.max(.4,metadata_gap),next_book) else finish() end
     end
-    UIManager:scheduleIn(.25,next_book)
+    UIManager:scheduleIn(lightweight and math.max(.8,metadata_gap) or .25,next_book)
     return true
 end
 
@@ -8884,7 +8924,7 @@ function Plugin:maintenance_menu()
 end
 
 function Plugin:show_home_quick_panel(more_expanded)
-    local started=os.clock()
+    local started=monotonic_wall_time()
     local now=started
     if self._home_quick_panel_opening==true
         or now-(tonumber(self._home_quick_panel_last_open) or 0)<.35 then return true end
@@ -8958,7 +8998,7 @@ function Plugin:show_home_quick_panel(more_expanded)
             end} or nil,
         }
     end
-    local prepared=os.clock()
+    local prepared=monotonic_wall_time()
     local panel,err=HomeQuickPanel.show{
         time_text=self:_display_time("%H:%M"),
         battery_text=battery,
@@ -8971,16 +9011,18 @@ function Plugin:show_home_quick_panel(more_expanded)
         end,
     }
     self._home_quick_panel_opening=false
-    local completed=os.clock()
+    local completed=monotonic_wall_time()
+    local total_ms=math.floor((completed-started)*1000+.5)
     logger.info("[MiuRead][QuickPanel] timing",
         "prep_ms=",tostring(math.floor((prepared-started)*1000+.5)),
         "show_ms=",tostring(math.floor((completed-prepared)*1000+.5)),
-        "total_ms=",tostring(math.floor((completed-started)*1000+.5)))
+        "total_ms=",tostring(total_ms))
     if not panel then
         logger.warn("[MiuRead][QuickPanel] unavailable",tostring(err or "unknown"))
         self:info("快捷控制暂时无法打开")
         return false
     end
+    self:_record_performance("home_panel",total_ms)
     return true
 end
 
@@ -9092,7 +9134,9 @@ end
 
 function Plugin:_reader_background_idle()
     if os.time()<(tonumber(self._reader_busy_until) or 0) then return false end
-    return os.clock()-(tonumber(self._reader_last_interaction_clock) or 0)>=.80
+    local quiet=self:_lightweight_enabled()
+        and (tonumber(Config.LIGHTWEIGHT_READER_IDLE_SECONDS) or 1.5) or .80
+    return os.clock()-(tonumber(self._reader_last_interaction_clock) or 0)>=quiet
 end
 
 function Plugin:_reader_toolbar_cache()
@@ -11294,19 +11338,20 @@ end
 
 function Plugin:_show_reader_quick_panel_now()
     if not (self.ui and self.ui.document) then return false end
-    local started=os.clock()
+    local started=monotonic_wall_time()
     self:_mark_reader_busy(2)
     local options=self:_reader_quick_panel_options()
-    local options_done=os.clock()
+    local options_done=monotonic_wall_time()
     if not options then return false end
     local panel,err=ReaderToolbar.show(options,tostring(HOME_SESSION.reader_session_generation or 0))
-    local shown=os.clock()
+    local shown=monotonic_wall_time()
     if not panel then
         logger.warn("[MiuRead][ReaderToolbar] unavailable",tostring(err or "unknown"))
         return false
     end
     local header_perf=self._reader_toolbar_header_perf or {}
     local options_perf=self._reader_toolbar_options_perf or {}
+    local total_ms=math.floor((shown-started)*1000+.5)
     logger.info("[MiuRead][ReaderToolbarPerf]",
         "title_ms=",tostring(options_perf.title_ms or 0),
         "device_ms=",tostring(header_perf.device_ms or 0),
@@ -11315,7 +11360,8 @@ function Plugin:_show_reader_quick_panel_now()
         "show_ms=",tostring(math.floor((shown-options_done)*1000+.5)),
         "cache_age_s=",tostring(header_perf.cache_age or 0),
         "chapter_cached=",tostring(header_perf.chapter_cached==true),
-        "total_ms=",tostring(math.floor((shown-started)*1000+.5)))
+        "total_ms=",tostring(total_ms))
+    self:_record_performance("reader_toolbar",total_ms)
     return true
 end
 
@@ -11622,6 +11668,8 @@ function Plugin:_begin_page_transition(kind)
     kind=tostring(kind or "transition")
     HOME_SESSION.page_transition_generation=(tonumber(HOME_SESSION.page_transition_generation) or 0)+1
     HOME_SESSION.page_transition_state=kind
+    HOME_SESSION.page_transition_started_clock=monotonic_wall_time()
+    HOME_SESSION.page_transition_started_kind=kind
     if kind=="opening_reader" then self:_set_navigation_state("opening_reader","page transition")
     elseif kind=="closing_reader" then self:_set_navigation_state("closing_reader","page transition")
     elseif kind=="native_menu" then self:_set_navigation_state("native_menu","page transition")
@@ -11642,6 +11690,8 @@ end
 
 function Plugin:_finish_page_transition(delay,reason)
     local generation=tonumber(HOME_SESSION.page_transition_generation) or 0
+    local transition_kind=tostring(HOME_SESSION.page_transition_started_kind or HOME_SESSION.page_transition_state or "")
+    local transition_started=tonumber(HOME_SESSION.page_transition_started_clock) or 0
     if self._page_transition_release_task then
         UIManager:unschedule(self._page_transition_release_task)
         self._page_transition_release_task=nil
@@ -11661,8 +11711,20 @@ function Plugin:_finish_page_transition(delay,reason)
                 self.download_task:resume("page_transition")
             end
         end
-        logger.info("[MiuRead][Transition] complete",tostring(reason or "surface ready"),
+        local reason_text=tostring(reason or "surface ready")
+        logger.info("[MiuRead][Transition] complete",reason_text,
             "generation=",tostring(generation))
+        if transition_kind=="opening_reader" and transition_started>0
+            and reason_text:find("reader first page",1,true) then
+            local elapsed_ms=math.floor((monotonic_wall_time()-transition_started)*1000+.5)
+            logger.info("[MiuRead][Perf] interaction","kind=reader_open","elapsed_ms=",tostring(elapsed_ms))
+            self:_record_performance("reader_open",elapsed_ms)
+            if self._performance_prompt_pending then self:_schedule_performance_prompt(1.2) end
+        end
+        if generation==(tonumber(HOME_SESSION.page_transition_generation) or 0) then
+            HOME_SESSION.page_transition_started_clock=0
+            HOME_SESSION.page_transition_started_kind=nil
+        end
     end
     self._page_transition_release_task=task
     UIManager:scheduleIn(math.max(0,tonumber(delay) or 0),task)
@@ -11867,8 +11929,11 @@ function Plugin:_complete_reader_close(generation,reason)
         "generation=",tostring(generation),"reason=",tostring(reason or READER_CLOSE.reason or "close"))
     local requested_clock=tonumber(READER_CLOSE.requested_clock) or 0
     if requested_clock>0 then
+        local elapsed_ms=math.floor((monotonic_wall_time()-requested_clock)*1000+.5)
         logger.info("[MiuRead][ReaderClosePerf] return complete",
-            "elapsed_ms=",tostring(math.floor((monotonic_wall_time()-requested_clock)*1000+.5)))
+            "elapsed_ms=",tostring(elapsed_ms))
+        self:_record_performance("reader_home",elapsed_ms)
+        if self._performance_prompt_pending then self:_schedule_performance_prompt(.9) end
     end
     self:_clear_reader_return(generation,"home restored")
     return true
@@ -16795,11 +16860,15 @@ function Plugin:_performance_mode_label()
     return status.enabled and "轻量模式" or "标准模式"
 end
 
+function Plugin:_lightweight_enabled()
+    return self.performance_mode and self.performance_mode:enabled() or false
+end
+
 function Plugin:_set_performance_mode(enabled)
     self.performance_mode:set_enabled(enabled==true)
     if enabled then
         if self.ui and self.ui.document then self:_mark_reader_busy(3) end
-        self:info("轻量模式已开启。\n\n阅读操作会优先于后台下载；下载仍会继续，但会更保守地分批运行。")
+        self:info("轻量模式已开启。\n\n阅读和菜单操作会优先；后台下载、封面、书籍资料和自动更新会更保守地执行。阅读、下载和同步功能不会关闭。")
     else
         if self.download_task then self.download_task:resume("reader_interaction") end
         self:info("已恢复标准模式。")
@@ -16813,9 +16882,30 @@ function Plugin:_toggle_performance_auto_detect()
 end
 
 function Plugin:_record_performance(kind,elapsed_ms)
-    if not self.performance_mode then return end
+    if not self.performance_mode then return nil end
     local result=self.performance_mode:record(kind,elapsed_ms)
     if result then self._performance_prompt_pending=result end
+    return result
+end
+
+function Plugin:_schedule_performance_prompt(delay)
+    if not self._performance_prompt_pending then return false end
+    local pending=self._performance_prompt_pending
+    local attempts=0
+    local task
+    task=function()
+        if self._performance_prompt_pending~=pending then return end
+        if HOME_EXITING or UIManager._exit_code~=nil
+            or HOME_SESSION.suspended==true or self._miuread_suspended==true then return end
+        if reader_close_active() or self._thought_popup_busy==true then
+            attempts=attempts+1
+            if attempts<8 then UIManager:scheduleIn(.6,task) end
+            return
+        end
+        self:_show_performance_prompt()
+    end
+    UIManager:scheduleIn(math.max(.25,tonumber(delay) or .9),task)
+    return true
 end
 
 function Plugin:_show_performance_prompt()
@@ -16829,7 +16919,7 @@ function Plugin:_show_performance_prompt()
     end
     local dialog
     dialog=ButtonDialog:new{
-        title="检测到运行较慢\n\n觅阅检测到多次明显操作延迟。开启轻量模式后，会减少阅读操作与后台下载之间的竞争，并降低后台处理频率。",
+        title="检测到运行较慢\n\n觅阅检测到近期多次明显操作延迟。开启轻量模式后，阅读和菜单操作会优先，后台下载、封面、书籍资料和自动更新会更保守地执行；阅读、下载和同步功能不会关闭。",
         title_align="center",
         buttons={
             {{text="开启轻量模式",callback=function()

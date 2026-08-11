@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.3.0-beta.37",
+    VERSION = "4.3.0-beta.38",
     SCHEMA = 112,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -38,14 +38,40 @@ local C = {
     LOW_MEMORY_RATIO = 0.15,
 
     -- Runtime performance protection is based on measured UI latency, not on
-    -- device model or age. The lightweight flag is shared with the download
-    -- subprocess so an already-running job can adapt immediately.
+    -- device model or firmware. The lightweight flag is shared with the
+    -- download subprocess so an already-running job can adapt immediately.
     LIGHTWEIGHT_MODE_FLAG = "/tmp/miuread-lightweight-mode.flag",
     PERFORMANCE_SLOW_MS = 1200,
     PERFORMANCE_EXTREME_MS = 2500,
     PERFORMANCE_WINDOW_SECONDS = 10 * 60,
     PERFORMANCE_REPEAT_COUNT = 2,
     PERFORMANCE_PROMPT_COOLDOWN = 7 * 24 * 60 * 60,
+
+    -- Different user-visible operations have different normal costs.
+    -- Only repeated slow samples of the SAME kind are combined. A single
+    -- extreme Reader->Home delay may prompt because it is already severe.
+    PERFORMANCE_RULES = {
+        default = {slow_ms = 1200, extreme_ms = 2500, repeat_count = 2},
+        home_panel = {slow_ms = 1000, extreme_ms = 2000, repeat_count = 2},
+        reader_toolbar = {slow_ms = 800, extreme_ms = 1800, repeat_count = 2},
+        thought_popup = {slow_ms = 1200, extreme_ms = 2500, repeat_count = 2},
+        reader_open = {slow_ms = 3000, extreme_ms = 6000, repeat_count = 2},
+        reader_home = {slow_ms = 4000, extreme_ms = 8000, repeat_count = 2, single_extreme = true},
+    },
+
+    -- Lightweight mode does not disable features. It gives the foreground
+    -- longer quiet windows, refreshes automatic sources less often, and
+    -- processes metadata/covers in smaller batches with wider gaps.
+    LIGHTWEIGHT_HOME_REMOTE_TTL = 30 * 60,
+    LIGHTWEIGHT_HOME_LOCAL_TTL = 60 * 60,
+    LIGHTWEIGHT_HOME_IDLE_DELAY = 6,
+    LIGHTWEIGHT_READER_IDLE_SECONDS = 1.5,
+    LIGHTWEIGHT_LOCAL_METADATA_QUEUE = 3,
+    LIGHTWEIGHT_REMOTE_COVER_QUEUE = 4,
+    LIGHTWEIGHT_DERIVATIVE_COVER_QUEUE = 1,
+    LIGHTWEIGHT_METADATA_GAP = 0.75,
+    LIGHTWEIGHT_COVER_GAP = 0.65,
+    LIGHTWEIGHT_DERIVATIVE_GAP = 1.0,
 
     -- Online features are verified by their real request. Renewal is recovery,
     -- never a prerequisite. Diagnostics never include account secrets.
