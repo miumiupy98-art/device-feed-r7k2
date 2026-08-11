@@ -1179,6 +1179,7 @@ function HomeWidget:_rebuild()
     self:_build_sections(static_body_layer, m, compact, "static")
     children[#children + 1] = static_body_layer
     self._static_body_layer = static_body_layer
+    self._static_body_layer_index = #children
     local section_layer = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
     self._building_shelf_slots={}
     self:_build_sections(section_layer, m, compact, "section")
@@ -1291,6 +1292,35 @@ function HomeWidget:updateSection(opts)
     return self
 end
 
+
+function HomeWidget:updateHero(hero)
+    self.opts = self.opts or {}
+    self.opts.hero = hero
+    local m = self._metrics_cache
+    local root = self[1]
+    if not m or not root or not self._static_body_layer_index
+        or Screen:getWidth() ~= self._last_screen_w or Screen:getHeight() ~= self._last_screen_h then
+        return self:update(self.opts, "content")
+    end
+    local previous_region = self.content_dimen and self.content_dimen:copy() or nil
+    local previous_section = self.section_dimen and self.section_dimen:copy() or nil
+    local layer = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
+    self:_build_sections(layer, m, tostring(self.opts.layout_style or "standard") == "compact", "static")
+    local current_section = self.section_dimen and self.section_dimen:copy() or nil
+    local same_geometry = previous_section and current_section
+        and previous_section.x == current_section.x and previous_section.y == current_section.y
+        and previous_section.w == current_section.w and previous_section.h == current_section.h
+    if not same_geometry then
+        if layer.free then pcall(layer.free, layer) end
+        return self:update(self.opts, "content")
+    end
+    local old = root[self._static_body_layer_index]
+    root[self._static_body_layer_index] = layer
+    self._static_body_layer = layer
+    if old and old ~= layer and old.free then pcall(old.free, old) end
+    self:_mark_dirty("content", previous_region)
+    return self
+end
 
 function HomeWidget:updateBook(book_id)
     local key=tostring(book_id or "")
@@ -1622,6 +1652,12 @@ function HomeView.update_book(book_id)
     local ok, updated = pcall(live_widget.updateBook, live_widget, book_id)
     if not ok then logger.warn("[MiuRead][Home] book update failed", tostring(updated)); return false end
     return updated==true
+end
+function HomeView.update_hero(hero)
+    if not HomeView.is_shown() or not live_widget.updateHero then return false end
+    local ok, updated = pcall(live_widget.updateHero, live_widget, hero)
+    if not ok then logger.warn("[MiuRead][Home] hero update failed", tostring(updated)); return false end
+    return updated~=false
 end
 function HomeView.show(opts, refresh_kind)
     opts = opts or {}

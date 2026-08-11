@@ -2177,20 +2177,18 @@ function Plugin:_home_preferences()
         changed=true
     end
     if (tonumber(home.performance_defaults_version) or 0)<1 then
-        -- Older builds enabled full local scans and network metadata by default.
-        -- On e-ink devices these jobs compete with first paint and touch handling,
-        -- so beta.8 migrated once to cache-first defaults.
+        -- Historical performance defaults are no longer allowed to change a
+        -- feature switch during ordinary startup. The current local-library
+        -- policy is normalized below from the user's saved choice.
         home.performance_defaults_version=1
-        home.auto_scan=false
-        home.network_metadata=false
         changed=true
     end
-    if (tonumber(home.network_metadata_defaults_version) or 0)<1 then
-        -- The home metadata worker now touches only the current recent-reading
-        -- book, and a successful network result is kept until a manual refresh.
-        -- Re-enable network completion once for users migrated by beta.8.
-        home.network_metadata_defaults_version=1
-        home.network_metadata=true
+    if (tonumber(home.network_metadata_defaults_version) or 0)<2 then
+        -- beta.35 repairs the historical beta.8 default once. After a user
+        -- explicitly changes this switch, future upgrades must preserve it.
+        if home.network_metadata_user_set~=true then home.network_metadata=true end
+        home.network_metadata_defaults_version=2
+        if home.network_metadata_user_set~=true then home.network_metadata_user_set=false end
         changed=true
     end
     if home.layout_style~="compact" and home.layout_style~="desk" then
@@ -2247,9 +2245,9 @@ function Plugin:_home_preferences()
         if type(home[items_key])~="table" then home[items_key]={}; changed=true end
         if type(home[order_key])~="table" then home[order_key]={}; changed=true end
         if (tonumber(home[version_key]) or 0)<expected_version then
-            home[items_key]={}
-            for _,key in ipairs(item_order) do home[items_key][key]=item_defaults[key]==true end
-            home[order_key]=U.copy(item_order)
+            -- Layout upgrades are incremental: keep explicit visibility and
+            -- ordering, then append only genuinely new keys below. Special
+            -- migrations that remove/replace a key run before this helper.
             home[version_key]=expected_version
             changed=true
         end
@@ -2831,6 +2829,10 @@ function Plugin:_home_resume_visible_work_after_idle()
             return
         end
         self._home_ui_resume_task=nil
+        -- Recent-reading changes are applied only after the post-reader/user
+        -- interaction barrier releases. This keeps Reader->Home fast and uses
+        -- a static hero-layer update instead of rebuilding the shelf.
+        self:_home_refresh_recent_hero_cached()
         local metadata=self._home_visible_metadata_targets or {}
         local covers=self._home_visible_cover_targets or {}
         self:_home_schedule_local_metadata(metadata)
@@ -5543,21 +5545,89 @@ function Plugin:_home_miuread_rows()
     return rows
 end
 
+local function normalized_home_time(value)
+    local stamp=tonumber(value) or 0
+    if stamp>100000000000 then stamp=math.floor(stamp/1000) end
+    return stamp>0 and stamp or 0
+end
+
+function Plugin:_home_recent_read_state()
+    if self.store.recent_reads then return self.store:recent_reads() end
+    local state=self.store:get("recent_reads",{version=1,items={}})
+    if type(state)~="table" then state={version=1,items={}} end
+    if type(state.items)~="table" then state.items={} end
+    return state
+end
+
+function Plugin:_home_apply_recent_read_times(...)
+    local state=self:_home_recent_read_state()
+    local by_book,by_file={},{}
+    for _,item in ipairs(state.items or {}) do
+        if type(item)=="table" then
+            local stamp=normalized_home_time(item.read_at)
+            local id=tostring(item.book_id or "")
+            local file=LocalLibrary.normalize(item.file or "")
+            if stamp>0 and id~="" and stamp>(tonumber(by_book[id]) or 0) then by_book[id]=stamp end
+            if stamp>0 and file~="" and stamp>(tonumber(by_file[file]) or 0) then by_file[file]=stamp end
+        end
+    end
+    for index=1,select("#",...) do
+        local list=select(index,...)
+        for _,book in ipairs(type(list)=="table" and list or {}) do
+            local id=tostring(book.bookId or book.book_id or "")
+            local file=LocalLibrary.normalize(book.file or "")
+            local stamp=math.max(tonumber(by_book[id]) or 0,tonumber(by_file[file]) or 0)
+            if stamp>0 then book.local_recent_read_at=stamp end
+        end
+    end
+    return state
+end
+
 function Plugin:_home_book_time(book)
-    local value=tonumber(book and (book.lastReadTime or book.readUpdateTime or book.cloudUpdatedAt or book.last_read_at or book.opened_at or book.updateTime or book.downloadedAt or book.modified_at) or 0) or 0
-    if value>100000000000 then value=math.floor(value/1000) end
-    return value
+    if type(book)~="table" then return 0 end
+    local primary=math.max(
+        normalized_home_time(book.local_recent_read_at),
+        normalized_home_time(book.lastReadTime),
+        normalized_home_time(book.readUpdateTime),
+        normalized_home_time(book.last_read_at),
+        normalized_home_time(book.opened_at))
+    if primary>0 then return primary end
+    return math.max(
+        normalized_home_time(book.cloudUpdatedAt),
+        normalized_home_time(book.updateTime),
+        normalized_home_time(book.downloadedAt),
+        normalized_home_time(book.modified_at))
 end
 
 function Plugin:_home_recent_book(miuread_rows,local_rows,account_rows)
-    local best
     local lists={miuread_rows or {},local_rows or {},account_rows or {}}
+    local state=self:_home_apply_recent_read_times(unpack_args(lists))
+    local by_book,by_file={},{}
     for _,list in ipairs(lists) do
         for _,book in ipairs(list) do
             if not (book.local_folder==true or book.kind=="folder") then
-                local progress=tonumber(book.progress) or 0
-                if progress>0 and progress<100 and (not best or self:_home_book_time(book)>self:_home_book_time(best)) then best=book end
+                local id=tostring(book.bookId or book.book_id or "")
+                local file=LocalLibrary.normalize(book.file or "")
+                if id~="" and not by_book[id] then by_book[id]=book end
+                if file~="" and not by_file[file] then by_file[file]=book end
             end
+        end
+    end
+    -- A successful local Reader session is authoritative. Progress 0% and
+    -- 100% are both valid recent reads; cloud timestamps are only fallback.
+    for _,item in ipairs(state.items or {}) do
+        if type(item)=="table" then
+            local id=tostring(item.book_id or "")
+            local file=LocalLibrary.normalize(item.file or "")
+            local match=(id~="" and by_book[id]) or (file~="" and by_file[file]) or nil
+            if match then return match end
+        end
+    end
+    local best
+    for _,list in ipairs(lists) do
+        for _,book in ipairs(list) do
+            if not (book.local_folder==true or book.kind=="folder")
+                and (not best or self:_home_book_time(book)>self:_home_book_time(best)) then best=book end
         end
     end
     if best then return best end
@@ -5663,7 +5733,8 @@ function Plugin:_home_recent_books(miuread_rows,local_rows,account_rows,hero,lim
         for _,book in ipairs(list) do
             local progress=tonumber(book.progress) or 0
             local key=self:_home_book_key(book)
-            if not (book.local_folder==true or book.kind=="folder") and progress>0 and key~="" and not seen[key] then
+            if not (book.local_folder==true or book.kind=="folder")
+                and (progress>0 or self:_home_book_time(book)>0) and key~="" and not seen[key] then
                 seen[key]=true
                 rows[#rows+1]=book
             end
@@ -6168,13 +6239,14 @@ function Plugin:_show_home_refresh_popup(anchor)
         title="刷新",
         subtitle="常用更新直接执行 维护操作不放在主页",
         actions={
-            {icon="↻",label="刷新当前页面",detail="只更新当前书架和状态",callback=function() self:_home_manual_refresh() end},
+            {icon="▤",label="刷新当前页面",detail="立即整屏刷新并清除残影",callback=function() self:_home_full_refresh(true) end},
+            {icon="↻",label="更新当前栏目",detail="按当前栏目更新书架或本地数据",callback=function() self:_home_manual_refresh() end},
             {icon="☁",label="更新微信书架",detail="重新获取微信书架变化",callback=function() self:_home_refresh_remote(true,true) end},
             {icon="⌕",label="更新本地书库",detail="检查本地书籍变化",callback=function()
                 local started=self:_home_scan_local(true)
                 if started then self:toast("正在更新本地书库…",2) end
             end},
-            {icon="▤",label="全屏刷新",detail="只清除墨水屏残影",callback=function() self:_home_full_refresh() end},
+            {icon="i",label="补全书籍信息",detail="更新缺失资料",callback=function() self:_home_complete_refresh(true) end},
         },
     }
 end
@@ -6428,11 +6500,11 @@ end
 
 function Plugin:_home_action_function_actions(key,anchor)
     if key=="refresh" then return {
-        {icon="↻",label="刷新当前页面",detail="只更新当前书架和状态",callback=function() self:_home_manual_refresh() end},
+        {icon="▤",label="刷新当前页面",detail="立即整屏刷新并清除残影",callback=function() self:_home_full_refresh(true) end},
+        {icon="↻",label="更新当前栏目",detail="按当前栏目更新书架或本地数据",callback=function() self:_home_manual_refresh() end},
         {icon="☁",label="更新微信书架",detail="重新获取微信书架变化",callback=function() self:_home_refresh_remote(true,true) end},
         {icon="⌕",label="扫描本地书库",detail="检查本地书籍变化",callback=function() self:_home_scan_local(true) end},
         {icon="i",label="补全书籍信息",detail="更新缺失资料",callback=function() self:_home_complete_refresh(true) end},
-        {icon="▤",label="全屏刷新",detail="清除墨水屏残影",callback=function() self:_home_full_refresh() end},
         {icon="▦",label="刷新设置",detail="进入书架与刷新设置",callback=function() self:_show_standalone_menu("首页与书架",self:display_settings_menu(),{anchor=anchor}) end},
     } end
     if key=="search" then return {
@@ -6732,8 +6804,10 @@ function Plugin:_home_action_entries()
     elseif sync_summary.total>0 then sync_badge=sync_summary.total>99 and "99+" or tostring(sync_summary.total) end
 
     local definitions={
-        refresh={icon="↻",icon_key="refresh",label="刷新",callback=function(anchor)
-            self:_home_manual_refresh(); self:_show_home_quick_notice(anchor,"已刷新","当前书架和状态已更新")
+        refresh={icon="↻",icon_key="refresh",label="刷新",callback=function()
+            -- The primary shortcut is visual refresh only: no network, scan,
+            -- metadata lookup or toast is started from a single tap.
+            self:_home_full_refresh(true)
         end},
         search={icon="⌕",icon_key="search",label="搜索",callback=function(anchor) self:_show_home_search_popup(anchor) end},
         downloads={icon="⇩",icon_key="download",label="下载",badge=download_badge,callback=function(anchor) self:_show_home_download_popup(anchor) end},
@@ -11408,6 +11482,72 @@ function Plugin:_schedule_reader_close_settle(path,session_generation,reason)
     return self:_schedule_reader_return_finish(generation,.10,reason or "document closed")
 end
 
+function Plugin:_home_prepare_hero_book(book)
+    if type(book)~="table" then return nil end
+    local hero=U.copy(book)
+    hero.heading="最近阅读"
+    hero.source_text=self:_home_source_text(hero)
+    hero.last_read_text=self:_home_last_read_text(hero)
+    hero.status_text=self:_home_status_text(hero,hero.source=="local" or hero.local_file==true)
+    self:_home_apply_cached_network_metadata(hero)
+    if U.trim(tostring(hero.format or ""))=="" then
+        local extension=tostring(hero.file or ""):match("%.([%w]+)$")
+        if extension then hero.format=extension:upper() end
+    end
+    local variant=tostring(hero.variant or "")
+    if hero.annotation_requested==true or variant:find("notes",1,true) then
+        hero.edition_text="含评论"
+    elseif variant:find("clean",1,true) then
+        hero.edition_text="纯净版"
+    end
+    hero.on_tap=function(anchor) self:_home_open_book(hero,anchor) end
+    hero.on_refresh_metadata=function() self:_home_refresh_current_network_metadata(hero) end
+    return hero
+end
+
+function Plugin:_home_refresh_recent_hero_cached()
+    if self._home_recent_read_dirty~=true and HOME_SESSION.recent_read_dirty~=true then return false end
+    if not HomeView.is_shown() or self:_active_reader_ui() then return false end
+    local sections=self._home_sections or {}
+    local generated=sections.generated and sections.generated.rows or {}
+    local local_rows=sections["local"] and sections["local"].rows or {}
+    local account=sections.account and sections.account.rows or {}
+    if #generated==0 and #local_rows==0 and #account==0 then return false end
+    self:_home_apply_recent_read_times(generated,local_rows,account)
+    local hero=self:_home_prepare_hero_book(self:_home_recent_book(generated,local_rows,account))
+    self._home_recent_read_dirty=false
+    HOME_SESSION.recent_read_dirty=false
+    if not hero then return false end
+    local previous_key=self:_home_book_key(self._home_hero)
+    local current_key=self:_home_book_key(hero)
+    local previous_time=self:_home_book_time(self._home_hero)
+    local current_time=self:_home_book_time(hero)
+    self._home_hero=hero
+    if previous_key~=current_key or previous_time~=current_time then
+        HomeView.update_hero(hero)
+        logger.info("[MiuRead][Recent] hero updated",
+            "book=",tostring(current_key),"read_at=",tostring(current_time))
+    end
+    local current=HomeView.current()
+    local shelf=(current and current.opts and current.opts.shelf_books) or {}
+    local metadata_targets={hero}
+    local cover_targets={hero}
+    for _,book in ipairs(shelf) do
+        metadata_targets[#metadata_targets+1]=book
+        cover_targets[#cover_targets+1]=book
+    end
+    self._home_visible_metadata_targets=metadata_targets
+    self._home_visible_cover_targets=cover_targets
+    local home=self:_home_preferences()
+    HOME_SESSION.lockscreen_recent_enabled=home.lockscreen_recent~=false
+    HOME_SESSION.screensaver_file=home.lockscreen_recent~=false and self:_home_prepare_lockscreen_cover(hero) or nil
+    if home.network_metadata~=false then
+        local key=self:_home_network_metadata_key(hero)
+        if key~="" then self._home_pending_network_metadata_key=key end
+    end
+    return true
+end
+
 function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kind)
     sync_home_session()
     if HOME_EXITING or UIManager._exit_code~=nil or HOME_SESSION.suspended==true or self._miuread_suspended==true then return false end
@@ -11456,27 +11596,8 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     end
 
     local home,home_preferences=self:_home_preferences()
-    local hero=self:_home_recent_book(miuread_rows,local_rows,account_rows)
-    if hero then
-        hero=U.copy(hero)
-        hero.heading="最近阅读"
-        hero.source_text=self:_home_source_text(hero)
-        hero.last_read_text=self:_home_last_read_text(hero)
-        hero.status_text=self:_home_status_text(hero,hero.source=="local" or hero.local_file==true)
-        self:_home_apply_cached_network_metadata(hero)
-        if U.trim(tostring(hero.format or ""))=="" then
-            local extension=tostring(hero.file or ""):match("%.([%w]+)$")
-            if extension then hero.format=extension:upper() end
-        end
-        local variant=tostring(hero.variant or "")
-        if hero.annotation_requested==true or variant:find("notes",1,true) then
-            hero.edition_text="含评论"
-        elseif variant:find("clean",1,true) then
-            hero.edition_text="纯净版"
-        end
-        hero.on_tap=function(anchor) self:_home_open_book(hero,anchor) end
-        hero.on_refresh_metadata=function() self:_home_refresh_current_network_metadata(hero) end
-    end
+    self:_home_apply_recent_read_times(miuread_rows,local_rows,account_rows,mp_rows)
+    local hero=self:_home_prepare_hero_book(self:_home_recent_book(miuread_rows,local_rows,account_rows))
 
     local sections={
         account={title="微信书架",rows=account_rows,empty="这里还没有微信书架内容"},
@@ -15968,6 +16089,8 @@ end
 function Plugin:_toggle_home_network_metadata()
     local home,preferences=self:_home_preferences()
     home.network_metadata=home.network_metadata==false
+    home.network_metadata_user_set=true
+    home.network_metadata_defaults_version=2
     self:_save_home_preferences(home,preferences)
     if home.network_metadata and self._home_hero then
         self:_home_schedule_network_metadata(self._home_hero,true,true,nil,true)
@@ -17274,6 +17397,25 @@ function Plugin:_setup_thought_tap()
     self._thought_tap_setup=true
 end
 
+function Plugin:_record_recent_read(path,book,record)
+    path=normalized_reader_file(path) or tostring(path or "")
+    local book_id=tostring((book and (book.book_id or book.bookId))
+        or (record and (record.book_id or record.bookId)) or "")
+    if path=="" and book_id=="" then return false end
+    if self.store.record_recent_read then
+        self.store:record_recent_read(book_id,path,os.time())
+    elseif book_id~="" then
+        self.store:mark_last_read(book_id,path,nil,false)
+    end
+    self._home_recent_read_dirty=true
+    HOME_SESSION.recent_read_dirty=true
+    local owner=home_owner()
+    if owner and owner~=self then owner._home_recent_read_dirty=true end
+    logger.info("[MiuRead][Recent] reader recorded",
+        "book=",book_id~="" and book_id or "local","file=",tostring(path))
+    return true
+end
+
 function Plugin:on_sync_record_ready(current)
     self:_teardown_thought_tap()
     if current and current.book then
@@ -17283,12 +17425,10 @@ function Plugin:on_sync_record_ready(current)
         if record.annotation_requested==true or variant:find("notes",1,true) then
             self:_setup_thought_tap()
         end
-        UIManager:scheduleIn(1.0,function()
-            local active=self.sync and self.sync.current
-            if self.ui and self.ui.document and active and tostring(active.book.book_id)==book_id then
-                self.store:mark_last_read(book_id,path)
-            end
-        end)
+        -- ReaderReady already records the file immediately in LuaSettings
+        -- memory. Once Sync resolves the canonical book id, backfill that id
+        -- without a synchronous disk flush or another delayed timer.
+        self:_record_recent_read(path,current.book,current.record)
         self:_schedule_current_book_repair_check(current,false)
     end
     if self.store:preferences().sync.progress_enabled~=false then
@@ -17626,10 +17766,10 @@ function Plugin:onReaderReady()
         HOME_SESSION.opening_file=nil
         HOME_SESSION.opening_at=0
         local path=self:_current_document_path()
-        local record,variant
+        local book,record,variant
         if path then
-            local _book
-            _book,record,variant=self.store:identify_file(path,false)
+            book,record,variant=self.store:identify_file(path,false)
+            self:_record_recent_read(path,book,record)
         end
         if record and (record.annotation_requested==true or tostring(variant or record.variant or ""):find("notes",1,true)) then
             self:_setup_thought_tap()
