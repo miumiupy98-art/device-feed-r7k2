@@ -95,8 +95,9 @@ local unpack_args=unpack or table.unpack
 local SHELF_CACHE_TTL=15*60
 local SHELF_DIRECT_CACHE_TTL=6*60*60
 local COVER_GUARD_WINDOW=6*60*60
-local HOME_LOCAL_CACHE_TTL=4*60*60
-local HOME_SHELF_REFRESH_TTL=90
+local HOME_LOCAL_CACHE_TTL=20*60
+local HOME_SHELF_REFRESH_TTL=10*60
+local HOME_REMOTE_AUTO_RETRY=5*60
 local HOME_SECTION_ORDER={"account","generated","local","mp"}
 local HOME_QUICK_ITEM_LEGACY_ORDER={"wifi","frontlight","refresh_shelf","full_refresh","settings","koreader_menu","downloads","sync","night","rotate","sleep","restart","quit"}
 local HOME_QUICK_ITEM_LEGACY_DEFAULT={wifi=true,frontlight=true,refresh_shelf=true,full_refresh=true,settings=true,koreader_menu=true,downloads=true,sync=true,night=false,rotate=false,sleep=true,restart=false,quit=false}
@@ -2926,7 +2927,9 @@ function Plugin:home_mode_menu()
 end
 
 function Plugin:_home_refresh_priority(kind)
-    local priority={header=1,section=2,content=3,full=4}
+    -- "page" is a full home-state repaint with the normal UI waveform.
+    -- "full" remains the heavier structural rebuild used by settings/rotation.
+    local priority={header=1,section=2,content=3,page=4,full=5}
     return priority[tostring(kind or "content")] or 3
 end
 
@@ -2976,6 +2979,75 @@ function Plugin:_home_ui_busy()
         or now < (tonumber(self._home_modal_cooldown_until) or 0)
 end
 
+function Plugin:_home_refresh_header_now(force_device,force_sync)
+    if not HomeView.is_shown() or self:_active_reader_ui() then return false end
+    if force_device==true then HomeData.quick_device_state(true) end
+    return HomeView.update_header{
+        account_name=self:_home_account_name(),
+        wifi_text=self:_home_wifi_text(),
+        sync_text=self:_home_sync_status_label(force_sync==true),
+        time_text=self:_display_time("%H:%M"),
+        battery_text=self:_home_battery_text(),
+    }
+end
+
+function Plugin:_home_schedule_clock()
+    self._home_clock_generation=(tonumber(self._home_clock_generation) or 0)+1
+    local generation=self._home_clock_generation
+    if self._home_clock_task then
+        UIManager:unschedule(self._home_clock_task)
+        self._home_clock_task=nil
+    end
+    if not HomeView.is_shown() or self:_active_reader_ui() then return false end
+    HomeView.update_time(self:_display_time("%H:%M"))
+    local task
+    task=function()
+        if generation~=self._home_clock_generation or self._home_clock_task~=task then return end
+        if not HomeView.is_shown() then
+            self._home_clock_task=nil
+            return
+        end
+        if self._home_suspended~=true and HOME_SESSION.suspended~=true and not self:_active_reader_ui() then
+            HomeView.update_time(self:_display_time("%H:%M"))
+        end
+        local now=os.time()
+        UIManager:scheduleIn(math.max(10,60-(now%60)+.12),task)
+    end
+    self._home_clock_task=task
+    local now=os.time()
+    UIManager:scheduleIn(math.max(10,60-(now%60)+.12),task)
+    return true
+end
+
+function Plugin:_home_schedule_stale_checks(delay)
+    self._home_stale_check_generation=(tonumber(self._home_stale_check_generation) or 0)+1
+    local generation=self._home_stale_check_generation
+    if self._home_stale_check_task then
+        UIManager:unschedule(self._home_stale_check_task)
+        self._home_stale_check_task=nil
+    end
+    local task
+    task=function()
+        if generation~=self._home_stale_check_generation or self._home_stale_check_task~=task then return end
+        if not HomeView.is_shown() or self:_active_reader_ui()
+            or self._home_suspended==true or HOME_SESSION.suspended==true then
+            self._home_stale_check_task=nil
+            return
+        end
+        if self:_home_ui_busy() then
+            UIManager:scheduleIn(.75,task)
+            return
+        end
+        self._home_stale_check_task=nil
+        -- Cache first. Only stale sources are allowed to do work here.
+        self:_home_refresh_remote(false,false)
+        if self._home_active_section=="local" then self:_home_scan_local(false) end
+    end
+    self._home_stale_check_task=task
+    UIManager:scheduleIn(math.max(.8,tonumber(delay) or 4.5),task)
+    return true
+end
+
 function Plugin:_home_resume_visible_work_after_idle()
     if self._home_ui_resume_task then UIManager:unschedule(self._home_ui_resume_task) end
     if self._home_suspended==true or HOME_SESSION.suspended==true then
@@ -3016,6 +3088,18 @@ function Plugin:_home_resume_visible_work_after_idle()
         -- interaction barrier releases. This keeps Reader->Home fast and uses
         -- a static hero-layer update instead of rebuilding the shelf.
         self:_home_refresh_recent_hero_cached()
+        local pending_kind=self._home_refresh_pending_kind
+        if pending_kind then
+            self._home_refresh_pending_kind=nil
+            self._home_refresh_pending=false
+            self:_refresh_home_view(nil,pending_kind)
+            UIManager:scheduleIn(.35,function()
+                if HomeView.is_shown() and not self:_active_reader_ui() then
+                    self:_home_resume_visible_work_after_idle()
+                end
+            end)
+            return
+        end
         local metadata=self._home_visible_metadata_targets or {}
         local covers=self._home_visible_cover_targets or {}
         self:_home_schedule_local_metadata(metadata)
@@ -3035,6 +3119,7 @@ function Plugin:_home_resume_visible_work_after_idle()
             self.download_task:resume("home_interaction")
             self.download_task:resume("page_transition")
         end
+        self:_home_schedule_stale_checks(1.1)
         logger.info("[MiuRead][HomePerf] background released after interaction")
     end
     self._home_ui_resume_task=task
@@ -3115,6 +3200,8 @@ function Plugin:_home_freeze_for_suspend()
     self:_home_unschedule_task("_home_render_refresh_task")
     self:_home_unschedule_task("_home_resume_background_task")
     self:_home_unschedule_task("_home_ui_resume_task")
+    self:_home_unschedule_task("_home_clock_task")
+    self:_home_unschedule_task("_home_stale_check_task")
     self:_home_unschedule_task("_home_cover_render_retry_task")
     self:_home_unschedule_task("_home_manual_metadata_retry_task")
     self._home_pending_network_metadata_key=nil
@@ -3301,6 +3388,7 @@ function Plugin:_home_begin_resume(slept)
             return
         end
         self._home_resume_first_frame=true
+        self:_home_schedule_clock()
         local elapsed=math.floor((os.clock()-self._home_resume_started_clock)*1000+.5)
         logger.info("[MiuRead][Resume] first surface released",
             "ms=",tostring(elapsed),"samples=",tostring(attempts),
@@ -3325,12 +3413,19 @@ function Plugin:_refresh_home_view(message,refresh_kind)
         return false
     end
     if HomeView.is_shown() then
+        local kind=refresh_kind or "content"
         UIManager:scheduleIn(.05,function()
-            if HomeView.is_shown() and not self:_active_reader_ui() then
-                self:_show_miuread_home_now(false,true,true,refresh_kind or "content")
+            if not HomeView.is_shown() or self:_active_reader_ui() then return end
+            if kind=="header" then
+                -- Header-only state changes must not reconstruct shelves or covers.
+                self:_home_refresh_header_now(false,false)
+            else
+                self:_show_miuread_home_now(false,true,true,kind)
             end
         end)
+        return true
     end
+    return false
 end
 
 function Plugin:_notify_home_data_changed(refresh_kind)
@@ -3341,24 +3436,30 @@ function Plugin:_notify_home_data_changed(refresh_kind)
     end
     self._home_refresh_debounce_generation=(tonumber(self._home_refresh_debounce_generation) or 0)+1
     local generation=self._home_refresh_debounce_generation
-    local interaction_generation=tonumber(self._home_interaction_generation) or 0
     local task
     task=function()
         if generation~=self._home_refresh_debounce_generation then return end
+        if not HomeView.is_shown() or self:_active_reader_ui() then
+            self._home_refresh_task=nil
+            return
+        end
+        if self:_home_ui_busy() then
+            self._home_refresh_task=nil
+            self:_home_resume_visible_work_after_idle()
+            return
+        end
         self._home_refresh_task=nil
         local kind=self._home_refresh_pending_kind or "content"
         self._home_refresh_pending_kind=nil
-        if HomeView.is_shown() and not self:_active_reader_ui() then
-            if interaction_generation~=(tonumber(self._home_interaction_generation) or 0) then
-                self:_notify_home_data_changed(kind)
-                return
-            end
-            self._home_refresh_pending=false
-            self:_refresh_home_view(nil,kind)
-        end
+        self._home_refresh_pending=false
+        self:_refresh_home_view(nil,kind)
     end
+    if self._home_refresh_task then UIManager:unschedule(self._home_refresh_task) end
     self._home_refresh_task=task
-    UIManager:scheduleIn(.70,task)
+    -- Several cover/download/status events inside this window become one
+    -- ordinary e-ink UI update instead of a visible series of repaints.
+    UIManager:scheduleIn(.25,task)
+    return true
 end
 
 function Plugin:_home_schedule_render_refresh(kind)
@@ -3416,8 +3517,12 @@ function Plugin:_home_refresh_remote(force,user_requested)
     end
     if self._home_remote_refreshing or self:_active_reader_ui() then return false end
     local _,_,updated_at=self.library:cached()
-    local age=math.max(0,os.time()-(tonumber(updated_at) or 0))
-    if force~=true and age<HOME_SHELF_REFRESH_TTL then return false end
+    local now=os.time()
+    local age=math.max(0,now-(tonumber(updated_at) or 0))
+    if force~=true then
+        if age<HOME_SHELF_REFRESH_TTL then return false end
+        if now-(tonumber(self._home_remote_auto_attempt_at) or 0)<HOME_REMOTE_AUTO_RETRY then return false end
+    end
     if not self:logged_in() then
         if user_requested then self:toast("登录后才能刷新微信书架",3) end
         return false
@@ -3427,6 +3532,7 @@ function Plugin:_home_refresh_remote(force,user_requested)
         return false
     end
     self._home_remote_refreshing=true
+    if force~=true then self._home_remote_auto_attempt_at=now end
     if user_requested then self:toast("正在刷新书架…",2) end
     local started=self:_refresh_shelf_async(function(_,_,err)
         self._home_remote_refreshing=false
@@ -3435,7 +3541,7 @@ function Plugin:_home_refresh_remote(force,user_requested)
             return
         end
         if HomeView.is_shown() and not self:_active_reader_ui() then
-            self:_notify_home_data_changed("content")
+            self:_notify_home_data_changed("section")
         end
         if user_requested then self:toast("书架已刷新",2) end
     end,true)
@@ -3444,21 +3550,41 @@ function Plugin:_home_refresh_remote(force,user_requested)
 end
 
 function Plugin:_home_manual_refresh()
-    -- A normal refresh is intentionally light: reload saved state, refresh the
-    -- active cloud shelf, and let the local library update only when its own
-    -- automatic-update switch is enabled. Heavy rebuild operations live under
-    -- Tools & Maintenance.
+    local active=self._home_active_section or "account"
+    if active=="account" or active=="mp" then
+        local started=self:_home_refresh_remote(true,true)
+        if not started and HomeView.is_shown() then self:_notify_home_data_changed("section") end
+        return true
+    end
+    if active=="local" then
+        local started=self:_home_scan_local(true)
+        if started then self:toast("正在更新本地书库…",2)
+        else self:toast("本地书库暂时无法开始更新",2) end
+        return true
+    end
+    -- Generated books are already known to MiuRead. Reconcile its saved
+    -- records/files only; do not scan arbitrary folders or query the network.
     self.store:reload()
     self.store:prune_missing_files()
-    self:toast("正在刷新当前页面…",2)
-    local remote=false
-    if self._home_active_section=="account" or self._home_active_section=="mp" then
-        remote=self:_home_refresh_remote(true,false)
-    end
-    local local_started=false
-    if self._home_active_section=="local" then local_started=self:_home_scan_local(false) end
-    if not remote and not local_started then self:_notify_home_data_changed("content") end
+    self:toast("正在更新已下载书籍…",2)
+    self:_notify_home_data_changed("section")
     return true
+end
+
+function Plugin:_home_refresh_whole_page()
+    if not HomeView.is_shown() or self:_active_reader_ui() then return false end
+    -- "Refresh entire home" means show every state MiuRead already knows now.
+    -- It does not force network, local scans, metadata lookups or a full-waveform
+    -- e-ink refresh; those remain separate explicit actions.
+    HomeData.quick_device_state(true)
+    self._home_recent_read_dirty=true
+    HOME_SESSION.recent_read_dirty=true
+    local shown=self:_show_miuread_home_now(false,true,true,"page",{skip_background=true})
+    if shown then
+        self:_home_schedule_clock()
+        self:toast("主页状态已刷新",2)
+    end
+    return shown==true
 end
 
 function Plugin:_home_complete_refresh(confirmed)
@@ -3669,6 +3795,7 @@ function Plugin:_set_home_section(section)
         UIManager:scheduleIn(.05,function()
             if HomeView.is_shown() and self._home_active_section=="local" then self:_home_ensure_local_inline_loaded() end
         end)
+        self:_home_schedule_stale_checks(1.0)
     end
 end
 
@@ -3857,7 +3984,7 @@ function Plugin:_home_schedule_cover_derivatives(books)
     if fast_changed and HomeView.is_shown() and not self:_active_reader_ui() then
         for section in pairs(fast_sections) do self:_home_bump_section_revision(section) end
         local active=self._home_active_section or "account"
-        if fast_hero_changed then self:_home_schedule_render_refresh("content") end
+        if fast_hero_changed and self._home_hero then HomeView.update_hero(self._home_hero) end
         if fast_sections[active] then
             for id in pairs(fast_ids) do HomeView.update_book(id) end
         end
@@ -3988,7 +4115,7 @@ function Plugin:_home_schedule_cover_derivatives(books)
         if any_changed and HomeView.is_shown() and not self:_active_reader_ui() then
             for section in pairs(changed_sections) do self:_home_bump_section_revision(section) end
             local active=self._home_active_section or "account"
-            if hero_changed then self:_home_schedule_render_refresh("content") end
+            if hero_changed and self._home_hero then HomeView.update_hero(self._home_hero) end
             if changed_sections[active] then
                 for id in pairs(changed_ids) do HomeView.update_book(id) end
             end
@@ -4338,7 +4465,7 @@ function Plugin:home_source_settings_menu()
 end
 
 local HOME_ACTION_LABELS={
-    refresh="刷新",search="搜索",downloads="下载",sync="同步",sleep="休眠",
+    refresh="更新",search="搜索",downloads="下载",sync="同步",sleep="休眠",
     miuread_settings="觅阅设置",all_books="全部书籍",history="阅读历史",file_manager="文件管理",screenshot="截图",
 }
 local HOME_PANEL_LABELS={
@@ -5734,12 +5861,80 @@ local function normalized_home_time(value)
     return stamp>0 and stamp or 0
 end
 
+local function home_recent_item_identity(item)
+    if type(item)~="table" then return "","" end
+    local id=tostring(item.book_id or item.bookId or "")
+    local file=LocalLibrary.normalize(item.file or "")
+    return id,file
+end
+
+local function home_recent_item_key(item)
+    local id,file=home_recent_item_identity(item)
+    if id~="" then return "book:"..id end
+    return file~="" and ("file:"..file) or ""
+end
+
+function Plugin:_home_share_recent_read(book_id,path,stamp)
+    book_id=tostring(book_id or "")
+    path=LocalLibrary.normalize(path or "")
+    stamp=normalized_home_time(stamp)
+    if stamp<=0 or (book_id=="" and path=="") then return false end
+    local item={book_id=book_id,file=path,read_at=stamp}
+    item.key=home_recent_item_key(item)
+    local bridge=type(HOME_SESSION.recent_reads_bridge)=="table"
+        and HOME_SESSION.recent_reads_bridge or {version=1,items={}}
+    bridge.version=1
+    bridge.items=type(bridge.items)=="table" and bridge.items or {}
+    local items={item}
+    local seen_ids,seen_files={},{}
+    if book_id~="" then seen_ids[book_id]=true end
+    if path~="" then seen_files[path]=true end
+    for _,old in ipairs(bridge.items) do
+        local old_id,old_file=home_recent_item_identity(old)
+        local duplicate=(old_id~="" and seen_ids[old_id]) or (old_file~="" and seen_files[old_file])
+        if not duplicate and (old_id~="" or old_file~="") then
+            if old_id~="" then seen_ids[old_id]=true end
+            if old_file~="" then seen_files[old_file]=true end
+            items[#items+1]=old
+            if #items>=10 then break end
+        end
+    end
+    bridge.items=items
+    HOME_SESSION.recent_reads_bridge=bridge
+    HOME_SESSION.recent_read_dirty=true
+    return true
+end
+
 function Plugin:_home_recent_read_state()
-    if self.store.recent_reads then return self.store:recent_reads() end
-    local state=self.store:get("recent_reads",{version=1,items={}})
-    if type(state)~="table" then state={version=1,items={}} end
-    if type(state.items)~="table" then state.items={} end
-    return state
+    local stored
+    if self.store.recent_reads then stored=self.store:recent_reads()
+    else stored=self.store:get("recent_reads",{version=1,items={}}) end
+    stored=type(stored)=="table" and stored or {version=1,items={}}
+    stored.items=type(stored.items)=="table" and stored.items or {}
+    local bridge=type(HOME_SESSION.recent_reads_bridge)=="table"
+        and HOME_SESSION.recent_reads_bridge or {items={}}
+    local merged={version=1,items={}}
+    local seen_ids,seen_files={},{}
+    local function append(item)
+        if type(item)~="table" then return end
+        local id,file=home_recent_item_identity(item)
+        if id=="" and file=="" then return end
+        if (id~="" and seen_ids[id]) or (file~="" and seen_files[file]) then return end
+        if id~="" then seen_ids[id]=true end
+        if file~="" then seen_files[file]=true end
+        merged.items[#merged.items+1]=item
+    end
+    for _,item in ipairs(type(bridge.items)=="table" and bridge.items or {}) do
+        append(item)
+        if #merged.items>=10 then break end
+    end
+    if #merged.items<10 then
+        for _,item in ipairs(stored.items) do
+            append(item)
+            if #merged.items>=10 then break end
+        end
+    end
+    return merged
 end
 
 function Plugin:_home_apply_recent_read_times(...)
@@ -6302,7 +6497,12 @@ function Plugin:_home_force_refresh_current_cover(book,on_done)
         end
 
         if old_cached and old_cached~=path then os.remove(old_cached) end
-        if HomeView.is_shown() then self:_home_schedule_render_refresh("content") end
+        if HomeView.is_shown() then
+            if self._home_hero and tostring(self._home_hero.bookId or self._home_hero.book_id or "")==id then
+                HomeView.update_hero(self._home_hero)
+            end
+            HomeView.update_book(id)
+        end
         logger.info("[MiuRead][Cover] manual refresh complete",tostring(id),tostring(path))
         if on_done then on_done(true) end
     end,background and 35 or 14)
@@ -6419,17 +6619,22 @@ function Plugin:_show_home_refresh_popup(anchor)
         cache_key="home_refresh",
         anchor=anchor,
         preferred_direction="below",
-        title="刷新",
-        subtitle="常用更新直接执行 维护操作不放在主页",
+        title="更新",
+        subtitle="内容更新与墨水屏全刷分开执行",
         actions={
-            {icon="▤",label="刷新当前页面",detail="立即整屏刷新并清除残影",callback=function() self:_home_full_refresh(true) end},
-            {icon="↻",label="更新当前栏目",detail="按当前栏目更新书架或本地数据",callback=function() self:_home_manual_refresh() end},
+            {icon="↻",label="更新当前栏目",detail="只检查当前看到的内容",callback=function() self:_home_manual_refresh() end},
+            {icon="▣",label="刷新整个主页",detail="核对已有状态并整页更新一次",callback=function() self:_home_refresh_whole_page() end},
             {icon="☁",label="更新微信书架",detail="重新获取微信书架变化",callback=function() self:_home_refresh_remote(true,true) end},
-            {icon="⌕",label="更新本地书库",detail="检查本地书籍变化",callback=function()
+            {icon="⌕",label="更新本地书库",detail="检查新增、删除和移动的书籍",callback=function()
                 local started=self:_home_scan_local(true)
                 if started then self:toast("正在更新本地书库…",2) end
             end},
-            {icon="i",label="补全书籍信息",detail="更新缺失资料",callback=function() self:_home_complete_refresh(true) end},
+            {icon="i",label="更新最近阅读信息",detail="更新顶部这本书的资料和封面",callback=function()
+                local hero=self._home_hero
+                if hero then self:_home_refresh_current_network_metadata(hero)
+                else self:toast("当前没有最近阅读书籍",2) end
+            end},
+            {icon="▤",label="全屏刷新",detail="整屏刷新并清除墨水屏残影",callback=function() self:_home_full_refresh(true) end},
         },
     }
 end
@@ -6683,12 +6888,19 @@ end
 
 function Plugin:_home_action_function_actions(key,anchor)
     if key=="refresh" then return {
-        {icon="▤",label="刷新当前页面",detail="立即整屏刷新并清除残影",callback=function() self:_home_full_refresh(true) end},
-        {icon="↻",label="更新当前栏目",detail="按当前栏目更新书架或本地数据",callback=function() self:_home_manual_refresh() end},
+        {icon="↻",label="更新当前栏目",detail="只检查当前看到的内容",callback=function() self:_home_manual_refresh() end},
+        {icon="▣",label="刷新整个主页",detail="核对已有状态并整页更新一次",callback=function() self:_home_refresh_whole_page() end},
         {icon="☁",label="更新微信书架",detail="重新获取微信书架变化",callback=function() self:_home_refresh_remote(true,true) end},
-        {icon="⌕",label="扫描本地书库",detail="检查本地书籍变化",callback=function() self:_home_scan_local(true) end},
-        {icon="i",label="补全书籍信息",detail="更新缺失资料",callback=function() self:_home_complete_refresh(true) end},
-        {icon="▦",label="刷新设置",detail="进入书架与刷新设置",callback=function() self:_show_standalone_menu("首页与书架",self:display_settings_menu(),{anchor=anchor}) end},
+        {icon="⌕",label="更新本地书库",detail="检查新增、删除和移动的书籍",callback=function()
+            local started=self:_home_scan_local(true)
+            if started then self:toast("正在更新本地书库…",2) end
+        end},
+        {icon="i",label="更新最近阅读信息",detail="更新顶部这本书的资料和封面",callback=function()
+            local hero=self._home_hero
+            if hero then self:_home_refresh_current_network_metadata(hero)
+            else self:toast("当前没有最近阅读书籍",2) end
+        end},
+        {icon="▤",label="全屏刷新",detail="整屏刷新并清除墨水屏残影",callback=function() self:_home_full_refresh(true) end},
     } end
     if key=="search" then return {
         {icon="⌕",label="搜索书籍",detail="按书名或作者查找",callback=function() self:show_home_search_dialog() end},
@@ -6987,10 +7199,10 @@ function Plugin:_home_action_entries()
     elseif sync_summary.total>0 then sync_badge=sync_summary.total>99 and "99+" or tostring(sync_summary.total) end
 
     local definitions={
-        refresh={icon="↻",icon_key="refresh",label="刷新",callback=function()
-            -- The primary shortcut is visual refresh only: no network, scan,
-            -- metadata lookup or toast is started from a single tap.
-            self:_home_full_refresh(true)
+        refresh={icon="↻",icon_key="refresh",label="更新",callback=function()
+            -- Single tap means "update what I am looking at". E-ink full refresh
+            -- remains available from the long-press menu and quick panel.
+            self:_home_manual_refresh()
         end},
         search={icon="⌕",icon_key="search",label="搜索",callback=function(anchor) self:_show_home_search_popup(anchor) end},
         downloads={icon="⇩",icon_key="download",label="下载",badge=download_badge,callback=function(anchor) self:_show_home_download_popup(anchor) end},
@@ -7139,6 +7351,11 @@ function Plugin:_home_scan_local(force)
     local home=self:_home_preferences()
     local mode="auto" -- compatibility label for existing logging
     if force~=true and home.local_auto_update~=true then return false end
+    if force~=true then
+        local cached=self:_home_local_cache()
+        local scanned_at=tonumber(cached and cached.scanned_at or 0) or 0
+        if scanned_at>0 and os.time()-scanned_at<HOME_LOCAL_CACHE_TTL then return false end
+    end
     if self:_home_background_blocked() or self:_active_reader_ui() then return false end
     local roots=self:_home_local_roots(true)
     if #roots==0 or not self.home_async or self.home_async:busy() or not self.home_async:available() then return false end
@@ -7589,7 +7806,9 @@ function Plugin:_home_schedule_network_metadata(book,force,silent,on_done,explic
         or home_network_patch_has_data(cached.patch))
     if force~=true and cached_completed then
         if type(cached.patch)=="table" and self:_home_merge_network_patch(book,cached.patch) then
-            self:_home_schedule_render_refresh("content")
+            if self._home_hero and self:_home_network_metadata_key(self._home_hero)==key then
+                HomeView.update_hero(self._home_hero)
+            end
         end
         return false
     end
@@ -7657,7 +7876,7 @@ function Plugin:_home_schedule_network_metadata(book,force,silent,on_done,explic
         self:_home_save_network_metadata(candidate,saved_patch,found)
         if self._home_hero and self:_home_network_metadata_key(self._home_hero)==key then
             local changed=self:_home_merge_network_patch(self._home_hero,patch)
-            if changed and HomeView.is_shown() then self:_home_schedule_render_refresh("content") end
+            if changed and HomeView.is_shown() then HomeView.update_hero(self._home_hero) end
         end
         local missing=home_network_missing_fields(candidate,saved_patch)
         local detail={
@@ -7724,11 +7943,8 @@ function Plugin:_home_schedule_local_metadata(books)
     local cache_dir=self:_home_local_metadata_dir()
     local function finish()
         if generation~=self._home_metadata_generation or not HomeView.is_shown() then return end
-        if hero_changed then
-            -- The recent-reading card lives in the static upper body. Only a
-            -- real change to that card may rebuild the content region.
-            self:_home_schedule_render_refresh("content")
-            return
+        if hero_changed and self._home_hero then
+            HomeView.update_hero(self._home_hero)
         end
         for key in pairs(changed_book_keys) do HomeView.update_book(key) end
     end
@@ -7832,11 +8048,10 @@ function Plugin:_home_schedule_remote_covers(books)
         if changed_count<=0 then return end
         for section in pairs(changed_sections) do self:_home_bump_section_revision(section) end
         local active=self._home_active_section or "account"
-        if hero_changed then
-            -- The recent-reading card belongs to the static body. Rebuild that
-            -- content only when the hero itself changed. Shelf cards are updated
-            -- independently below so unrelated covers never blink.
-            self:_home_schedule_render_refresh("content")
+        if hero_changed and self._home_hero then
+            -- Update only the recent-reading static layer; unrelated shelf cards
+            -- keep their rendered objects and do not blink.
+            HomeView.update_hero(self._home_hero)
         end
         if changed_sections[active] then
             for id in pairs(changed_ids) do HomeView.update_book(id) end
@@ -11732,7 +11947,8 @@ function Plugin:_home_refresh_recent_hero_cached()
     return true
 end
 
-function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kind)
+function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kind,options)
+    options=type(options)=="table" and options or {}
     sync_home_session()
     if HOME_EXITING or UIManager._exit_code~=nil or HOME_SESSION.suspended==true or self._miuread_suspended==true then return false end
     if READER_CLOSE.state~="idle" and READER_CLOSE.state~="completed"
@@ -11886,6 +12102,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     rawset(_G,HOME_OWNER_KEY,self)
     self:_set_foreground("home")
     self._home_refresh_pending=false
+    self:_home_schedule_clock()
     if active=="local" then
         UIManager:scheduleIn(.05,function()
             if HomeView.is_shown() and self._home_active_section=="local" then self:_home_ensure_local_inline_loaded() end
@@ -11904,13 +12121,15 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     end
     self._home_visible_metadata_targets=metadata_targets
     self._home_visible_cover_targets=cover_targets
-    self:_home_schedule_local_metadata(metadata_targets)
-    self:_home_schedule_remote_covers(cover_targets)
-    -- Existing covers are converted only after the home is already interactive.
-    -- Newly downloaded covers schedule the same worker when their batch ends.
-    UIManager:scheduleIn(.85,function()
-        if HomeView.is_shown() and not self:_active_reader_ui() then self:_home_schedule_cover_derivatives(cover_targets) end
-    end)
+    if options.skip_background~=true then
+        self:_home_schedule_local_metadata(metadata_targets)
+        self:_home_schedule_remote_covers(cover_targets)
+        -- Existing covers are converted only after the home is already interactive.
+        -- Newly downloaded covers schedule the same worker when their batch ends.
+        UIManager:scheduleIn(.85,function()
+            if HomeView.is_shown() and not self:_active_reader_ui() then self:_home_schedule_cover_derivatives(cover_targets) end
+        end)
+    end
     local hero_needs_network = hero and (
         U.trim(tostring(hero.description or hero.intro or hero.summary or ""))==""
         or U.trim(tostring(hero.category or ""))==""
@@ -11924,7 +12143,8 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         home.last_network_metadata_recent_key=hero_key
         self:_save_home_preferences_deferred(home,home_preferences)
     end
-    if hero_recent_changed and hero_needs_network and home.network_metadata~=false then
+    if options.skip_background~=true
+        and hero_recent_changed and hero_needs_network and home.network_metadata~=false then
         -- Only the newly changed recent-reading book may start an automatic
         -- network lookup. Successful results stay cached until manual refresh.
         UIManager:scheduleIn(2.5,function()
@@ -11935,10 +12155,11 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         end)
     end
 
-    if not from_refresh then
-        self:_home_scan_local(force_scan==true)
-        -- Remote shelves are shown from cache at startup. A network refresh is
-        -- performed only from the explicit refresh action.
+    if not from_refresh and options.skip_background~=true then
+        if force_scan==true then self:_home_scan_local(true) end
+        -- Startup remains cache-first. Stale cloud/local checks are allowed
+        -- only after the interface is idle and their TTL has expired.
+        self:_home_schedule_stale_checks(4.5)
     end
     return true
 end
@@ -12065,6 +12286,7 @@ function Plugin:_restore_home_after_reader_close(attempt,generation)
         HOME_RETURN_FILE=nil
         persist_home_session()
         self:_set_foreground("home")
+        self:_home_schedule_clock()
         self:_close_reader_recovery_surface()
         self:_release_reader_transition_guard("home already visible")
         self:_home_enter_post_reader_priority_window(4.0,"home revealed")
@@ -17619,17 +17841,30 @@ function Plugin:_record_recent_read(path,book,record)
     local book_id=tostring((book and (book.book_id or book.bookId))
         or (record and (record.book_id or record.bookId)) or "")
     if path=="" and book_id=="" then return false end
+    local stamp=os.time()
     if self.store.record_recent_read then
-        self.store:record_recent_read(book_id,path,os.time())
+        self.store:record_recent_read(book_id,path,stamp)
     elseif book_id~="" then
-        self.store:mark_last_read(book_id,path,nil,false)
+        self.store:mark_last_read(book_id,path,nil,false,stamp)
     end
+    self:_home_share_recent_read(book_id,path,stamp)
     self._home_recent_read_dirty=true
     HOME_SESSION.recent_read_dirty=true
     local owner=home_owner()
-    if owner and owner~=self then owner._home_recent_read_dirty=true end
+    if owner and owner~=self then
+        -- Keep the parked Home instance's in-memory view current too. These are
+        -- deferred settings writes; no synchronous disk I/O is added to
+        -- ReaderReady or the page-turn path.
+        if owner.store and owner.store.record_recent_read then
+            owner.store:record_recent_read(book_id,path,stamp)
+        elseif owner.store and book_id~="" then
+            owner.store:mark_last_read(book_id,path,nil,false,stamp)
+        end
+        owner._home_recent_read_dirty=true
+    end
     logger.info("[MiuRead][Recent] reader recorded",
-        "book=",book_id~="" and book_id or "local","file=",tostring(path))
+        "book=",book_id~="" and book_id or "local","file=",tostring(path),
+        "shared=true")
     return true
 end
 
