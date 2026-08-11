@@ -552,6 +552,12 @@ function Plugin:init()
     self.mp_async=Async:new(self.store,{poll_interval=.35,allow_android=true})
     self.search_async=Async:new(self.store,{poll_interval=.4,allow_android=true})
     self.shelf_async=Async:new(self.store,{poll_interval=.4,allow_android=true})
+    -- User-triggered network reads that used to run through UIManager must
+    -- always stay off the UI thread. This worker is intentionally separate
+    -- from sync/download/search workers so those lifecycles cannot block it.
+    self.interactive_network_async=Async:new(self.store,{poll_interval=.30,allow_android=true,disable_fallback=true})
+    self._interactive_network_generation=0
+    self._interactive_network_key=nil
     self.cover_async=Async:new(self.store,{poll_interval=.30,allow_android=true})
     self.identity_async=Async:new(self.store,{poll_interval=.20,allow_android=true,
         disable_fallback=true})
@@ -783,6 +789,164 @@ end
 function Plugin:safe(label,fn) return function(...) local a={...}; local ok,e=xpcall(function() return fn(unpack_args(a)) end,debug.traceback); if not ok then logger.err("[MiuRead]",label,e); self:info(_("Operation failed")..":\n"..U.first_line(e)) end end end
 function Plugin:is_online() local ok,N=pcall(require,"ui/network/manager"); if not ok or not N or not N.isOnline then return true end; local g,v=pcall(N.isOnline,N); return not g or v==true end
 function Plugin:online(label,fn) if not self:is_online() then self:info(_("Network unavailable")); return end; UIManager:scheduleIn(.05,self:safe(label,fn)) end
+
+local function interactive_child_store(auth,data_dir,temp_dir)
+    local current=U.copy(type(auth)=="table" and auth or {})
+    local changed=false
+    local store={data_dir=tostring(data_dir or ""),temp_dir=tostring(temp_dir or "")}
+    function store:auth() return U.copy(current) end
+    function store:save_auth(value) current=U.copy(type(value)=="table" and value or {}); changed=true end
+    function store:snapshot() return U.copy(current),changed end
+    return store
+end
+
+function Plugin:_interactive_network_context()
+    return {
+        reader_file=normalized_reader_file(self:_current_document_path()),
+        reader_generation=tonumber(HOME_SESSION.reader_session_generation) or 0,
+        home_shown=HomeView.is_shown()==true,
+        home_section=tostring(self._home_active_section or ""),
+    }
+end
+
+function Plugin:_interactive_network_context_valid(context)
+    context=type(context)=="table" and context or {}
+    if self._miuread_suspended==true or HOME_SESSION.suspended==true or HOME_EXITING then return false end
+    local current_file=normalized_reader_file(self:_current_document_path())
+    if context.reader_file then
+        return current_file==context.reader_file
+            and tonumber(HOME_SESSION.reader_session_generation or 0)==tonumber(context.reader_generation or 0)
+    end
+    if current_file then return false end
+    if context.home_shown then
+        return HomeView.is_shown()==true and tostring(self._home_active_section or "")==tostring(context.home_section or "")
+    end
+    return true
+end
+
+function Plugin:_apply_interactive_auth(snapshot)
+    if type(snapshot)~="table" or snapshot.changed~=true or type(snapshot.auth)~="table" then return false end
+    local current=self.store:auth()
+    local incoming=snapshot.auth
+    local current_session=tostring(current.login_session_id or "")
+    local incoming_session=tostring(incoming.login_session_id or "")
+    if current_session=="" or incoming_session=="" or current_session~=incoming_session then
+        logger.warn("[MiuRead][NetTask] ignored stale auth snapshot")
+        return false
+    end
+    local current_vid=tostring((current.account or {}).vid or (current.cookies or {}).wr_vid or "")
+    local incoming_vid=tostring((incoming.account or {}).vid or (incoming.cookies or {}).wr_vid or "")
+    if current_vid~="" and incoming_vid~="" and current_vid~=incoming_vid then
+        logger.warn("[MiuRead][NetTask] ignored cross-account auth snapshot")
+        return false
+    end
+    self.store:save_auth(incoming)
+    return true
+end
+
+function Plugin:_cancel_interactive_network(reason)
+    self._interactive_network_generation=(tonumber(self._interactive_network_generation) or 0)+1
+    self._interactive_network_key=nil
+    if self.interactive_network_async then self.interactive_network_async:cancel(reason or "cancelled") end
+    return true
+end
+
+function Plugin:_run_interactive_network(key,label,worker,callback,options)
+    options=type(options)=="table" and options or {}
+    key=tostring(key or label or "interactive")
+    label=tostring(label or key)
+    if not self:is_online() then
+        if options.silent~=true then self:info(_("Network unavailable")) end
+        return false,"offline"
+    end
+    local async=self.interactive_network_async
+    if not async or not async:available() then
+        if options.silent~=true then self:info("当前设备暂时无法启动后台网络任务，请稍后重试。") end
+        return false,"background worker unavailable"
+    end
+    if async:busy() then
+        if tostring(self._interactive_network_key or "")==key then
+            if options.silent~=true then self:toast("该网络请求正在进行中",2) end
+            return false,"duplicate request"
+        end
+        self:_cancel_interactive_network("superseded by "..key)
+    end
+    self._interactive_network_generation=(tonumber(self._interactive_network_generation) or 0)+1
+    local generation=self._interactive_network_generation
+    self._interactive_network_key=key
+    local context=options.context or self:_interactive_network_context()
+    local started_at=monotonic_wall_time()
+    if options.status_title and options.status_text and options.silent~=true then
+        self:status_toast(options.status_title,options.status_text,tonumber(options.status_seconds) or 2)
+    end
+    logger.info("[MiuRead][NetTask] started","key=",key)
+    local started,err=async:run(label,worker,function(result)
+        if generation~=self._interactive_network_generation then return end
+        self._interactive_network_key=nil
+        local network_ms=math.floor((monotonic_wall_time()-started_at)*1000+.5)
+        if not self:_interactive_network_context_valid(context) then
+            logger.info("[MiuRead][NetTask] stale result dropped","key=",key,"network_ms=",tostring(network_ms))
+            return
+        end
+        local callback_started=monotonic_wall_time()
+        if callback then callback(result) end
+        local callback_ms=math.floor((monotonic_wall_time()-callback_started)*1000+.5)
+        logger.info("[MiuRead][NetTask] completed","key=",key,
+            "network_ms=",tostring(network_ms),"callback_ms=",tostring(callback_ms),
+            "ok=",tostring(result and result.ok==true))
+    end,tonumber(options.timeout) or 35)
+    if not started then
+        if generation==self._interactive_network_generation then self._interactive_network_key=nil end
+        if options.silent~=true then self:info("无法启动后台网络任务：\n"..tostring(err or "未知错误")) end
+        return false,err
+    end
+    return true
+end
+
+function Plugin:_request_catalog(book,label,on_ready,options)
+    options=type(options)=="table" and options or {}
+    local id=tostring(book and (book.bookId or book.book_id) or "")
+    if id=="" then return false,"missing book id" end
+    local auth=U.copy(self.store:auth())
+    local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
+    label=tostring(label or "catalog")
+    local key="catalog:"..id..":"..label
+    return self:_run_interactive_network(key,label,function()
+        local HttpChild=require("miuread.http")
+        local ReaderChild=require("miuread.reader")
+        local DownloaderChild=require("miuread.downloader")
+        local child_store=interactive_child_store(auth,data_dir,temp_dir)
+        local child_http=HttpChild:new(child_store)
+        local child_reader=ReaderChild:new(child_http,child_store)
+        local child_downloader=DownloaderChild:new(child_reader,nil,nil,child_store,child_http)
+        local request_ok,catalog,rows=pcall(child_downloader.catalog,child_downloader,id)
+        local child_auth,auth_changed=child_store:snapshot()
+        return {request_ok=request_ok,rows=request_ok and rows or nil,
+            error=request_ok and nil or tostring(catalog),auth=child_auth,auth_changed=auth_changed}
+    end,function(result)
+        if not result or result.ok~=true then
+            local message=result and result.error or "章节目录加载失败"
+            if options.on_error then options.on_error(message)
+            elseif options.silent~=true then self:info(self:_friendly_remote_error(message,"章节目录加载")) end
+            return
+        end
+        local payload=type(result.value)=="table" and result.value or {}
+        if payload.auth_changed==true then self:_apply_interactive_auth{auth=payload.auth,changed=true} end
+        if payload.request_ok~=true then
+            local message=tostring(payload.error or "章节目录加载失败")
+            if options.on_error then options.on_error(message)
+            elseif options.silent~=true then self:info(self:_friendly_remote_error(message,"章节目录加载")) end
+            return
+        end
+        if on_ready then on_ready(type(payload.rows)=="table" and payload.rows or {}) end
+    end,{
+        context=options.context,timeout=tonumber(options.timeout) or 45,silent=options.silent,
+        status_title=options.status_title or "章节",
+        status_text=options.status_text or "正在后台读取章节目录…",
+        status_seconds=2,
+    })
+end
+
 function Plugin:_wait_for_network(label,callback,options)
     options=options or {}
     self._network_wait_tokens=self._network_wait_tokens or {}
@@ -1093,18 +1257,35 @@ function Plugin:_set_all_auth_ok()
 end
 function Plugin:check_account_status()
     if not self:logged_in() then self.auth_flow:start(); return end
-    self:online("account-status-check",function()
-        self:status_toast("账号状态","正在检查基础账号和书架访问",3)
-        local shelf_ok,shelf_result=pcall(self.api.shelf,self.api,{retries=0,timeout={7,12}})
-        if shelf_ok then
+    local auth=U.copy(self.store:auth())
+    local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
+    local context=self:_interactive_network_context()
+    self:_run_interactive_network("account-status","account-status-check",function()
+        local HttpChild=require("miuread.http")
+        local ApiChild=require("miuread.api")
+        local child_store=interactive_child_store(auth,data_dir,temp_dir)
+        local child_api=ApiChild:new(HttpChild:new(child_store),child_store)
+        local ok,value=pcall(child_api.shelf,child_api,{retries=0,timeout={7,12}})
+        local child_auth,auth_changed=child_store:snapshot()
+        return {request_ok=ok,value=ok and value or nil,error=ok and nil or tostring(value),
+            auth=child_auth,auth_changed=auth_changed}
+    end,function(result)
+        if not result or result.ok~=true then
+            self:_mark_auth_channel_error("shelf",result and result.error or "账号检查失败")
+            self:show_account_status()
+            return
+        end
+        local payload=type(result.value)=="table" and result.value or {}
+        if payload.auth_changed==true then self:_apply_interactive_auth{auth=payload.auth,changed=true} end
+        if payload.request_ok==true then
             self:_mark_auth_channel_ok("shelf")
-        elseif Http.is_auth_error(shelf_result) then
-            self:_mark_auth_problem("shelf",shelf_result,false)
+        elseif Http.is_auth_error(payload.error) then
+            self:_mark_auth_problem("shelf",payload.error,false)
         else
-            self:_mark_auth_channel_error("shelf",shelf_result)
+            self:_mark_auth_channel_error("shelf",payload.error or "账号检查失败")
         end
         self:show_account_status()
-    end)
+    end,{context=context,timeout=24,status_title="账号状态",status_text="正在后台检查基础账号和书架访问"})
 end
 function Plugin:confirm_logout()
     if not self:logged_in() then self:toast("当前没有登录微信读书账号",3); return end
@@ -1114,6 +1295,7 @@ function Plugin:confirm_logout()
     UIManager:show(ConfirmBox:new{text=text,ok_text="退出登录",ok_callback=function()
         if downloading and self.download_task then self.download_task:cancel() end
         self.auth_flow:cancel()
+        self:_cancel_interactive_network("logout")
         self._auth_transitioning=true
         if self.sync and self.sync.invalidate_login_session then
             pcall(self.sync.invalidate_login_session,self.sync,"logout")
@@ -1127,6 +1309,7 @@ function Plugin:confirm_logout()
 end
 
 function Plugin:on_auth_replacing(_old_auth,_new_auth)
+    self:_cancel_interactive_network("auth replacing")
     self._auth_transitioning=true
     if self.sync and self.sync.invalidate_login_session then
         self.sync:invalidate_login_session("new_login")
@@ -8587,6 +8770,7 @@ function Plugin:show_home_quick_panel(more_expanded)
 end
 
 function Plugin:_begin_koreader_exit(reason)
+    self:_cancel_interactive_network(reason or "KOReader exit")
     self:_cancel_native_menu_guard()
     HOME_EXITING=true
     HOME_SESSION_SUPPRESSED=true
@@ -12712,7 +12896,38 @@ function Plugin:book_menu(b)
 end
 
 function Plugin:book_details(b)
-    self:online("details",function() local x=self.api:book(b.bookId); local z=normalize(x); self:info(z.title.."\n"..z.author.."\n\n"..tostring(x.intro or x.description or "")) end)
+    b=U.copy(b or {})
+    local id=tostring(b.bookId or b.book_id or "")
+    if id=="" then self:info("当前书籍缺少可查询的图书编号。") return false end
+    local auth=U.copy(self.store:auth())
+    local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
+    local context=self:_interactive_network_context()
+    return self:_run_interactive_network("book-details:"..id,"details",function()
+        local HttpChild=require("miuread.http")
+        local ApiChild=require("miuread.api")
+        local child_store=interactive_child_store(auth,data_dir,temp_dir)
+        local child_api=ApiChild:new(HttpChild:new(child_store),child_store)
+        local request_ok,detail=pcall(child_api.book,child_api,id)
+        local child_auth,auth_changed=child_store:snapshot()
+        return {request_ok=request_ok,detail=request_ok and detail or nil,error=request_ok and nil or tostring(detail),
+            auth=child_auth,auth_changed=auth_changed}
+    end,function(result)
+        if not result or result.ok~=true then
+            self:info(self:_friendly_remote_error(result and result.error or "未知错误","书籍详情加载"))
+            return
+        end
+        local payload=type(result.value)=="table" and result.value or {}
+        if payload.auth_changed==true then self:_apply_interactive_auth{auth=payload.auth,changed=true} end
+        if payload.request_ok~=true then
+            self:info(self:_friendly_remote_error(payload.error or "未知错误","书籍详情加载"))
+            return
+        end
+        local x=type(payload.detail)=="table" and payload.detail or {}
+        local z=normalize(x)
+        local title=z.title~="" and z.title or tostring(b.title or "书籍详情")
+        local author=z.author~="" and z.author or tostring(b.author or "")
+        self:info(title.."\n"..author.."\n\n"..tostring(x.intro or x.description or b.intro or b.description or "暂无简介"))
+    end,{context=context,timeout=28,status_title="书籍详情",status_text="正在后台获取书籍信息…"})
 end
 function Plugin:_download_preflight(callback)
     local state=HomeData.device_state(true) or {}
@@ -13728,8 +13943,8 @@ function Plugin:range_extend_menu(b)
     return items
 end
 function Plugin:show_range_extend_options(b,annotations,record)
-    self:online("range-extend",function()
-        local _,rows=self.downloader:catalog(b.bookId)
+    local context=self:_interactive_network_context()
+    self:_request_catalog(b,"range-extend",function(rows)
         rows=rows or {}
         local first=math.max(1,tonumber(record.range_start_index) or 1)
         local last=math.min(#rows,tonumber(record.range_end_index) or first)
@@ -13750,7 +13965,7 @@ function Plugin:show_range_extend_options(b,annotations,record)
         end}
         items[#items+1]={text="重新选择章节范围",callback=function() self:chapters(b) end}
         self:list("扩展章节版 · 当前 "..tostring(last-first+1).." 章",items)
-    end)
+    end,{context=context,status_text="正在后台读取可扩展章节…"})
 end
 function Plugin:_current_catalog_index(record,rows)
     if not record or not record.record then return nil end
@@ -13779,14 +13994,14 @@ function Plugin:download_current_chapters(count)
     if not record or not record.book then self:info("当前不是觅阅生成的书籍。") return end
     local b={bookId=record.book.book_id,title=record.book.title,author=record.book.author,cover=record.book.cover}
     local wanted=math.max(1,tonumber(count) or 1)
-    self:online("current-chapter-download",function()
-        local _,rows=self.downloader:catalog(b.bookId)
+    local context=self:_interactive_network_context()
+    self:_request_catalog(b,"current-chapter-download",function(rows)
         rows=rows or {}
         local first=self:_current_catalog_index(record,rows)
         if not first or not rows[first] then self:info("暂时无法确定当前章节，请使用“选择章节范围”。") return end
         local last=math.min(#rows,first+wanted-1)
         self:_choose_range_version(b,rows,first,last,false)
-    end)
+    end,{context=context,status_text="正在后台定位当前章节…"})
 end
 
 function Plugin:_chapter_state_text(book_id,chapter)
@@ -13852,8 +14067,8 @@ function Plugin:_range_count_menu(b,rows,first)
     self:list("从《"..tostring(start_ch and start_ch.title or "所选章节").."》开始",items)
 end
 function Plugin:chapters(b)
-    self:online("chapters",function()
-        local _,rows=self.downloader:catalog(b.bookId)
+    local context=self:_interactive_network_context()
+    self:_request_catalog(b,"chapters",function(rows)
         rows=rows or {}
         local items={
             {text="下载单章",callback=function()
@@ -13869,7 +14084,7 @@ function Plugin:chapters(b)
             end},
         }
         self:list("章节下载 · "..tostring(b.title or "未命名"),items,"没有可用章节")
-    end)
+    end,{context=context,status_text="正在后台读取章节目录…"})
 end
 function Plugin:chapter_menu(b,ch)
     local uid=tostring(ch.chapterUid or ch.uid or "")
@@ -13907,6 +14122,7 @@ function Plugin:_open_file_direct(path)
     end
     HOME_SESSION.opening_file=path
     HOME_SESSION.opening_at=now
+    self:_cancel_interactive_network("reader opening")
     HOME_SESSION.home_restore_generation=(tonumber(HOME_SESSION.home_restore_generation) or 0)+1
     HOME_SESSION.home_restore_active=false
 
@@ -17022,6 +17238,7 @@ function Plugin:show_about()
         .."\n\n非官方社区项目，与微信读书及 KOReader 无官方隶属或合作关系。")
 end
 function Plugin:onExit()
+    self:_cancel_interactive_network("exit")
     if not HOME_EXITING then self:_begin_koreader_exit("external exit") end
     return false
 end
@@ -17495,6 +17712,7 @@ function Plugin:_prepare_reader_disappearance(reason)
         self._reader_sync_ready_task=nil
     end
     self:_cancel_network_waits()
+    self:_cancel_interactive_network(reason or "reader disappeared")
     if self.repair_async and self.repair_async.job and self.repair_async.job.label=="book-migration-check" then
         self.repair_async:cancel(reason or "reader disappeared")
         if self.annotation_async then self.annotation_async:cancel(reason or "reader disappeared") end
@@ -18303,6 +18521,7 @@ function Plugin:onSuspend()
     self:_set_foreground("suspended")
     StatusToast.set_blocked(true)
     StatusToast.close()
+    self:_cancel_interactive_network("suspend")
     if self._local_annotation_snapshot_task then
         UIManager:unschedule(self._local_annotation_snapshot_task)
         self._local_annotation_snapshot_task=nil
