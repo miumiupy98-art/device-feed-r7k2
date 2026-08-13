@@ -324,6 +324,7 @@ local function catalog_progress_from_remote(remote, chapters)
     if type(remote)~="table" then return remote end
     chapters=type(chapters)=="table" and chapters or {}
     remote.raw_percent=tonumber(remote.raw_percent or remote.percent)
+    if remote.raw_percent~=nil then remote.percent=remote.raw_percent end
     if #chapters==0 then return remote end
 
     local wanted_uid=tostring(remote.chapter_uid or "")
@@ -339,22 +340,31 @@ local function catalog_progress_from_remote(remote, chapters)
         if not selected then before=before+words end
         total=total+words
     end
-    if not selected or total<=0 then return remote end
+    if not selected then return remote end
 
     local words=chapter_words(selected)
-    local offset=tonumber(remote.offset)
-    if offset==nil then return remote end
-    offset=math.max(0,math.min(words,offset))
-    local calculated=U.clamp(((before+offset)/total)*100,0,100)
-    remote.calculated_percent=calculated
-    remote.percent=calculated
-    remote.position_basis="chapter_offset"
+    local native_offset=tonumber(remote.offset)
     remote.chapter_uid=chapter_uid(selected) or remote.chapter_uid
     remote.chapter_idx=chapter_index(selected,selected_pos)
-    remote.offset=offset
     remote.chapter_word_count=words
     remote.total_word_count=total
     remote.words_before=before
+    if native_offset~=nil then
+        -- beta46: getProgress chapterOffset is the same native Web Reader co
+        -- coordinate used by beta45 uploads. Preserve it verbatim; it is not a
+        -- wordCount coordinate and may legitimately exceed chapter.wordCount.
+        remote.offset=math.max(0,math.floor(native_offset))
+        remote.native_offset=true
+        remote.offset_basis="wr_data_co"
+        remote.position_basis="wr_data_co"
+        -- Keep beta43/beta44's old word-space interpretation only as a last
+        -- fallback if native reverse text positioning cannot be resolved.
+        if words>0 and total>0 then
+            local legacy_offset=math.max(0,math.min(words,native_offset))
+            remote.legacy_chapter_ratio=U.clamp(legacy_offset/words,0,1)
+            remote.legacy_calculated_percent=U.clamp(((before+legacy_offset)/total)*100,0,100)
+        end
+    end
     return remote
 end
 
@@ -1042,14 +1052,16 @@ function Sync:_position_for_report(ratio, precise)
     return fallback
 end
 
-function Sync:jump_remote(remote)
+function Sync:_jump_remote_fallback(remote)
     remote = remote or {}
     local record = self:record()
     if not record then return false, "未识别到当前觅阅书籍" end
     local mode, standalone_uid = self:_record_mode(record)
     local ok, err
     if mode ~= "standalone" or not standalone_uid then
-        ok = self:jump(remote.percent)
+        local fallback_percent = tonumber(remote.legacy_calculated_percent or remote.percent)
+        if fallback_percent == nil then return false, "云端位置缺少可用进度" end
+        ok = self:jump(fallback_percent)
         err = ok and nil or "无法跳转到云端阅读位置"
     else
         local remote_uid = remote.chapter_uid
@@ -1073,20 +1085,161 @@ function Sync:jump_remote(remote)
         if not selected then return false, "暂时无法换算当前章节位置" end
 
         local words = chapter_words(selected)
-        local local_ratio
-        if tonumber(remote.offset) then
-            local_ratio = tonumber(remote.offset) / words
-        elseif tonumber(remote.percent) and total > 0 then
+        local local_ratio = tonumber(remote.legacy_chapter_ratio)
+        if local_ratio == nil and tonumber(remote.percent) and total > 0 and words > 0 then
             local target = U.clamp(tonumber(remote.percent), 0, 100) / 100 * total
             local_ratio = (target - before) / words
         end
-        if local_ratio == nil then return false, "云端位置缺少章节内偏移" end
+        if local_ratio == nil then return false, "云端位置缺少可用章节进度" end
         local_ratio = U.clamp(local_ratio, 0, 1)
         ok = self:jump(local_ratio * 100)
         err = ok and nil or "无法跳转到云端阅读位置"
     end
 
     return ok, err
+end
+
+-- Compatibility entry point. Callers that need beta46's native reverse path
+-- should use jump_remote_precise(); this retains the old synchronous fallback.
+function Sync:jump_remote(remote)
+    return self:_jump_remote_fallback(remote)
+end
+
+function Sync:_jump_native_source_anchor(source_anchor)
+    local record = self:record()
+    local ui = self.host and self.host.ui or nil
+    if not record or not ui or not ui.document then
+        return false, "本地阅读位置不可用"
+    end
+    local target, locate_error = PrecisePosition.findSourceAnchor(ui, record, source_anchor)
+    if not target or tostring(target.xpointer or "") == "" then
+        return false, tostring(locate_error or "无法在本地正文找到云端位置")
+    end
+
+    local xp = tostring(target.xpointer)
+    local ok, jump_error = pcall(function()
+        if ui.link and type(ui.link.onGotoLink) == "function" then
+            ui.link:onGotoLink({xpointer=xp}, false)
+        elseif ui.rolling and type(ui.rolling.onGotoXPointer) == "function" then
+            ui.rolling:onGotoXPointer(xp)
+        elseif ui.document and type(ui.document.gotoXPointer) == "function" then
+            ui.document:gotoXPointer(xp)
+            if ui.rolling and type(ui.rolling.onUpdatePos) == "function" then
+                ui.rolling:onUpdatePos(true)
+            end
+        else
+            error("xpointer jump API unavailable")
+        end
+    end)
+    if not ok then return false, tostring(jump_error) end
+
+    logger.info("[MiuRead][RemoteNative] local anchor jump",
+        "chapter=", tostring(source_anchor.chapter_uid or "-"),
+        "co=", tostring(source_anchor.native_co or "-"),
+        "toc=", tostring(target.toc_index or "-"),
+        "search_chars=", tostring(target.search_chars or "-"),
+        "hits=", tostring(target.search_hits or "-"),
+        "context=", tostring(target.context_disambiguated == true))
+    return true, nil, target
+end
+
+-- beta46 cloud -> local path:
+-- remote native co -> raw source position (subprocess/network or cache)
+-- -> visible source anchor -> CREngine text search -> local XPointer.
+-- Any failure falls back to beta43/45 percentage positioning without changing
+-- the already-proven local -> cloud native upload path.
+function Sync:jump_remote_precise(remote, callback)
+    remote = type(remote) == "table" and remote or {}
+    callback = type(callback) == "function" and callback or function() end
+    local record = self:record()
+    if not record then callback(false, "未识别到当前觅阅书籍"); return false end
+
+    local mode, standalone_uid = self:_record_mode(record)
+    local remote_uid = tostring(remote.chapter_uid or "")
+    local remote_co = tonumber(remote.offset or remote.chapter_offset)
+    if mode == "standalone" and standalone_uid
+        and remote_uid ~= "" and remote_uid ~= tostring(standalone_uid) then
+        callback(false, "云端位置不在当前下载章节中")
+        return false
+    end
+
+    local function fallback(reason)
+        local jumped, jump_error = self:_jump_remote_fallback(remote)
+        logger.info("[MiuRead][RemoteNative] fallback",
+            "chapter=", remote_uid ~= "" and remote_uid or "-",
+            "co=", tostring(remote_co or "-"),
+            "reason=", tostring(reason or "native_unavailable"),
+            "ok=", tostring(jumped == true))
+        callback(jumped, jumped and nil or jump_error, {
+            native=false,
+            fallback=true,
+            native_error=tostring(reason or "native_unavailable"),
+        })
+        return jumped
+    end
+
+    if remote_uid == "" or remote_co == nil then
+        return fallback("remote_native_fields_missing")
+    end
+    local local_row = local_chapter_by_uid(
+        type(record.record) == "table" and record.record.chapter_map or {}, remote_uid)
+    if not local_row then return fallback("remote_chapter_not_local") end
+    if not self.async or not self.async:available() or self.async:busy() then
+        return fallback(self.async and self.async:busy() and "source_worker_busy" or "source_worker_unavailable")
+    end
+
+    local generation = tonumber(self.record_generation or 0) or 0
+    local book_id = tostring(record.book and record.book.book_id or "")
+    local path = tostring(record.path or "")
+    local reader = self.reader
+    local record_snapshot = {
+        book = U.copy(record.book or {}),
+        record = U.copy(record.record or {}),
+        variant = record.variant,
+        path = record.path,
+    }
+    local remote_snapshot = {
+        chapter_uid = remote_uid,
+        chapter_idx = tonumber(remote.chapter_idx),
+        offset = math.max(0, math.floor(remote_co)),
+        percent = tonumber(remote.percent),
+    }
+
+    self.state = "fetching_remote"
+    self.last_stage = "精确定位云端阅读位置"
+    local started, run_error = self.async:run("remote_native_position", function()
+        local value, why = SourcePosition.remoteAnchor(reader, record_snapshot, remote_snapshot)
+        if not value then error(tostring(why or "remote_source_anchor_failed")) end
+        return value
+    end, function(result)
+        local current = self:record()
+        if generation ~= tonumber(self.record_generation or 0)
+            or not current
+            or tostring(current.book and current.book.book_id or "") ~= book_id
+            or tostring(current.path or "") ~= path then
+            callback(false, "书籍已切换", {native=false, stale=true})
+            return
+        end
+
+        if result and result.ok == true and type(result.value) == "table"
+            and result.value.safe == true then
+            local jumped, jump_error, target = self:_jump_native_source_anchor(result.value)
+            if jumped then
+                self.last_stage = "已精确采用云端阅读位置"
+                callback(true, nil, {
+                    native=true,
+                    source_anchor=result.value,
+                    local_target=target,
+                })
+                return
+            end
+            fallback("local_anchor:" .. tostring(jump_error or "not_found"))
+            return
+        end
+        fallback(tostring(result and result.error or "remote_source_anchor_failed"))
+    end, 40)
+    if not started then return fallback(run_error or "source_worker_start_failed") end
+    return true
 end
 
 function Sync:is_verified(book_id)

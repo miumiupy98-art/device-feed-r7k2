@@ -15780,29 +15780,62 @@ end
 
 function Plugin:_use_remote_position(id,localp,remote)
     local remotep=math.floor((tonumber(remote and remote.percent) or 0)+.5)
-    local jumped,jump_error=self.sync:jump_remote(remote)
-    if not jumped then
-        self:_save_progress_state(id,"remote_jump_unconfirmed","无法跳转到云端位置",localp,remotep)
-        self.sync:end_progress_sync("云端位置跳转失败，阅读时间暂缓上传")
-        self:info(tostring(jump_error or "无法跳转到云端位置。").."\n\n当前位置未确认，因此暂不上传阅读时间。")
-        return false
-    end
-    UIManager:scheduleIn(1.2,function()
-        local actual_position=self.sync:local_position()
-        local actual=actual_position and actual_position.progress and math.floor(actual_position.progress+.5) or localp
-        local threshold=tonumber(self.store:preferences().sync.threshold) or 2
-        if math.abs(actual-remotep)<=threshold then
-            self.sync:mark_verified(id,"remote_position_selected",actual,remotep)
-            self:_save_progress_state(id,"remote_selected","已采用云端位置",actual,remotep)
-            self.sync:end_progress_sync("已采用云端位置，阅读时间开始同步")
-            self:status_toast("阅读进度同步","已切换到云端进度："..remotep.."%",4)
-        else
-            self:_save_progress_state(id,"remote_jump_unconfirmed","已请求跳转，位置仍待确认",actual,remotep)
-            self.sync:end_progress_sync("云端位置仍待确认，阅读时间暂缓上传")
-            self:info("已请求跳到云端位置，但当前显示位置为 "..actual.."%。\n\n为避免覆盖云端位置，暂不上传阅读时间。")
+    local started=self.sync:jump_remote_precise(remote,function(jumped,jump_error,jump_meta)
+        if not jumped then
+            self:_save_progress_state(id,"remote_jump_unconfirmed","无法跳转到云端位置",localp,remotep)
+            self.sync:end_progress_sync("云端位置跳转失败，阅读时间暂缓上传")
+            self:info(tostring(jump_error or "无法跳转到云端位置。").."\n\n当前位置未确认，因此暂不上传阅读时间。")
+            return
         end
+        UIManager:scheduleIn(1.2,function()
+            local actual_position=self.sync:local_position()
+            local actual=actual_position and actual_position.progress and math.floor(actual_position.progress+.5) or localp
+            local threshold=tonumber(self.store:preferences().sync.threshold) or 2
+            local native_confirmed=false
+            if jump_meta and jump_meta.native==true and jump_meta.local_target
+                and tostring(jump_meta.local_target.xpointer or "")~="" then
+                local doc=self.ui and self.ui.document or nil
+                local target_xp=tostring(jump_meta.local_target.xpointer)
+                local current_xp=self.ui and self.ui.rolling and self.ui.rolling.xpointer or nil
+                if (not current_xp or current_xp=="") and doc and type(doc.getXPointer)=="function" then
+                    local ok,value=pcall(doc.getXPointer,doc)
+                    if ok then current_xp=value end
+                end
+                if doc and type(doc.getPageFromXPointer)=="function"
+                    and current_xp and tostring(current_xp)~="" then
+                    local ok_target,target_page=pcall(doc.getPageFromXPointer,doc,target_xp)
+                    local ok_current,current_page=pcall(doc.getPageFromXPointer,doc,current_xp)
+                    native_confirmed=ok_target and ok_current and target_page~=nil
+                        and current_page~=nil and tonumber(target_page)==tonumber(current_page)
+                else
+                    -- The exact text anchor has already been resolved and the
+                    -- XPointer jump call succeeded. On older CRE builds without
+                    -- page lookup, trust that native path rather than rejecting
+                    -- it because the legacy percentage model disagrees.
+                    native_confirmed=true
+                end
+            end
+            if native_confirmed or math.abs(actual-remotep)<=threshold then
+                self.sync:mark_verified(id,
+                    native_confirmed and "remote_native_position_selected" or "remote_position_selected",
+                    actual,remotep)
+                self:_save_progress_state(id,"remote_selected",
+                    native_confirmed and "已精确采用云端位置" or "已采用云端位置",actual,remotep)
+                self.sync:end_progress_sync("已采用云端位置，阅读时间开始同步")
+                self:status_toast("阅读进度同步",
+                    native_confirmed and ("已精确切换到云端位置："..remotep.."%")
+                        or ("已切换到云端进度："..remotep.."%"),4)
+            else
+                self:_save_progress_state(id,"remote_jump_unconfirmed","已请求跳转，位置仍待确认",actual,remotep)
+                self.sync:end_progress_sync("云端位置仍待确认，阅读时间暂缓上传")
+                self:info("已请求跳到云端位置，但当前显示位置为 "..actual.."%。\n\n为避免覆盖云端位置，暂不上传阅读时间。")
+            end
+        end)
     end)
-    return true
+    if not started then
+        logger.warn("[MiuRead][RemoteNative] precise jump did not start", "book=", tostring(id))
+    end
+    return started
 end
 
 function Plugin:on_remote_source_conflict(id,localp,remote,automatic)

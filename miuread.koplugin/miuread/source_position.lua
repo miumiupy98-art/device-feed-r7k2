@@ -234,4 +234,175 @@ function M.locate(reader, record, anchor)
     }
 end
 
+
+local NAMED_ENTITIES = {
+    amp = "&", lt = "<", gt = ">", quot = '"', apos = "'",
+    nbsp = " ", ensp = " ", emsp = " ", thinsp = " ",
+    hellip = "…", mdash = "—", ndash = "–",
+    lsquo = "‘", rsquo = "’", ldquo = "“", rdquo = "”",
+    zwnj = "", zwj = "",
+}
+
+local function utf8_encode(codepoint)
+    codepoint = tonumber(codepoint)
+    if not codepoint or codepoint < 0 or codepoint > 0x10FFFF
+        or (codepoint >= 0xD800 and codepoint <= 0xDFFF) then
+        return nil
+    end
+    if codepoint < 0x80 then
+        return string.char(codepoint)
+    elseif codepoint < 0x800 then
+        return string.char(0xC0 + math.floor(codepoint / 0x40), 0x80 + (codepoint % 0x40))
+    elseif codepoint < 0x10000 then
+        return string.char(
+            0xE0 + math.floor(codepoint / 0x1000),
+            0x80 + (math.floor(codepoint / 0x40) % 0x40),
+            0x80 + (codepoint % 0x40)
+        )
+    end
+    return string.char(
+        0xF0 + math.floor(codepoint / 0x40000),
+        0x80 + (math.floor(codepoint / 0x1000) % 0x40),
+        0x80 + (math.floor(codepoint / 0x40) % 0x40),
+        0x80 + (codepoint % 0x40)
+    )
+end
+
+local function decode_entities(value)
+    value = tostring(value or "")
+    value = value:gsub("&#[xX]([%x]+);", function(hex)
+        return utf8_encode(tonumber(hex, 16)) or ("&#x" .. hex .. ";")
+    end)
+    value = value:gsub("&#(%d+);", function(dec)
+        return utf8_encode(tonumber(dec, 10)) or ("&#" .. dec .. ";")
+    end)
+    value = value:gsub("&([%w]+);", function(name)
+        local decoded = NAMED_ENTITIES[name]
+        return decoded ~= nil and decoded or ("&" .. name .. ";")
+    end)
+    return value
+end
+
+local function clean_search_text(value)
+    value = decode_entities(value)
+    value = value:gsub("[%z\1-\31]", " "):gsub("%s+", " ")
+    return U.trim(value)
+end
+
+local function text_slice(map, first, last)
+    local runes = type(map) == "table" and map.text_runes or nil
+    if type(runes) ~= "table" or #runes == 0 then return "" end
+    first = math.max(1, math.floor(tonumber(first) or 1))
+    last = math.min(#runes, math.floor(tonumber(last) or #runes))
+    if last < first then return "" end
+    return clean_search_text(table.concat(runes, "", first, last))
+end
+
+local function nearest_visible_text_index(map, html_boundary)
+    local runes = type(map) == "table" and map.runes or nil
+    local html_to_text = type(map) == "table" and map.html_to_text or nil
+    local text_runes = type(map) == "table" and map.text_runes or nil
+    if type(runes) ~= "table" or type(html_to_text) ~= "table"
+        or type(text_runes) ~= "table" or #text_runes == 0 then
+        return nil, "source_text_map_missing"
+    end
+    local boundary = math.max(1, math.min(#runes + 1, math.floor(tonumber(html_boundary) or 1)))
+    for i = boundary, #runes do
+        local t = html_to_text[i]
+        local r = t and text_runes[t] or nil
+        if t and r and not r:match("%s") and r ~= "*" then
+            return t, "forward"
+        end
+    end
+    for i = math.min(boundary - 1, #runes), 1, -1 do
+        local t = html_to_text[i]
+        local r = t and text_runes[t] or nil
+        if t and r and not r:match("%s") and r ~= "*" then
+            return t, "backward"
+        end
+    end
+    return nil, "source_visible_text_missing"
+end
+
+local function record_chapter(record, wanted_uid)
+    wanted_uid = tostring(wanted_uid or "")
+    local rows = type(record) == "table" and type(record.record) == "table"
+        and record.record.chapter_map or nil
+    for index, row in ipairs(type(rows) == "table" and rows or {}) do
+        if tostring(chapter_uid(row) or "") == wanted_uid then
+            return row, index
+        end
+    end
+    return nil
+end
+
+-- Reverse path used by cloud -> KOReader sync. The cloud `chapterOffset` is
+-- interpreted in the same raw-XHTML UTF-16 basis used by beta45 uploads, then
+-- converted to a small visible-text anchor. Heavy source fetching and mapping
+-- are designed to run in the existing subprocess, never on the Reader UI thread.
+function M.remoteAnchor(reader, record, remote)
+    remote = type(remote) == "table" and remote or {}
+    local uid = tostring(remote.chapter_uid or remote.chapterUid or "")
+    local co = tonumber(remote.offset or remote.chapter_offset or remote.chapterOffset)
+    if uid == "" then return nil, "remote_chapter_uid_missing" end
+    if co == nil then return nil, "remote_chapter_offset_missing" end
+
+    local row, local_index = record_chapter(record, uid)
+    if not row then return nil, "remote_chapter_not_local" end
+    local anchor_meta = {
+        chapter_uid = uid,
+        chapter_index = chapter_index(row, remote.chapter_idx or local_index),
+        chapter_title = tostring(row.title or ""),
+        book_version = tonumber(type(record.book) == "table"
+            and (record.book.version or record.book.bookVersion) or nil) or 0,
+    }
+    local coord_html, cache_hit, fetch_error = fetch_coord_html(reader, record, anchor_meta)
+    if not coord_html then return nil, fetch_error end
+    local built_ok, map = pcall(PosMap.build, coord_html)
+    if not built_ok or type(map) ~= "table" then
+        return nil, "remote_source_map_build_failed:" .. tostring(map)
+    end
+
+    local resolved, resolve_error = WRCo.toMap(map, co)
+    if not resolved then return nil, resolve_error end
+    local text_index, direction = nearest_visible_text_index(map, resolved.rune_boundary)
+    if not text_index then return nil, direction end
+
+    local candidates = {}
+    local seen = {}
+    for _, count in ipairs({24, 36, 52, 72, 96}) do
+        local text = text_slice(map, text_index, text_index + count - 1)
+        if text ~= "" and U.utf8_len(text) >= 8 and not seen[text] then
+            seen[text] = true
+            candidates[#candidates + 1] = {
+                text = text,
+                context_before = text_slice(map, text_index - 28, text_index - 1),
+                context_after = text_slice(map, text_index + count, text_index + count + 27),
+                source_runes = count,
+            }
+        end
+    end
+    if #candidates == 0 then return nil, "remote_source_anchor_empty" end
+
+    return {
+        chapter_uid = uid,
+        chapter_index = anchor_meta.chapter_index,
+        chapter_title = anchor_meta.chapter_title,
+        native_co = math.max(0, math.floor(co)),
+        native_basis = tostring(resolved.basis or "raw_xhtml_utf16"),
+        native_exact = resolved.exact ~= false,
+        native_resolved_co = tonumber(resolved.resolved_co) or math.max(0, math.floor(co)),
+        source_html_boundary = tonumber(resolved.rune_boundary),
+        source_text_index = text_index,
+        source_text_total = #(map.text_runes or {}),
+        source_text_ratio = #(map.text_runes or {}) > 0
+            and U.clamp((text_index - 1) / #map.text_runes, 0, 1) or 0,
+        source_direction = direction,
+        source_cache_hit = cache_hit == true,
+        search_candidates = candidates,
+        source = "weread_remote_wr_co",
+        safe = true,
+    }
+end
+
 return M
