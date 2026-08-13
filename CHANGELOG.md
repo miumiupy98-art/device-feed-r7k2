@@ -6,6 +6,13 @@
 
 - 暂无。
 
+## 4.3.0-beta.48 - 2026-08-14
+
+- 回退 完整撤销 beta46 与 beta47 的云端 native `co` 反向解析、原文锚点跳转及相关云端进度重算逻辑。
+- 恢复 云端 → KOReader 读取、比较与跳转恢复为 beta45 的原有实现，不保留新的反向定位或诊断路径。
+- 保留 KOReader → 微信继续使用 beta45 已验证的 raw XHTML UTF-16 native `wr-co` 精确上传。
+- 范围 除版本号与本条 Changelog 外，阅读进度相关运行时代码与 beta45 完全一致。
+
 ## 4.3.0-beta.47 - 2026-08-14
 
 - 修复 云端 `progress` 字段可能长期停留在 98/100，beta46 错把它重新当整书位置，现改为优先用 `chapterUid + native co` 逆解原文位置。
