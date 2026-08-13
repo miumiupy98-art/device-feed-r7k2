@@ -224,9 +224,12 @@ local function positions_match(submitted,remote,threshold)
         local a,b=tonumber(submitted.offset or submitted.chapter_offset),tonumber(remote.offset or remote.chapter_offset)
         local chapter_words=tonumber(submitted.chapter_word_count) or 0
         if a~=nil and b~=nil then
-            local tolerance=math.max(256,math.floor(chapter_words*0.04))
-            if math.abs(a-b)>tolerance and submitted_percent~=nil and remote_percent~=nil
-                and math.abs(submitted_percent-remote_percent)>math.max(0.5,threshold/2) then
+            -- Cloud getprogress exposes the native chapter offset, so a
+            -- progress-only upload is confirmed primarily by chapterUid + co.
+            -- Keep a small tolerance for service-side normalization, but do
+            -- not let a broad whole-book percent threshold hide a bad offset.
+            local tolerance=math.max(12,math.floor(chapter_words*0.005))
+            if math.abs(a-b)>tolerance then
                 return false,"chapter_offset_mismatch"
             end
         end
@@ -565,6 +568,95 @@ function Sync:local_position(ratio)
     return position
 end
 
+function Sync:_prefer_inverse_cloud_mapping(record, position)
+    if type(position) ~= "table" or position.safe ~= true then return position end
+    record = record or self:record()
+    if not record or type(record.record) ~= "table" then return position end
+
+    local local_map = type(record.record.chapter_map) == "table" and record.record.chapter_map or {}
+    local catalog = self:_precision_catalog(record)
+    -- The inverse whole-book mapping is valid only when the local EPUB really
+    -- represents the complete WeRead catalog. Range/single-chapter files keep
+    -- the source-anchor chapter ratio because their local whole-book fraction
+    -- is not the WeRead whole-book fraction.
+    if record.record.partial_range == true
+        or not BookIntegrity.maps_equivalent(local_map, catalog) then
+        position.inverse_mapping_used = false
+        position.inverse_mapping_reason = "local_map_not_full_catalog"
+        return position
+    end
+
+    local ratio = self:local_ratio()
+    if ratio == nil then
+        position.inverse_mapping_used = false
+        position.inverse_mapping_reason = "local_global_ratio_missing"
+        return position
+    end
+    local inverse = self:position(record, ratio, local_map, catalog)
+    if type(inverse) ~= "table" or inverse.safe ~= true
+        or tostring(inverse.chapter_uid or "") == "" then
+        position.inverse_mapping_used = false
+        position.inverse_mapping_reason = tostring(type(inverse) == "table"
+            and inverse.mapping_error or "inverse_position_unavailable")
+        return position
+    end
+
+    local source_uid = tostring(position.chapter_uid or "")
+    local inverse_uid = tostring(inverse.chapter_uid or "")
+    if source_uid == "" or inverse_uid == "" or source_uid ~= inverse_uid then
+        position.inverse_mapping_used = false
+        position.inverse_mapping_reason = "inverse_chapter_mismatch"
+        position.inverse_chapter_uid = inverse_uid
+        logger.info("[MiuRead][ProgressOffset]",
+            "book=", tostring(record.book and record.book.book_id or ""),
+            "chapter=", source_uid ~= "" and source_uid or "-",
+            "source_co=", tostring(position.chapter_offset or position.offset or "-"),
+            "inverse_co=", tostring(inverse.chapter_offset or inverse.offset or "-"),
+            "selected=source", "reason=chapter_mismatch")
+        return position
+    end
+
+    local source_offset = tonumber(position.chapter_offset or position.offset)
+    local inverse_offset = tonumber(inverse.chapter_offset or inverse.offset)
+    if inverse_offset == nil then
+        position.inverse_mapping_used = false
+        position.inverse_mapping_reason = "inverse_offset_missing"
+        return position
+    end
+
+    position.source_anchor_offset = source_offset
+    position.source_anchor_progress = tonumber(position.progress)
+    position.source_anchor_chapter_ratio = tonumber(position.chapter_ratio)
+    position.inverse_offset = inverse_offset
+    position.inverse_progress = tonumber(inverse.progress)
+    position.inverse_delta = source_offset ~= nil and (inverse_offset - source_offset) or nil
+    position.local_global_ratio = U.clamp(tonumber(ratio) or 0, 0, 1)
+
+    position.offset = inverse_offset
+    position.chapter_offset = inverse_offset
+    position.progress = tonumber(inverse.progress) or position.progress
+    position.chapter_word_count = tonumber(inverse.chapter_word_count) or position.chapter_word_count
+    position.total_word_count = tonumber(inverse.total_word_count) or position.total_word_count
+    position.words_before = tonumber(inverse.words_before) or position.words_before
+    if tonumber(position.chapter_word_count) and tonumber(position.chapter_word_count) > 0 then
+        position.chapter_ratio = U.clamp(inverse_offset / tonumber(position.chapter_word_count), 0, 1)
+        position.chapter_percent = math.floor(position.chapter_ratio * 100 + 0.5)
+    end
+    position.source = "inverse_cloud_map"
+    position.position_basis = "inverse_remote_chapter_offset"
+    position.inverse_mapping_used = true
+
+    logger.info("[MiuRead][ProgressOffset]",
+        "book=", tostring(record.book and record.book.book_id or ""),
+        "chapter=", source_uid,
+        "source_co=", tostring(source_offset or "-"),
+        "inverse_co=", tostring(inverse_offset),
+        "delta=", tostring(position.inverse_delta or "-"),
+        "global_ratio=", string.format("%.6f", tonumber(position.local_global_ratio) or 0),
+        "selected=inverse")
+    return position
+end
+
 function Sync:_precision_catalog(record)
     local catalog = select(1, self:_progress_catalog(record))
     return type(catalog) == "table" and catalog or {}
@@ -835,8 +927,9 @@ function Sync:_source_position_async(callback)
         end
         if result and result.ok == true and type(result.value) == "table"
             and result.value.safe == true then
-            result.value.captured_at = os.time()
-            if callback then callback(result.value, nil) end
+            local adjusted = self:_prefer_inverse_cloud_mapping(current, result.value)
+            adjusted.captured_at = os.time()
+            if callback then callback(adjusted, nil) end
             return
         end
         if callback then callback(nil, tostring(result and result.error or "source_position_failed")) end
@@ -856,6 +949,7 @@ function Sync:_position_for_report(ratio, precise)
     local position, err = PrecisePosition.locate(
         ui, record, self:_precision_catalog(record), self.precise_position_cache)
     if position then
+        position = self:_prefer_inverse_cloud_mapping(record, position)
         position.epub_percent = math.floor(U.clamp(tonumber(ratio) or self:local_ratio() or 0, 0, 1) * 100 + .5)
         logger.info("[MiuRead][Progress] precise position",
             "book=", tostring(record.book and record.book.book_id or ""),

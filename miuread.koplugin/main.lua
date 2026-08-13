@@ -15615,16 +15615,39 @@ end
 
 function Plugin:_remote_matches(remote,target)
     local threshold=tonumber(self.store:preferences().sync.threshold) or 2
-    target=tonumber(target)
-    if not target or not remote then return false,nil,nil end
+    if not remote then return false,nil,nil end
+    local target_position=type(target)=="table" and target or nil
+    local target_percent=target_position and tonumber(target_position.progress) or tonumber(target)
+    if target_percent==nil then return false,nil,nil end
+    local target_uid=target_position and tostring(target_position.chapter_uid or target_position.chapterUid or "") or ""
+    local target_co=target_position and tonumber(target_position.chapter_offset or target_position.offset)
+    local chapter_words=target_position and tonumber(target_position.chapter_word_count) or 0
+    local co_tolerance=math.max(12,math.floor((chapter_words or 0)*0.005))
+
     local function match(candidate)
-        local percent=candidate and tonumber(candidate.percent)
-        return percent and math.abs(percent-target)<=threshold,percent,candidate and candidate.source
+        if not candidate then return false,nil,nil end
+        local percent=tonumber(candidate.percent)
+        local candidate_uid=tostring(candidate.chapter_uid or candidate.chapterUid or "")
+        local candidate_co=tonumber(candidate.offset or candidate.chapter_offset)
+        if target_uid~="" and candidate_uid~="" and target_uid~=candidate_uid then
+            return false,percent,candidate.source,{reason="chapter_uid_mismatch"}
+        end
+        if target_co~=nil and candidate_co~=nil and target_uid~="" and candidate_uid~="" then
+            local delta=math.abs(candidate_co-target_co)
+            if delta<=co_tolerance then
+                return true,percent,candidate.source,{co_delta=delta,co_tolerance=co_tolerance}
+            end
+            return false,percent,candidate.source,{
+                reason="chapter_offset_mismatch",co_delta=delta,co_tolerance=co_tolerance,
+            }
+        end
+        return percent and math.abs(percent-target_percent)<=threshold,
+            percent,candidate.source,{reason="percent_fallback"}
     end
     if remote.conflict then
-        local ok,p,source=match(remote.web); if ok then return true,p,source end
-        ok,p,source=match(remote.agent); if ok then return true,p,source end
-        return false,nil,nil
+        local ok,pct,source,meta=match(remote.web); if ok then return true,pct,source,meta end
+        ok,pct,source,meta=match(remote.agent); if ok then return true,pct,source,meta end
+        return false,nil,nil,meta
     end
     return match(remote)
 end
@@ -15680,18 +15703,34 @@ function Plugin:upload_local_progress(manual,callback)
                 if callback then callback(false,result) end
                 return
             end
-            target=math.floor((tonumber(submitted and submitted.progress) or target)+.5)
+            local submitted_position=type(submitted)=="table" and submitted or position
+            target=math.floor((tonumber(submitted_position and submitted_position.progress) or target)+.5)
             self:_save_progress_state(id,"verifying_upload","请求已接收，正在确认云端位置",target,nil)
             local function verify(attempt)
                 UIManager:scheduleIn(attempt==1 and 1.5 or 2.5,function()
                     if not self.ui or not self.ui.document then return end
                     self.sync:remote(id,function(remote,remote_err)
-                        local matched,actual,source=self:_remote_matches(remote,target)
+                        local matched,actual,source,verify_meta=self:_remote_matches(remote,submitted_position)
+                        logger.info("[MiuRead][ProgressVerify]",
+                            "book=",id,
+                            "submitted_chapter=",tostring(submitted_position and submitted_position.chapter_uid or "-"),
+                            "submitted_co=",tostring(submitted_position and (submitted_position.chapter_offset or submitted_position.offset) or "-"),
+                            "remote_chapter=",tostring(remote and remote.chapter_uid or "-"),
+                            "remote_co=",tostring(remote and remote.offset or "-"),
+                            "co_delta=",tostring(verify_meta and verify_meta.co_delta or "-"),
+                            "matched=",tostring(matched==true))
                         if matched then
                             actual=math.floor((tonumber(actual) or target)+.5)
                             self.sync:mark_verified(id,"local_progress_uploaded",target,actual)
                             self:_save_progress_state(id,"local_uploaded","本机进度已上传并确认",target,actual)
-                            self.store:save_session(id,{progress_upload_state="verified",progress_upload_verified_at=os.time(),progress_upload_source=source})
+                            self.store:save_session(id,{
+                                progress_upload_state="verified",
+                                progress_upload_verified_at=os.time(),
+                                progress_upload_source=source,
+                                progress_upload_chapter_uid=submitted_position and submitted_position.chapter_uid,
+                                progress_upload_co=submitted_position and (submitted_position.chapter_offset or submitted_position.offset),
+                                progress_upload_remote_co=remote and remote.offset,
+                            })
                             self.sync:end_progress_sync("本机阅读进度已上传并确认")
                             if manual then
                                 self:status_toast("阅读进度同步","已上传并确认："..target.."%",4)
