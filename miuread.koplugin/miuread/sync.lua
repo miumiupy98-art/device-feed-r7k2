@@ -185,8 +185,20 @@ end
 local function choose_remote_progress(web,agent,threshold)
     threshold=math.max(0,tonumber(threshold) or 2)
     if web and agent then
-        local delta=math.abs((tonumber(web.percent) or 0)-(tonumber(agent.percent) or 0))
-        if delta>threshold then
+        -- beta47: chapterUid + native co is the authoritative position identity.
+        -- The server `progress` field can remain stale (for example 98/100)
+        -- after chapterUid/co have already moved, so never manufacture a source
+        -- conflict solely from that stale percentage when both native positions
+        -- are actually the same.
+        local web_uid=tostring(web.chapter_uid or web.chapterUid or "")
+        local agent_uid=tostring(agent.chapter_uid or agent.chapterUid or "")
+        local web_co=tonumber(web.offset or web.chapter_offset or web.chapterOffset)
+        local agent_co=tonumber(agent.offset or agent.chapter_offset or agent.chapterOffset)
+        local native_comparable=web_uid~="" and agent_uid~="" and web_co~=nil and agent_co~=nil
+        local native_same=native_comparable and web_uid==agent_uid
+            and math.abs(web_co-agent_co)<=12
+
+        if native_comparable and not native_same then
             return {
                 conflict=true,
                 web=web,
@@ -194,7 +206,19 @@ local function choose_remote_progress(web,agent,threshold)
                 source="conflict",
                 fetched_at=os.time(),
             }
+        elseif not native_comparable then
+            local delta=math.abs((tonumber(web.percent) or 0)-(tonumber(agent.percent) or 0))
+            if delta>threshold then
+                return {
+                    conflict=true,
+                    web=web,
+                    agent=agent,
+                    source="conflict",
+                    fetched_at=os.time(),
+                }
+            end
         end
+
         local wt,at=normalize_timestamp(web.updated_at) or 0,normalize_timestamp(agent.updated_at) or 0
         local selected=wt>at and web or agent
         if wt==at then selected=web end
@@ -217,26 +241,28 @@ local function positions_match(submitted,remote,threshold)
     if submitted_uid~="" and remote_uid~="" and submitted_uid~=remote_uid then
         return false,"chapter_uid_mismatch"
     end
+
+    if submitted_uid~="" and remote_uid~="" then
+        local a,b=tonumber(submitted.offset or submitted.chapter_offset),tonumber(remote.offset or remote.chapter_offset)
+        local chapter_words=tonumber(submitted.chapter_word_count) or 0
+        if a~=nil and b~=nil then
+            -- Native chapterUid + co is stronger than the server's stale `pr`
+            -- field. Confirm matching native positions first, then fall back to
+            -- percent only when native identity is unavailable.
+            local tolerance=submitted.native_offset==true and 12
+                or math.max(12,math.floor(chapter_words*0.005))
+            if math.abs(a-b)<=tolerance then
+                return true
+            end
+            return false,"chapter_offset_mismatch"
+        end
+    end
+
     local submitted_percent=tonumber(submitted.progress)
     local remote_percent=tonumber(remote.percent)
     if submitted_percent~=nil and remote_percent~=nil
         and math.abs(submitted_percent-remote_percent)>threshold then
         return false,"progress_mismatch"
-    end
-    if submitted_uid~="" and remote_uid~="" then
-        local a,b=tonumber(submitted.offset or submitted.chapter_offset),tonumber(remote.offset or remote.chapter_offset)
-        local chapter_words=tonumber(submitted.chapter_word_count) or 0
-        if a~=nil and b~=nil then
-            -- Cloud getprogress exposes the native chapter offset, so a
-            -- progress-only upload is confirmed primarily by chapterUid + co.
-            -- Keep a small tolerance for service-side normalization, but do
-            -- not let a broad whole-book percent threshold hide a bad offset.
-            local tolerance=submitted.native_offset==true and 12
-                or math.max(12,math.floor(chapter_words*0.005))
-            if math.abs(a-b)>tolerance then
-                return false,"chapter_offset_mismatch"
-            end
-        end
     end
     return true
 end
@@ -324,8 +350,10 @@ local function catalog_progress_from_remote(remote, chapters)
     if type(remote)~="table" then return remote end
     chapters=type(chapters)=="table" and chapters or {}
     remote.raw_percent=tonumber(remote.raw_percent or remote.percent)
-    if remote.raw_percent~=nil then remote.percent=remote.raw_percent end
-    if #chapters==0 then return remote end
+    if #chapters==0 then
+        if remote.raw_percent~=nil then remote.percent=remote.raw_percent end
+        return remote
+    end
 
     local wanted_uid=tostring(remote.chapter_uid or "")
     local wanted_idx=tonumber(remote.chapter_idx)
@@ -340,7 +368,10 @@ local function catalog_progress_from_remote(remote, chapters)
         if not selected then before=before+words end
         total=total+words
     end
-    if not selected then return remote end
+    if not selected then
+        if remote.raw_percent~=nil then remote.percent=remote.raw_percent end
+        return remote
+    end
 
     local words=chapter_words(selected)
     local native_offset=tonumber(remote.offset)
@@ -350,20 +381,44 @@ local function catalog_progress_from_remote(remote, chapters)
     remote.total_word_count=total
     remote.words_before=before
     if native_offset~=nil then
-        -- beta46: getProgress chapterOffset is the same native Web Reader co
-        -- coordinate used by beta45 uploads. Preserve it verbatim; it is not a
-        -- wordCount coordinate and may legitimately exceed chapter.wordCount.
+        -- `chapterOffset` is native Web Reader raw-XHTML UTF-16 `co`.
+        -- Preserve it verbatim and derive a whole-book display/comparison
+        -- percentage only after the native source position has been reversed.
         remote.offset=math.max(0,math.floor(native_offset))
         remote.native_offset=true
         remote.offset_basis="wr_data_co"
-        remote.position_basis="wr_data_co"
-        -- Keep beta43/beta44's old word-space interpretation only as a last
-        -- fallback if native reverse text positioning cannot be resolved.
+
         if words>0 and total>0 then
             local legacy_offset=math.max(0,math.min(words,native_offset))
             remote.legacy_chapter_ratio=U.clamp(legacy_offset/words,0,1)
             remote.legacy_calculated_percent=U.clamp(((before+legacy_offset)/total)*100,0,100)
         end
+
+        local source_ratio=tonumber(remote.native_source_ratio)
+        if source_ratio~=nil and words>0 and total>0 then
+            source_ratio=U.clamp(source_ratio,0,1)
+            local calculated=U.clamp(((before+words*source_ratio)/total)*100,0,100)
+            remote.calculated_percent=calculated
+            remote.percent=calculated
+            remote.position_basis="wr_data_co_source"
+            remote.percent_trusted=true
+        elseif remote.legacy_calculated_percent~=nil then
+            -- Safe compatibility fallback: chapter identity is still known.
+            -- This may be less precise, but is far better than treating the
+            -- often-stale server `progress` field (98/100 in the beta46 log)
+            -- as the actual whole-book position.
+            remote.percent=remote.legacy_calculated_percent
+            remote.position_basis="chapter_offset_legacy_fallback"
+            remote.percent_trusted=false
+        elseif remote.raw_percent~=nil then
+            remote.percent=remote.raw_percent
+            remote.position_basis="raw_percent"
+            remote.percent_trusted=false
+        end
+    elseif remote.raw_percent~=nil then
+        remote.percent=remote.raw_percent
+        remote.position_basis="raw_percent"
+        remote.percent_trusted=false
     end
     return remote
 end
@@ -1184,6 +1239,28 @@ function Sync:jump_remote_precise(remote, callback)
     local local_row = local_chapter_by_uid(
         type(record.record) == "table" and record.record.chapter_map or {}, remote_uid)
     if not local_row then return fallback("remote_chapter_not_local") end
+
+    -- beta47 remote() already reverses native co while reading the cloud
+    -- position. Reuse that prepared source anchor so "使用云端位置" can jump
+    -- immediately and does not start a second network/source worker.
+    local prepared=type(remote.source_anchor)=="table" and remote.source_anchor or nil
+    if prepared and prepared.safe==true
+        and tostring(prepared.chapter_uid or "")==remote_uid
+        and math.abs((tonumber(prepared.native_co) or remote_co)-remote_co)<=12 then
+        local jumped,jump_error,target=self:_jump_native_source_anchor(prepared)
+        if jumped then
+            self.last_stage="已精确采用云端阅读位置"
+            callback(true,nil,{
+                native=true,
+                source_anchor=prepared,
+                local_target=target,
+                reused_remote_anchor=true,
+            })
+            return true
+        end
+        return fallback("local_anchor:"..tostring(jump_error or "not_found"))
+    end
+
     if not self.async or not self.async:available() or self.async:busy() then
         return fallback(self.async and self.async:busy() and "source_worker_busy" or "source_worker_unavailable")
     end
@@ -1318,6 +1395,15 @@ function Sync:remote(book_id, callback, options)
     local generation_snapshot=tonumber(self.record_generation or 0) or 0
     local current_record=self:record()
     local path_snapshot=current_record and tostring(current_record.path or "") or ""
+    local catalog_snapshot=U.copy(self:_remote_catalog(book_id))
+    local record_snapshot=current_record and {
+        book=U.copy(current_record.book or {}),
+        record=U.copy(current_record.record or {}),
+        variant=current_record.variant,
+        path=current_record.path,
+    } or nil
+    local reader=self.reader
+
     self.state = "fetching_remote"
     self.last_stage = "读取云端进度"
     local threshold=tonumber(self.store:preferences().sync.threshold) or 2
@@ -1325,12 +1411,62 @@ function Sync:remote(book_id, callback, options)
     local account_snapshot=type(auth_snapshot.account)=="table" and auth_snapshot.account or {}
     local login_snapshot=tostring(auth_snapshot.login_session_id or "")
     local vid_snapshot=tostring(account_snapshot.vid or "")
+
     local ok, err = self.async:run("remote_progress", function()
         local out={}
         local agent_ok,agent=pcall(self.api.progress,self.api,book_id)
-        if agent_ok then out.agent=agent else out.agent_error=tostring(agent) end
         local web_ok,web=pcall(self.api.web_progress,self.api,book_id)
-        if web_ok then out.web=web else out.web_error=tostring(web) end
+
+        local anchor_cache={}
+        local function normalize_candidate(raw,source)
+            if raw==nil then return nil end
+            local candidate=catalog_progress_from_remote(
+                sourced_progress(raw,book_id,source),catalog_snapshot)
+            if type(candidate)~="table" then return nil end
+
+            local uid=tostring(candidate.chapter_uid or "")
+            local co=tonumber(candidate.offset or candidate.chapter_offset)
+            if record_snapshot and uid~="" and co~=nil and candidate.native_offset==true then
+                local key=uid.."@"..tostring(math.floor(co))
+                local cached=anchor_cache[key]
+                local anchor,anchor_error
+                if cached then
+                    anchor=cached.anchor
+                    anchor_error=cached.error
+                else
+                    anchor,anchor_error=SourcePosition.remoteAnchor(
+                        reader,record_snapshot,{
+                            chapter_uid=uid,
+                            chapter_idx=tonumber(candidate.chapter_idx),
+                            offset=math.max(0,math.floor(co)),
+                            percent=tonumber(candidate.percent),
+                        })
+                    anchor_cache[key]={anchor=anchor,error=anchor_error}
+                end
+                if type(anchor)=="table" and anchor.safe==true then
+                    candidate.source_anchor=anchor
+                    candidate.native_source_ratio=tonumber(anchor.source_text_ratio)
+                    candidate.native_source_resolved=true
+                    candidate.source_cache_hit=anchor.source_cache_hit==true
+                    candidate=catalog_progress_from_remote(candidate,catalog_snapshot)
+                else
+                    candidate.native_source_resolved=false
+                    candidate.native_source_error=tostring(anchor_error or "remote_source_anchor_failed")
+                end
+            end
+            return candidate
+        end
+
+        if agent_ok then
+            out.agent=normalize_candidate(agent,"agent_gateway")
+        else
+            out.agent_error=tostring(agent)
+        end
+        if web_ok then
+            out.web=normalize_candidate(web,"web_cookie")
+        else
+            out.web_error=tostring(web)
+        end
         return out
     end, function(result)
         local now_record=self:record()
@@ -1361,9 +1497,10 @@ function Sync:remote(book_id, callback, options)
             callback(nil, self.last_error)
             return
         end
+
         local value=result.value
-        local web=self:_normalize_remote_progress(sourced_progress(value.web,book_id,"web_cookie"),book_id)
-        local agent=self:_normalize_remote_progress(sourced_progress(value.agent,book_id,"agent_gateway"),book_id)
+        local web=self:_normalize_remote_progress(value.web,book_id)
+        local agent=self:_normalize_remote_progress(value.agent,book_id)
         local remote=choose_remote_progress(web,agent,threshold)
         if not remote then
             self.last_error=tostring(value.web_error or value.agent_error or "remote progress unavailable")
@@ -1373,6 +1510,7 @@ function Sync:remote(book_id, callback, options)
             callback(nil,self.last_error)
             return
         end
+
         self.last_error=nil
         if self.host.on_auth_channel_ok then pcall(self.host.on_auth_channel_ok,self.host,"progress") end
         self.store:save_session(book_id,{
@@ -1386,17 +1524,23 @@ function Sync:remote(book_id, callback, options)
             logger.warn("[MiuRead][Sync] cloud progress source conflict",
                 "book=",tostring(book_id),
                 "web=",tostring(web and web.percent or "-"),
-                "agent=",tostring(agent and agent.percent or "-"))
+                "agent=",tostring(agent and agent.percent or "-"),
+                "web_chapter=",tostring(web and web.chapter_uid or "-"),
+                "web_co=",tostring(web and web.offset or "-"),
+                "agent_chapter=",tostring(agent and agent.chapter_uid or "-"),
+                "agent_co=",tostring(agent and agent.offset or "-"))
         else
             logger.info("[MiuRead][Sync] remote progress", "book=", tostring(book_id),
                 "percent=", tostring(remote.percent), "raw_percent=",tostring(remote.raw_percent or "-"),
                 "basis=",tostring(remote.position_basis or "raw_percent"),
                 "source=",tostring(remote.source or "-"),
                 "chapter=", tostring(remote.chapter_uid or "-"),
-                "offset=", tostring(remote.offset or "-"), "updated=", tostring(remote.updated_at or "-"))
+                "offset=", tostring(remote.offset or "-"),
+                "native_resolved=",tostring(remote.native_source_resolved==true),
+                "updated=", tostring(remote.updated_at or "-"))
         end
         callback(remote,nil)
-    end, 42)
+    end, 50)
     if not ok then callback(nil, err) end
 end
 
