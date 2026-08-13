@@ -322,11 +322,78 @@ local function refresh_context(client, book_id, book, force)
     return book, true
 end
 
+local function native_local_position(book, ratio)
+    if book.local_native_chapter_offset ~= true then return nil end
+    if tostring(book.local_chapter_offset_basis or "") ~= "wr_data_co" then
+        return nil, "native chapter offset basis mismatch"
+    end
+
+    local uid = tostring(book.local_chapter_uid or "")
+    local offset = tonumber(book.local_chapter_offset)
+    if uid == "" or offset == nil then
+        return nil, "native local position incomplete"
+    end
+    offset = math.max(0, math.floor(offset + 0.5))
+
+    local chapters = type(book.chapters) == "table" and book.chapters or {}
+    local selected
+    for _, chapter in ipairs(chapters) do
+        if tostring(chapter_uid(chapter) or "") == uid
+            and not Content.is_structural_chapter(chapter) then
+            selected = chapter
+            break
+        end
+    end
+    if not selected then
+        return nil, "native local chapter not found in catalog"
+    end
+
+    local whole_ratio = math.max(0, math.min(1, tonumber(ratio) or 0))
+    if book.source_is_standalone == true then
+        -- For standalone EPUBs the parent intentionally reports chapter-local
+        -- ratio. Convert only `pr` back to whole-book space; native `co` stays
+        -- untouched because it is raw XHTML source position, not wordCount.
+        local total, before = 0, 0
+        local found = false
+        for _, chapter in ipairs(chapters) do
+            local words = trusted_words(book, chapter)
+            if not found and tostring(chapter_uid(chapter) or "") == uid then
+                found = true
+            elseif not found then
+                before = before + words
+            end
+            total = total + words
+        end
+        local words = trusted_words(book, selected)
+        if not found or words <= 0 or total <= 0 then
+            return nil, "standalone native progress catalog unavailable"
+        end
+        whole_ratio = math.max(0, math.min(1, (before + words * whole_ratio) / total))
+    end
+
+    return {
+        chapter_uid = chapter_uid(selected) or uid,
+        chapter_idx = chapter_index(selected, book.local_chapter_idx or book.chapter_idx),
+        chapter_offset = offset,
+        progress = native_progress_percent(whole_ratio),
+        source = "native_wr_data_co",
+        native_offset = true,
+        offset_basis = "wr_data_co",
+    }
+end
+
 local function estimate_position(book, progress_ratio)
     local chapters = type(book.chapters) == "table" and book.chapters or {}
     local ratio = normalize_progress_ratio(progress_ratio)
         or normalize_progress_ratio(book.progress)
         or 0
+
+    local native, native_error = native_local_position(book, ratio)
+    if native then return native end
+    -- An explicitly native offset must never silently fall through to the old
+    -- wordCount clamp, otherwise a valid Web Reader source coordinate can be
+    -- truncated before upload.
+    if book.local_native_chapter_offset == true then return nil, native_error end
 
     if book.source_is_standalone == true then
         local mapped, map_error = standalone_position(book, ratio)
@@ -435,6 +502,8 @@ local function build_payload(book_id, elapsed_seconds, book, progress_ratio)
         local_chapter_idx=book.local_chapter_idx,
         remote_chapter_uid=book.remote_chapter_uid,
         remote_chapter_idx=book.remote_chapter_idx,
+        native_chapter_offset=position.native_offset == true,
+        chapter_offset_basis=position.offset_basis or book.local_chapter_offset_basis,
     }
     return payload, position, public
 end
@@ -471,6 +540,7 @@ local BOOK_PATCH_KEYS = {
     "book_id", "bookId", "title", "author", "reader_url",
     "psvts", "pclts", "token", "chapters", "progress",
     "chapter_uid", "chapter_idx", "chapter_offset", "chapter_word_count",
+    "local_native_chapter_offset", "local_chapter_offset_basis",
     "source_is_standalone", "source_chapter_uid", "source_chapter_index",
     "source_chapter_word_count", "source_chapter_title",
     "catalog_complete", "remote_progress_loaded", "remote_progress",

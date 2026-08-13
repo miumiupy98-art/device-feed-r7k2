@@ -18,21 +18,14 @@ Sync.__index = Sync
 local legacy_daemon_retired = false
 
 local CONTEXT_MAX_AGE = 15 * 60
-local READ_REPORT_SERVICE_VERSION = 14
+local READ_REPORT_SERVICE_VERSION = 15
 local FIRST_REPORT_DELAY = 10
 local FINAL_REPORT_MIN_SECONDS = 10
 local PRECISE_POSITION_LEAD_SECONDS = 12
 local READER_BUSY_PATH = "/tmp/miuread-reader-busy.until"
 
--- beta.44: chapter-offset calibration learned only from real cloud -> local jumps.
--- One anchor gently corrects the existing inverse mapping near that point; two
--- anchors can interpolate a chapter-local co curve without changing page turns.
-local PROGRESS_CALIBRATION_VERSION = 1
-local PROGRESS_CALIBRATION_MAX_ANCHORS = 6
-local PROGRESS_CALIBRATION_SINGLE_RADIUS = 0.18
-local PROGRESS_CALIBRATION_EXTRAPOLATE_RADIUS = 0.08
-local PROGRESS_CALIBRATION_MIN_SPAN = 0.035
-local PROGRESS_CALIBRATION_CAPTURE_DELAY = 0.65
+-- beta.45: source-anchor reports may carry the Web Reader's native raw-XHTML
+-- UTF-16 `co`. Whole-book inverse mapping remains only as a `pr`/fallback aid.
 
 local function reader_interaction_busy(host)
     if type(host) == "table" then
@@ -238,7 +231,8 @@ local function positions_match(submitted,remote,threshold)
             -- progress-only upload is confirmed primarily by chapterUid + co.
             -- Keep a small tolerance for service-side normalization, but do
             -- not let a broad whole-book percent threshold hide a bad offset.
-            local tolerance=math.max(12,math.floor(chapter_words*0.005))
+            local tolerance=submitted.native_offset==true and 12
+                or math.max(12,math.floor(chapter_words*0.005))
             if math.abs(a-b)>tolerance then
                 return false,"chapter_offset_mismatch"
             end
@@ -619,12 +613,13 @@ function Sync:_prefer_inverse_cloud_mapping(record, position)
     record = record or self:record()
     if not record or type(record.record) ~= "table" then return position end
 
+    local native_offset = position.native_offset == true
+        and tostring(position.offset_basis or position.position_basis or "") == "wr_data_co"
     local local_map = type(record.record.chapter_map) == "table" and record.record.chapter_map or {}
     local catalog = self:_precision_catalog(record)
-    -- The inverse whole-book mapping is valid only when the local EPUB really
-    -- represents the complete WeRead catalog. Range/single-chapter files keep
-    -- the source-anchor chapter ratio because their local whole-book fraction
-    -- is not the WeRead whole-book fraction.
+    -- Whole-book inverse mapping is still useful for `pr`, but native Web
+    -- Reader `co` is source-coordinate based and must never be overwritten by
+    -- a wordCount-space estimate.
     if record.record.partial_range == true
         or not BookIntegrity.maps_equivalent(local_map, catalog) then
         position.inverse_mapping_used = false
@@ -649,6 +644,17 @@ function Sync:_prefer_inverse_cloud_mapping(record, position)
 
     local source_uid = tostring(position.chapter_uid or "")
     local inverse_uid = tostring(inverse.chapter_uid or "")
+    local source_offset = tonumber(position.chapter_offset or position.offset)
+    local inverse_offset = tonumber(inverse.chapter_offset or inverse.offset)
+    position.source_anchor_offset = source_offset
+    position.source_anchor_progress = tonumber(position.progress)
+    position.source_anchor_chapter_ratio = tonumber(position.chapter_ratio)
+    position.inverse_offset = inverse_offset
+    position.inverse_progress = tonumber(inverse.progress)
+    position.inverse_delta = source_offset ~= nil and inverse_offset ~= nil
+        and (inverse_offset - source_offset) or nil
+    position.local_global_ratio = U.clamp(tonumber(ratio) or 0, 0, 1)
+
     if source_uid == "" or inverse_uid == "" or source_uid ~= inverse_uid then
         position.inverse_mapping_used = false
         position.inverse_mapping_reason = "inverse_chapter_mismatch"
@@ -656,28 +662,42 @@ function Sync:_prefer_inverse_cloud_mapping(record, position)
         logger.info("[MiuRead][ProgressOffset]",
             "book=", tostring(record.book and record.book.book_id or ""),
             "chapter=", source_uid ~= "" and source_uid or "-",
-            "source_co=", tostring(position.chapter_offset or position.offset or "-"),
-            "inverse_co=", tostring(inverse.chapter_offset or inverse.offset or "-"),
-            "selected=source", "reason=chapter_mismatch")
+            native_offset and "native_co=" or "source_co=", tostring(source_offset or "-"),
+            "inverse_co=", tostring(inverse_offset or "-"),
+            native_offset and "selected=native" or "selected=source", "reason=chapter_mismatch")
         return position
     end
 
-    local source_offset = tonumber(position.chapter_offset or position.offset)
-    local inverse_offset = tonumber(inverse.chapter_offset or inverse.offset)
     if inverse_offset == nil then
         position.inverse_mapping_used = false
         position.inverse_mapping_reason = "inverse_offset_missing"
         return position
     end
 
-    position.source_anchor_offset = source_offset
-    position.source_anchor_progress = tonumber(position.progress)
-    position.source_anchor_chapter_ratio = tonumber(position.chapter_ratio)
-    position.inverse_offset = inverse_offset
-    position.inverse_progress = tonumber(inverse.progress)
-    position.inverse_delta = source_offset ~= nil and (inverse_offset - source_offset) or nil
-    position.local_global_ratio = U.clamp(tonumber(ratio) or 0, 0, 1)
+    if native_offset then
+        -- Native co remains untouched. Only the whole-book progress percentage
+        -- adopts the continuous inverse whole-book ratio so `pr` stays aligned
+        -- with beta43's long-book precision improvements.
+        position.progress = tonumber(inverse.progress) or position.progress
+        position.chapter_word_count = tonumber(inverse.chapter_word_count) or position.chapter_word_count
+        position.total_word_count = tonumber(inverse.total_word_count) or position.total_word_count
+        position.words_before = tonumber(inverse.words_before) or position.words_before
+        position.inverse_mapping_used = true
+        position.inverse_mapping_role = "progress_only"
+        logger.info("[MiuRead][ProgressOffset]",
+            "book=", tostring(record.book and record.book.book_id or ""),
+            "chapter=", source_uid,
+            "native_co=", tostring(source_offset or "-"),
+            "source_word_co=", tostring(position.source_word_offset or "-"),
+            "inverse_co=", tostring(inverse_offset),
+            "global_ratio=", string.format("%.8f", tonumber(position.local_global_ratio) or 0),
+            "ratio_source=", tostring(self.last_local_ratio_source or "-"),
+            "selected=native")
+        return position
+    end
 
+    -- Legacy beta43 fallback: when native source coordinates are unavailable,
+    -- retain the proven full-book inverse mapping for chapter offset.
     position.offset = inverse_offset
     position.chapter_offset = inverse_offset
     position.progress = tonumber(inverse.progress) or position.progress
@@ -690,6 +710,8 @@ function Sync:_prefer_inverse_cloud_mapping(record, position)
     end
     position.source = "inverse_cloud_map"
     position.position_basis = "inverse_remote_chapter_offset"
+    position.offset_basis = "inverse_remote_chapter_offset"
+    position.native_offset = false
     position.inverse_mapping_used = true
 
     logger.info("[MiuRead][ProgressOffset]",
@@ -703,265 +725,6 @@ function Sync:_prefer_inverse_cloud_mapping(record, position)
         "selected=inverse")
     return position
 end
-
-local function calibration_source_fields(position)
-    position = type(position) == "table" and position or {}
-    local norm_start = tonumber(position.source_norm_start)
-    local norm_total = tonumber(position.source_norm_total)
-    if not norm_start or not norm_total or norm_total <= 0 then return nil end
-    local source_ratio = U.clamp(norm_start / norm_total, 0, 1)
-    local source_co = tonumber(position.source_anchor_offset)
-    if source_co == nil and tostring(position.position_basis or "") == "weread_source_norm_anchor" then
-        source_co = tonumber(position.chapter_offset or position.offset)
-    end
-    if source_co == nil then
-        local words = tonumber(position.chapter_word_count)
-        if words and words > 0 then source_co = math.floor(words * source_ratio + 0.5) end
-    end
-    if source_co == nil then return nil end
-    return source_ratio, source_co, norm_start, norm_total
-end
-
-function Sync:_progress_calibration(record)
-    record = record or self:record()
-    if not record then return nil end
-    local book_id = tostring(record.book and record.book.book_id or "")
-    if book_id == "" then return nil end
-    local session = self.store:session(book_id) or {}
-    local state = type(session.progress_offset_calibration) == "table"
-        and session.progress_offset_calibration or nil
-    if not state or tonumber(state.version or 0) ~= PROGRESS_CALIBRATION_VERSION then return nil end
-    local core_hash = self:_core_map_hash(record)
-    if tostring(state.core_map_hash or "") ~= "" and core_hash ~= ""
-        and tostring(state.core_map_hash or "") ~= tostring(core_hash) then
-        return nil
-    end
-    state.chapters = type(state.chapters) == "table" and state.chapters or {}
-    return state
-end
-
-function Sync:_save_progress_calibration_anchor(record, remote, position)
-    record = record or self:record()
-    if not record or type(remote) ~= "table" or type(position) ~= "table" then return false end
-    local book_id = tostring(record.book and record.book.book_id or "")
-    local remote_uid = tostring(remote.chapter_uid or remote.chapterUid or "")
-    local position_uid = tostring(position.chapter_uid or position.chapterUid or "")
-    local remote_co = tonumber(remote.offset or remote.chapter_offset or remote.chapterOffset)
-    local source_ratio, source_co, norm_start, norm_total = calibration_source_fields(position)
-    if book_id == "" or remote_uid == "" or remote_uid ~= position_uid
-        or remote_co == nil or source_ratio == nil then
-        return false
-    end
-
-    local state = self:_progress_calibration(record) or {
-        version = PROGRESS_CALIBRATION_VERSION,
-        core_map_hash = self:_core_map_hash(record),
-        chapters = {},
-    }
-    state = U.copy(state)
-    state.version = PROGRESS_CALIBRATION_VERSION
-    state.core_map_hash = self:_core_map_hash(record)
-    state.updated_at = os.time()
-    state.chapters = type(state.chapters) == "table" and U.copy(state.chapters) or {}
-
-    local row = type(state.chapters[remote_uid]) == "table" and U.copy(state.chapters[remote_uid]) or {}
-    local anchors = type(row.anchors) == "table" and U.copy(row.anchors) or {}
-    local anchor = {
-        source_ratio = source_ratio,
-        source_co = source_co,
-        remote_co = math.max(0, math.floor(remote_co + 0.5)),
-        delta = math.floor(remote_co + 0.5) - source_co,
-        source_norm_start = norm_start,
-        source_norm_total = norm_total,
-        chapter_word_count = tonumber(position.chapter_word_count or remote.chapter_word_count) or 0,
-        remote_updated_at = tonumber(remote.updated_at) or 0,
-        captured_at = os.time(),
-    }
-
-    local replaced = false
-    for index, old in ipairs(anchors) do
-        if type(old) == "table" and math.abs((tonumber(old.source_ratio) or -10) - source_ratio) <= 0.012 then
-            anchors[index] = anchor
-            replaced = true
-            break
-        end
-    end
-    if not replaced then anchors[#anchors + 1] = anchor end
-    table.sort(anchors, function(a,b) return (tonumber(a.source_ratio) or 0) < (tonumber(b.source_ratio) or 0) end)
-    while #anchors > PROGRESS_CALIBRATION_MAX_ANCHORS do
-        local oldest_index, oldest_at = 1, math.huge
-        for index, item in ipairs(anchors) do
-            local at = tonumber(item and item.captured_at or 0) or 0
-            if at < oldest_at then oldest_at, oldest_index = at, index end
-        end
-        table.remove(anchors, oldest_index)
-    end
-    row.anchors = anchors
-    row.updated_at = os.time()
-    state.chapters[remote_uid] = row
-    self.store:save_session(book_id, {progress_offset_calibration=state})
-    logger.info("[MiuRead][ProgressCalibration] anchor saved",
-        "book=",book_id,"chapter=",remote_uid,
-        "source_ratio=",string.format("%.6f",source_ratio),
-        "source_co=",tostring(source_co),"remote_co=",tostring(anchor.remote_co),
-        "delta=",tostring(anchor.delta),"anchors=",tostring(#anchors))
-    return true
-end
-
-function Sync:_apply_progress_calibration(record, position)
-    if type(position) ~= "table" or position.safe ~= true then return position end
-    record = record or self:record()
-    if not record then return position end
-    local state = self:_progress_calibration(record)
-    if not state then return position end
-    local uid = tostring(position.chapter_uid or "")
-    local row = uid ~= "" and state.chapters and state.chapters[uid] or nil
-    local anchors = type(row) == "table" and type(row.anchors) == "table" and row.anchors or nil
-    if not anchors or #anchors == 0 then return position end
-
-    local source_ratio, source_co = calibration_source_fields(position)
-    if source_ratio == nil or source_co == nil then return position end
-    local inverse_co = tonumber(position.inverse_offset or position.chapter_offset or position.offset)
-    local words = tonumber(position.chapter_word_count) or 0
-    local total = tonumber(position.total_word_count) or 0
-    local before = tonumber(position.words_before) or 0
-    if inverse_co == nil or words <= 0 or total <= 0 then return position end
-
-    local lower, upper, nearest, nearest_distance
-    for _, anchor in ipairs(anchors) do
-        if type(anchor) == "table" and tonumber(anchor.source_ratio) ~= nil and tonumber(anchor.remote_co) ~= nil then
-            local ratio = tonumber(anchor.source_ratio)
-            local distance = math.abs(source_ratio - ratio)
-            if nearest == nil or distance < nearest_distance then nearest, nearest_distance = anchor, distance end
-            if ratio <= source_ratio and (not lower or ratio > tonumber(lower.source_ratio)) then lower = anchor end
-            if ratio >= source_ratio and (not upper or ratio < tonumber(upper.source_ratio)) then upper = anchor end
-        end
-    end
-    if not nearest then return position end
-
-    local candidate, method, weight, span
-    if lower and upper and lower ~= upper then
-        span = tonumber(upper.source_ratio) - tonumber(lower.source_ratio)
-        if span >= PROGRESS_CALIBRATION_MIN_SPAN then
-            local t = U.clamp((source_ratio - tonumber(lower.source_ratio)) / span, 0, 1)
-            candidate = tonumber(lower.remote_co) + t * (tonumber(upper.remote_co) - tonumber(lower.remote_co))
-            method, weight = "interpolate", 1
-        end
-    end
-    if candidate == nil and nearest_distance <= PROGRESS_CALIBRATION_SINGLE_RADIUS then
-        local anchor_delta = tonumber(nearest.delta)
-        if anchor_delta == nil then
-            anchor_delta = (tonumber(nearest.remote_co) or 0) - (tonumber(nearest.source_co) or 0)
-        end
-        local shifted = source_co + anchor_delta
-        weight = U.clamp(1 - nearest_distance / PROGRESS_CALIBRATION_SINGLE_RADIUS, 0, 1)
-        candidate = inverse_co + (shifted - inverse_co) * weight
-        method = "nearest_bias"
-    elseif candidate == nil and lower and not upper
-        and source_ratio - tonumber(lower.source_ratio) <= PROGRESS_CALIBRATION_EXTRAPOLATE_RADIUS then
-        candidate = source_co + ((tonumber(lower.remote_co) or 0) - (tonumber(lower.source_co) or 0))
-        method, weight = "lower_bias", 0.5
-        candidate = inverse_co + (candidate - inverse_co) * weight
-    elseif candidate == nil and upper and not lower
-        and tonumber(upper.source_ratio) - source_ratio <= PROGRESS_CALIBRATION_EXTRAPOLATE_RADIUS then
-        candidate = source_co + ((tonumber(upper.remote_co) or 0) - (tonumber(upper.source_co) or 0))
-        method, weight = "upper_bias", 0.5
-        candidate = inverse_co + (candidate - inverse_co) * weight
-    end
-    if candidate == nil then return position end
-
-    candidate = math.floor(candidate + 0.5)
-    local max_correction = math.max(120, math.floor(words * (method == "interpolate" and 0.12 or 0.07)))
-    local correction = candidate - inverse_co
-    if math.abs(correction) > max_correction then
-        logger.warn("[MiuRead][ProgressCalibration] candidate rejected",
-            "book=",tostring(record.book and record.book.book_id or ""),"chapter=",uid,
-            "method=",tostring(method),"inverse_co=",tostring(inverse_co),
-            "candidate_co=",tostring(candidate),"correction=",tostring(correction),
-            "limit=",tostring(max_correction))
-        return position
-    end
-
-    candidate = math.max(0, math.min(words, candidate))
-    position.calibration_used = true
-    position.calibration_method = method
-    position.calibration_anchor_count = #anchors
-    position.calibration_source_ratio = source_ratio
-    position.calibration_source_co = source_co
-    position.calibration_inverse_co = inverse_co
-    position.calibration_correction = candidate - inverse_co
-    position.calibration_weight = weight
-    position.offset = candidate
-    position.chapter_offset = candidate
-    position.progress = U.clamp(((before + candidate) / total) * 100, 0, 100)
-    position.chapter_ratio = U.clamp(candidate / words, 0, 1)
-    position.chapter_percent = math.floor(position.chapter_ratio * 100 + 0.5)
-    position.source = "cloud_anchor_calibrated"
-    position.position_basis = "cloud_calibrated_chapter_offset"
-
-    logger.info("[MiuRead][ProgressCalibration] applied",
-        "book=",tostring(record.book and record.book.book_id or ""),"chapter=",uid,
-        "method=",tostring(method),"anchors=",tostring(#anchors),
-        "source_ratio=",string.format("%.6f",source_ratio),
-        "source_co=",tostring(source_co),"inverse_co=",tostring(inverse_co),
-        "calibrated_co=",tostring(candidate),"correction=",tostring(position.calibration_correction),
-        "weight=",string.format("%.3f",tonumber(weight) or 1))
-    return position
-end
-
-function Sync:_schedule_cloud_calibration(remote)
-    remote = type(remote) == "table" and U.copy(remote) or nil
-    local record = self:record()
-    if not remote or not record or remote.conflict == true then return false end
-    local book_id = tostring(record.book and record.book.book_id or "")
-    local chapter_uid_value = tostring(remote.chapter_uid or "")
-    if book_id == "" or chapter_uid_value == "" or tonumber(remote.offset) == nil then return false end
-    local generation = tonumber(self.record_generation or 0) or 0
-    local path = tostring(record.path or "")
-    local target_ratio = tonumber(remote.percent) and U.clamp(tonumber(remote.percent) / 100, 0, 1) or nil
-    local mode, standalone_uid = self:_record_mode(record)
-    if mode == "standalone" and standalone_uid and tostring(remote.chapter_uid or "") == tostring(standalone_uid) then
-        local catalog = select(1, self:_progress_catalog(record))
-        local chapter = local_chapter_by_uid(catalog, standalone_uid)
-        local words = chapter_words(chapter)
-        if words > 0 and tonumber(remote.offset) ~= nil then
-            target_ratio = U.clamp(tonumber(remote.offset) / words, 0, 1)
-        end
-    end
-
-    local function attempt(remaining)
-        local current = self:record()
-        if generation ~= tonumber(self.record_generation or 0) or not current
-            or tostring(current.book and current.book.book_id or "") ~= book_id
-            or tostring(current.path or "") ~= path then return end
-        if target_ratio ~= nil then
-            local local_ratio = self:local_ratio()
-            if local_ratio ~= nil and math.abs(local_ratio - target_ratio) > 0.0035 then
-                logger.info("[MiuRead][ProgressCalibration] capture skipped",
-                    "book=",book_id,"chapter=",chapter_uid_value,"reason=reader_moved")
-                return
-            end
-        end
-        local started, err = self:_source_position_async(function(position, locate_error)
-            if position then
-                self:_save_progress_calibration_anchor(current, remote, position)
-            else
-                logger.info("[MiuRead][ProgressCalibration] capture skipped",
-                    "book=",book_id,"chapter=",chapter_uid_value,
-                    "reason=",tostring(locate_error or "source_position_failed"))
-            end
-        end)
-        if not started and remaining > 0 and tostring(err or ""):find("busy",1,true) then
-            UIManager:scheduleIn(0.8, function() attempt(remaining - 1) end)
-        elseif not started then
-            logger.info("[MiuRead][ProgressCalibration] capture skipped",
-                "book=",book_id,"chapter=",chapter_uid_value,"reason=",tostring(err or "unavailable"))
-        end
-    end
-    UIManager:scheduleIn(PROGRESS_CALIBRATION_CAPTURE_DELAY, function() attempt(1) end)
-    return true
-end
-
 function Sync:_precision_catalog(record)
     local catalog = select(1, self:_progress_catalog(record))
     return type(catalog) == "table" and catalog or {}
@@ -1011,6 +774,8 @@ function Sync:_prepare_progress_catalog(callback)
         legacy_book.local_chapter_uid = local_guess.chapter_uid
         legacy_book.local_chapter_idx = local_guess.chapter_index
         legacy_book.local_chapter_offset = local_guess.offset
+        legacy_book.local_native_chapter_offset = false
+        legacy_book.local_chapter_offset_basis = "catalog_word_fallback"
         local row = local_chapter_by_uid(record.record and record.record.chapter_map or {}, local_guess.chapter_uid)
         legacy_book.local_chapter_word_count = tonumber(row and (row.word_count or row.wordCount) or 0) or 0
     end
@@ -1181,9 +946,11 @@ function Sync:resolve_local_progress(callback, options)
             logger.info("[MiuRead][ProgressSource] ready", "book=",book_id,
                 "chapter=",tostring(position.chapter_uid or "-"),
                 "offset=",tostring(position.offset or "-"),
+                "basis=",tostring(position.offset_basis or position.position_basis or "-"),
+                "native=",tostring(position.native_offset == true),
                 "progress=",string.format("%.3f",tonumber(position.progress) or 0),
                 "cache=",tostring(position.source_cache_hit == true))
-            if callback then callback(position, nil, {source="weread_source_anchor"}) end
+            if callback then callback(position, nil, {source=position.source or "weread_source_anchor"}) end
             return
         end
         emit("position_fallback", err)
@@ -1233,7 +1000,6 @@ function Sync:_source_position_async(callback)
         if result and result.ok == true and type(result.value) == "table"
             and result.value.safe == true then
             local adjusted = self:_prefer_inverse_cloud_mapping(current, result.value)
-            adjusted = self:_apply_progress_calibration(current, adjusted)
             adjusted.captured_at = os.time()
             if callback then callback(adjusted, nil) end
             return
@@ -1320,12 +1086,6 @@ function Sync:jump_remote(remote)
         err = ok and nil or "无法跳转到云端阅读位置"
     end
 
-    if ok then
-        -- A real cloud position is our only trustworthy chapterOffset ground
-        -- truth. After KOReader settles at that position, capture the matching
-        -- source-text coordinate and keep a small per-chapter calibration set.
-        self:_schedule_cloud_calibration(remote)
-    end
     return ok, err
 end
 
@@ -1975,6 +1735,8 @@ function Sync:upload(elapsed, callback, options)
     legacy_book.local_chapter_idx=position_snapshot.chapter_index or position_snapshot.chapter_idx
     legacy_book.local_chapter_offset=position_snapshot.offset or position_snapshot.chapter_offset
     legacy_book.local_chapter_word_count=position_snapshot.chapter_word_count
+    legacy_book.local_native_chapter_offset=position_snapshot.native_offset == true
+    legacy_book.local_chapter_offset_basis=position_snapshot.offset_basis or position_snapshot.position_basis
     legacy_book.progress=position_snapshot.progress
     legacy_book.core_map_hash=core_hash
     local report_ratio=report_ratio_from_position(position_snapshot)
@@ -2519,6 +2281,8 @@ function Sync:_write_daemon_control(active, immediate, extra)
                 position=nil
             end
         end
+        local native_offset_flag = existing.local_native_chapter_offset == true
+        if position then native_offset_flag = position.native_offset == true end
         local control = {
             active = active ~= false and d.active == true,
             generation = own_generation,
@@ -2534,6 +2298,9 @@ function Sync:_write_daemon_control(active, immediate, extra)
             local_chapter_idx = position and position.chapter_index or existing.local_chapter_idx,
             local_chapter_offset = position and (position.chapter_offset or position.offset) or existing.local_chapter_offset,
             local_chapter_word_count = position and position.chapter_word_count or existing.local_chapter_word_count,
+            local_native_chapter_offset = native_offset_flag,
+            local_chapter_offset_basis = position and (position.offset_basis or position.position_basis or "")
+                or existing.local_chapter_offset_basis,
             position_source = position and position.source or existing.position_source,
             position_basis = position and position.position_basis or existing.position_basis,
             position_precision_ms = position and position.precision_ms or existing.position_precision_ms,
@@ -2877,6 +2644,8 @@ function Sync:_maybe_refresh_precise_position()
             logger.info("[MiuRead][Progress] interval source position",
                 "chapter=", tostring(position.chapter_uid or "-"),
                 "offset=", tostring(position.offset or "-"),
+                "basis=", tostring(position.offset_basis or position.position_basis or "-"),
+                "native=", tostring(position.native_offset == true),
                 "progress=", string.format("%.3f", tonumber(position.progress) or 0),
                 "cache=", tostring(position.source_cache_hit == true))
             self:_save_local_snapshot(tostring(current_daemon.book_id or ""), position)
@@ -3008,6 +2777,8 @@ function Sync:_start_daemon(reason)
     legacy_book.local_chapter_idx=position_snapshot.chapter_index
     legacy_book.local_chapter_offset=position_snapshot.chapter_offset or position_snapshot.offset
     legacy_book.local_chapter_word_count=position_snapshot.chapter_word_count
+    legacy_book.local_native_chapter_offset=position_snapshot.native_offset == true
+    legacy_book.local_chapter_offset_basis=position_snapshot.offset_basis or position_snapshot.position_basis
     legacy_book.progress=position_snapshot.progress
     legacy_book.core_map_hash=core_hash
     self:_save_local_snapshot(book_id,position_snapshot)

@@ -1,5 +1,6 @@
 local U = require("miuread.util")
 local PosMap = require("miuread.annotations.posmap")
+local WRCo = require("miuread.wr_co")
 
 local M = {}
 
@@ -123,7 +124,31 @@ local function locate_anchor(map, anchor)
     local text_start, text_end_pos = PosMap.htmlToText(map, html_start, html_end_pos)
     if not text_start or not text_end_pos then return nil, "text_map_failed" end
 
-    local boundary = tostring(anchor.point_side or "start") == "end" and text_end_pos or text_start
+    local point_side = tostring(anchor.point_side or "start")
+    local boundary = point_side == "end" and text_end_pos or text_start
+    local html_boundary = html_start
+    local html_boundary_kind = "anchor_start"
+    if point_side == "end" then
+        -- Backward anchors end immediately before the current XPointer. A raw
+        -- half-open HTML end can land on a closing tag, which Web Reader never
+        -- exposes as a text `data-wr-co`. Prefer the next visible source rune;
+        -- at chapter end fall back to the last visible anchor rune.
+        local next_text
+        for i = text_end_pos, #(map.text_runes or {}) do
+            local r = map.text_runes[i]
+            if r and not r:match("%s") and r ~= "*" then
+                next_text = i
+                break
+            end
+        end
+        if next_text and map.text_to_html[next_text] then
+            html_boundary = map.text_to_html[next_text]
+            html_boundary_kind = "next_visible_text"
+        else
+            html_boundary = map.text_to_html[text_end_pos - 1] or html_end_pos
+            html_boundary_kind = "last_visible_text"
+        end
+    end
     local norm_before = norm_count_before(map, boundary)
     local norm_total = type(map.norm_map) == "table" and #map.norm_map or 0
     if norm_before == nil or norm_total <= 0 then return nil, "normalized_text_missing" end
@@ -135,6 +160,8 @@ local function locate_anchor(map, anchor)
         text_start = text_start,
         text_end_pos = text_end_pos,
         text_boundary = boundary,
+        html_boundary = html_boundary,
+        html_boundary_kind = html_boundary_kind,
         norm_before = norm_before,
         norm_total = norm_total,
     }
@@ -158,8 +185,15 @@ function M.locate(reader, record, anchor)
     if not located then return nil, locate_error end
 
     local within = U.clamp(located.norm_before / located.norm_total, 0, 1)
-    local offset = math.max(0, math.min(words, math.floor(words * within + 0.5)))
-    local progress = U.clamp(((words_before + offset) / total_words) * 100, 0, 100)
+    -- Keep the old word-space candidate only for progress/fallback diagnostics.
+    -- Native Web Reader `co` is a raw source coordinate and is not bounded by
+    -- chapter.wordCount.
+    local source_word_offset = math.max(0, math.min(words, math.floor(words * within + 0.5)))
+    local progress = U.clamp(((words_before + source_word_offset) / total_words) * 100, 0, 100)
+
+    local native, native_error = WRCo.fromMap(map, located.html_boundary)
+    local native_ok = type(native) == "table" and tonumber(native.co) ~= nil
+    local offset = native_ok and math.max(0, math.floor(tonumber(native.co))) or source_word_offset
 
     return {
         progress = progress,
@@ -176,15 +210,25 @@ function M.locate(reader, record, anchor)
         safe = true,
         precise = true,
         standalone = anchor.standalone == true,
-        source = "weread_source_anchor",
-        position_basis = "weread_source_norm_anchor",
-        confidence = "exact",
+        source = native_ok and "weread_native_wr_co" or "weread_source_anchor",
+        position_basis = native_ok and "wr_data_co" or "weread_source_norm_anchor",
+        offset_basis = native_ok and "wr_data_co" or "weread_source_norm_anchor",
+        native_offset = native_ok,
+        confidence = native_ok and "native" or "exact",
         source_cache_hit = cache_hit == true,
         source_html_start = located.html_start,
+        source_html_boundary = located.html_boundary,
+        source_html_boundary_kind = located.html_boundary_kind,
         source_text_start = located.text_start,
         source_text_boundary = located.text_boundary,
         source_norm_start = located.norm_before,
         source_norm_total = located.norm_total,
+        source_word_offset = source_word_offset,
+        source_wr_co = native_ok and offset or nil,
+        source_wr_co_basis = native_ok and tostring(native.basis or "raw_xhtml_utf16") or nil,
+        source_wr_co_rune_boundary = native_ok and tonumber(native.rune_boundary) or nil,
+        source_wr_co_utf16_extra = native_ok and tonumber(native.utf16_extra) or nil,
+        source_wr_co_error = native_ok and nil or tostring(native_error or "wr_co_unavailable"),
         precision_anchor = tostring(anchor.anchor_kind or "source_anchor"),
         precision_anchor_chars = tonumber(anchor.anchor_chars) or 0,
     }

@@ -221,6 +221,8 @@ function Service.run(job)
         report_book.local_chapter_idx=tonumber(control.local_chapter_idx)
         report_book.local_chapter_offset=tonumber(control.local_chapter_offset) or 0
         report_book.local_chapter_word_count=tonumber(control.local_chapter_word_count) or 0
+        report_book.local_native_chapter_offset=control.local_native_chapter_offset == true
+        report_book.local_chapter_offset_basis=tostring(control.local_chapter_offset_basis or "")
         report_book.progress=(tonumber(control.progress_ratio) or 0)*100
         local report_job = {
             book_id = tostring(current_job.book_id or ""),
