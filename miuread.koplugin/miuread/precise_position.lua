@@ -180,13 +180,34 @@ local function chapter_source(record)
 end
 
 local function local_chapter(record, toc_index)
-    local standalone_uid = scalar(record and record.record and record.record.chapter_uid)
+    local explicit_uid = scalar(record and record.record and record.record.chapter_uid)
     local local_map = chapter_source(record)
-    if standalone_uid ~= "" then
-        local chapter = local_map[1] or {}
-        return chapter, standalone_uid, chapter_index(chapter, 1), true
+    local readable = 0
+    for _, row in ipairs(local_map) do
+        if type(row) == "table" and row.structural ~= true and chapter_uid(row) ~= "" then
+            readable = readable + 1
+        end
     end
+
+    -- chapter_uid is an explicit single-chapter identity only when the local
+    -- EPUB really contains one readable chapter. Old/recovered full books may
+    -- retain this field, so never let it override the current TOC chapter.
+    if explicit_uid ~= "" and readable <= 1 then
+        local chapter
+        for _, row in ipairs(local_map) do
+            if chapter_uid(row) == explicit_uid then chapter = row; break end
+        end
+        chapter = chapter or local_map[1] or {}
+        return chapter, explicit_uid, chapter_index(chapter, 1), true
+    end
+
     local chapter = local_map[toc_index]
+    if type(chapter) ~= "table" then
+        for index, row in ipairs(local_map) do
+            local idx = chapter_index(row, index)
+            if idx == toc_index or idx == toc_index - 1 then chapter = row; break end
+        end
+    end
     if type(chapter) ~= "table" then return nil, nil, nil, false, "local_chapter_missing" end
     local uid = chapter_uid(chapter)
     if uid == "" then return nil, nil, nil, false, "local_chapter_uid_missing" end

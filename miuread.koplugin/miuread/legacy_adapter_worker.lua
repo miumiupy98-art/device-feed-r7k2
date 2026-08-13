@@ -115,6 +115,7 @@ function Adapter.run(job)
         wr_wrpa = job.wr_wrpa or "",
         allow_renewal = job.allow_renewal == true,
         force_context = job.force_context == true,
+        context_only = job.context_only == true,
     }
     local result = Legacy.run(legacy_job)
     local context = merge(legacy_job.book, result.book_patch)
@@ -128,7 +129,7 @@ function Adapter.run(job)
         path = path,
         legacy_context = context,
         context_changed = result.context_changed == true,
-        position = result.position or position(context, job.progress_ratio),
+        position = result.position or (job.context_only ~= true and position(context, job.progress_ratio) or nil),
         cookies_changed = result.cookies_changed == true,
         cookies = result.cookies,
         wr_ticket_changed = result.wr_ticket_changed == true,
@@ -140,7 +141,7 @@ function Adapter.run(job)
             or (result.uncertain == true and ("unconfirmed: " .. tostring(result.error or "no explicit acknowledgement"))
             or tostring(result.error or "compatibility path rejected"))),
         attempts = { { stage = tostring(result.path or "compatibility") } },
-        payload_public = merge({ compatibility_path = true }, result.payload_public or {}),
+        payload_public = merge({ compatibility_path = true, context_only = job.context_only == true }, result.payload_public or {}),
         meta = result.meta,
     }
 end

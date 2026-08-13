@@ -292,41 +292,25 @@ local function chapter_words(chapter)
     return math.max(1, tonumber(chapter and (chapter.wordCount or chapter.word_count) or 0) or 0)
 end
 
-local function map_standalone_position(chapters, source_uid, ratio, fallback)
-    chapters = type(chapters) == "table" and chapters or {}
-    source_uid = tostring(source_uid or "")
-    ratio = U.clamp(tonumber(ratio) or 0, 0, 1)
-    fallback = fallback or {}
-    if source_uid == "" or #chapters == 0 then return nil end
-
-    local total, before, selected = 0, 0, nil
-    for _, chapter in ipairs(chapters) do
-        local words = chapter_words(chapter)
-        if not selected and tostring(chapter_uid(chapter) or "") == source_uid then
-            selected = chapter
-        elseif not selected then
-            before = before + words
+local function readable_local_chapter_count(chapters)
+    local count = 0
+    for _, chapter in ipairs(type(chapters) == "table" and chapters or {}) do
+        if type(chapter) == "table" and chapter.structural ~= true
+            and tostring(chapter_uid(chapter) or "") ~= "" then
+            count = count + 1
         end
-        total = total + words
     end
-    if not selected or total <= 0 then return nil end
+    return count
+end
 
-    local words = chapter_words(selected)
-    local offset = math.max(0, math.min(words, math.floor(words * ratio + .5)))
-    local progress = U.clamp(((before + offset) / total) * 100, 0, 100)
-    return {
-        progress = progress,
-        chapter_uid = chapter_uid(selected) or source_uid,
-        chapter_index = chapter_index(selected, fallback.chapter_index),
-        offset = offset,
-        summary = selected.title or fallback.summary or "",
-        standalone = true,
-        safe = true,
-        chapter_percent = math.floor(ratio * 100 + .5),
-        chapter_word_count = words,
-        total_word_count = total,
-        words_before = before,
-    }
+local function local_chapter_by_uid(chapters, wanted_uid)
+    wanted_uid = tostring(wanted_uid or "")
+    if wanted_uid == "" then return nil end
+    for index, chapter in ipairs(type(chapters) == "table" and chapters or {}) do
+        if type(chapter) == "table" and tostring(chapter_uid(chapter) or "") == wanted_uid then
+            return chapter, index
+        end
+    end
 end
 
 local function catalog_progress_from_remote(remote, chapters)
@@ -453,10 +437,77 @@ function Sync:_core_map_hash(record)
     return BookIntegrity.record_hash(record.book,record.record)
 end
 
-function Sync:position(record, ratio, chapters)
+function Sync:_record_mode(record)
+    record = record or self:record()
+    local local_map = record and record.record and record.record.chapter_map or {}
+    local explicit_uid = tostring(record and record.record and record.record.chapter_uid or "")
+    local readable = readable_local_chapter_count(local_map)
+    if explicit_uid ~= "" and readable <= 1 then
+        return "standalone", explicit_uid, readable
+    end
+    return "full", nil, readable
+end
+
+function Sync:_book_catalog_is_complete(record, catalog)
+    catalog = type(catalog) == "table" and catalog or {}
+    if #catalog == 0 or type(record) ~= "table" then return false end
+    local book = type(record.book) == "table" and record.book or {}
+    local row = type(record.record) == "table" and record.record or {}
+    local expected = tonumber(row.catalog_chapter_count or row.expected_catalog_chapter_count)
+    if expected and expected > 0 then return #catalog >= expected end
+    if tostring(book.core_catalog_hash or "") ~= "" then return true end
+    local mode = self:_record_mode(record)
+    local local_map = type(row.chapter_map) == "table" and row.chapter_map or {}
+    if mode ~= "standalone" and row.partial_range ~= true
+        and BookIntegrity.maps_equivalent(local_map, catalog) then
+        return true
+    end
+    return false
+end
+
+function Sync:_progress_catalog(record)
+    record = record or self:record()
+    if not record then return {}, "missing_record" end
+    local book_id = tostring(record.book and record.book.book_id or "")
+    local core_hash = self:_core_map_hash(record)
+    local auth = self.store:auth()
+    local login_id = tostring(auth.login_session_id or "")
+    local session = self.store:session(book_id) or {}
+
+    local function context_catalog(context, source, session_bound)
+        if type(context) ~= "table" or context.catalog_complete ~= true
+            or type(context.chapters) ~= "table" or #context.chapters == 0 then return nil end
+        if tostring(context.book_id or context.bookId or book_id) ~= book_id then return nil end
+        local context_core = tostring(context.core_map_hash or "")
+        if core_hash ~= "" and context_core ~= "" and context_core ~= core_hash then return nil end
+        if session_bound then
+            if tostring(session.report_login_session_id or "") ~= login_id then return nil end
+            local session_core = tostring(session.report_core_map_hash or "")
+            if core_hash ~= "" and session_core ~= "" and session_core ~= core_hash then return nil end
+            if core_hash ~= "" and context_core == "" and session_core == "" then return nil end
+        elseif core_hash ~= "" and context_core == "" then
+            return nil
+        end
+        return context.chapters, source
+    end
+
+    local chapters, source = context_catalog(self.daemon_context, "daemon_context", false)
+    if chapters then return chapters, source end
+    chapters, source = context_catalog(session.legacy_report_context, "session_context", true)
+    if chapters then return chapters, source end
+
+    local catalog = record.book and record.book.catalog or {}
+    if self:_book_catalog_is_complete(record, catalog) then return catalog, "book_catalog" end
+    return {}, "missing"
+end
+
+function Sync:position(record, ratio, chapters, full_catalog)
     ratio = ratio or self:local_ratio() or 0
     local local_map = chapters or (record.record and record.record.chapter_map) or {}
-    local full_map = (record.book and record.book.catalog) or local_map
+    local full_map = full_catalog
+    if type(full_map) ~= "table" or #full_map == 0 then
+        full_map = select(1, self:_progress_catalog(record))
+    end
     local mapped,map_error=BookIntegrity.position_from_maps(local_map,full_map,ratio,{
         chapter_uid = record.record and record.record.chapter_uid or 0,
         summary = record.book.title,
@@ -477,15 +528,15 @@ function Sync:_decorate_legacy_context(context, record)
     local core_hash=self:_core_map_hash(record)
     context.book_id=tostring(record and record.book and record.book.book_id or context.book_id or "")
     context.core_map_hash=core_hash
-    local full_catalog=record and record.book and record.book.catalog
+    local full_catalog=select(1,self:_progress_catalog(record))
     if type(full_catalog)=="table" and #full_catalog>0 then
         context.chapters=U.copy(full_catalog)
         context.catalog_complete=true
     end
-    local standalone_uid = record and record.record and record.record.chapter_uid
-    if standalone_uid ~= nil and tostring(standalone_uid) ~= "" then
+    local mode, standalone_uid = self:_record_mode(record)
+    if mode == "standalone" and standalone_uid then
         local local_map = record.record.chapter_map or {}
-        local local_chapter = local_map[1] or {}
+        local local_chapter = local_chapter_by_uid(local_map, standalone_uid) or local_map[1] or {}
         context.source_is_standalone = true
         context.source_chapter_uid = tostring(standalone_uid)
         context.source_chapter_index = chapter_index(local_chapter, 0)
@@ -505,57 +556,246 @@ function Sync:local_position(ratio)
     local record = self:record()
     if not record then return nil end
     ratio = ratio or self:local_ratio() or 0
-    local standalone_uid = record.record and record.record.chapter_uid
-    if standalone_uid ~= nil and tostring(standalone_uid) ~= "" then
-        local session = self.store:session(record.book.book_id) or {}
-        local auth=self.store:auth()
-        local context_matches=tostring(session.report_login_session_id or "")
-            ==tostring(auth.login_session_id or "")
-        local context = self.daemon_context
-            or (context_matches and type(session.legacy_report_context) == "table" and session.legacy_report_context)
-            or {}
-        local position = context.catalog_complete == true and map_standalone_position(context.chapters, standalone_uid, ratio, {
-            chapter_index = record.record and record.record.chapter_map
-                and record.record.chapter_map[1] and record.record.chapter_map[1].index,
-            summary = record.book.title,
-        }) or nil
-        if position then return position end
-        return {
-            progress = nil,
-            chapter_uid = tostring(standalone_uid),
-            standalone = true,
-            safe = false,
-            chapter_percent = math.floor(U.clamp(ratio, 0, 1) * 100 + .5),
-            summary = record.book.title,
-        }
-    end
     local position = self:position(record, ratio)
     position.safe = position.safe~=false and position.progress~=nil and tostring(position.chapter_uid or "")~=""
-    position.standalone = false
+    local mode = self:_record_mode(record)
+    position.standalone = mode == "standalone"
     position.epub_percent = math.floor(U.clamp(ratio, 0, 1) * 100 + .5)
     position.chapter_percent = tonumber(position.chapter_percent) or position.epub_percent
     return position
 end
 
 function Sync:_precision_catalog(record)
-    local standalone_uid = record and record.record and record.record.chapter_uid
-    if standalone_uid ~= nil and tostring(standalone_uid) ~= "" then
-        local context = self.daemon_context
-        if not (type(context) == "table" and context.catalog_complete == true
-            and type(context.chapters) == "table" and #context.chapters > 0) then
-            local session = self.store:session(record.book.book_id) or {}
-            local auth = self.store:auth()
-            if tostring(session.report_login_session_id or "") == tostring(auth.login_session_id or "") then
-                context = type(session.legacy_report_context) == "table" and session.legacy_report_context or nil
-            end
-        end
-        if type(context) == "table" and context.catalog_complete == true
-            and type(context.chapters) == "table" and #context.chapters > 0 then
-            return context.chapters
-        end
-    end
-    local catalog = record and record.book and record.book.catalog
+    local catalog = select(1, self:_progress_catalog(record))
     return type(catalog) == "table" and catalog or {}
+end
+
+function Sync:_prepare_progress_catalog(callback)
+    local record = self:record()
+    if not record then return false, "position_context_missing" end
+    local book_id = tostring(record.book and record.book.book_id or "")
+    if book_id == "" then return false, "book_id_missing" end
+    local auth = self.store:auth()
+    local account = type(auth.account) == "table" and auth.account or {}
+    local login_snapshot = tostring(auth.login_session_id or "")
+    local vid_snapshot = tostring(account.vid or "")
+    if login_snapshot == "" or vid_snapshot == "" then return false, "authentication_required" end
+
+    local worker
+    if self.identity_async and self.identity_async:available() and not self.identity_async:busy() then
+        worker = self.identity_async
+    elseif self.async and self.async:available() and not self.async:busy() then
+        worker = self.async
+    elseif (self.identity_async and self.identity_async:busy()) or (self.async and self.async:busy()) then
+        return false, "catalog_worker_busy"
+    else
+        return false, "catalog_worker_unavailable"
+    end
+
+    local generation = tonumber(self.record_generation or 0) or 0
+    local path = tostring(record.path or "")
+    local core_hash = self:_core_map_hash(record)
+    local session = self.store:session(book_id) or {}
+    local saved = type(session.legacy_report_context) == "table" and session.legacy_report_context or nil
+    local context_matches = saved ~= nil
+        and tostring(session.report_login_session_id or "") == login_snapshot
+        and (tostring(session.report_core_map_hash or "") == ""
+            or tostring(session.report_core_map_hash or "") == tostring(core_hash or ""))
+    local legacy_book = U.copy(context_matches and saved or {})
+    legacy_book.book_id = book_id
+    legacy_book.title = record.book.title
+    self:_decorate_legacy_context(legacy_book, record)
+
+    -- Even before the full catalog exists, preserve the current local chapter
+    -- identity so the context worker can choose a sensible reader chapter.
+    local local_guess = map_position((record.record and record.record.chapter_map) or {},
+        self:local_ratio() or 0, {chapter_uid=record.record and record.record.chapter_uid, summary=record.book.title})
+    if type(local_guess) == "table" then
+        legacy_book.local_chapter_uid = local_guess.chapter_uid
+        legacy_book.local_chapter_idx = local_guess.chapter_index
+        legacy_book.local_chapter_offset = local_guess.offset
+        local row = local_chapter_by_uid(record.record and record.record.chapter_map or {}, local_guess.chapter_uid)
+        legacy_book.local_chapter_word_count = tonumber(row and (row.word_count or row.wordCount) or 0) or 0
+    end
+
+    local ratio_snapshot = self:local_ratio() or 0
+    local book_title = tostring(record.book.title or "")
+    logger.info("[MiuRead][ProgressMap] catalog prepare started",
+        "book=", book_id, "mode=", self:_record_mode(record),
+        "local_chapters=", tostring(#((record.record and record.record.chapter_map) or {})),
+        "core=", tostring(core_hash):sub(1,12))
+
+    local started, run_error = worker:run("progress_catalog_context", function()
+        return ReadReportWorker.run{
+            book_id = book_id,
+            book_title = book_title,
+            book = legacy_book,
+            core_map_hash = core_hash,
+            progress_ratio = ratio_snapshot,
+            elapsed_seconds = 0,
+            cookies = auth.cookies or {},
+            api_key = auth.api_key or "",
+            wr_ticket = auth.wr_ticket or "",
+            wr_wrpa = auth.wr_wrpa or "",
+            allow_renewal = false,
+            force_context = true,
+            context_only = true,
+        }
+    end, function(result)
+        local current = self:record()
+        local current_auth = self.store:auth()
+        local current_account = type(current_auth.account) == "table" and current_auth.account or {}
+        if generation ~= tonumber(self.record_generation or 0)
+            or not current or tostring(current.book and current.book.book_id or "") ~= book_id
+            or tostring(current.path or "") ~= path then
+            if callback then callback(nil, "stale_catalog_result", {error_kind="context"}) end
+            return
+        end
+        if login_snapshot ~= tostring(current_auth.login_session_id or "")
+            or vid_snapshot ~= tostring(current_account.vid or "") then
+            if callback then callback(nil, "login_changed", {error_kind="authentication"}) end
+            return
+        end
+        local value = result and result.ok == true and result.value or nil
+        local context = type(value) == "table" and value.legacy_context or nil
+        if type(value) ~= "table" or value.accepted ~= true
+            or type(context) ~= "table" or context.catalog_complete ~= true
+            or type(context.chapters) ~= "table" or #context.chapters == 0 then
+            local err = tostring((type(value)=="table" and value.error) or (result and result.error) or "catalog_context_failed")
+            local kind = tostring(type(value)=="table" and value.error_kind or "context")
+            logger.warn("[MiuRead][ProgressMap] catalog prepare failed", "book=",book_id,
+                "kind=",kind,"reason=",err)
+            if callback then callback(nil, err, {error_kind=kind}) end
+            return
+        end
+        context.core_map_hash = core_hash
+        if value.cookies_changed and type(value.cookies) == "table" then
+            local latest_auth = self.store:auth()
+            latest_auth.cookies = value.cookies
+            if value.wr_ticket_changed then latest_auth.wr_ticket = value.wr_ticket end
+            if value.wr_wrpa_changed then latest_auth.wr_wrpa = value.wr_wrpa end
+            self.store:save_auth(latest_auth)
+        end
+        self.daemon_context = U.copy(context)
+        self.store:save_session(book_id,{
+            legacy_report_context=U.copy(context),
+            report_login_session_id=login_snapshot,
+            report_core_map_hash=core_hash,
+            book_core_map_hash=core_hash,
+            last_stage="完整章节信息已准备",
+        })
+        logger.info("[MiuRead][ProgressMap] catalog ready", "book=",book_id,
+            "chapters=",tostring(#context.chapters),"source=context_only")
+        if callback then callback(context.chapters, nil, {source="context_only"}) end
+    end, 55)
+    if not started then return false, run_error end
+    return true
+end
+
+function Sync:resolve_local_progress(callback, options)
+    options = options or {}
+    local record = self:record()
+    if not record then return false, "position_context_missing" end
+    local book_id = tostring(record.book and record.book.book_id or "")
+    local generation = tonumber(self.record_generation or 0) or 0
+    local path = tostring(record.path or "")
+
+    local function still_current()
+        local current = self:record()
+        return generation == tonumber(self.record_generation or 0)
+            and current and tostring(current.book and current.book.book_id or "") == book_id
+            and tostring(current.path or "") == path
+    end
+
+    local function emit(stage, detail)
+        if type(options.on_stage) == "function" then pcall(options.on_stage, stage, detail) end
+    end
+
+    local function complete_fallback(prepared, source_error)
+        if not still_current() then
+            if callback then callback(nil, "stale_position_result", {error_kind="context"}) end
+            return
+        end
+        local ratio = self:local_ratio() or 0
+        local position = options.precise == false and self:local_position(ratio)
+            or self:_position_for_report(ratio, true)
+        if type(position) == "table" and position.safe == true and position.progress ~= nil
+            and tostring(position.chapter_uid or "") ~= "" then
+            if source_error then position.precision_fallback = position.precision_fallback or tostring(source_error) end
+            if callback then callback(position, nil, {source=position.source or position.position_basis}) end
+            return
+        end
+        local mapping_error = tostring(type(position)=="table" and position.mapping_error or source_error or "position_unavailable")
+        if options.prepare_catalog ~= false and prepared ~= true then
+            emit("mapping_preparing", mapping_error)
+            local started, err = self:_prepare_progress_catalog(function(chapters, prepare_error, meta)
+                if chapters then
+                    -- Re-run once with the freshly cached full catalog. This is
+                    -- also the recovery path for stale/incomplete stored catalogs.
+                    local next_options = U.copy(options)
+                    next_options._catalog_prepared = true
+                    next_options.on_stage = options.on_stage
+                    self:resolve_local_progress(callback, next_options)
+                elseif callback then
+                    callback(nil, prepare_error or "catalog_prepare_failed", meta or {error_kind="context"})
+                end
+            end)
+            if started then return end
+            if callback then callback(nil, tostring(err or "catalog_prepare_unavailable"), {error_kind="busy"}) end
+            return
+        end
+        if callback then callback(nil, mapping_error, {error_kind="position"}) end
+    end
+
+    local catalog, catalog_source = self:_progress_catalog(record)
+    local prepared = options._catalog_prepared == true
+    if type(catalog) ~= "table" or #catalog == 0 then
+        if options.prepare_catalog == false or prepared then
+            complete_fallback(prepared, "full_catalog_missing")
+            return true
+        end
+        emit("mapping_preparing", "full_catalog_missing")
+        local started, err = self:_prepare_progress_catalog(function(chapters, prepare_error, meta)
+            if chapters then
+                local next_options = U.copy(options)
+                next_options._catalog_prepared = true
+                next_options.on_stage = options.on_stage
+                self:resolve_local_progress(callback, next_options)
+            elseif callback then
+                callback(nil, prepare_error or "catalog_prepare_failed", meta or {error_kind="context"})
+            end
+        end)
+        if not started then return false, err end
+        return true
+    end
+
+    logger.info("[MiuRead][ProgressMap] position resolving",
+        "book=",book_id,"mode=",self:_record_mode(record),
+        "catalog=",tostring(catalog_source),"chapters=",tostring(#catalog))
+
+    if options.precise == false then
+        complete_fallback(prepared, nil)
+        return true
+    end
+
+    emit("position_locating", catalog_source)
+    local started, source_error = self:_source_position_async(function(position, err)
+        if position then
+            logger.info("[MiuRead][ProgressSource] ready", "book=",book_id,
+                "chapter=",tostring(position.chapter_uid or "-"),
+                "offset=",tostring(position.offset or "-"),
+                "progress=",string.format("%.3f",tonumber(position.progress) or 0),
+                "cache=",tostring(position.source_cache_hit == true))
+            if callback then callback(position, nil, {source="weread_source_anchor"}) end
+            return
+        end
+        emit("position_fallback", err)
+        complete_fallback(prepared, err)
+    end)
+    if started then return true end
+    emit("position_fallback", source_error)
+    complete_fallback(prepared, source_error)
+    return true
 end
 
 function Sync:_source_position_async(callback)
@@ -640,8 +880,8 @@ function Sync:jump_remote(remote)
     remote = remote or {}
     local record = self:record()
     if not record then return false, "未识别到当前觅阅书籍" end
-    local standalone_uid = record.record and record.record.chapter_uid
-    if standalone_uid == nil or tostring(standalone_uid) == "" then
+    local mode, standalone_uid = self:_record_mode(record)
+    if mode ~= "standalone" or not standalone_uid then
         return self:jump(remote.percent), nil
     end
 
@@ -650,15 +890,8 @@ function Sync:jump_remote(remote)
         return false, "云端位置不在当前下载章节中"
     end
 
-    local session = self.store:session(record.book.book_id) or {}
-    local auth=self.store:auth()
-    local context_matches=tostring(session.report_login_session_id or "")
-        ==tostring(auth.login_session_id or "")
-    local context = self.daemon_context
-        or (context_matches and type(session.legacy_report_context) == "table" and session.legacy_report_context)
-        or {}
-    if context.catalog_complete ~= true then return false, "完整目录尚未准备好" end
-    local chapters = type(context.chapters) == "table" and context.chapters or {}
+    local chapters = select(1,self:_progress_catalog(record))
+    if type(chapters) ~= "table" or #chapters == 0 then return false, "完整目录尚未准备好" end
     local selected, before, total
     before, total = 0, 0
     for _, chapter in ipairs(chapters) do
@@ -745,21 +978,9 @@ end
 function Sync:_remote_catalog(book_id)
     local record=self:record()
     if not record or tostring(record.book.book_id or "")~=tostring(book_id or "") then return {} end
-    local map=(record.book and record.book.catalog) or (record.record and record.record.chapter_map) or {}
-    local standalone_uid=record.record and record.record.chapter_uid
-    if standalone_uid~=nil and tostring(standalone_uid)~="" then
-        local session=self.store:session(record.book.book_id) or {}
-        local auth=self.store:auth()
-        local context_matches=tostring(session.report_login_session_id or "")
-            ==tostring(auth.login_session_id or "")
-        local context=self.daemon_context
-            or (context_matches and type(session.legacy_report_context)=="table" and session.legacy_report_context)
-            or {}
-        if context.catalog_complete==true and type(context.chapters)=="table" and #context.chapters>0 then
-            map=context.chapters
-        end
-    end
-    return type(map)=="table" and map or {}
+    local map=select(1,self:_progress_catalog(record))
+    if type(map)=="table" and #map>0 then return map end
+    return type(record.record and record.record.chapter_map)=="table" and record.record.chapter_map or {}
 end
 
 function Sync:_normalize_remote_progress(remote,book_id)
@@ -1564,30 +1785,35 @@ function Sync:upload(elapsed, callback, options)
     return true
 end
 
-function Sync:upload_progress(callback)
+function Sync:upload_progress(callback, options)
+    options = options or {}
     self.state = "progress_locating"
-    self.last_stage = "正在按微信原始正文定位当前位置"
-    local started, source_error = self:_source_position_async(function(position, err)
-        if position then
-            logger.info("[MiuRead][Progress] source position ready",
-                "chapter=", tostring(position.chapter_uid or "-"),
-                "offset=", tostring(position.offset or "-"),
-                "progress=", string.format("%.3f", tonumber(position.progress) or 0),
-                "cache=", tostring(position.source_cache_hit == true))
-            self:upload(0,callback,{
-                silent=true, progress_only=true, precise_position=true,
-                position_override=position,
-            })
+    self.last_stage = "正在定位当前阅读位置"
+    if type(options.position_override) == "table" then
+        return self:upload(0,callback,{
+            silent=true,progress_only=true,
+            position_override=options.position_override,
+        })
+    end
+    local started, resolve_error = self:resolve_local_progress(function(position, err, meta)
+        if not position then
+            if callback then callback(false,err,nil,{error_kind=meta and meta.error_kind or "position"}) end
             return
         end
-        logger.info("[MiuRead][Progress] source position fallback",
-            "reason=", tostring(err or "unknown"))
-        self:upload(0,callback,{silent=true,progress_only=true,precise_position=true})
-    end)
-    if started then return true end
-    logger.info("[MiuRead][Progress] source position worker unavailable",
-        "reason=", tostring(source_error or "unknown"))
-    return self:upload(0,callback,{silent=true,progress_only=true,precise_position=true})
+        self:upload(0,callback,{
+            silent=true,progress_only=true,
+            position_override=position,
+        })
+    end,{
+        precise=true,
+        prepare_catalog=true,
+        on_stage=options.on_stage,
+    })
+    if not started then
+        if callback then callback(false,resolve_error,nil,{error_kind="busy"}) end
+        return false
+    end
+    return true
 end
 
 function Sync:_notify_failure()

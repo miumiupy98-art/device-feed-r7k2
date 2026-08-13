@@ -564,6 +564,20 @@ function Worker.run(job)
     book = context_or_error
     context_changed = initial_context_changed == true
 
+    -- Catalog/context preparation must be possible before progress verification.
+    -- In this mode the worker performs only reader-state/catalog reads and never
+    -- sends a read-report request, so preparing a chapter map cannot alter cloud
+    -- progress or fabricate reading time.
+    if job.context_only == true then
+        return finish(settings, book, {
+            ok = true,
+            context_only = true,
+            response_summary = "reader context and full catalog ready",
+            path = "context_only",
+            payload_public = { context_only = true, payload_fields_complete = false },
+        }, true)
+    end
+
     local accepted, result, first_error, first_kind, first_position, first_public, first_meta = attempt_report(
         client, book_id, elapsed_seconds, book, progress_ratio
     )

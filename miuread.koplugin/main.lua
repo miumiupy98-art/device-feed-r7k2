@@ -15078,7 +15078,7 @@ function Plugin:progress_sync_label()
         if kind=="context" or kind=="position" then return "需要修复" end
     end
     local state=session and session.progress_sync_state or nil
-    local labels={checking="正在检查",retrying="正在重试",mapping_pending="等待章节换算",aligned="已同步",local_selected="使用本机位置",local_uploaded="已上传并确认",uploading="正在上传",verifying_upload="正在确认",upload_failed="上传失败",upload_unconfirmed="云端未确认",source_conflict="云端来源冲突",remote_selected="已采用云端位置",different="等待选择",deferred="本次暂不处理",remote_unavailable="等待重新检查",remote_jump_unconfirmed="跳转待确认"}
+    local labels={checking="正在检查",retrying="正在重试",mapping_pending="准备章节信息",mapping_preparing="准备章节信息",mapping_failed="章节信息失败",position_locating="正在定位",aligned="已同步",local_selected="使用本机位置",local_uploaded="已上传并确认",uploading="正在上传",verifying_upload="正在确认",upload_failed="上传失败",upload_unconfirmed="云端未确认",source_conflict="云端来源冲突",remote_selected="已采用云端位置",different="等待选择",deferred="本次暂不处理",remote_unavailable="等待重新检查",remote_jump_unconfirmed="跳转待确认"}
     return labels[state] or "已开启"
 end
 
@@ -15131,9 +15131,10 @@ function Plugin:sync_diagnostics_menu()
                 local sessions=self.store:get("sessions",{})
                 local session=sessions[id] or {}
                 for _,key in ipairs({
-                    "legacy_report_context","report_context","last_error","last_response_summary",
+                    "last_error","last_response_summary",
                     "last_http_code","last_http_length","last_payload_public","last_path","last_stage",
                     "progress_sync_state","progress_sync_message","progress_upload_state","progress_upload_error",
+                    "progress_local_percent","progress_remote_percent","progress_decided_at",
                     "consecutive_failures"
                 }) do session[key]=nil end
                 -- Failed remote reading time is intentionally not queued for later replay.
@@ -15501,73 +15502,110 @@ function Plugin:ensure_read_report_progress(reason,automatic)
         return false
     end
     if self._progress_check_running then
-        if not automatic then self:toast("正在读取云端位置……",2) end
+        if not automatic then self:toast("正在检查阅读位置……",2) end
         return false
     end
+
     self._progress_check_running=true
-    local local_position=self.sync:local_position()
-    if not local_position or local_position.safe~=true or local_position.progress==nil then
-        local chapter_percent=local_position and local_position.chapter_percent
-            or math.floor((self.sync:local_ratio() or 0)*100+.5)
-        self:_save_progress_state(id,"mapping_pending","正在取得完整目录以换算单章进度",chapter_percent,nil)
-        self._progress_check_running=false
-        self.sync:end_progress_sync("单章位置等待完整目录")
-        if not automatic then
-            self:info("当前打开的是单章文件。\n\n正在等待完整目录用于换算整书进度；在换算完成前，不会把本章百分比直接上传成整书百分比。")
-        end
-        return false
-    end
-    local localp=math.floor((tonumber(local_position.progress) or 0)+.5)
-    self:_save_progress_state(id,"checking","正在读取云端位置",localp,nil)
     self.sync:begin_progress_sync(reason or "读取云端进度")
-    self.sync:remote(id,function(remote,remote_err)
+    local chapter_percent=math.floor((self.sync:local_ratio() or 0)*100+.5)
+    local function local_failed(err,meta)
         self._progress_check_running=false
-        self._progress_remote_retries=self._progress_remote_retries or {}
-        if not remote then
-            local retries=tonumber(self._progress_remote_retries[id] or 0) or 0
-            if automatic and retries<1 and self.ui and self.ui.document then
-                self._progress_remote_retries[id]=retries+1
-                self:_save_progress_state(id,"retrying","云端位置读取失败，准备重试",localp,nil)
-                self.sync:end_progress_sync("云端位置读取失败，等待重试")
-                UIManager:scheduleIn(2.5,function()
-                    if self.ui and self.ui.document then
-                        self:ensure_read_report_progress("remote_progress_retry",true)
-                    end
-                end)
+        local kind=tostring(meta and meta.error_kind or "position")
+        local message
+        if kind=="authentication" then message="登录状态无法用于获取章节信息"
+        elseif kind=="transport" or kind=="server" then message="网络暂时无法获取章节信息"
+        elseif kind=="busy" then message="章节信息后台任务暂时繁忙"
+        else message="当前书籍章节信息无法完成换算" end
+        self:_save_progress_state(id,"mapping_failed",message,chapter_percent,nil)
+        self.sync:end_progress_sync("章节信息准备失败")
+        logger.warn("[MiuRead][ProgressMap] initial position failed","book=",id,
+            "kind=",kind,"reason=",tostring(err or "unknown"))
+        if automatic and kind=="busy" and self.ui and self.ui.document then
+            UIManager:scheduleIn(1.0,function()
+                if self.ui and self.ui.document then self:ensure_read_report_progress("mapping_retry",true) end
+            end)
+        elseif not automatic then
+            self:info(message.."。\n\n"..U.first_line(tostring(err or "未知错误"),220)
+                .."\n\n不会把章节百分比直接当成整书进度上传。")
+        end
+    end
+
+    local started,resolve_error=self.sync:resolve_local_progress(function(local_position,local_err,meta)
+        if not local_position then local_failed(local_err,meta); return end
+        local localp=math.floor((tonumber(local_position.progress) or 0)+.5)
+        self:_save_progress_state(id,"checking","正在读取云端位置",localp,nil)
+        self.sync:remote(id,function(remote,remote_err)
+            self._progress_check_running=false
+            self._progress_remote_retries=self._progress_remote_retries or {}
+            if not remote then
+                local retries=tonumber(self._progress_remote_retries[id] or 0) or 0
+                if automatic and retries<1 and self.ui and self.ui.document then
+                    self._progress_remote_retries[id]=retries+1
+                    self:_save_progress_state(id,"retrying","云端位置读取失败，准备重试",localp,nil)
+                    self.sync:end_progress_sync("云端位置读取失败，等待重试")
+                    UIManager:scheduleIn(2.5,function()
+                        if self.ui and self.ui.document then
+                            self:ensure_read_report_progress("remote_progress_retry",true)
+                        end
+                    end)
+                    return
+                end
+                self:_save_progress_state(id,"remote_unavailable","暂时无法读取云端位置",localp,nil)
+                self.sync:end_progress_sync("云端位置暂时不可用，阅读时间等待确认")
+                if not automatic then
+                    self:info("暂时无法读取云端位置。\n\n为了避免覆盖其他设备上的位置，本次阅读时间会等待位置确认后再上传。")
+                end
+                logger.warn("[MiuRead][Sync] remote position unavailable", tostring(remote_err or "unknown"))
                 return
             end
-            self:_save_progress_state(id,"remote_unavailable","暂时无法读取云端位置",localp,nil)
-            self.sync:end_progress_sync("云端位置暂时不可用，阅读时间等待确认")
-            if not automatic then
-                self:info("暂时无法读取云端位置。\n\n为了避免覆盖其他设备上的位置，本次阅读时间会等待位置确认后再上传。")
+            self._progress_remote_retries[id]=0
+            if remote.conflict then
+                local webp=remote.web and math.floor((tonumber(remote.web.percent) or 0)+.5) or nil
+                local agentp=remote.agent and math.floor((tonumber(remote.agent.percent) or 0)+.5) or nil
+                self:_save_progress_state(id,"source_conflict","云端两个来源的位置不一致",localp,webp or agentp)
+                self.sync.state="verification_required"
+                self.sync.last_stage="等待选择云端位置来源"
+                self:on_remote_source_conflict(id,localp,remote,automatic==true)
+                return
             end
-            logger.warn("[MiuRead][Sync] remote position unavailable", tostring(remote_err or "unknown"))
-            return
-        end
-        self._progress_remote_retries[id]=0
-        if remote.conflict then
-            local webp=remote.web and math.floor((tonumber(remote.web.percent) or 0)+.5) or nil
-            local agentp=remote.agent and math.floor((tonumber(remote.agent.percent) or 0)+.5) or nil
-            self:_save_progress_state(id,"source_conflict","云端两个来源的位置不一致",localp,webp or agentp)
+            local remotep=math.floor((tonumber(remote.percent) or 0)+.5)
+            local cmp=self.sync:compare(localp,remote)
+            if cmp=="same" then
+                self.sync:mark_verified(id,"positions_aligned",localp,remotep)
+                self:_save_progress_state(id,"aligned","本机与云端位置接近",localp,remotep)
+                self.sync:end_progress_sync("位置接近，阅读时间开始同步")
+                if not automatic then self:info("本机位置："..localp.."%\n云端位置："..remotep.."%\n\n位置接近，无需处理。") end
+                return
+            end
+            self:_save_progress_state(id,"different","检测到本机与云端位置不同",localp,remotep)
             self.sync.state="verification_required"
-            self.sync.last_stage="等待选择云端位置来源"
-            self:on_remote_source_conflict(id,localp,remote,automatic==true)
-            return
-        end
-        local remotep=math.floor((tonumber(remote.percent) or 0)+.5)
-        local cmp=self.sync:compare(localp,remote)
-        if cmp=="same" then
-            self.sync:mark_verified(id,"positions_aligned",localp,remotep)
-            self:_save_progress_state(id,"aligned","本机与云端位置接近",localp,remotep)
-            self.sync:end_progress_sync("位置接近，阅读时间开始同步")
-            if not automatic then self:info("本机位置："..localp.."%\n云端位置："..remotep.."%\n\n位置接近，无需处理。") end
-            return
-        end
-        self:_save_progress_state(id,"different","检测到本机与云端位置不同",localp,remotep)
-        self.sync.state="verification_required"
-        self.sync.last_stage="等待选择本机或云端位置"
-        self:on_remote_progress(id,localp,remote,automatic==true)
-    end)
+            self.sync.last_stage="等待选择本机或云端位置"
+            self:on_remote_progress(id,localp,remote,automatic==true)
+        end)
+    end,{
+        precise=true,
+        prepare_catalog=true,
+        on_stage=function(stage,detail)
+            if stage=="mapping_preparing" then
+                self:_save_progress_state(id,"mapping_preparing","正在后台准备完整章节信息",chapter_percent,nil)
+                self.sync.last_stage="正在后台准备完整章节信息"
+            elseif stage=="position_locating" then
+                self:_save_progress_state(id,"position_locating","正在按微信原始正文定位当前位置",chapter_percent,nil)
+                self.sync.last_stage="正在按微信原始正文定位当前位置"
+            elseif stage=="position_fallback" then
+                logger.info("[MiuRead][ProgressMap] source position fallback","book=",id,
+                    "reason=",tostring(detail or "unknown"))
+            end
+        end,
+    })
+    if not started then
+        self._progress_check_running=false
+        self.sync:end_progress_sync("无法启动章节位置检查")
+        self:_save_progress_state(id,"mapping_failed","章节位置后台任务暂时不可用",chapter_percent,nil)
+        if not automatic then self:info("暂时无法启动章节位置检查：\n"..tostring(resolve_error or "后台任务不可用")) end
+        return false
+    end
     return true
 end
 
@@ -15598,13 +15636,6 @@ function Plugin:upload_local_progress(manual,callback)
         if callback then callback(false,"未识别当前书籍") end
         return false
     end
-    local position=self.sync:local_position()
-    if not position or position.safe~=true or position.progress==nil then
-        local err="当前文件暂时无法安全换算整书进度。"
-        if manual then self:info(err) end
-        if callback then callback(false,err) end
-        return false
-    end
     local id=tostring(r.book.book_id)
     local session=self.store:session(id) or {}
     if session.sync_repair_required==true
@@ -15613,64 +15644,96 @@ function Plugin:upload_local_progress(manual,callback)
         if callback then callback(false,session.sync_repair_error or "当前书籍需要修复同步") end
         return false
     end
-    local target=math.floor((tonumber(position.progress) or 0)+.5)
+
     self.sync:begin_progress_sync("主动上传本机阅读进度")
-    self:_save_progress_state(id,"uploading","正在上传本机阅读进度",target,nil)
-    if manual then self:status_toast("阅读进度同步","正在上传 "..target.."%……",3) end
-    local started=self.sync:upload_progress(function(ok,result,submitted)
-        if not ok then
-            local current_session=self.store:session(id) or {}
-            local repair=current_session.sync_repair_required==true
-                and (tostring(current_session.sync_repair_kind or "")=="context" or tostring(current_session.sync_repair_kind or "")=="position")
-            local kind=tostring(current_session.last_error_kind or self.sync.last_error_kind or "")
-            local state=(kind=="transport" or kind=="server" or kind=="unconfirmed") and "upload_unconfirmed" or "upload_failed"
-            self:_save_progress_state(id,state,repair and "当前书籍同步信息需要修复" or "本次上传暂未完成",target,nil)
-            self.sync:end_progress_sync(repair and "当前书籍同步信息需要修复" or "本次上传暂未完成，稍后可继续")
-            if manual then
-                if repair then self:_show_sync_repair_prompt(result,"context",id)
-                elseif kind=="authentication" then self:status_toast("阅读进度同步","登录状态需要重新验证",4)
-                else self:status_toast("阅读进度同步","本次未获确认，稍后可再次同步",4) end
-            end
-            if callback then callback(false,result) end
+    local chapter_percent=math.floor((self.sync:local_ratio() or 0)*100+.5)
+    local started,resolve_error=self.sync:resolve_local_progress(function(position,position_error,meta)
+        if not position then
+            local kind=tostring(meta and meta.error_kind or "position")
+            local message=kind=="authentication" and "登录状态无法用于获取章节信息"
+                or ((kind=="transport" or kind=="server") and "网络暂时无法获取章节信息"
+                or "当前文件暂时无法安全换算整书进度")
+            self:_save_progress_state(id,"mapping_failed",message,chapter_percent,nil)
+            self.sync:end_progress_sync("当前进度定位失败")
+            if manual then self:info(message.."。\n\n"..U.first_line(tostring(position_error or "未知错误"),220)) end
+            if callback then callback(false,position_error or message) end
             return
         end
-        target=math.floor((tonumber(submitted and submitted.progress) or target)+.5)
-        self:_save_progress_state(id,"verifying_upload","请求已接收，正在确认云端位置",target,nil)
-        local function verify(attempt)
-            UIManager:scheduleIn(attempt==1 and 1.5 or 2.5,function()
-                if not self.ui or not self.ui.document then return end
-                self.sync:remote(id,function(remote,remote_err)
-                    local matched,actual,source=self:_remote_matches(remote,target)
-                    if matched then
-                        actual=math.floor((tonumber(actual) or target)+.5)
-                        self.sync:mark_verified(id,"local_progress_uploaded",target,actual)
-                        self:_save_progress_state(id,"local_uploaded","本机进度已上传并确认",target,actual)
-                        self.store:save_session(id,{progress_upload_state="verified",progress_upload_verified_at=os.time(),progress_upload_source=source})
-                        self.sync:end_progress_sync("本机阅读进度已上传并确认")
-                        if manual then
-                            self:status_toast("阅读进度同步","已上传并确认："..target.."%",4)
+
+        local target=math.floor((tonumber(position.progress) or 0)+.5)
+        self:_save_progress_state(id,"uploading","正在上传本机阅读进度",target,nil)
+        if manual then self:status_toast("阅读进度同步","正在上传 "..target.."%……",3) end
+        local upload_started=self.sync:upload_progress(function(ok,result,submitted)
+            if not ok then
+                local current_session=self.store:session(id) or {}
+                local repair=current_session.sync_repair_required==true
+                    and (tostring(current_session.sync_repair_kind or "")=="context" or tostring(current_session.sync_repair_kind or "")=="position")
+                local kind=tostring(current_session.last_error_kind or self.sync.last_error_kind or "")
+                local state=(kind=="transport" or kind=="server" or kind=="unconfirmed") and "upload_unconfirmed" or "upload_failed"
+                self:_save_progress_state(id,state,repair and "当前书籍同步信息需要修复" or "本次上传暂未完成",target,nil)
+                self.sync:end_progress_sync(repair and "当前书籍同步信息需要修复" or "本次上传暂未完成，稍后可继续")
+                if manual then
+                    if repair then self:_show_sync_repair_prompt(result,"context",id)
+                    elseif kind=="authentication" then self:status_toast("阅读进度同步","登录状态需要重新验证",4)
+                    else self:status_toast("阅读进度同步","本次未获确认，稍后可再次同步",4) end
+                end
+                if callback then callback(false,result) end
+                return
+            end
+            target=math.floor((tonumber(submitted and submitted.progress) or target)+.5)
+            self:_save_progress_state(id,"verifying_upload","请求已接收，正在确认云端位置",target,nil)
+            local function verify(attempt)
+                UIManager:scheduleIn(attempt==1 and 1.5 or 2.5,function()
+                    if not self.ui or not self.ui.document then return end
+                    self.sync:remote(id,function(remote,remote_err)
+                        local matched,actual,source=self:_remote_matches(remote,target)
+                        if matched then
+                            actual=math.floor((tonumber(actual) or target)+.5)
+                            self.sync:mark_verified(id,"local_progress_uploaded",target,actual)
+                            self:_save_progress_state(id,"local_uploaded","本机进度已上传并确认",target,actual)
+                            self.store:save_session(id,{progress_upload_state="verified",progress_upload_verified_at=os.time(),progress_upload_source=source})
+                            self.sync:end_progress_sync("本机阅读进度已上传并确认")
+                            if manual then
+                                self:status_toast("阅读进度同步","已上传并确认："..target.."%",4)
+                            else
+                                self:_show_progress_success("已同步："..target.."%")
+                            end
+                            if callback then callback(true,remote) end
+                        elseif attempt<2 then
+                            verify(attempt+1)
                         else
-                            self:_show_progress_success("已同步："..target.."%")
+                            self:_save_progress_state(id,"upload_unconfirmed","请求已发送，但云端位置尚未更新",target,remote and remote.percent)
+                            self.store:save_session(id,{progress_upload_state="unconfirmed",progress_upload_error=remote_err})
+                            self.sync:end_progress_sync("进度请求已发送，云端尚未确认")
+                            if manual then self:info("上传请求已发送，但云端位置尚未更新。\n\n本机位置："..target.."%") end
+                            if callback then callback(false,remote_err or "云端位置尚未更新") end
                         end
-                        if callback then callback(true,remote) end
-                    elseif attempt<2 then
-                        verify(attempt+1)
-                    else
-                        self:_save_progress_state(id,"upload_unconfirmed","请求已发送，但云端位置尚未更新",target,remote and remote.percent)
-                        self.store:save_session(id,{progress_upload_state="unconfirmed",progress_upload_error=remote_err})
-                        self.sync:end_progress_sync("进度请求已发送，云端尚未确认")
-                        if manual then self:info("上传请求已发送，但云端位置尚未更新。\n\n本机位置："..target.."%") end
-                        if callback then callback(false,remote_err or "云端位置尚未更新") end
-                    end
-                end,{force=true})
-            end)
+                    end,{force=true})
+                end)
+            end
+            verify(1)
+        end,{position_override=position})
+        if not upload_started then
+            self.sync:end_progress_sync("无法启动阅读进度上传")
+            if manual then self:info("无法启动阅读进度上传：同步任务正在运行。") end
+            if callback then callback(false,"同步任务正在运行") end
         end
-        verify(1)
-    end)
+    end,{
+        precise=true,
+        prepare_catalog=true,
+        on_stage=function(stage)
+            if stage=="mapping_preparing" then
+                self:_save_progress_state(id,"mapping_preparing","正在后台准备完整章节信息",chapter_percent,nil)
+            elseif stage=="position_locating" then
+                self:_save_progress_state(id,"position_locating","正在定位当前阅读位置",chapter_percent,nil)
+            end
+        end,
+    })
     if not started then
-        self.sync:end_progress_sync("无法启动阅读进度上传")
-        if manual then self:info("无法启动阅读进度上传：同步任务正在运行。") end
-        if callback then callback(false,"同步任务正在运行") end
+        self.sync:end_progress_sync("无法启动当前进度定位")
+        self:_save_progress_state(id,"mapping_failed","章节位置后台任务暂时不可用",chapter_percent,nil)
+        if manual then self:info("暂时无法启动当前进度定位：\n"..tostring(resolve_error or "后台任务不可用")) end
+        if callback then callback(false,resolve_error or "后台任务不可用") end
         return false
     end
     return true
@@ -15918,7 +15981,7 @@ end
 function Plugin:on_read_report_success(path)
     local r=self.sync:record()
     local session=r and self.store:session(r.book.book_id) or {}
-    if r and session.progress_sync_state=="mapping_pending"
+    if r and (session.progress_sync_state=="mapping_pending" or session.progress_sync_state=="mapping_preparing")
         and self.store:preferences().sync.progress_enabled~=false then
         UIManager:scheduleIn(.5,function()
             if self.ui and self.ui.document then self:ensure_read_report_progress("catalog_ready",true) end
