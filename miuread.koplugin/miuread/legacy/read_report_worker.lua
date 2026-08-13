@@ -75,6 +75,14 @@ local function normalize_progress_ratio(value)
     return value
 end
 
+local function native_progress_percent(value)
+    local ratio = normalize_progress_ratio(value) or 0
+    -- The Web Reader uses parseInt(100 * ratio), i.e. floor for the valid
+    -- non-negative range. Sending a rounded percentage can disagree with co by
+    -- one whole percentage point on long books.
+    return math.floor(math.max(0, math.min(1, ratio)) * 100)
+end
+
 local function chapter_uid(chapter)
     return chapter and (chapter.chapterUid or chapter.uid or chapter.chapter_uid)
 end
@@ -129,7 +137,7 @@ local function standalone_position(book, ratio)
         chapter_uid = chapter_uid(selected) or source_uid,
         chapter_idx = chapter_index(selected, book.source_chapter_index),
         chapter_offset = offset,
-        progress = math.floor(whole_ratio * 100 + 0.5),
+        progress = native_progress_percent(whole_ratio),
         source = "standalone_chapter",
     }
 end
@@ -328,7 +336,7 @@ local function estimate_position(book, progress_ratio)
                 chapter_uid = book.remote_chapter_uid or book.chapter_uid or 0,
                 chapter_idx = tonumber(book.remote_chapter_idx or book.chapter_idx) or 0,
                 chapter_offset = tonumber(book.remote_chapter_offset or book.chapter_offset) or 0,
-                progress = math.floor((normalize_progress_ratio(book.remote_progress or book.progress) or 0) * 100 + 0.5),
+                progress = native_progress_percent(book.remote_progress or book.progress),
                 source = "remote_fallback",
             }
         end
@@ -369,7 +377,7 @@ local function estimate_position(book, progress_ratio)
             chapter_uid=chapter_uid(chapter),
             chapter_idx=chapter_index(chapter,book.local_chapter_idx or book.chapter_idx),
             chapter_offset=offset,
-            progress=math.floor(ratio*100+0.5),
+            progress=native_progress_percent(ratio),
             source=found and total>0 and "trusted_local_chapter_global" or "trusted_local_chapter",
         }
     end
@@ -386,7 +394,7 @@ local function estimate_position(book, progress_ratio)
                     chapter_uid=chapter_uid(item),
                     chapter_idx=chapter_index(item,0),
                     chapter_offset=math.max(0,math.min(words,math.floor(target-before))),
-                    progress=math.floor(ratio*100+0.5),
+                    progress=native_progress_percent(ratio),
                     source="catalog_ratio",
                 }
             end

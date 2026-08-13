@@ -257,7 +257,7 @@ local function map_position(chapters, ratio, fallback)
     fallback = fallback or {}
     if #chapters == 0 then
         return {
-            progress = math.floor(ratio * 100 + .5),
+            progress = U.clamp(ratio * 100, 0, 100),
             chapter_uid = fallback.chapter_uid or 0,
             chapter_index = tonumber(fallback.chapter_index or 0) or 0,
             offset = tonumber(fallback.offset or 0) or 0,
@@ -271,7 +271,7 @@ local function map_position(chapters, ratio, fallback)
         local words = math.max(1, tonumber(ch.word_count or 0) or 0)
         if target <= acc + words or index == #chapters then
             return {
-                progress = math.floor(ratio * 100 + .5),
+                progress = U.clamp(ratio * 100, 0, 100),
                 chapter_uid = ch.uid or 0,
                 chapter_index = tonumber(ch.index) or index,
                 offset = math.max(0, math.floor(target - acc)),
@@ -419,18 +419,54 @@ end
 function Sync:local_ratio()
     local ui = self.host.ui
     if not ui or not ui.document then return nil end
+    local document = ui.document
+
+    -- For reflowable documents, prefer the current XPointer's continuous
+    -- document Y coordinate. ReaderFooter.percent_finished is page/page-count
+    -- and therefore quantized to one rendered KOReader page; converting that
+    -- back into WeRead's whole-book word space makes the absolute error grow
+    -- with book length. CRE exposes a continuous position for the same XPointer
+    -- we already use for precise source anchoring, so keep that precision here.
+    local height = document.info and tonumber(document.info.doc_height) or nil
+    if ui.rolling and height and height > 0 and type(document.getPosFromXPointer) == "function" then
+        local xp = ui.rolling.xpointer
+        if (xp == nil or tostring(xp) == "") and type(document.getXPointer) == "function" then
+            local ok_xp, current_xp = pcall(document.getXPointer, document)
+            if ok_xp then xp = current_xp end
+        end
+        if xp ~= nil and tostring(xp) ~= "" then
+            local ok_pos, y = pcall(document.getPosFromXPointer, document, xp)
+            y = ok_pos and tonumber(y) or nil
+            if y then
+                self.last_local_ratio_source = "xpointer_doc_pos"
+                return U.clamp(y / height, 0, 1)
+            end
+        end
+    end
+
+    -- current_pos is also continuous and cheaper than page/page-count. Keep it
+    -- as the second choice when an XPointer position cannot be resolved.
+    if ui.rolling and height and height > 0 then
+        local pos = tonumber(ui.rolling.current_pos)
+        if pos then
+            self.last_local_ratio_source = "rolling_doc_pos"
+            return U.clamp(pos / height, 0, 1)
+        end
+    end
+
     local footer = ui.view and ui.view.footer
     local value = footer and tonumber(footer.percent_finished)
-    if value then return value > 1 and U.clamp(value / 100, 0, 1) or U.clamp(value, 0, 1) end
-    local document = ui.document
+    if value then
+        self.last_local_ratio_source = "footer_page_ratio"
+        return value > 1 and U.clamp(value / 100, 0, 1) or U.clamp(value, 0, 1)
+    end
     if document.getCurrentPage and document.getPageCount then
         local a, page = pcall(document.getCurrentPage, document)
         local b, total = pcall(document.getPageCount, document)
-        if a and b and tonumber(total) and tonumber(total) > 0 then return U.clamp(tonumber(page) / tonumber(total), 0, 1) end
-    end
-    if ui.rolling and document.info then
-        local pos, height = tonumber(ui.rolling.current_pos), tonumber(document.info.doc_height)
-        if pos and height and height > 0 then return U.clamp(pos / height, 0, 1) end
+        if a and b and tonumber(total) and tonumber(total) > 0 then
+            self.last_local_ratio_source = "document_page_ratio"
+            return U.clamp(tonumber(page) / tonumber(total), 0, 1)
+        end
     end
 end
 
@@ -652,7 +688,8 @@ function Sync:_prefer_inverse_cloud_mapping(record, position)
         "source_co=", tostring(source_offset or "-"),
         "inverse_co=", tostring(inverse_offset),
         "delta=", tostring(position.inverse_delta or "-"),
-        "global_ratio=", string.format("%.6f", tonumber(position.local_global_ratio) or 0),
+        "global_ratio=", string.format("%.8f", tonumber(position.local_global_ratio) or 0),
+        "ratio_source=", tostring(self.last_local_ratio_source or "-"),
         "selected=inverse")
     return position
 end
@@ -1938,9 +1975,15 @@ function Sync:compare(local_percent, remote)
 end
 
 function Sync:jump(percent)
-    percent = math.floor(U.clamp(percent, 0, 100) + .5)
+    -- KOReader accepts fractional GotoPercent values. Do not round this to an
+    -- integer: +/-0.5% of a long book is several phone pages and was the last
+    -- visible book-length-dependent error in cloud -> local positioning.
+    percent = U.clamp(tonumber(percent) or 0, 0, 100)
     local ui = self.host.ui
     if not ui or not ui.document then return false end
+    logger.info("[MiuRead][ProgressJump]",
+        "percent=", string.format("%.6f", percent),
+        "ratio_source=", tostring(self.last_local_ratio_source or "-"))
     return pcall(function()
         if ui.rolling and ui.rolling.onGotoPercent then ui.rolling:onGotoPercent(percent)
         else ui:handleEvent(Event:new("GotoPercent", percent)) end
