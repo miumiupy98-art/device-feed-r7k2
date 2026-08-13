@@ -164,7 +164,6 @@ end
 local function chapter_bounds(document, toc, toc_index)
     local start_xp = toc_item_xpointer(document, toc.toc[toc_index])
     if not start_xp then return nil, nil, "chapter_start_missing" end
-
     local end_xp = toc_item_xpointer(document, toc.toc[toc_index + 1])
     if not end_xp then
         local ending, err = last_document_xpointer(document)
@@ -234,7 +233,6 @@ local function chapter_text(document, start_xp, end_xp, cache, cache_key)
         and cache.chapter_text ~= "" then
         return cache.chapter_text, cache.chapter_chars, true
     end
-
     local text, err = doc_text(document, start_xp, end_xp)
     if not text then return nil, nil, false, err end
     if #text > MAX_CHAPTER_BYTES then return nil, nil, false, "chapter_text_too_large" end
@@ -256,12 +254,12 @@ local function locate_current_char(document, xp, chapter_text_value)
             if anchor and anchor:find("%S") then
                 local byte_pos = unique_match(chapter_text_value, anchor)
                 if byte_pos then
-                    return U.utf8_len(chapter_text_value:sub(1, byte_pos - 1)), "forward_" .. tostring(steps), U.utf8_len(anchor)
+                    return U.utf8_len(chapter_text_value:sub(1, byte_pos - 1)),
+                        "forward_" .. tostring(steps), U.utf8_len(anchor)
                 end
             end
         end
     end
-
     local before_xp = retreat_words(document, xp, 12)
     local after_xp = advance_words(document, xp, 24)
     if before_xp and after_xp then
@@ -279,9 +277,77 @@ local function locate_current_char(document, xp, chapter_text_value)
     return nil, "anchor_not_unique"
 end
 
---- Resolve the current top-of-page XPointer to a chapter-relative text position.
--- This function only reads the already-open CRE document. It performs no network
--- request and never persists extracted chapter text; the optional cache is memory-only.
+-- Lightweight capture for the new source-coordinate path. It only reads a
+-- small text window around the current XPointer; it never scans the full local
+-- chapter and performs no network request.
+function M.capture(ui, record, catalog)
+    if type(record) ~= "table" then return nil, "record_missing" end
+    local document = ui and ui.document or nil
+    local toc = ui and ui.toc or nil
+    if not document then return nil, "document_missing" end
+
+    local xp, xp_error = current_xpointer(ui, document)
+    if not xp then return nil, xp_error end
+    local toc_index, toc_error = toc_index_for_xpointer(toc, xp)
+    if not toc_index then return nil, toc_error end
+    local local_row, uid, idx, standalone, chapter_error = local_chapter(record, toc_index)
+    if not local_row then return nil, chapter_error end
+    local catalog_row, catalog_error = catalog_position(catalog, uid, idx)
+    if not catalog_row then return nil, catalog_error end
+    if catalog_row.words > MAX_CHAPTER_WORDS then return nil, "chapter_too_large_for_precision" end
+
+    local before_xp = retreat_words(document, xp, 12)
+    local anchor_end = advance_words(document, xp, 24)
+    local point_side = "start"
+    local anchor_text
+    local anchor_kind = "forward_24"
+    if anchor_end then anchor_text = doc_text(document, xp, anchor_end) end
+
+    if not anchor_text or not anchor_text:find("%S") then
+        local anchor_start = retreat_words(document, xp, 24)
+        if not anchor_start then return nil, "anchor_unavailable" end
+        anchor_text = doc_text(document, anchor_start, xp)
+        if not anchor_text or not anchor_text:find("%S") then return nil, "anchor_empty" end
+        before_xp = retreat_words(document, anchor_start, 12)
+        anchor_end = xp
+        point_side = "end"
+        anchor_kind = "backward_24"
+    end
+
+    local context_before = ""
+    if before_xp then
+        local boundary_start = point_side == "start" and xp or retreat_words(document, xp, 24)
+        if boundary_start then context_before = doc_text(document, before_xp, boundary_start) or "" end
+    end
+    local context_after = ""
+    if anchor_end then
+        local after_xp = advance_words(document, anchor_end, 12)
+        if after_xp then context_after = doc_text(document, anchor_end, after_xp) or "" end
+    end
+
+    return {
+        xpointer = xp,
+        toc_index = toc_index,
+        chapter_uid = chapter_uid(catalog_row.chapter) ~= "" and chapter_uid(catalog_row.chapter) or uid,
+        chapter_index = chapter_index(catalog_row.chapter, catalog_row.index),
+        chapter_title = tostring(catalog_row.chapter.title or local_row.title or ""),
+        chapter_word_count = catalog_row.words,
+        total_word_count = catalog_row.total,
+        words_before = catalog_row.before,
+        standalone = standalone == true,
+        anchor_text = anchor_text,
+        context_before = context_before,
+        context_after = context_after,
+        point_side = point_side,
+        anchor_kind = anchor_kind,
+        anchor_chars = U.utf8_len(anchor_text),
+        book_version = tonumber(record.book and (record.book.version or record.book.bookVersion))
+            or tonumber(record.record and (record.record.book_version or record.record.bookVersion)) or 0,
+    }
+end
+
+-- Existing local-only precision path kept intact as a fallback. It scans only
+-- the already-open CRE document and never uses the network.
 function M.locate(ui, record, catalog, cache)
     local started = now_ms()
     if type(record) ~= "table" then return nil, "record_missing" end
@@ -328,6 +394,7 @@ function M.locate(ui, record, catalog, cache)
         total_word_count = catalog_row.total,
         words_before = catalog_row.before,
         chapter_percent = math.floor(within * 100 + 0.5),
+        chapter_ratio = within,
         summary = tostring(catalog_row.chapter.title or local_row.title or ""),
         safe = true,
         precise = true,

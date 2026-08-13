@@ -10,6 +10,7 @@ local Http = require("miuread.http")
 local ReadReportWorker = require("miuread.legacy_adapter_worker")
 local BookIntegrity = require("miuread.book_integrity")
 local PrecisePosition = require("miuread.precise_position")
+local SourcePosition = require("miuread.source_position")
 local U = require("miuread.util")
 
 local Sync = {}
@@ -37,6 +38,9 @@ end
 
 local function report_ratio_from_position(position)
     position = type(position) == "table" and position or {}
+    if position.standalone == true and tonumber(position.chapter_ratio) ~= nil then
+        return U.clamp(tonumber(position.chapter_ratio), 0, 1)
+    end
     if position.standalone == true and tonumber(position.chapter_percent) ~= nil then
         return U.clamp(tonumber(position.chapter_percent) / 100, 0, 1)
     end
@@ -552,6 +556,53 @@ function Sync:_precision_catalog(record)
     end
     local catalog = record and record.book and record.book.catalog
     return type(catalog) == "table" and catalog or {}
+end
+
+function Sync:_source_position_async(callback)
+    local record = self:record()
+    local ui = self.host and self.host.ui or nil
+    if not record or not ui or not ui.document then return false, "position_context_missing" end
+    -- The source-coordinate path is intentionally subprocess-only. If this
+    -- device cannot fork a worker, keep the existing local precision path
+    -- rather than doing a network request on the Reader UI thread.
+    if not self.async or not self.async:available() then return false, "source_worker_unavailable" end
+    if self.async:busy() then return false, "source_worker_busy" end
+
+    local anchor, anchor_error = PrecisePosition.capture(
+        ui, record, self:_precision_catalog(record))
+    if not anchor then return false, anchor_error end
+
+    local generation = tonumber(self.record_generation or 0) or 0
+    local book_id = tostring(record.book and record.book.book_id or "")
+    local path = tostring(record.path or "")
+    local reader = self.reader
+    local record_snapshot = {
+        book = U.copy(record.book or {}),
+        record = U.copy(record.record or {}),
+        variant = record.variant,
+        path = record.path,
+    }
+    local started, run_error = self.async:run("progress_source_position", function()
+        return SourcePosition.locate(reader, record_snapshot, anchor)
+    end, function(result)
+        local current = self:record()
+        if generation ~= tonumber(self.record_generation or 0)
+            or not current
+            or tostring(current.book and current.book.book_id or "") ~= book_id
+            or tostring(current.path or "") ~= path then
+            if callback then callback(nil, "stale_position_result") end
+            return
+        end
+        if result and result.ok == true and type(result.value) == "table"
+            and result.value.safe == true then
+            result.value.captured_at = os.time()
+            if callback then callback(result.value, nil) end
+            return
+        end
+        if callback then callback(nil, tostring(result and result.error or "source_position_failed")) end
+    end, 40)
+    if not started then return false, run_error end
+    return true
 end
 
 function Sync:_position_for_report(ratio, precise)
@@ -1275,7 +1326,8 @@ function Sync:upload(elapsed, callback, options)
     legacy_book.book_id = book_id
     legacy_book.title = record.book.title
     self:_decorate_legacy_context(legacy_book, record)
-    local position_snapshot=self:_position_for_report(ratio,options.precise_position==true or options.progress_only==true)
+    local position_snapshot=type(options.position_override)=="table" and U.copy(options.position_override)
+        or self:_position_for_report(ratio,options.precise_position==true or options.progress_only==true)
     self:_save_local_snapshot(book_id,position_snapshot)
     if type(position_snapshot)~="table" or position_snapshot.safe~=true or position_snapshot.progress==nil
         or tostring(position_snapshot.chapter_uid or "")=="" then
@@ -1513,6 +1565,28 @@ function Sync:upload(elapsed, callback, options)
 end
 
 function Sync:upload_progress(callback)
+    self.state = "progress_locating"
+    self.last_stage = "正在按微信原始正文定位当前位置"
+    local started, source_error = self:_source_position_async(function(position, err)
+        if position then
+            logger.info("[MiuRead][Progress] source position ready",
+                "chapter=", tostring(position.chapter_uid or "-"),
+                "offset=", tostring(position.offset or "-"),
+                "progress=", string.format("%.3f", tonumber(position.progress) or 0),
+                "cache=", tostring(position.source_cache_hit == true))
+            self:upload(0,callback,{
+                silent=true, progress_only=true, precise_position=true,
+                position_override=position,
+            })
+            return
+        end
+        logger.info("[MiuRead][Progress] source position fallback",
+            "reason=", tostring(err or "unknown"))
+        self:upload(0,callback,{silent=true,progress_only=true,precise_position=true})
+    end)
+    if started then return true end
+    logger.info("[MiuRead][Progress] source position worker unavailable",
+        "reason=", tostring(source_error or "unknown"))
     return self:upload(0,callback,{silent=true,progress_only=true,precise_position=true})
 end
 
@@ -1773,6 +1847,8 @@ function Sync:_write_daemon_control(active, immediate, extra)
     if not daemon then return false end
     extra = type(extra) == "table" and extra or {}
     local precise_position = extra._precise_position == true
+    local position_override = type(extra._position_override) == "table"
+        and U.copy(extra._position_override) or nil
 
     local function write_now()
         self.control_write_task = nil
@@ -1793,7 +1869,7 @@ function Sync:_write_daemon_control(active, immediate, extra)
         local position=nil
         local record=self:record()
         if record and book_id~="" and tostring(record.book.book_id or "")==book_id then
-            position=self:_position_for_report(nil,precise_position)
+            position=position_override or self:_position_for_report(nil,precise_position)
             if type(position)=="table" and position.safe==true then
                 self:_save_local_snapshot(book_id,position)
             else
@@ -1823,7 +1899,7 @@ function Sync:_write_daemon_control(active, immediate, extra)
             updated_at = os.time(),
         }
         for key, value in pairs(extra) do
-            if key ~= "_precise_position" then control[key] = value end
+            if key ~= "_precise_position" and key ~= "_position_override" then control[key] = value end
         end
         -- Never activate a reporting interval without a current, safe position.
         if control.active and (not position or tostring(control.local_chapter_uid or "")=="") then
@@ -2140,11 +2216,39 @@ function Sync:_maybe_refresh_precise_position()
     if due <= 0 or tonumber(self.precise_due_refreshed or 0) == due then return false end
     if due - os.time() > PRECISE_POSITION_LEAD_SECONDS then return false end
     if reader_interaction_busy(self.host) then return false end
-    -- Refresh once shortly before the child report. Page turns themselves keep
-    -- their existing memory-only path and never parse chapter text.
-    local wrote = self:_write_daemon_control(true, true, {_precise_position=true})
+
+    -- First write a cheap, current fallback so the child never has to wait for
+    -- source-coordinate work. This does not scan chapter text.
+    local fallback = self:local_position()
+    if type(fallback) == "table" and fallback.safe == true then
+        self:_write_daemon_control(true, true, {_position_override=fallback})
+    end
     self.precise_due_refreshed = due
-    return wrote == true
+
+    -- Source XHTML fetch + PosMap build run only in the subprocess. Page turns
+    -- still only mark activity/control dirty and never scan text.
+    local started, source_error = self:_source_position_async(function(position, err)
+        local current_daemon = self.daemon
+        if not current_daemon or current_daemon.active ~= true or self.suspended then return end
+        if position then
+            logger.info("[MiuRead][Progress] interval source position",
+                "chapter=", tostring(position.chapter_uid or "-"),
+                "offset=", tostring(position.offset or "-"),
+                "progress=", string.format("%.3f", tonumber(position.progress) or 0),
+                "cache=", tostring(position.source_cache_hit == true))
+            self:_save_local_snapshot(tostring(current_daemon.book_id or ""), position)
+            self:_write_daemon_control(true, true, {_position_override=position})
+        else
+            logger.info("[MiuRead][Progress] interval source position skipped",
+                "reason=", tostring(err or "unknown"))
+        end
+    end)
+    if started then return true end
+
+    logger.info("[MiuRead][Progress] interval source worker unavailable",
+        "reason=", tostring(source_error or "unknown"))
+    if type(fallback) == "table" and fallback.safe == true then return true end
+    return self:_write_daemon_control(true, true, {_precise_position=true}) == true
 end
 
 function Sync:_schedule_daemon_poll(delay)
