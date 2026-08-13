@@ -1709,6 +1709,64 @@ local function relink_saved_record(store,all,book,record,path,current_size,relin
     if changed then store:set("library",all) end
 end
 
+-- Older MiuRead library records may still point to a valid generated EPUB but
+-- lack chapter_map. The EPUB itself embeds the authoritative local chapter list
+-- in OEBPS/miuread.json. Restore that list once on discovery instead of forcing
+-- progress sync to guess from an empty local map. This reads only ZIP metadata
+-- and the small embedded MiuRead JSON; it never scans chapter bodies or uses the
+-- network.
+local function restore_embedded_chapter_map(store,all,book,record,path,kind,forced_uid)
+    if type(record)~="table" or type(book)~="table" then return false end
+    if type(record.chapter_map)=="table" and #record.chapter_map>0 then return false end
+    if not path or not U.file_exists(path) or not tostring(path):lower():match("%.epub$") then return false end
+
+    local ok_installer,Installer=pcall(require,"miuread.epub_installer")
+    if not ok_installer or type(Installer)~="table" or type(Installer.inspect)~="function" then return false end
+    local ok_meta,meta=pcall(Installer.inspect,path)
+    if not ok_meta or type(meta)~="table" then return false end
+
+    local book_id=tostring(book.book_id or record.book_id or "")
+    local meta_id=tostring(meta.book_id or meta.bookId or "")
+    if book_id~="" and meta_id~="" and book_id~=meta_id then
+        logger.warn("[MiuRead][Store] embedded chapter map ignored book mismatch",
+            "record=",book_id,"embedded=",meta_id)
+        return false
+    end
+    local chapters=type(meta.chapters)=="table" and meta.chapters or {}
+    if #chapters==0 then return false end
+
+    record.chapter_map=U.copy(chapters)
+    record.chapter_count=#chapters
+    if tostring(record.core_map_hash or "")=="" and tostring(meta.core_map_hash or "")~="" then
+        record.core_map_hash=tostring(meta.core_map_hash)
+    end
+    if record.partial_range==nil and meta.partial_range~=nil then record.partial_range=meta.partial_range==true end
+    if record.range_start_index==nil then record.range_start_index=tonumber(meta.range_start_index) end
+    if record.range_end_index==nil then record.range_end_index=tonumber(meta.range_end_index) end
+    if record.range_start_title==nil then record.range_start_title=meta.range_start_title end
+    if record.range_end_title==nil then record.range_end_title=meta.range_end_title end
+
+    local uid=tostring(forced_uid or record.chapter_uid or meta.chapter_uid or "")
+    if uid~="" then record.chapter_uid=uid end
+
+    -- Only a complete multi-chapter EPUB may also repair an empty book catalog.
+    -- A standalone/range EPUB carries only a subset and must still obtain the
+    -- full WeRead catalog through the normal context-only path.
+    local local_is_subset=meta.standalone==true or meta.partial_range==true
+    if not local_is_subset and (type(book.catalog)~="table" or #book.catalog==0) then
+        book.catalog=U.copy(chapters)
+    end
+
+    store:set("library",all)
+    logger.info("[MiuRead][Store] embedded chapter map restored",
+        "book=",book_id~="" and book_id or meta_id,
+        "variant=",tostring(kind or record.variant or ""),
+        "chapters=",tostring(#chapters),
+        "standalone=",tostring(meta.standalone==true),
+        "partial=",tostring(meta.partial_range==true))
+    return true
+end
+
 function Store:file_record_fast(path,relink)
     if not path then return nil end
     local normalized=normalize_path(path)
@@ -1725,6 +1783,7 @@ function Store:file_record_fast(path,relink)
         for kind,record in pairs(book.variants or {}) do
             if match_record(record) then
                 relink_saved_record(self,all,book,record,path,file_size(),relink)
+                restore_embedded_chapter_map(self,all,book,record,path,kind,nil)
                 return book,record,kind
             end
         end
@@ -1733,6 +1792,7 @@ function Store:file_record_fast(path,relink)
                 if match_record(record) then
                     record.chapter_uid=uid
                     relink_saved_record(self,all,book,record,path,file_size(),relink)
+                    restore_embedded_chapter_map(self,all,book,record,path,kind,uid)
                     return book,record,kind
                 end
             end
@@ -1759,6 +1819,7 @@ function Store:file_record_fast(path,relink)
         local found=matches[1]
         if found.uid then found.record.chapter_uid=found.uid end
         relink_saved_record(self,all,found.book,found.record,path,file_size(),relink)
+        restore_embedded_chapter_map(self,all,found.book,found.record,path,found.kind,found.uid)
         return found.book,found.record,found.kind
     end
     return nil
@@ -1815,6 +1876,13 @@ function Store:file_record_from_identity(path,meta,relink)
             if record then record.chapter_uid=uid end
         else
             record=book.variants and book.variants[kind]
+        end
+        if record and (type(record.chapter_map)~="table" or #record.chapter_map==0) and #chapters>0 then
+            record.chapter_map=U.copy(chapters)
+            record.chapter_count=#chapters
+            if tostring(record.core_map_hash or "")=="" and tostring(meta.core_map_hash or "")~="" then
+                record.core_map_hash=tostring(meta.core_map_hash)
+            end
         end
         if not record then
             record={
