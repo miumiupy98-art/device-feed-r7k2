@@ -39,6 +39,13 @@ local function exists(path)
 end
 
 local function cover_path(path)
+    -- Prefer KOReader's own custom-cover lookup. This is the same source used
+    -- by KOReader itself, so MiuRead does not maintain a competing cover rule.
+    local ok,DocSettings=pcall(require,"docsettings")
+    if ok and DocSettings and type(DocSettings.findCustomCoverFile)=="function" then
+        local found_ok,found=pcall(DocSettings.findCustomCoverFile,DocSettings,path)
+        if found_ok and exists(found) then return found end
+    end
     local dir=dirname(path)
     local base=stem(path)
     local candidates={

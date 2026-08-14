@@ -2589,6 +2589,9 @@ function Plugin:_home_preferences()
     if home.background_thought_index~=nil then home.background_thought_index=nil; changed=true end
     if home.active_section~="account" and home.active_section~="generated" and home.active_section~="local" and home.active_section~="mp" then home.active_section="account"; changed=true end
     if home.lockscreen_recent==nil then home.lockscreen_recent=true; changed=true end
+    if home.lockscreen_style~="frame" and home.lockscreen_style~="fit" and home.lockscreen_style~="fill" then
+        home.lockscreen_style="frame"; changed=true
+    end
     home.local_root=tostring(home.local_root or "")
     local original_roots=type(home.local_roots)=="table" and home.local_roots or {}
     local normalized_roots,root_seen={},{}
@@ -3869,15 +3872,17 @@ function Plugin:_home_prepare_lockscreen_cover(book)
     if width<=0 or height<=0 then return nil end
     local id=self:_home_cover_render_id(book)
     if not id then return tostring(book.cover_path or "")~="" and book.cover_path or nil end
+    local home=self:_home_preferences()
+    local style=tostring(home.lockscreen_style or "frame")
+    if style~="frame" and style~="fit" and style~="fill" then style="frame" end
     local dir=self.store.data_dir.."/lockscreen"
     U.mkdir(dir)
     local prefix=dir.."/"..U.id_name(id)
-    local current=prefix.."-fill3-"..tostring(width).."x"..tostring(height)..".png"
+    local tag=style=="frame" and "frame1" or (style=="fit" and "fit1" or "fill3")
+    local current=prefix.."-"..tag.."-"..tostring(width).."x"..tostring(height)..".png"
     if lfs.attributes(current,"mode")=="file" and (tonumber(U.file_size(current) or 0) or 0)>0 then return current end
-    -- Keep the beta.2 full-screen artifact as a temporary fallback while the
-    -- sharper beta.3 image is rebuilt in a low-priority worker.
-    local previous=prefix.."-fill2-"..tostring(width).."x"..tostring(height)..".png"
-    if lfs.attributes(previous,"mode")=="file" and (tonumber(U.file_size(previous) or 0) or 0)>0 then return previous end
+    -- While the selected style is being rendered in the low-priority worker,
+    -- keep the source cover visible rather than blocking suspend.
     local fallback=tostring(book.cover_path or "")
     return fallback~="" and fallback or nil
 end
@@ -3988,9 +3993,12 @@ function Plugin:_home_schedule_cover_derivatives(books)
                     local inputs={}
                     for _,path in ipairs(sources) do inputs[#inputs+1]=path end
                     if file~="" and U.file_exists(file) and not source_seen[file] then inputs[#inputs+1]=file end
-                    local home_target=render_dir.."/"..U.id_name(id).."-home1-"..tostring(thumb_w).."x"..tostring(thumb_h)..".png"
+                    local home_target=render_dir.."/"..U.id_name(id).."-home2-"..tostring(thumb_w).."x"..tostring(thumb_h)..".png"
+                    local lock_style=tostring(self:_home_preferences().lockscreen_style or "frame")
+                    if lock_style~="frame" and lock_style~="fit" and lock_style~="fill" then lock_style="frame" end
+                    local lock_tag=lock_style=="frame" and "frame1" or (lock_style=="fit" and "fit1" or "fill3")
                     local lock_target=(hero_id~="" and id==hero_id)
-                        and (lock_dir.."/"..U.id_name(id).."-fill3-"..tostring(sw).."x"..tostring(sh)..".png") or nil
+                        and (lock_dir.."/"..U.id_name(id).."-"..lock_tag.."-"..tostring(sw).."x"..tostring(sh)..".png") or nil
                     items[#items+1]={
                         id=id,
                         sources=sources,
@@ -4001,6 +4009,7 @@ function Plugin:_home_schedule_cover_derivatives(books)
                         home_target=home_target,
                         home_w=thumb_w,home_h=thumb_h,
                         lock_target=lock_target,
+                        lock_style=lock_style,
                         lock_w=sw,lock_h=sh,
                         home_fresh=self:_home_cover_target_fresh(home_target,inputs),
                         lock_fresh=not lock_target or self:_home_cover_target_fresh(lock_target,inputs),
@@ -4107,7 +4116,9 @@ function Plugin:_home_schedule_cover_derivatives(books)
             if item.file~="" and UChild.file_exists(item.file) then
                 local ok,metadata=pcall(LocalMetadataChild.read,item.file,item.source_dir,{open_document=false,use_bim=true})
                 if ok and type(metadata)=="table" and tostring(metadata.cover_path or "")~="" then
-                    sources[#sources+1]=metadata.cover_path
+                    -- For local books, KOReader BookInfo/custom-cover extraction is
+                    -- authoritative. Do not let a guessed sibling JPG/PNG override it.
+                    sources={metadata.cover_path}
                 end
             end
             local source=CoverRender.best_source(sources)
@@ -4120,7 +4131,13 @@ function Plugin:_home_schedule_cover_derivatives(books)
                 if item.lock_target then
                     lock_path=item.lock_target
                     if not CoverRender.is_fresh(lock_path,source) then
-                        lock_path=CoverRender.render_fill(source,item.lock_target,item.lock_w,item.lock_h,{ink_boost=.075})
+                        if item.lock_style=="frame" then
+                            lock_path=CoverRender.render_frame(source,item.lock_target,item.lock_w,item.lock_h)
+                        elseif item.lock_style=="fit" then
+                            lock_path=CoverRender.render_fit(source,item.lock_target,item.lock_w,item.lock_h,{ink_boost=.055})
+                        else
+                            lock_path=CoverRender.render_fill(source,item.lock_target,item.lock_w,item.lock_h,{ink_boost=.075})
+                        end
                     end
                 end
                 out[#out+1]={id=item.id,home_path=home_path,lock_path=lock_path,source=source}
@@ -11511,11 +11528,17 @@ function Plugin:_show_reader_page_panel(back_callback)
         on_back=back_callback or function() self:show_reader_quick_panel() end,
         on_home=function() return self:return_to_miuread_home("reader surface") end,
         rows=function()
-            return {
-                {label="页边距",value=self:_reader_margin_label(),value_bold=true,callback=function() self:_show_reader_margin_panel(return_to_page) end},
-                {label="页面显示",value="状态栏与阅读信息",callback=function() self:_show_reader_page_display_panel(return_to_page) end},
-                {label="刷新与夜间",value=self:_reader_refresh_rate_label(),callback=function() self:_show_reader_refresh_panel(return_to_page) end},
-            }
+            local rows={}
+            if self:_reader_is_reflowable() then
+                rows[#rows+1]={label="页边距",value=self:_reader_margin_label(),value_bold=true,callback=function() self:_show_reader_margin_panel(return_to_page) end}
+            else
+                rows[#rows+1]={label="页面与缩放",value="使用 KOReader 固定页面设置",value_bold=true,callback=function()
+                    self:_show_koreader_reader_menu(return_to_page)
+                end}
+            end
+            rows[#rows+1]={label="页面显示",value="状态栏与阅读信息",callback=function() self:_show_reader_page_display_panel(return_to_page) end}
+            rows[#rows+1]={label="刷新与夜间",value=self:_reader_refresh_rate_label(),callback=function() self:_show_reader_refresh_panel(return_to_page) end}
+            return rows
         end,
     }
     return true
@@ -11569,12 +11592,44 @@ function Plugin:_reader_config_value(name)
     return configurable and configurable[name] or nil
 end
 
+function Plugin:_reader_is_reflowable()
+    local document=self.ui and self.ui.document or nil
+    if not document then return false end
+    local info=document.info or {}
+    -- KOReader uses has_pages for fixed-page engines (PDF/DJVU/etc.).
+    return info.has_pages~=true and self.ui.font~=nil
+end
+
 function Plugin:_reader_emit_config(event,value,value2)
     local ui=self.ui
     if not (ui and type(ui.handleEvent)=="function") then return false end
+    -- Mirror KOReader ConfigDialog:onConfigChoose(): the native dialog first
+    -- emits ConfigChange so ReaderCoptListener updates document.configurable,
+    -- then emits the concrete action. Keeping this exact order means MiuRead
+    -- has no second copy of the reading setting.
+    local option_names={
+        SetPageHorizMargins="h_page_margins",
+        SetPageTopMargin="t_page_margin",
+        SetPageBottomMargin="b_page_margin",
+        SetWordSpacing="word_spacing",
+        SetCJKWidthScaling="cjk_width_scaling",
+        SetBlockRenderingMode="block_rendering_mode",
+    }
+    local option_name=option_names[event]
     self:_mark_reader_busy(5)
+    if option_name then ui:handleEvent(Event:new("ConfigChange",option_name,value)) end
     if value2~=nil then ui:handleEvent(Event:new(event,value,value2))
     else ui:handleEvent(Event:new(event,value)) end
+    return true
+end
+
+function Plugin:_reader_set_margin_sync(enabled)
+    local ui=self.ui
+    if not (ui and type(ui.handleEvent)=="function") then return false end
+    enabled=enabled==true
+    self:_mark_reader_busy(5)
+    ui:handleEvent(Event:new("ConfigChange","sync_t_b_page_margins",enabled and 1 or 0))
+    ui:handleEvent(Event:new("SyncPageTopBottomMargins",enabled))
     return true
 end
 
@@ -11629,6 +11684,10 @@ function Plugin:_reader_adjust_vertical_margin(delta)
 end
 
 function Plugin:_show_reader_margin_panel(back_callback)
+    if not self:_reader_is_reflowable() then
+        self:info("当前是固定页面文档，页边距由 KOReader 的裁边/缩放设置控制")
+        return false
+    end
     local return_here=function() self:_show_reader_margin_panel(back_callback) end
     ReaderSettingsDialog.show{
         title="页边距",
@@ -11647,6 +11706,9 @@ function Plugin:_show_reader_margin_panel(back_callback)
                     {label="左右边距 +5",value="增大",keep_open=true,callback=function() self:_reader_adjust_horizontal_margin(5) end},
                     {label="上下边距 -5",value="缩小",keep_open=true,callback=function() self:_reader_adjust_vertical_margin(-5) end},
                     {label="上下边距 +5",value="增大",keep_open=true,callback=function() self:_reader_adjust_vertical_margin(5) end},
+                    {label="上下边距同步",value=(tonumber(self:_reader_config_value("sync_t_b_page_margins"))==1) and "已开启" or "已关闭",keep_open=true,callback=function()
+                        self:_reader_set_margin_sync(tonumber(self:_reader_config_value("sync_t_b_page_margins"))~=1)
+                    end},
                 }},
             }
         end,
@@ -11681,6 +11743,7 @@ function Plugin:_reader_adjust_cjk_width(delta)
 end
 
 function Plugin:_show_reader_word_spacing_panel(back_callback)
+    if not self:_reader_is_reflowable() then return self:_show_koreader_reader_menu(back_callback) end
     ReaderSettingsDialog.show{
         title="字符间距（高级）",
         subtitle=function() return "空格缩放/压缩 "..self:_reader_word_spacing_label() end,
@@ -11724,9 +11787,10 @@ function Plugin:_show_reader_refresh_panel(back_callback)
 end
 
 function Plugin:_show_reader_advanced_typeset_panel(back_callback)
+    if not self:_reader_is_reflowable() then return self:_show_koreader_reader_menu(back_callback) end
     ReaderSettingsDialog.show{
         title="高级排版",
-        subtitle="常用高级选项仍由觅阅直接提供, 不进入 KOReader 总菜单",
+        subtitle="界面由觅阅整理，设置直接写入 KOReader 当前书籍",
         on_back=back_callback or function() self:show_reader_control_center("typeset") end,
         on_home=function() return self:return_to_miuread_home("reader surface") end,
         rows=function()
@@ -11821,6 +11885,20 @@ end
 
 function Plugin:_reader_control_categories()
     local function back_to(key) return function() self:show_reader_control_center(key) end end
+    local typeset_items
+    if self:_reader_is_reflowable() then
+        typeset_items={
+            {icon="font",label="字体与字号",value=self:_reader_font_label().." · "..self:_reader_font_size_label(),callback=function() self:_show_reader_font_panel(back_to("typeset")) end},
+            {icon="line-spacing",label="行距",value=tostring(math.floor(self:_reader_line_spacing_value()+.5)).."%",callback=function() self:_show_reader_spacing_panel(back_to("typeset")) end},
+            {icon="display",label="页面",value="页边距与阅读信息",callback=function() self:_show_reader_page_panel(back_to("typeset")) end},
+            {icon="settings",label="高级排版",value="字符间距与更多版式",callback=function() self:_show_reader_advanced_typeset_panel(back_to("typeset")) end},
+        }
+    else
+        typeset_items={
+            {icon="display",label="页面与缩放",value="KOReader 固定页面设置",callback=function() self:_show_koreader_reader_menu(back_to("typeset")) end},
+            {icon="settings",label="页面显示",value="状态栏、刷新与方向",callback=function() self:_show_reader_page_display_panel(back_to("typeset")) end},
+        }
+    end
     return {
         {key="reading",label="阅读",sections={{items={
             {icon="toc",label="目录",value="当前章节",callback=function() self:_show_reader_toc(back_to("reading")) end},
@@ -11830,12 +11908,7 @@ function Plugin:_reader_control_categories()
             {icon="highlight",label="批注",value=self:_reader_annotation_summary_label(),callback=function() self:_show_reader_annotation_panel(back_to("reading")) end},
             {icon="comment",label="评论",value=self:_thoughts_enabled_label(),value_bold=true,callback=function() self:_show_reader_comment_settings(back_to("reading")) end},
         }}}},
-        {key="typeset",label="排版",sections={{items={
-            {icon="font",label="字体与字号",value=self:_reader_font_label().." · "..self:_reader_font_size_label(),callback=function() self:_show_reader_font_panel(back_to("typeset")) end},
-            {icon="line-spacing",label="行距",value=tostring(math.floor(self:_reader_line_spacing_value()+.5)).."%",callback=function() self:_show_reader_spacing_panel(back_to("typeset")) end},
-            {icon="display",label="页面",value="页边距与阅读信息",callback=function() self:_show_reader_page_panel(back_to("typeset")) end},
-            {icon="settings",label="高级排版",value="字符间距与更多版式",callback=function() self:_show_reader_advanced_typeset_panel(back_to("typeset")) end},
-        }}}},
+        {key="typeset",label=self:_reader_is_reflowable() and "排版" or "页面",sections={{items=typeset_items}}},
         {key="book",label="书籍",sections={{items={
             {icon="current-book",label="当前书籍",value="信息与本地状态",callback=function() self:_show_reader_current_book_panel(back_to("book")) end},
             {icon="sync",label="阅读同步",value=self:progress_sync_label(),value_bold=true,callback=function() self:_show_reader_sync_panel(back_to("book")) end},
@@ -11955,33 +12028,42 @@ function Plugin:_reader_quick_panel_options()
         definitions.edge_guard,
     }
 
-    local typeset={
-        font={
-            label="字体",value=self:_reader_font_size_label(),
-            callback=function() self:_show_reader_font_panel(function() self:show_reader_quick_panel() end) end,
-            on_decrease=function()
-                if self:_reader_adjust_font_size(-1) then return self:_reader_font_size_label() end
-                return false
-            end,
-            on_increase=function()
-                if self:_reader_adjust_font_size(1) then return self:_reader_font_size_label() end
-                return false
-            end,
-        },
-        spacing={
-            label="行距",value=tostring(math.floor(self:_reader_line_spacing_value()+.5)).."%",
-            callback=function() self:_show_reader_spacing_panel(function() self:show_reader_quick_panel() end) end,
-            on_decrease=function()
-                if self:_reader_adjust_line_spacing(-5) then return tostring(math.floor(self:_reader_line_spacing_value()+.5)).."%" end
-                return false
-            end,
-            on_increase=function()
-                if self:_reader_adjust_line_spacing(5) then return tostring(math.floor(self:_reader_line_spacing_value()+.5)).."%" end
-                return false
-            end,
-        },
-        page={label="页面",callback=function() self:_show_reader_page_panel(function() self:show_reader_quick_panel() end) end},
-    }
+    local typeset
+    if self:_reader_is_reflowable() then
+        typeset={
+            font={
+                label="字体",value=self:_reader_font_size_label(),
+                callback=function() self:_show_reader_font_panel(function() self:show_reader_quick_panel() end) end,
+                on_decrease=function()
+                    if self:_reader_adjust_font_size(-1) then return self:_reader_font_size_label() end
+                    return false
+                end,
+                on_increase=function()
+                    if self:_reader_adjust_font_size(1) then return self:_reader_font_size_label() end
+                    return false
+                end,
+            },
+            spacing={
+                label="行距",value=tostring(math.floor(self:_reader_line_spacing_value()+.5)).."%",
+                callback=function() self:_show_reader_spacing_panel(function() self:show_reader_quick_panel() end) end,
+                on_decrease=function()
+                    if self:_reader_adjust_line_spacing(-5) then return tostring(math.floor(self:_reader_line_spacing_value()+.5)).."%" end
+                    return false
+                end,
+                on_increase=function()
+                    if self:_reader_adjust_line_spacing(5) then return tostring(math.floor(self:_reader_line_spacing_value()+.5)).."%" end
+                    return false
+                end,
+            },
+            page={label="页面",callback=function() self:_show_reader_page_panel(function() self:show_reader_quick_panel() end) end},
+        }
+    else
+        typeset={fixed_page=true,fixed_actions={
+            {icon="display",label="页面与缩放",callback=function() self:_show_koreader_reader_menu(function() self:show_reader_quick_panel() end) end},
+            {icon="settings",label="页面显示",callback=function() self:_show_reader_page_display_panel(function() self:show_reader_quick_panel() end) end},
+            {icon="full-refresh",label="刷新",callback=function() self:_show_reader_refresh_settings(function() self:show_reader_quick_panel() end) end},
+        }}
+    end
 
     local frontlight
     local warmth
@@ -17705,6 +17787,51 @@ function Plugin:local_library_settings_menu()
     return items
 end
 
+
+function Plugin:_home_lockscreen_style_label(home)
+    home=home or self:_home_preferences()
+    local labels={frame="画框",fit="完整",fill="铺满"}
+    return labels[tostring(home.lockscreen_style or "frame")] or "画框"
+end
+
+function Plugin:_set_home_lockscreen_style(style)
+    local allowed={frame=true,fit=true,fill=true}
+    style=allowed[style] and style or "frame"
+    local home,preferences=self:_home_preferences()
+    if home.lockscreen_style==style then return true end
+    home.lockscreen_style=style
+    self:_save_home_preferences(home,preferences)
+    if self._home_hero then
+        self:_home_remove_lockscreen_cover_cache(self._home_hero)
+        local cover=self:_home_prepare_lockscreen_cover(self._home_hero)
+        HOME_SESSION.screensaver_file=cover
+        local current=HomeView.current()
+        if current and current.opts then current.opts.screensaver_file=cover end
+        UIManager:scheduleIn(.05,function()
+            if HomeView.is_shown() and not self:_active_reader_ui() then
+                self:_home_schedule_cover_derivatives({self._home_hero})
+            end
+        end)
+    end
+    self:toast("锁屏封面："..self:_home_lockscreen_style_label(home),1.5)
+    return true
+end
+
+function Plugin:home_lockscreen_style_menu()
+    local labels={frame="画框",fit="完整",fill="铺满"}
+    local notes={frame="84% · 正中 · 完整封面",fit="尽量放大 · 不裁切",fill="铺满屏幕 · 居中裁切"}
+    local items={}
+    for _,style in ipairs({"frame","fit","fill"}) do
+        local key=style
+        items[#items+1]={
+            text=labels[key],post_text=notes[key],radio=true,
+            checked_func=function() return tostring(self:_home_preferences().lockscreen_style or "frame")==key end,
+            callback=function() self:_set_home_lockscreen_style(key) end,
+        }
+    end
+    return items
+end
+
 function Plugin:display_settings_menu()
     local home=self:_home_preferences()
     local size_labels={compact="紧凑",standard="标准",large="大号"}
@@ -17719,6 +17846,7 @@ function Plugin:display_settings_menu()
         {text="下滑工具栏",post_text="设备与 KOReader",sub_item_table_func=function() return self:home_panel_settings_menu() end},
         {text="网络补全图书信息",post_text="只补充缺失资料",checked_func=function() return self:_home_preferences().network_metadata~=false end,keep_menu_open=true,callback=function() self:_toggle_home_network_metadata() end},
         {text="主页锁屏显示最近阅读封面",checked_func=function() return self:_home_preferences().lockscreen_recent~=false end,keep_menu_open=true,callback=function() self:_toggle_home_lockscreen() end},
+        {text="锁屏封面样式",post_text=self:_home_lockscreen_style_label(home),enabled_func=function() return self:_home_preferences().lockscreen_recent~=false end,sub_item_table_func=function() return self:home_lockscreen_style_menu() end},
         {text="显示书架封面",checked_func=function() return self.store:preferences().shelf_covers~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("shelf_covers") end},
     }
 end

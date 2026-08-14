@@ -562,6 +562,10 @@ end
 
 function Toolbar:_typeset_row(root, typeset, x, y, width, height)
     typeset = type(typeset) == "table" and typeset or {}
+    if typeset.fixed_page==true then
+        self:_content_row(root, typeset.fixed_actions or {}, x, y, width, height)
+        return
+    end
     local page_w = math.floor(width * .22)
     local left = width - page_w
     local half = math.floor(left / 2)

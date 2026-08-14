@@ -125,11 +125,69 @@ function M.render_fill(source, target, width, height, options)
     return result
 end
 
--- Home thumbnails use a modest portrait target and a gentler boost. They are
--- rendered once in the background and then reused, keeping image conversion
--- completely off the home gesture path.
+-- Aspect-preserving renderer used by the home shelf and framed screensaver.
+-- The output canvas always has the requested size, while the source image is
+-- centered inside it without cropping or stretching.
+function M.render_fit(source, target, width, height, options)
+    options = options or {}
+    width, height = tonumber(width) or 0, tonumber(height) or 0
+    if width <= 0 or height <= 0 then return nil, "invalid target size" end
+    local image, iw, ih = load(source)
+    if not image then return nil, "cover decode failed" end
+
+    local scaled, canvas
+    local ok, result = xpcall(function()
+        local max_ratio = math.max(.10, math.min(1.0, tonumber(options.max_ratio) or 1.0))
+        local max_w = math.max(1, math.floor(width * max_ratio + .5))
+        local max_h = math.max(1, math.floor(height * max_ratio + .5))
+        local scale = math.min(max_w / iw, max_h / ih)
+        local sw = math.max(1, math.floor(iw * scale + .5))
+        local sh = math.max(1, math.floor(ih * scale + .5))
+        scaled = RenderImage:scaleBlitBuffer(image, sw, sh, false)
+        if not scaled then error("cover scale failed") end
+        canvas = Blitbuffer.new(width, height, scaled:getType())
+        canvas:fill(Blitbuffer.COLOR_WHITE)
+        local x = math.floor((width - sw) / 2)
+        local y = math.floor((height - sh) / 2)
+        local border = options.border == true and math.max(1, tonumber(options.border_size) or 1) or 0
+        if border > 0 and type(canvas.paintRect) == "function" then
+            local color = options.border_color or Blitbuffer.COLOR_DARK_GRAY
+            canvas:paintRect(math.max(0, x-border), math.max(0, y-border), math.min(width, sw+border*2), border, color)
+            canvas:paintRect(math.max(0, x-border), math.min(height-border, y+sh), math.min(width, sw+border*2), border, color)
+            canvas:paintRect(math.max(0, x-border), math.max(0, y-border), border, math.min(height, sh+border*2), color)
+            canvas:paintRect(math.min(width-border, x+sw), math.max(0, y-border), border, math.min(height, sh+border*2), color)
+        end
+        canvas:blitFrom(scaled, x, y, 0, 0, sw, sh)
+        local boost = math.max(0, math.min(.14, tonumber(options.ink_boost) or 0))
+        if boost > 0 and type(canvas.darkenRect) == "function" then
+            pcall(canvas.darkenRect, canvas, x, y, sw, sh, boost)
+        end
+        local path, err = write_png(canvas, target)
+        if not path then error(err or "cover write failed") end
+        return path
+    end, debug.traceback)
+
+    if scaled == image then scaled = nil end
+    free(image)
+    free(scaled)
+    free(canvas)
+    if not ok then
+        logger.warn("[MiuRead][CoverRender] fit render failed", tostring(result))
+        return nil, result
+    end
+    return result
+end
+
+function M.render_frame(source, target, width, height)
+    return M.render_fit(source, target, width, height, {
+        max_ratio = .84, border = true, border_size = 1, ink_boost = .045,
+    })
+end
+
+-- Home thumbnails are rendered into the final portrait canvas once, preserving
+-- the original cover ratio. The home UI can then reuse that canvas directly.
 function M.render_home(source, target, width, height)
-    return M.render_fill(source, target, width, height, {ink_boost = .035})
+    return M.render_fit(source, target, width, height, {ink_boost = .035})
 end
 
 return M
