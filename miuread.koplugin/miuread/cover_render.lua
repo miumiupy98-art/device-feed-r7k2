@@ -77,12 +77,15 @@ function M.render_screen_image(image, width, height, style, source_label)
 
     local scaled, canvas
     local ok, result = xpcall(function()
-        local ratio = style == "frame" and .76 or 1.0
         local scale
         if style == "fill" then
             scale = math.max(width / iw, height / ih)
+        elseif style == "frame" then
+            local max_w = width * .84
+            local max_h = height * .86
+            scale = math.min(max_w / iw, max_h / ih)
         else
-            scale = math.min((width * ratio) / iw, (height * ratio) / ih)
+            scale = math.min(width / iw, height / ih)
         end
         local sw = math.max(1, math.floor(iw * scale + .5))
         local sh = math.max(1, math.floor(ih * scale + .5))
