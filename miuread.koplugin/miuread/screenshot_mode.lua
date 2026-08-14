@@ -1,51 +1,44 @@
-local DataStorage = require("datastorage")
-local Device = require("device")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
-local U = require("miuread.util")
 local ActionSheet = require("miuread.action_sheet")
 
 local ScreenshotMode = {}
 local generation = 0
 local armed = false
 
-local function screenshot_directory()
-    local root
-    if type(DataStorage.getFullDataDir) == "function" then
-        local ok, value = pcall(DataStorage.getFullDataDir, DataStorage)
-        if ok then root = value end
+local function native_screenshoter(host)
+    local ui = host and host.ui or nil
+    if ui and ui.screenshot and type(ui.screenshot.onScreenshot) == "function" then
+        return ui.screenshot
     end
-    if not root and type(DataStorage.getDataDir) == "function" then
-        local ok, value = pcall(DataStorage.getDataDir, DataStorage)
-        if ok then root = value end
+    local ok_reader, ReaderUI = pcall(require, "apps/reader/readerui")
+    if ok_reader and ReaderUI and ReaderUI.instance and ReaderUI.instance.screenshot
+        and type(ReaderUI.instance.screenshot.onScreenshot) == "function" then
+        return ReaderUI.instance.screenshot
     end
-    root = tostring(root or ".")
-    local dir = root:gsub("/$", "") .. "/screenshots"
-    U.mkdir(dir)
-    return dir
+    local ok_fm, FileManager = pcall(require, "apps/filemanager/filemanager")
+    if ok_fm and FileManager and FileManager.instance and FileManager.instance.screenshot
+        and type(FileManager.instance.screenshot.onScreenshot) == "function" then
+        return FileManager.instance.screenshot
+    end
+    return nil
 end
 
 local function capture(host, token)
     if not armed or token ~= generation then return false end
     armed = false
-    local path = screenshot_directory() .. "/miuread-" .. os.date("%Y%m%d-%H%M%S") .. ".png"
-    local screen = Device.screen
-    local ok, result = false, "当前设备不支持截图"
-    if screen and type(screen.shot) == "function" then
-        ok, result = pcall(screen.shot, screen, path)
-    elseif screen and type(screen.saveScreenshot) == "function" then
-        ok, result = pcall(screen.saveScreenshot, screen, path)
+    local screenshoter = native_screenshoter(host)
+    if not screenshoter then
+        if host and host.info then host:info("当前 KOReader 暂时无法截图") end
+        return false
     end
-    if ok and result ~= false and U.file_exists(path) then
-        logger.info("[MiuRead][Screenshot] saved", path)
-        if host and host.toast then host:toast("截图已保存", 1.6) end
-        UIManager:setDirty(nil, "full")
-        return true
+    local ok, err = pcall(screenshoter.onScreenshot, screenshoter)
+    if not ok then
+        logger.warn("[MiuRead][Screenshot] native KOReader screenshot failed", tostring(err))
+        if host and host.info then host:info("截图失败：\n" .. tostring(err or "KOReader 截图不可用")) end
+        return false
     end
-    local err = ok and "设备没有生成截图文件" or result
-    logger.warn("[MiuRead][Screenshot] failed", tostring(err))
-    if host and host.info then host:info("截图失败：\n" .. tostring(err or "当前设备不支持截图")) end
-    return false
+    return true
 end
 
 local function arm(host, seconds)
@@ -62,7 +55,7 @@ end
 
 function ScreenshotMode.start(host, anchor)
     local actions = {
-        {icon = "5", label = "5 秒后截图", detail = "适合切换一两个页面", callback = function() arm(host, 5) end},
+        {icon = "5", label = "5 秒后截图", detail = "截图由 KOReader 保存", callback = function() arm(host, 5) end},
         {icon = "10", label = "10 秒后截图", detail = "适合进入菜单或翻页", callback = function() arm(host, 10) end},
         {icon = "15", label = "15 秒后截图", detail = "留出更多操作时间", callback = function() arm(host, 15) end},
     }
@@ -76,7 +69,7 @@ function ScreenshotMode.start(host, anchor)
         anchor = anchor,
         preferred_direction = "below",
         title = "延时截图",
-        subtitle = "选择时间后面板会关闭，期间可以正常操作设备",
+        subtitle = "觅阅只负责倒计时，截图与保存由 KOReader 完成",
         show_close = false,
         actions = actions,
     }

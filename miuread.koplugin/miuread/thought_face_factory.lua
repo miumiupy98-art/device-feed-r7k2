@@ -6,6 +6,7 @@
 local Font = require("ui/font")
 local FontList = require("fontlist")
 local Freetype = require("ffi/freetype")
+local Screen = require("device").screen
 local logger = require("logger")
 
 local FaceFactory = {
@@ -129,10 +130,20 @@ end
 
 function FaceFactory:_buildFace(path, size)
     path = realpath(path)
-    size = math.max(8, math.floor(tonumber(size) or 0))
-    if not path or size <= 0 then return nil end
+    local orig_size = math.max(8, math.floor(tonumber(size) or 0))
+    if not path or orig_size <= 0 then return nil end
+    -- Font:getFace() treats its size argument as a logical KOReader size and
+    -- applies Screen:scaleBySize() before opening FreeType. Custom UI fonts
+    -- must do the same or they become dramatically smaller on 300-ppi Kindles.
+    local scaled_size = orig_size
+    if Screen and type(Screen.scaleBySize) == "function" then
+        local ok_scale, value = pcall(Screen.scaleBySize, Screen, orig_size)
+        if ok_scale and tonumber(value) and tonumber(value) > 0 then
+            scaled_size = math.max(8, math.floor(tonumber(value) + .5))
+        end
+    end
 
-    local ok, ftsize = pcall(Freetype.newFaceSize, path, size)
+    local ok, ftsize = pcall(Freetype.newFaceSize, path, scaled_size)
     if not ok or not ftsize then
         logger.warn("[MiuRead][ThoughtPopup] unable to open fallback font:", tostring(path))
         return nil
@@ -141,10 +152,10 @@ function FaceFactory:_buildFace(path, size)
     local face = {
         orig_font = path,
         realname = path,
-        size = size,
-        orig_size = size,
+        size = scaled_size,
+        orig_size = orig_size,
         ftsize = ftsize,
-        hash = path .. "|" .. tostring(size),
+        hash = path .. "|" .. tostring(scaled_size),
         is_real_bold = false,
         hb_features = {"+kern", "+liga"},
         fallbacks = {},

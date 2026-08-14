@@ -9008,9 +9008,37 @@ function Plugin:_home_frontlight()
     return self:_show_frontlight_panel{placement="center"}
 end
 
+function Plugin:_koreader_device_listener()
+    local ui=self.ui
+    if ui and ui.devicelistener then return ui.devicelistener end
+    local ok_reader,ReaderUI=pcall(require,"apps/reader/readerui")
+    if ok_reader and ReaderUI and ReaderUI.instance and ReaderUI.instance.devicelistener then
+        return ReaderUI.instance.devicelistener
+    end
+    local ok_fm,FileManager=pcall(require,"apps/filemanager/filemanager")
+    if ok_fm and FileManager and FileManager.instance and FileManager.instance.devicelistener then
+        return FileManager.instance.devicelistener
+    end
+    return nil
+end
+
 function Plugin:_home_toggle_night()
-    UIManager:broadcastEvent(Event:new("ToggleNightMode"))
-    UIManager:scheduleIn(.2,function() UIManager:setDirty("all","full") end)
+    local listener=self:_koreader_device_listener()
+    if not (listener and type(listener.onToggleNightMode)=="function") then
+        self:info("当前 KOReader 暂时无法切换夜间模式")
+        return false
+    end
+    local before=self:_reader_night_enabled()
+    local ok,err=pcall(listener.onToggleNightMode,listener)
+    if not ok then
+        logger.warn("[MiuRead][NightMode] native toggle failed",tostring(err))
+        self:info("夜间模式切换失败")
+        return false
+    end
+    UIManager:scheduleIn(.08,function()
+        local after=self:_reader_night_enabled()
+        if after==before then logger.warn("[MiuRead][NightMode] state unchanged after native toggle") end
+    end)
     return true
 end
 
@@ -9078,7 +9106,15 @@ function Plugin:_home_full_refresh(confirmed)
         UIManager:show(dialog)
         return true
     end
-    UIManager:setDirty("all","full")
+    local listener=self:_koreader_device_listener()
+    if listener and type(listener.onFullRefresh)=="function" then
+        local ok,err=pcall(listener.onFullRefresh,listener)
+        if ok then return true end
+        logger.warn("[MiuRead][Refresh] native full refresh failed",tostring(err))
+    end
+    -- Compatibility fallback for KOReader builds where the active UI listener
+    -- is temporarily unavailable during a desktop transition.
+    UIManager:broadcastEvent(Event:new("FullRefresh"))
     return true
 end
 
@@ -10565,6 +10601,45 @@ function Plugin:_show_reader_annotation_actions(item,kind,anchor,refresh_callbac
     return true
 end
 
+function Plugin:_reader_record_inline_actions(item,kind,back_callback)
+    local function refresh_records()
+        local next_kind=self:_reader_annotation_type(item) or kind
+        self:_show_reader_records(next_kind,back_callback)
+    end
+    local actions={{label="跳转正文",close=true,callback=function() self:_reader_goto_annotation(item) end}}
+    if kind=="highlight" then
+        actions[#actions+1]={label="添加想法",callback=function()
+            self:_reader_edit_annotation_note(item,true,refresh_records)
+        end}
+        actions[#actions+1]={label="删除划线",danger=true,callback=function()
+            self:_reader_confirm_annotation_action("删除这条划线？","删除划线",function()
+                self:_reader_delete_annotation_item(item,refresh_records)
+            end,refresh_records)
+        end}
+    elseif kind=="thought" then
+        actions[#actions+1]={label="修改想法",callback=function()
+            self:_reader_edit_annotation_note(item,false,refresh_records)
+        end}
+        actions[#actions+1]={label="删除想法",danger=true,callback=function()
+            self:_reader_confirm_annotation_action("删除这条想法？\n\n原划线会继续保留。","删除想法",function()
+                self:_reader_delete_annotation_note(item,refresh_records)
+            end,refresh_records)
+        end}
+        actions[#actions+1]={label="删除全部",danger=true,callback=function()
+            self:_reader_confirm_annotation_action("删除整条批注？\n\n划线和想法都会被删除。","全部删除",function()
+                self:_reader_delete_annotation_item(item,refresh_records)
+            end,refresh_records)
+        end}
+    else
+        actions[#actions+1]={label="删除书签",danger=true,callback=function()
+            self:_reader_confirm_annotation_action("删除这枚书签？","删除书签",function()
+                self:_reader_delete_annotation_item(item,refresh_records)
+            end,refresh_records)
+        end}
+    end
+    return actions
+end
+
 function Plugin:_reader_record_rows(kind,back_callback)
     local annotations=(self.ui and self.ui.annotation and self.ui.annotation.annotations)
         or (self.ui and self.ui.bookmark and self.ui.bookmark.bookmarks) or {}
@@ -10578,13 +10653,7 @@ function Plugin:_reader_record_rows(kind,back_callback)
                 label=excerpt~="" and excerpt or (kind=="bookmark" and "书页书签" or "无文字内容"),
                 value=page and ("第 "..tostring(page).." 页") or "",
                 detail=tostring(item.datetime or item.date or ""),
-                callback=function() self:_reader_goto_annotation(target) end,
-                hold_callback=function(anchor)
-                    self:_show_reader_annotation_actions(target,kind,anchor,function()
-                        local next_kind=self:_reader_annotation_type(target) or kind
-                        self:_show_reader_records(next_kind,back_callback)
-                    end)
-                end,
+                inline_actions=function() return self:_reader_record_inline_actions(target,kind,back_callback) end,
             }
         end
     end
@@ -10692,7 +10761,7 @@ function Plugin:_show_reader_records(initial_kind,back_callback)
     local labels={bookmark="书签",highlight="划线",thought="想法"}
     ReaderListDialog.show{
         title="阅读记录",
-        subtitle="点击跳转 · 长按管理",
+        subtitle="点击记录展开操作 · 跳转、修改与删除都在当前列表完成",
         initial_category=labels[initial_kind] and initial_kind or "bookmark",
         categories=function()
             return {
@@ -10701,7 +10770,7 @@ function Plugin:_show_reader_records(initial_kind,back_callback)
                 {key="thought",label="想法",items=self:_reader_record_rows("thought",back_callback),empty_text="当前书籍还没有自己的想法"},
             }
         end,
-        page_size=5,
+        page_size=4,
         on_back=back_callback or (self:_home_enabled() and function() self:show_reader_quick_panel() end or function() self:_show_koreader_reader_menu() end),
         on_home=self:_home_enabled() and function() return self:return_to_miuread_home("reader surface") end or nil,
     }
@@ -10972,55 +11041,46 @@ function Plugin:_reader_frontlight_bounds()
 end
 
 function Plugin:_reader_frontlight_enabled()
+    local powerd=self:_reader_power_device()
+    if not powerd then return false end
+    if type(powerd.isFrontlightOn)=="function" then
+        local ok,value=pcall(powerd.isFrontlightOn,powerd)
+        if ok then return value==true end
+    end
     local minimum=self:_reader_frontlight_bounds()
     return (self:_reader_frontlight_value() or minimum)>minimum
 end
 
 function Plugin:_reader_set_frontlight(value)
-    local powerd=self:_reader_power_device()
-    if not powerd then self:info("当前设备没有可调前光"); return false end
+    local listener=self:_koreader_device_listener()
+    if not (listener and type(listener.onSetFlIntensity)=="function") then
+        self:info("当前 KOReader 暂时无法调整前光")
+        return false
+    end
     local minimum,maximum=self:_reader_frontlight_bounds()
     local target=math.max(minimum,math.min(maximum,math.floor((tonumber(value) or minimum)+.5)))
-    local current=self:_reader_frontlight_value() or minimum
-    local ok=false
-    if target<=minimum then
-        if current>minimum then
-            self._miuread_last_frontlight=current
-            if type(powerd.turnOffFrontlight)=="function" then ok=pcall(powerd.turnOffFrontlight,powerd)
-            elseif type(powerd.toggleFrontlight)=="function" then ok=pcall(powerd.toggleFrontlight,powerd)
-            elseif type(powerd.setIntensity)=="function" then ok=pcall(powerd.setIntensity,powerd,minimum) end
-        else
-            ok=true
-        end
-    elseif type(powerd.setIntensity)=="function" then
-        ok=pcall(powerd.setIntensity,powerd,target)
-    elseif type(powerd.turnOnFrontlight)=="function" then
-        ok=pcall(powerd.turnOnFrontlight,powerd)
+    local ok,err=pcall(listener.onSetFlIntensity,listener,target)
+    if not ok then
+        logger.warn("[MiuRead][Frontlight] native intensity failed",tostring(err))
+        self:info("前光调整失败")
+        return false
     end
-    if type(powerd.updateResumeFrontlightState)=="function" then pcall(powerd.updateResumeFrontlightState,powerd) end
-    if ok then
-        local actual=self:_reader_frontlight_value() or target
-        if actual>minimum then self._miuread_last_frontlight=actual end
-        if UIManager and type(UIManager.broadcastEvent)=="function" then
-            pcall(UIManager.broadcastEvent,UIManager,Event:new("FrontlightStateChanged"))
-        end
-    else
-        self:info("当前设备暂时无法直接调整前光")
-    end
-    return ok
+    return true
 end
 
 function Plugin:_reader_toggle_frontlight()
-    local minimum,maximum=self:_reader_frontlight_bounds()
-    local current=self:_reader_frontlight_value() or minimum
-    if current>minimum then
-        self._miuread_last_frontlight=current
-        return self:_reader_set_frontlight(minimum)
+    local listener=self:_koreader_device_listener()
+    if not (listener and type(listener.onToggleFrontlight)=="function") then
+        self:info("当前 KOReader 暂时无法切换前光")
+        return false
     end
-    local fallback=math.min(maximum,minimum+math.max(1,math.ceil((maximum-minimum)/10)))
-    local target=tonumber(self._miuread_last_frontlight) or fallback
-    target=math.max(minimum+1,math.min(maximum,target))
-    return self:_reader_set_frontlight(target)
+    local ok,err=pcall(listener.onToggleFrontlight,listener)
+    if not ok then
+        logger.warn("[MiuRead][Frontlight] native toggle failed",tostring(err))
+        self:info("前光切换失败")
+        return false
+    end
+    return true
 end
 
 function Plugin:_reader_adjust_frontlight(delta)
@@ -11051,20 +11111,16 @@ function Plugin:_reader_warmth_state()
 end
 
 function Plugin:_reader_set_warmth(value)
-    local powerd=self:_reader_power_device()
     local state=self:_reader_warmth_state()
-    if not (powerd and state and type(powerd.setWarmth)=="function") then return false end
+    local listener=self:_koreader_device_listener()
+    if not (state and listener and type(listener.onSetFlWarmth)=="function") then return false end
     local target=math.max(state.min,math.min(state.max,math.floor((tonumber(value) or state.value)+.5)))
-    local device_value=target
-    if type(powerd.fromNativeWarmth)=="function" then
-        local ok,converted=pcall(powerd.fromNativeWarmth,powerd,target)
-        if ok and tonumber(converted) then device_value=tonumber(converted) end
+    local ok,err=pcall(listener.onSetFlWarmth,listener,target)
+    if not ok then
+        logger.warn("[MiuRead][Frontlight] native warmth failed",tostring(err))
+        return false
     end
-    local ok=pcall(powerd.setWarmth,powerd,device_value)
-    if ok and UIManager and type(UIManager.broadcastEvent)=="function" then
-        pcall(UIManager.broadcastEvent,UIManager,Event:new("FrontlightStateChanged"))
-    end
-    return ok
+    return true
 end
 
 function Plugin:_reader_adjust_warmth(delta)
@@ -11188,22 +11244,27 @@ function Plugin:_reader_toggle_footer_setting(key,inverted)
 end
 
 function Plugin:_reader_refresh_rate_label()
-    if type(UIManager.getRefreshRate)~="function" then return "系统默认" end
-    local ok,rate=pcall(UIManager.getRefreshRate,UIManager)
-    rate=ok and tonumber(rate) or nil
+    local rate=tonumber(UIManager.FULL_REFRESH_COUNT)
+    if not rate and type(UIManager.getRefreshRate)=="function" then
+        local ok,value=pcall(UIManager.getRefreshRate,UIManager)
+        if ok then rate=tonumber(value) end
+    end
     if not rate then return "系统默认" end
+    if rate==0 then return "从不" end
+    if rate<0 then return "每章" end
     if rate<=1 then return "每页" end
     return "每 "..tostring(math.floor(rate+.5)).." 页"
 end
 
 function Plugin:_reader_cycle_refresh_rate()
-    if type(UIManager.setRefreshRate)~="function" then
-        self:info("当前设备暂时无法直接调整刷新频率")
+    local listener=self:_koreader_device_listener()
+    if not listener then
+        self:info("当前 KOReader 暂时无法调整刷新频率")
         return false
     end
     local values={1,6,12,24,48}
-    local current
-    if type(UIManager.getRefreshRate)=="function" then
+    local current=tonumber(UIManager.FULL_REFRESH_COUNT)
+    if not current and type(UIManager.getRefreshRate)=="function" then
         local ok,value=pcall(UIManager.getRefreshRate,UIManager)
         if ok then current=tonumber(value) end
     end
@@ -11214,8 +11275,17 @@ function Plugin:_reader_cycle_refresh_rate()
             break
         end
     end
-    local ok=pcall(UIManager.setRefreshRate,UIManager,target)
-    if not ok then self:info("刷新频率调整失败") end
+    local night=self:_reader_night_enabled()
+    local method=night and listener.onSetNightRefreshRate or listener.onSetDayRefreshRate
+    if type(method)~="function" then
+        self:info("当前 KOReader 暂时无法调整刷新频率")
+        return false
+    end
+    local ok,err=pcall(method,listener,target)
+    if not ok then
+        logger.warn("[MiuRead][Refresh] native refresh-rate change failed",tostring(err))
+        self:info("刷新频率调整失败")
+    end
     return ok
 end
 

@@ -372,9 +372,11 @@ function QuickPanelWidget:_build()
     local buttons = type(self.opts.buttons) == "table" and self.opts.buttons or {}
     local line = UiScale.line("thin")
 
-    -- The pull-down shortcut strip is one horizontal row of up to eight.
-    local columns = 8
-    local rows = #buttons > 0 and 1 or 0
+    -- The pull-down shortcut strip uses the actual visible count (up to eight).
+    -- Hidden/unsupported controls therefore never leave dead space on the right.
+    local visible_button_count = math.min(8, #buttons)
+    local columns = math.max(1, visible_button_count)
+    local rows = visible_button_count > 0 and 1 or 0
     local frontlight=type(self.opts.frontlight)=="table" and self.opts.frontlight or nil
     local warmth=frontlight and type(frontlight.warmth)=="table" and frontlight.warmth or nil
     if frontlight then
@@ -482,7 +484,11 @@ function QuickPanelWidget:_build()
             function(anchor)
                 if not self:_controls_armed() then return true end
                 if type(frontlight.on_toggle)=="function" then pcall(frontlight.on_toggle,anchor) end
-                self:_refresh_frontlight_state(); return true
+                self:_refresh_frontlight_state()
+                -- Some KOReader power drivers ramp the frontlight asynchronously.
+                -- Re-read once more after the native toggle has settled.
+                UIManager:scheduleIn(.35,function() if not self._closed then self:_refresh_frontlight_state() end end)
+                return true
             end)
         local night=tappable(button_w,header_h,
             fixed_frame(button_w,header_h,{bordersize=UiScale.line("thin"),radius=UiScale.radius(6,5,9),background=Blitbuffer.COLOR_WHITE},night_text),

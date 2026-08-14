@@ -96,6 +96,7 @@ local Dialog = InputContainer:extend{
     pending_action = nil,
     selected_key = nil,
     page = 1,
+    expanded_index = nil,
 }
 
 function Dialog:handleEvent(event) return InputContainer.handleEvent(self, event) end
@@ -138,8 +139,19 @@ function Dialog:_page_size()
     return sh > 1100 and 7 or 6
 end
 
-function Dialog:_run_item(item)
+function Dialog:_inline_actions(item)
+    local actions = resolved(item and item.inline_actions, {})
+    return type(actions) == "table" and actions or {}
+end
+
+function Dialog:_run_item(item, index)
     if not item or item.enabled == false then return true end
+    local inline_actions = self:_inline_actions(item)
+    if #inline_actions > 0 then
+        self.expanded_index = self.expanded_index == index and nil or index
+        self:_rebuild()
+        return true
+    end
     if item.keep_open == true then
         if item.callback then
             local ok, err = pcall(item.callback)
@@ -153,13 +165,14 @@ function Dialog:_run_item(item)
     return self:_close(item.callback)
 end
 
-function Dialog:_row_widget(item, width, height)
+function Dialog:_row_widget(item, width, height, index)
     local enabled = item.enabled ~= false
     local pad = Skin.dp(7, 6, 10)
     local icon_w = tostring(item.icon or "") ~= "" and Skin.dp(31, 27, 41) or 0
     local value = tostring(item.value or item.post_text or "")
     local value_w = value ~= "" and math.max(Skin.dp(92, 76, 126), math.floor(width * .30)) or 0
-    local arrow = item.arrow ~= false and item.callback ~= nil and item.keep_open ~= true
+    local inline_actions = self:_inline_actions(item)
+    local arrow = item.arrow ~= false and ((#inline_actions > 0) or (item.callback ~= nil and item.keep_open ~= true))
     local arrow_w = arrow and Skin.dp(15, 13, 20) or 0
     local gap = Skin.dp(5, 4, 7)
     local text_w = math.max(1, width - pad * 2 - icon_w - value_w - arrow_w
@@ -216,16 +229,58 @@ function Dialog:_row_widget(item, width, height)
 
     local tap = TapBox:new{
         dimen = Geom:new{w = width, h = height}, enabled = enabled,
-        callback = function() self:_run_item(item) end,
-        hold_callback = item.hold_callback and function(anchor)
-            -- A held row is a complete action in its own right. Close this
-            -- list before opening its management sheet so two modal surfaces
-            -- can never overlap on slow E-ink devices.
+        callback = function() self:_run_item(item, index) end,
+        hold_callback = (#inline_actions == 0 and item.hold_callback) and function(anchor)
             return self:_close(function() item.hold_callback(anchor) end)
         end or nil,
     }
     tap[1] = CenterContainer:new{dimen = Geom:new{w = width, h = height}, row}
     return tap
+end
+
+function Dialog:_inline_actions_widget(item, width, height)
+    local actions = self:_inline_actions(item)
+    local count = math.max(1, #actions)
+    local gap = Skin.dp(5, 4, 7)
+    local button_w = math.max(1, math.floor((width - gap * (count - 1)) / count))
+    local group = HorizontalGroup:new{align = "center"}
+    for index, action in ipairs(actions) do
+        local actual_w = index == count and math.max(1, width - (button_w + gap) * (count - 1)) or button_w
+        local label = tostring(action.label or action.text or "操作")
+        local enabled = action.enabled ~= false
+        local tap = TapBox:new{
+            dimen = Geom:new{w = actual_w, h = height},
+            enabled = enabled,
+            callback = function()
+                if action.close == true then
+                    return self:_close(action.callback)
+                end
+                if type(action.callback) == "function" then
+                    local ok, err = pcall(action.callback)
+                    if not ok then
+                        logger.warn("[MiuRead][ReaderListDialog] inline action failed", tostring(err))
+                    end
+                end
+                UIManager:scheduleIn(.05, function()
+                    if not self.closed then self:_rebuild() end
+                end)
+                return true
+            end,
+        }
+        tap[1] = Skin.frame(actual_w, height, {
+            bordersize = Skin.line("thin"), padding = Skin.dp(2, 1, 3), radius = Skin.dp(5, 4, 7),
+            background = Blitbuffer.COLOR_WHITE,
+            color = action.danger == true and Blitbuffer.COLOR_DARK_GRAY or Blitbuffer.COLOR_GRAY,
+        }, Ui.textbox(label, math.max(1, actual_w - Skin.dp(6, 4, 8)), height - Skin.dp(4, 2, 6),
+            Skin.face("smallinfofont", count >= 4 and 8.6 or 9.3, count >= 4 and 11.4 or 12.3, count >= 4 and 7.2 or 7.9), {
+                bold = action.danger == true or action.bold == true,
+                alignment = "center", halign = "center",
+                fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+            }))
+        group[#group + 1] = tap
+        if index < count then group[#group + 1] = HorizontalSpan:new{width = gap} end
+    end
+    return group
 end
 
 function Dialog:_tab_widget(category, width, height, selected)
@@ -248,6 +303,7 @@ function Dialog:_tab_widget(category, width, height, selected)
         if self.selected_key ~= key then
             self.selected_key = key
             self.page = 1
+            self.expanded_index = nil
             self:_rebuild()
         end
     end}
@@ -281,6 +337,8 @@ function Dialog:_build_content()
     local tab_h = #categories > 1 and math.max(Skin.dp(37, 32, 49), math.floor(sh * .036)) or 0
     local pager_h_default = Skin.dp(34, 29, 45)
     local row_h = math.max(Skin.dp(64, 55, 86), math.floor(sh * (portrait and .060 or .084)))
+    local action_h = Skin.dp(40, 35, 52)
+    local action_gap = Skin.dp(5, 4, 7)
     local page_size = self:_page_size()
     local items = self:_items(selected)
     local pages = math.max(1, math.ceil(#items / page_size))
@@ -298,7 +356,11 @@ function Dialog:_build_content()
         if #candidate_items > page_size then has_pager = true end
     end
     local pager_h = has_pager and pager_h_default or 0
-    local body_h = visible_slots * row_h
+    if self.expanded_index and (self.expanded_index < first or self.expanded_index > last) then
+        self.expanded_index = nil
+    end
+    local expanded_h = self.expanded_index and (action_gap + action_h) or 0
+    local body_h = visible_slots * row_h + expanded_h
     local max_h = sh - Skin.dp(24, 20, 36)
     local panel_h = math.min(max_h, pad * 2 + header_h + subtitle_h + tab_h + body_h + pager_h + Skin.dp(8, 6, 12))
 
@@ -370,8 +432,14 @@ function Dialog:_build_content()
     else
         for index = first, last do
             local item = items[index]
-            root[#root + 1] = OffsetContainer:new{x_off = outer + pad, y_off = y, self:_row_widget(item, content_w, row_h)}
+            root[#root + 1] = OffsetContainer:new{x_off = outer + pad, y_off = y, self:_row_widget(item, content_w, row_h, index)}
             y = y + row_h
+            if self.expanded_index == index then
+                y = y + action_gap
+                root[#root + 1] = OffsetContainer:new{x_off = outer + pad, y_off = y,
+                    self:_inline_actions_widget(item, content_w, action_h)}
+                y = y + action_h
+            end
             if index < last then
                 root[#root + 1] = OffsetContainer:new{x_off = outer + pad + Skin.dp(4, 3, 6), y_off = y,
                     Skin.divider(math.max(1, content_w - Skin.dp(8, 6, 12)), Blitbuffer.COLOR_GRAY)}
@@ -387,13 +455,13 @@ function Dialog:_build_content()
             HorizontalGroup:new{
                 align = "center",
                 self:_pager_button("back", prev_w, pager_h, function()
-                    if self.page > 1 then self.page = self.page - 1; self:_rebuild() end
+                    if self.page > 1 then self.page = self.page - 1; self.expanded_index = nil; self:_rebuild() end
                 end, self.page > 1),
                 Ui.textbox(tostring(self.page).." / "..tostring(pages), page_w, pager_h, Skin.face("cfont", 10.0, 13.3, 8.5), {
                     alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_DARK_GRAY,
                 }),
                 self:_pager_button("chevron-right", next_w, pager_h, function()
-                    if self.page < pages then self.page = self.page + 1; self:_rebuild() end
+                    if self.page < pages then self.page = self.page + 1; self.expanded_index = nil; self:_rebuild() end
                 end, self.page < pages),
             }}
     end
@@ -419,6 +487,7 @@ function Dialog:init()
     self.opts = self.opts or {}
     self.selected_key = tostring(self.opts.initial_category or "")
     self.page = tonumber(self.opts.initial_page) or 1
+    self.expanded_index = nil
     self:_build_content()
     self.ges_events = {
         TapDismiss = {GestureRange:new{ges = "tap", range = self.dimen}},

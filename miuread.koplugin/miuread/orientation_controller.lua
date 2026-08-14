@@ -6,20 +6,37 @@ local logger = require("logger")
 local Screen = Device.screen
 local M = {}
 
-local state = rawget(_G, "__MIUREAD_ORIENTATION_SESSION")
-if type(state) ~= "table" then
-    state = {
-        session_locked = false,
-        locked_mode = nil,
-        original_rotation = nil,
-    }
-    rawset(_G, "__MIUREAD_ORIENTATION_SESSION", state)
-end
-state.session_locked = state.session_locked == true
-
 local function setting_true(key)
     return G_reader_settings and type(G_reader_settings.isTrue) == "function"
         and G_reader_settings:isTrue(key) or false
+end
+
+local function active_ui()
+    local ok_reader, ReaderUI = pcall(require, "apps/reader/readerui")
+    if ok_reader and ReaderUI and ReaderUI.instance and ReaderUI.instance.document then
+        return ReaderUI.instance
+    end
+    local ok_fm, FileManager = pcall(require, "apps/filemanager/filemanager")
+    if ok_fm and FileManager and FileManager.instance then return FileManager.instance end
+    if ok_reader and ReaderUI and ReaderUI.instance then return ReaderUI.instance end
+    return nil
+end
+
+local function device_listener()
+    local ui = active_ui()
+    return ui and ui.devicelistener or nil
+end
+
+local function native_call(name, ...)
+    local listener = device_listener()
+    local method = listener and listener[name] or nil
+    if type(method) ~= "function" then return false, "KOReader 方向控制暂时不可用" end
+    local ok, result = pcall(method, listener, ...)
+    if not ok then
+        logger.warn("[MiuRead][Orientation] native action failed", name, tostring(result))
+        return false, "KOReader 方向控制执行失败"
+    end
+    return result == false and false or true
 end
 
 function M.has_gsensor()
@@ -43,98 +60,73 @@ function M.rotation_label()
     return "竖屏"
 end
 
+-- Compatibility name retained for existing MiuRead UI callers. The value is
+-- now KOReader's own persistent lock state, not a second MiuRead session flag.
 function M.is_session_locked()
-    return state.session_locked == true
+    return setting_true("input_lock_gsensor")
 end
 
 function M.status_label()
     if not M.has_gsensor() then return M.rotation_label() end
-    if state.session_locked then return "已锁定 · " .. M.rotation_label() end
-    if setting_true("input_ignore_gsensor") then return "KOReader 已锁定" end
-    if setting_true("input_lock_gsensor") then return "横竖已锁" end
+    if setting_true("input_ignore_gsensor") then return "KOReader 已关闭自动旋转" end
+    if setting_true("input_lock_gsensor") then return "已锁定 · " .. M.rotation_label() end
     return "自动旋转"
 end
 
 function M.icon_key()
-    if state.session_locked or setting_true("input_ignore_gsensor") then
+    if setting_true("input_lock_gsensor") or setting_true("input_ignore_gsensor") then
         return "orientation-lock"
     end
     return "orientation-auto"
 end
 
-local function remember_original_rotation()
-    if state.original_rotation == nil then
-        state.original_rotation = M.rotation_mode()
-    end
-end
-
-local function set_sensor_enabled(enabled)
-    if not M.has_gsensor() or type(Device.toggleGSensor) ~= "function" then return true end
-    local ok, err = pcall(Device.toggleGSensor, Device, enabled == true)
-    if not ok then
-        logger.warn("[MiuRead][Orientation] sensor toggle failed", tostring(err))
-        return false
-    end
-    return true
-end
-
 function M.lock_current()
-    if not M.has_gsensor() then
-        return false, "当前设备没有自动旋转传感器"
-    end
-    remember_original_rotation()
-    if not set_sensor_enabled(false) then
-        return false, "方向锁定失败"
-    end
-    state.session_locked = true
-    state.locked_mode = M.rotation_mode()
-    logger.info("[MiuRead][Orientation] session locked", "mode=", tostring(state.locked_mode))
-    return true, "已锁定当前方向"
+    if not M.has_gsensor() then return false, "当前设备没有自动旋转传感器" end
+    local ok, message = native_call("onSetLockGSensor", true)
+    return ok, ok and "已使用 KOReader 锁定当前方向" or message
 end
 
 function M.follow_koreader()
-    state.session_locked = false
-    state.locked_mode = nil
-    state.original_rotation = nil
-    if M.has_gsensor() then
-        local enabled = not setting_true("input_ignore_gsensor")
-        if not set_sensor_enabled(enabled) then return false, "恢复 KOReader 方向设置失败" end
-        if enabled then return true, "已跟随 KOReader 自动旋转" end
+    if not M.has_gsensor() then return true, "当前设备使用手动方向" end
+    if setting_true("input_lock_gsensor") then
+        local ok, message = native_call("onSetLockGSensor", false)
+        if not ok then return false, message end
+    end
+    if setting_true("input_ignore_gsensor") then
         return true, "已跟随 KOReader；KOReader 当前关闭了自动旋转"
     end
-    return true, "当前设备使用手动方向"
+    return true, "已跟随 KOReader 自动旋转"
 end
 
 function M.enable_auto_rotation()
-    state.session_locked = false
-    state.locked_mode = nil
-    state.original_rotation = nil
-    if not M.has_gsensor() then
-        return false, "当前设备没有自动旋转传感器"
-    end
+    if not M.has_gsensor() then return false, "当前设备没有自动旋转传感器" end
     if setting_true("input_lock_gsensor") then
-        UIManager:broadcastEvent(Event:new("SetLockGSensor", false))
+        local ok, message = native_call("onSetLockGSensor", false)
+        if not ok then return false, message end
     end
     if setting_true("input_ignore_gsensor") then
-        UIManager:broadcastEvent(Event:new("ToggleGSensor"))
-    elseif not set_sensor_enabled(true) then
-        return false, "恢复自动旋转失败"
+        local ok, message = native_call("onToggleGSensor")
+        if not ok then return false, message end
     end
-    logger.info("[MiuRead][Orientation] automatic rotation restored")
-    return true, "已恢复自动旋转"
+    return true, "已通过 KOReader 恢复自动旋转"
 end
 
 function M.set_fixed(mode)
     if mode == nil then return false, "无效的屏幕方向" end
-    remember_original_rotation()
-    if M.has_gsensor() and not set_sensor_enabled(false) then
-        return false, "方向锁定失败"
+    local ui = active_ui()
+    if not (ui and type(ui.handleEvent) == "function") then
+        return false, "KOReader 当前无法切换屏幕方向"
     end
-    UIManager:broadcastEvent(Event:new("SetRotationMode", mode))
-    state.session_locked = M.has_gsensor()
-    state.locked_mode = mode
-    logger.info("[MiuRead][Orientation] fixed", "mode=", tostring(mode), "locked=", tostring(state.session_locked))
-    return true, state.session_locked and "已固定屏幕方向" or "已切换屏幕方向"
+    local ok, err = pcall(ui.handleEvent, ui, Event:new("SetRotationMode", mode))
+    if not ok then
+        logger.warn("[MiuRead][Orientation] SetRotationMode failed", tostring(err))
+        return false, "屏幕方向切换失败"
+    end
+    if M.has_gsensor() then
+        local locked, message = native_call("onSetLockGSensor", true)
+        if not locked then return false, message end
+    end
+    return true, M.has_gsensor() and "已通过 KOReader 固定屏幕方向" or "已切换屏幕方向"
 end
 
 function M.set_portrait()
@@ -146,27 +138,20 @@ function M.set_landscape()
 end
 
 function M.toggle_session_lock()
-    if state.session_locked then return M.follow_koreader() end
+    if not M.has_gsensor() then return false, "当前设备没有自动旋转传感器" end
     if setting_true("input_ignore_gsensor") then
-        return false, "KOReader 当前已关闭自动旋转；长按可选择“恢复自动旋转”"
+        return false, "KOReader 当前已关闭自动旋转；长按可选择恢复自动旋转"
     end
-    return M.lock_current()
+    local target = not setting_true("input_lock_gsensor")
+    local ok, message = native_call("onSetLockGSensor", target)
+    if not ok then return false, message end
+    return true, target and "已使用 KOReader 锁定当前方向" or "已解除方向锁定"
 end
 
-function M.release_session(reason)
-    if not state.session_locked then return false end
-    local original = state.original_rotation
-    state.session_locked = false
-    state.locked_mode = nil
-    state.original_rotation = nil
-    if M.has_gsensor() then
-        set_sensor_enabled(not setting_true("input_ignore_gsensor"))
-    end
-    if original ~= nil and original ~= M.rotation_mode() then
-        UIManager:broadcastEvent(Event:new("SetRotationMode", original))
-    end
-    logger.info("[MiuRead][Orientation] session released", tostring(reason or "leave MiuRead"))
-    return true
+-- Older builds restored a private MiuRead session lock when leaving the desktop.
+-- There is no private lock anymore, so leaving MiuRead must not alter KOReader.
+function M.release_session(_reason)
+    return false
 end
 
 return M
