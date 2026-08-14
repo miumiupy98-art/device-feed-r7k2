@@ -57,6 +57,114 @@ function M.best_source(paths)
     return best_path, best_area
 end
 
+function M.image_size(path)
+    local image, w, h = load(path)
+    if not image then return nil, nil end
+    free(image)
+    return w, h
+end
+
+-- Build a screen-sized presentation from an already decoded image. The caller
+-- owns `image`; this function only owns/free its scaled temporary buffer.
+function M.render_screen_image(image, width, height, style, source_label)
+    width, height = tonumber(width) or 0, tonumber(height) or 0
+    if width <= 0 or height <= 0 or not image then return nil, nil, "invalid direct cover input" end
+    local iw = tonumber(image:getWidth()) or 0
+    local ih = tonumber(image:getHeight()) or 0
+    if iw <= 0 or ih <= 0 then return nil, nil, "invalid direct cover dimensions" end
+    style = tostring(style or "frame")
+    if style ~= "frame" and style ~= "fit" and style ~= "fill" then style = "frame" end
+
+    local scaled, canvas
+    local ok, result = xpcall(function()
+        local ratio = style == "frame" and .76 or 1.0
+        local scale
+        if style == "fill" then
+            scale = math.max(width / iw, height / ih)
+        else
+            scale = math.min((width * ratio) / iw, (height * ratio) / ih)
+        end
+        local sw = math.max(1, math.floor(iw * scale + .5))
+        local sh = math.max(1, math.floor(ih * scale + .5))
+        scaled = RenderImage:scaleBlitBuffer(image, sw, sh, false)
+        if not scaled then error("cover scale failed") end
+
+        canvas = Blitbuffer.new(width, height, scaled:getType())
+        canvas:fill(Blitbuffer.COLOR_WHITE)
+        local display_w, display_h = sw, sh
+        if style == "fill" then
+            local sx = math.max(0, math.floor((sw - width) / 2))
+            local sy = math.max(0, math.floor((sh - height) / 2))
+            canvas:blitFrom(scaled, 0, 0, sx, sy, width, height)
+            display_w, display_h = width, height
+        else
+            local x = math.floor((width - sw) / 2)
+            local y = math.floor((height - sh) / 2)
+            if style == "frame" and type(canvas.paintRect) == "function" then
+                local border = 1
+                local color = Blitbuffer.COLOR_DARK_GRAY
+                canvas:paintRect(math.max(0, x-border), math.max(0, y-border), math.min(width, sw+border*2), border, color)
+                canvas:paintRect(math.max(0, x-border), math.min(height-border, y+sh), math.min(width, sw+border*2), border, color)
+                canvas:paintRect(math.max(0, x-border), math.max(0, y-border), border, math.min(height, sh+border*2), color)
+                canvas:paintRect(math.min(width-border, x+sw), math.max(0, y-border), border, math.min(height, sh+border*2), color)
+            end
+            canvas:blitFrom(scaled, x, y, 0, 0, sw, sh)
+        end
+        return {
+            source = tostring(source_label or "native"), source_w = iw, source_h = ih,
+            display_w = display_w, display_h = display_h, style = style,
+        }
+    end, debug.traceback)
+
+    if scaled ~= image then free(scaled) end
+    if not ok then
+        free(canvas)
+        logger.warn("[MiuRead][CoverRender] direct screensaver render failed", tostring(result))
+        return nil, nil, result
+    end
+    return canvas, result
+end
+
+-- Build the sleep-screen presentation only when KOReader is actually entering
+-- its screensaver. Nothing is written to disk: the highest-resolution source
+-- is decoded once, scaled once, and copied to one screen-sized buffer that the
+-- native KOReader Screensaver will display and dispose.
+function M.render_screen(paths, width, height, style, native_image, native_label)
+    local best, best_path, best_w, best_h, best_area = nil, nil, 0, 0, 0
+    local best_owned = false
+    if native_image then
+        local w = tonumber(native_image:getWidth()) or 0
+        local h = tonumber(native_image:getHeight()) or 0
+        if w > 0 and h > 0 then
+            best, best_path, best_w, best_h, best_area = native_image,
+                tostring(native_label or "koreader-native"), w, h, w * h
+        end
+    end
+
+    local seen = {}
+    for _, raw in ipairs(paths or {}) do
+        local path = tostring(raw or "")
+        if path ~= "" and not seen[path] then
+            seen[path] = true
+            local image, w, h = load(path)
+            if image then
+                local area = w * h
+                if area > best_area then
+                    if best_owned then free(best) end
+                    best, best_path, best_w, best_h, best_area = image, path, w, h, area
+                    best_owned = true
+                else
+                    free(image)
+                end
+            end
+        end
+    end
+    if not best then return nil, nil, "no valid cover source" end
+    local canvas, meta, err = M.render_screen_image(best, width, height, style, best_path)
+    if best_owned then free(best) end
+    return canvas, meta, err
+end
+
 function M.is_fresh(target, source)
     if not file_ok(target) then return false end
     local tm = file_mtime(target)
@@ -82,50 +190,7 @@ local function write_png(canvas, target)
     return target
 end
 
--- High-quality edge-to-edge renderer. The source is scaled with KOReader's
--- normal RenderImage path, center-cropped, then receives only a small e-ink
--- ink-density boost. Expensive Lua per-pixel sharpening is deliberately
--- avoided so all of this remains safe for a low-priority subprocess.
-function M.render_fill(source, target, width, height, options)
-    options = options or {}
-    width, height = tonumber(width) or 0, tonumber(height) or 0
-    if width <= 0 or height <= 0 then return nil, "invalid target size" end
-    local image, iw, ih = load(source)
-    if not image then return nil, "cover decode failed" end
-
-    local scaled, canvas
-    local ok, result = xpcall(function()
-        local scale = math.max(width / iw, height / ih)
-        local sw = math.max(width, math.floor(iw * scale + 0.5))
-        local sh = math.max(height, math.floor(ih * scale + 0.5))
-        scaled = RenderImage:scaleBlitBuffer(image, sw, sh, false)
-        if not scaled then error("cover scale failed") end
-        canvas = Blitbuffer.new(width, height, scaled:getType())
-        canvas:fill(Blitbuffer.COLOR_WHITE)
-        local sx = math.max(0, math.floor((sw - width) / 2))
-        local sy = math.max(0, math.floor((sh - height) / 2))
-        canvas:blitFrom(scaled, 0, 0, sx, sy, width, height)
-        local boost = math.max(0, math.min(.14, tonumber(options.ink_boost) or 0))
-        if boost > 0 and type(canvas.darkenRect) == "function" then
-            pcall(canvas.darkenRect, canvas, 0, 0, width, height, boost)
-        end
-        local path, err = write_png(canvas, target)
-        if not path then error(err or "cover write failed") end
-        return path
-    end, debug.traceback)
-
-    if scaled == image then scaled = nil end
-    free(image)
-    free(scaled)
-    free(canvas)
-    if not ok then
-        logger.warn("[MiuRead][CoverRender] render failed", tostring(result))
-        return nil, result
-    end
-    return result
-end
-
--- Aspect-preserving renderer used by the home shelf and framed screensaver.
+-- Aspect-preserving renderer used only for the small home-shelf derivative.
 -- The output canvas always has the requested size, while the source image is
 -- centered inside it without cropping or stretching.
 function M.render_fit(source, target, width, height, options)
@@ -176,12 +241,6 @@ function M.render_fit(source, target, width, height, options)
         return nil, result
     end
     return result
-end
-
-function M.render_frame(source, target, width, height)
-    return M.render_fit(source, target, width, height, {
-        max_ratio = .84, border = true, border_size = 1, ink_boost = .045,
-    })
 end
 
 -- Home thumbnails are rendered into the final portrait canvas once, preserving

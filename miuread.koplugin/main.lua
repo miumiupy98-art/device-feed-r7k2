@@ -201,6 +201,21 @@ local function reader_rebuild_active()
     return state=="pending" or state=="suspended_pending"
 end
 
+local READER_NATIVE_SETTING=rawget(_G,"__MIUREAD_READER_NATIVE_SETTING")
+if type(READER_NATIVE_SETTING)~="table" then
+    READER_NATIVE_SETTING={until_clock=0,label=nil,file=nil}
+    rawset(_G,"__MIUREAD_READER_NATIVE_SETTING",READER_NATIVE_SETTING)
+end
+READER_NATIVE_SETTING.until_clock=tonumber(READER_NATIVE_SETTING.until_clock) or 0
+local function reader_native_setting_active(path)
+    if monotonic_wall_time()>(tonumber(READER_NATIVE_SETTING.until_clock) or 0) then return false end
+    local expected=tostring(READER_NATIVE_SETTING.file or "")
+    local actual=tostring(path or "")
+    if expected=="" then expected=nil end
+    if actual=="" then actual=nil end
+    return expected==nil or actual==nil or expected==actual
+end
+
 HOME_SESSION.home_interaction_generation=tonumber(HOME_SESSION.home_interaction_generation) or 0
 HOME_SESSION.post_reader_work_interaction_generation=tonumber(HOME_SESSION.post_reader_work_interaction_generation) or 0
 local function reader_close_active()
@@ -303,42 +318,113 @@ local function install_home_screensaver_patch()
     if not ok or not Screensaver or type(Screensaver.setup)~="function" then return false end
     if Screensaver._miuread_original_setup then SCREENSAVER_PATCHED=true; return true end
     local original=Screensaver.setup
-    local keys={"screensaver_type","screensaver_document_cover","screensaver_show_message","screensaver_img_background"}
-    local function snapshot()
-        local saved={}
-        for _,key in ipairs(keys) do
-            saved[key]={has=G_reader_settings:has(key),value=G_reader_settings:readSetting(key)}
+
+    local function collect_sources(opts)
+        local out,seen={},{}
+        local function add(path)
+            path=tostring(path or "")
+            if path~="" and not seen[path] and lfs.attributes(path,"mode")=="file" then
+                seen[path]=true
+                out[#out+1]=path
+            end
         end
-        return saved
-    end
-    local function restore(saved)
-        for _,key in ipairs(keys) do
-            local row=saved[key]
-            if row and row.has then G_reader_settings:saveSetting(key,row.value)
-            else G_reader_settings:delSetting(key) end
+        if opts and type(opts.screensaver_sources)=="table" then
+            for _,path in ipairs(opts.screensaver_sources) do add(path) end
         end
+        if #out==0 and type(HOME_SESSION.screensaver_sources)=="table" then
+            for _,path in ipairs(HOME_SESSION.screensaver_sources) do add(path) end
+        end
+        if opts then add(opts.screensaver_file) end
+        add(HOME_SESSION.screensaver_file)
+        return out
     end
+
+    local function release_image(image)
+        if image and type(image.free)=="function" then pcall(image.free,image) end
+    end
+
+    local function native_cover_for_path(target_path)
+        local ReaderUI=require("apps/reader/readerui")
+        local FileManager=require("apps/filemanager/filemanager")
+        local reader=ReaderUI.instance
+        local document=reader and reader.document or nil
+        local reader_path=document and normalized_reader_file(document.file
+            or (document.getFilePath and document:getFilePath()) or nil) or nil
+        local path=normalized_reader_file(target_path) or reader_path
+        if not path then return nil,nil end
+
+        local host=reader or FileManager.instance
+        local bookinfo=host and host.bookinfo or nil
+        if not (bookinfo and type(bookinfo.getCoverImage)=="function") then return nil,path end
+        local document_arg=(reader_path and reader_path==path) and document or nil
+        local ok,image=pcall(bookinfo.getCoverImage,bookinfo,document_arg,path)
+        if ok and image then return image,path end
+        return nil,path
+    end
+
+    local function apply_direct_cover(manager,sources,style,book_file)
+        local CoverRender=require("miuread.cover_render")
+        local width,height=Device.screen:getWidth(),Device.screen:getHeight()
+        -- KOReader image screensavers are portrait-oriented. If suspend starts
+        -- from landscape, prepare the buffer for the portrait size show() will
+        -- switch to instead of creating a landscape derivative.
+        if width>height then width,height=height,width end
+        -- Compare MiuRead's original file candidates with KOReader's own cover
+        -- for the same book. The largest decoded source wins; a smaller network
+        -- cover can therefore never hide a sharper EPUB/custom/BookInfo cover.
+        local native_image,native_path=native_cover_for_path(book_file)
+        local image,meta,err=CoverRender.render_screen(sources,width,height,style,native_image,
+            native_image and ("koreader-native:"..tostring(native_path or "current")) or nil)
+        release_image(native_image)
+        if not image then
+            logger.warn("[MiuRead][Lockscreen] direct render unavailable",tostring(err or "no cover source"))
+            return false
+        end
+        if manager.image and manager.image~=image then release_image(manager.image) end
+        manager.show_message=false
+        manager.overlay_message=nil
+        manager.screensaver_type="cover"
+        manager.screensaver_background="white"
+        manager.image=image
+        manager.image_file=nil
+        logger.info("[MiuRead][Lockscreen]",
+            "style=",tostring(meta and meta.style or style),
+            "source=",tostring(meta and meta.source or ""),
+            "source_size=",tostring(meta and meta.source_w or 0).."x"..tostring(meta and meta.source_h or 0),
+            "display=",tostring(meta and meta.display_w or 0).."x"..tostring(meta and meta.display_h or 0),
+            "screen=",tostring(width).."x"..tostring(height),
+            "render=direct")
+        return true
+    end
+
     Screensaver._miuread_original_setup=original
     Screensaver.setup=function(manager,...)
         local args={n=select("#",...),...}
         local current=HomeView.current()
         local opts=current and current.opts or nil
-        local target=opts and opts.lockscreen_enabled~=false and tostring(opts.screensaver_file or "") or ""
-        local use_home_target=HomeView.is_shown()
-        if target=="" and HOME_READER_ORIGIN and HOME_SESSION.lockscreen_recent_enabled~=false then
-            target=tostring(HOME_SESSION.screensaver_file or "")
-            use_home_target=target~=""
-        end
+        local enabled=(opts and opts.lockscreen_enabled~=false)
+        if not opts then enabled=HOME_SESSION.lockscreen_recent_enabled~=false end
+        local use_home_target=enabled and (HomeView.is_shown() or HOME_READER_ORIGIN)
+        local sources=use_home_target and collect_sources(opts) or {}
+        local style=tostring((opts and opts.lockscreen_style) or HOME_SESSION.lockscreen_style or "frame")
+        if style~="frame" and style~="fit" and style~="fill" then style="frame" end
 
-        -- Preserve KOReader's native path whenever ReaderUI/FileManager still
-        -- exists.  beta.34 only intervenes in the exact beta.33 gap where the
-        -- parked MiuRead home is visible after ReaderUI has closed and before a
-        -- FileManager instance exists.  Kindle calls Screensaver:setup/show
-        -- before the normal Suspend broadcast, so without this fallback recent
-        -- KOReader versions return early and never establish screen_saver_mode.
         local ReaderUI=require("apps/reader/readerui")
         local FileManager=require("apps/filemanager/filemanager")
-        local native_ui=ReaderUI.instance or FileManager.instance
+        local reader_ui=ReaderUI.instance
+        local native_ui=reader_ui or FileManager.instance
+        local source_file=normalized_reader_file((opts and opts.screensaver_book_file) or HOME_SESSION.screensaver_book_file)
+        if reader_ui and reader_ui.document then
+            local reader_file=normalized_reader_file(reader_ui.document.file
+                or (reader_ui.document.getFilePath and reader_ui.document:getFilePath()) or nil)
+            if reader_file and (not source_file or reader_file~=source_file) then
+                -- The reader changed books without rebuilding the parked home.
+                -- Never show stale sources from the previous book; fall back to
+                -- KOReader's current document cover for this suspend.
+                sources={}
+                source_file=reader_file
+            end
+        end
         if not native_ui and args.n==0 and HomeView.is_shown() and current then
             local owner=home_owner()
             if HomeView.suspend then pcall(HomeView.suspend) end
@@ -358,36 +444,27 @@ local function install_home_screensaver_patch()
             manager.image_file=nil
             manager.screensaver_background="white"
 
-            if use_home_target and target~="" and lfs.attributes(target,"mode")=="file" then
-                manager.screensaver_type="cover"
-                manager.image_file=target
+            if use_home_target and apply_direct_cover(manager,sources,style,source_file) then
                 logger.info("[MiuRead][Suspend] screensaver home fallback",
-                    "native_ui=false","target=true","prefrozen=",tostring(owner~=nil))
+                    "native_ui=false","target=true","direct=true","prefrozen=",tostring(owner~=nil))
             else
-                -- No valid MiuRead cover is available.  Keep the already-painted
-                -- home surface instead of inventing a new fallback image; show()
-                -- will still mark the device as being in screen-saver mode.
                 manager.screensaver_type="disable"
                 logger.info("[MiuRead][Suspend] screensaver home fallback",
-                    "native_ui=false","target=false","prefrozen=",tostring(owner~=nil))
+                    "native_ui=false","target=false","direct=false","prefrozen=",tostring(owner~=nil))
             end
             return
         end
 
-        if use_home_target and target~="" and lfs.attributes(target,"mode")=="file" then
-            local saved=snapshot()
-            G_reader_settings:saveSetting("screensaver_type","document_cover")
-            G_reader_settings:saveSetting("screensaver_document_cover",target)
-            G_reader_settings:saveSetting("screensaver_show_message",false)
-            G_reader_settings:saveSetting("screensaver_img_background","white")
-            local packed={xpcall(function()
-                return original(manager,unpack_args(args,1,args.n))
-            end,debug.traceback)}
-            restore(saved)
-            if not packed[1] then error(packed[2]) end
-            return unpack_args(packed,2,#packed)
+        local packed={xpcall(function()
+            return original(manager,unpack_args(args,1,args.n))
+        end,debug.traceback)}
+        if not packed[1] then error(packed[2]) end
+        -- Poweroff/reboot keep KOReader's own screen. Only a normal suspend
+        -- substitutes the recent-reading cover presentation.
+        if args.n==0 and use_home_target then
+            apply_direct_cover(manager,sources,style,source_file)
         end
-        return original(manager,unpack_args(args,1,args.n))
+        return unpack_args(packed,2,#packed)
     end
     SCREENSAVER_PATCHED=true
     return true
@@ -410,6 +487,15 @@ function Plugin:init()
     math.randomseed(os.time()+math.floor(collectgarbage("count")))
     sync_home_session()
     self.store=Store:new()
+    local lockscreen_direct_version=tonumber(self.store:get("lockscreen_direct_version",0)) or 0
+    if lockscreen_direct_version<1 then
+        -- beta.10 no longer writes pre-rendered sleep-screen PNGs. Remove only
+        -- MiuRead's obsolete derivatives; raw covers and KOReader data stay intact.
+        U.remove_tree(self.store.data_dir.."/lockscreen")
+        U.remove_tree(self.store.data_dir.."/lockscreen-source")
+        self.store:set("lockscreen_direct_version",1)
+        logger.info("[MiuRead][Lockscreen] legacy derivative cache removed")
+    end
     local runtime_mode=rawget(_G,RUNTIME_MODE_KEY)
     if runtime_mode~="desktop" and runtime_mode~="plugin" then
         local configured=((self.store:preferences().home_ui or {}).enabled~=false)
@@ -3556,9 +3642,8 @@ function Plugin:_home_apply_cover_path(book_id,path)
     for _,section in pairs(self._home_sections or {}) do
         for _,book in ipairs(section.rows or {}) do apply(book) end
     end
-    if hero_id==book_id then
-        local current=HomeView.current()
-        if current and current.opts and not current.opts.screensaver_file then current.opts.screensaver_file=path end
+    if hero_id==book_id and self._home_hero then
+        self:_home_update_lockscreen_session(self._home_hero)
     end
     return changed
 end
@@ -3866,25 +3951,70 @@ function Plugin:_home_cover_render_id(book)
     return string.format("local-%08x",hash)
 end
 
+function Plugin:_home_lockscreen_sources(book)
+    if type(book)~="table" then return {} end
+    local out,seen={},{}
+    local function add(path)
+        path=tostring(path or "")
+        local normalized=path:gsub("\\","/")
+        if path=="" or seen[path] or lfs.attributes(path,"mode")~="file" then return end
+        -- Never feed a UI-sized derivative back into the sleep screen.
+        if normalized:find("/cover%-render%-v1/") or normalized:find("/lockscreen/")
+            or normalized:find("/lockscreen%-source/") then return end
+        seen[path]=true
+        out[#out+1]=path
+    end
+
+    local file=tostring(book.file or "")
+    if file~="" and U.file_exists(file) then
+        local ok,DocSettings=pcall(require,"docsettings")
+        if ok and DocSettings and type(DocSettings.findCustomCoverFile)=="function" then
+            local found_ok,custom=pcall(DocSettings.findCustomCoverFile,DocSettings,file)
+            if found_ok and tostring(custom or "")~="" and lfs.attributes(custom,"mode")=="file" then
+                -- A user-selected KOReader custom cover is authoritative.
+                return {custom}
+            end
+        end
+    end
+
+    add(book.cover_path)
+    if type(book.local_record)=="table" then add(book.local_record.cover_path) end
+    local id=tostring(book.bookId or book.book_id or "")
+    if id~="" then
+        local stored=self.store:book(id)
+        if type(stored)=="table" then add(stored.cover_path) end
+        local record=self:_preferred_record(id)
+        if type(record)=="table" then add(record.cover_path) end
+    end
+    return out
+end
+
 function Plugin:_home_prepare_lockscreen_cover(book)
-    if type(book)~="table" then return nil end
-    local width,height=Device.screen:getWidth(),Device.screen:getHeight()
-    if width<=0 or height<=0 then return nil end
-    local id=self:_home_cover_render_id(book)
-    if not id then return tostring(book.cover_path or "")~="" and book.cover_path or nil end
+    local sources=self:_home_lockscreen_sources(book)
+    return sources[1]
+end
+
+function Plugin:_home_update_lockscreen_session(book)
     local home=self:_home_preferences()
+    local enabled=home.lockscreen_recent~=false
+    local sources=enabled and self:_home_lockscreen_sources(book) or {}
     local style=tostring(home.lockscreen_style or "frame")
     if style~="frame" and style~="fit" and style~="fill" then style="frame" end
-    local dir=self.store.data_dir.."/lockscreen"
-    U.mkdir(dir)
-    local prefix=dir.."/"..U.id_name(id)
-    local tag=style=="frame" and "frame1" or (style=="fit" and "fit1" or "fill3")
-    local current=prefix.."-"..tag.."-"..tostring(width).."x"..tostring(height)..".png"
-    if lfs.attributes(current,"mode")=="file" and (tonumber(U.file_size(current) or 0) or 0)>0 then return current end
-    -- While the selected style is being rendered in the low-priority worker,
-    -- keep the source cover visible rather than blocking suspend.
-    local fallback=tostring(book.cover_path or "")
-    return fallback~="" and fallback or nil
+    local book_file=normalized_reader_file(book and book.file or nil)
+    HOME_SESSION.lockscreen_recent_enabled=enabled
+    HOME_SESSION.lockscreen_style=style
+    HOME_SESSION.screensaver_sources=sources
+    HOME_SESSION.screensaver_file=sources[1]
+    HOME_SESSION.screensaver_book_file=book_file
+    local current=HomeView.current()
+    if current and current.opts then
+        current.opts.lockscreen_enabled=enabled
+        current.opts.lockscreen_style=style
+        current.opts.screensaver_sources=sources
+        current.opts.screensaver_file=sources[1]
+        current.opts.screensaver_book_file=book_file
+    end
+    return sources[1],sources
 end
 
 function Plugin:_home_apply_rendered_cover_path(book_id,path)
@@ -3964,11 +4094,8 @@ function Plugin:_home_schedule_cover_derivatives(books)
     local thumb_w=math.max(240,math.min(420,math.floor(sw*.34+.5)))
     local thumb_h=math.max(340,math.floor(thumb_w/.69+.5))
     local render_dir=self.store.data_dir.."/cover-render-v1"
-    local lock_dir=self.store.data_dir.."/lockscreen"
-    local source_dir=self.store.data_dir.."/lockscreen-source"
-    U.mkdir(render_dir); U.mkdir(lock_dir); U.mkdir(source_dir)
-
-    local hero_id=tostring(self:_home_cover_render_id(self._home_hero) or "")
+    local source_dir=self:_home_local_metadata_dir()
+    U.mkdir(render_dir)
     local items,seen={},{}
     for _,book in ipairs(books or {}) do
         if type(book)=="table" then
@@ -3994,11 +4121,6 @@ function Plugin:_home_schedule_cover_derivatives(books)
                     for _,path in ipairs(sources) do inputs[#inputs+1]=path end
                     if file~="" and U.file_exists(file) and not source_seen[file] then inputs[#inputs+1]=file end
                     local home_target=render_dir.."/"..U.id_name(id).."-home2-"..tostring(thumb_w).."x"..tostring(thumb_h)..".png"
-                    local lock_style=tostring(self:_home_preferences().lockscreen_style or "frame")
-                    if lock_style~="frame" and lock_style~="fit" and lock_style~="fill" then lock_style="frame" end
-                    local lock_tag=lock_style=="frame" and "frame1" or (lock_style=="fit" and "fit1" or "fill3")
-                    local lock_target=(hero_id~="" and id==hero_id)
-                        and (lock_dir.."/"..U.id_name(id).."-"..lock_tag.."-"..tostring(sw).."x"..tostring(sh)..".png") or nil
                     items[#items+1]={
                         id=id,
                         sources=sources,
@@ -4008,11 +4130,7 @@ function Plugin:_home_schedule_cover_derivatives(books)
                         source_dir=source_dir,
                         home_target=home_target,
                         home_w=thumb_w,home_h=thumb_h,
-                        lock_target=lock_target,
-                        lock_style=lock_style,
-                        lock_w=sw,lock_h=sh,
                         home_fresh=self:_home_cover_target_fresh(home_target,inputs),
-                        lock_fresh=not lock_target or self:_home_cover_target_fresh(lock_target,inputs),
                     }
                     if #items>=10 then break end
                 end
@@ -4036,15 +4154,7 @@ function Plugin:_home_schedule_cover_derivatives(books)
             if changed then fast_ids[item.id]=true end
             for section in pairs(sections or {}) do fast_sections[section]=true end
         end
-        if item.lock_target and item.lock_fresh then
-            local current_hero_id=tostring(self:_home_cover_render_id(self._home_hero) or "")
-            if current_hero_id~="" and item.id==current_hero_id then
-                HOME_SESSION.screensaver_file=item.lock_target
-                local current=HomeView.current()
-                if current and current.opts then current.opts.screensaver_file=item.lock_target end
-            end
-        end
-        if not (item.home_fresh and item.lock_fresh) and #worker_items<derivative_limit then
+        if not item.home_fresh and #worker_items<derivative_limit then
             worker_items[#worker_items+1]=item
         end
     end
@@ -4065,10 +4175,10 @@ function Plugin:_home_schedule_cover_derivatives(books)
         return false
     end
 
-    local signature_parts={tostring(sw),tostring(sh),tostring(thumb_w),tostring(thumb_h),hero_id}
+    local signature_parts={tostring(sw),tostring(sh),tostring(thumb_w),tostring(thumb_h)}
     for _,item in ipairs(worker_items) do
         signature_parts[#signature_parts+1]=table.concat({
-            tostring(item.id),tostring(item.home_target),tostring(item.lock_target or ""),tostring(item.input_stamp or "")
+            tostring(item.id),tostring(item.home_target),tostring(item.input_stamp or "")
         },"|")
     end
     local request_signature=table.concat(signature_parts,";")
@@ -4127,20 +4237,7 @@ function Plugin:_home_schedule_cover_derivatives(books)
                 if not CoverRender.is_fresh(home_path,source) then
                     home_path=CoverRender.render_home(source,item.home_target,item.home_w,item.home_h)
                 end
-                local lock_path
-                if item.lock_target then
-                    lock_path=item.lock_target
-                    if not CoverRender.is_fresh(lock_path,source) then
-                        if item.lock_style=="frame" then
-                            lock_path=CoverRender.render_frame(source,item.lock_target,item.lock_w,item.lock_h)
-                        elseif item.lock_style=="fit" then
-                            lock_path=CoverRender.render_fit(source,item.lock_target,item.lock_w,item.lock_h,{ink_boost=.055})
-                        else
-                            lock_path=CoverRender.render_fill(source,item.lock_target,item.lock_w,item.lock_h,{ink_boost=.075})
-                        end
-                    end
-                end
-                out[#out+1]={id=item.id,home_path=home_path,lock_path=lock_path,source=source}
+                out[#out+1]={id=item.id,home_path=home_path,source=source}
             end
         end
         return out
@@ -4182,14 +4279,6 @@ function Plugin:_home_schedule_cover_derivatives(books)
                 hero_changed=hero_changed or is_hero
                 if changed then changed_ids[entry.id]=true end
                 for section in pairs(sections or {}) do changed_sections[section]=true end
-            end
-            if entry.lock_path and lfs.attributes(entry.lock_path,"mode")=="file" then
-                local current_hero_id=tostring(self:_home_cover_render_id(self._home_hero) or "")
-                if current_hero_id~="" and entry.id==current_hero_id then
-                    HOME_SESSION.screensaver_file=entry.lock_path
-                    local current=HomeView.current()
-                    if current and current.opts then current.opts.screensaver_file=entry.lock_path end
-                end
             end
         end
         if any_changed and HomeView.is_shown() and not self:_active_reader_ui() then
@@ -4309,21 +4398,11 @@ function Plugin:time_display_settings_menu()
     }
 end
 
-function Plugin:_toggle_home_lockscreen(confirmed)
+function Plugin:_toggle_home_lockscreen()
     local home,preferences=self:_home_preferences()
-    local enabling=home.lockscreen_recent==false
-    if enabling and confirmed~=true and self:_notice_enabled("lockscreen") then
-        local dialog
-        dialog=ButtonDialog:new{title="锁屏封面需要生成和写入图片，关闭书籍或刷新主页时可能会稍慢。",title_align="center",buttons={
-            {{text="开启",callback=function() UIManager:close(dialog); self:_toggle_home_lockscreen(true) end}},
-            {{text="开启并不再提示",callback=function() UIManager:close(dialog); self:_set_notice_enabled("lockscreen",false); self:_toggle_home_lockscreen(true) end}},
-            {{text="取消",callback=function() UIManager:close(dialog) end}},
-        }}
-        UIManager:show(dialog)
-        return
-    end
-    home.lockscreen_recent=enabling
+    home.lockscreen_recent=home.lockscreen_recent==false
     self:_save_home_preferences(home,preferences)
+    self:_home_update_lockscreen_session(self._home_hero)
     self:_refresh_home_view(home.lockscreen_recent and "主页锁屏将显示最近阅读封面" or "已恢复 KOReader 原锁屏设置","header")
 end
 
@@ -4830,12 +4909,12 @@ end
 
 local NOTICE_LABELS={
     reader_download="阅读时下载提醒",low_battery="低电量下载提醒",low_storage="存储空间提醒",
-    full_refresh="全屏刷新说明",lockscreen="锁屏封面影响说明",library_scan="扫描书库提醒",
+    full_refresh="全屏刷新说明",library_scan="扫描书库提醒",
     repair_while_reading="阅读中修复提醒",mode_switch="运行模式切换说明",mode_environment="进入模式说明",
 }
 
 function Plugin:notice_settings_menu()
-    local order={"reader_download","low_battery","low_storage","full_refresh","lockscreen","library_scan","repair_while_reading","mode_switch","mode_environment"}
+    local order={"reader_download","low_battery","low_storage","full_refresh","library_scan","repair_while_reading","mode_switch","mode_environment"}
     local rows={}
     for _,key in ipairs(order) do
         local notice_key=key
@@ -6195,6 +6274,8 @@ function Plugin:_home_open_book(book,anchor)
     self:_home_attach_local_record(book)
     local record=id~="" and self:_preferred_record(id) or nil
     if record and record.file and U.file_exists(record.file) then
+        book.file=record.file
+        self:_home_update_lockscreen_session(book)
         self:_home_stop_background("opening book")
         return self:_open_file_direct(record.file)
     end
@@ -6711,6 +6792,29 @@ function Plugin:_home_remove_lockscreen_cover_cache(book)
     return removed
 end
 
+function Plugin:_home_remove_cover_derivative_cache(book)
+    if type(book)~="table" then return false end
+    local id=tostring(self:_home_cover_render_id(book) or "")
+    if id=="" then return false end
+    local dir=self.store.data_dir.."/cover-render-v1"
+    if lfs.attributes(dir,"mode")~="directory" then
+        book.home_cover_path=nil
+        return false
+    end
+    local prefix=U.id_name(id).."-home"
+    local removed=false
+    local ok,iter,state,var=pcall(lfs.dir,dir)
+    if ok and iter then
+        for name in iter,state,var do
+            if name~="." and name~=".." and name:sub(1,#prefix)==prefix and name:match("%.png$") then
+                if os.remove(dir.."/"..name) then removed=true end
+            end
+        end
+    end
+    book.home_cover_path=nil
+    return removed
+end
+
 function Plugin:_home_force_refresh_current_cover(book,on_done)
     if type(book)~="table" then return false end
     local id=tostring(book.bookId or book.book_id or "")
@@ -6762,10 +6866,37 @@ function Plugin:_home_force_refresh_current_cover(book,on_done)
         if not result or result.ok~=true or not result.value then
             logger.warn("[MiuRead][Cover] manual refresh failed",tostring(id),
                 tostring(result and result.error or "unknown"))
-            if on_done then on_done(false) end
+            if on_done then on_done(false,{reason="download_failed"}) end
             return
         end
         local path=tostring(result.value)
+        local CoverRender=require("miuread.cover_render")
+        local new_w,new_h=CoverRender.image_size(path)
+        if not new_w or not new_h or new_w<=0 or new_h<=0 then
+            os.remove(path)
+            logger.warn("[MiuRead][Cover] manual refresh rejected invalid image",tostring(id))
+            if on_done then on_done(false,{reason="invalid_image"}) end
+            return
+        end
+
+        local old_w,old_h
+        if old_cached and old_cached~=path and lfs.attributes(old_cached,"mode")=="file" then
+            old_w,old_h=CoverRender.image_size(old_cached)
+        end
+        local new_area=new_w*new_h
+        local old_area=(tonumber(old_w) or 0)*(tonumber(old_h) or 0)
+        if old_area>new_area then
+            os.remove(path)
+            logger.info("[MiuRead][Cover] manual refresh kept sharper cached source",
+                "book=",tostring(id),
+                "old=",tostring(old_w or 0).."x"..tostring(old_h or 0),
+                "new=",tostring(new_w).."x"..tostring(new_h))
+            if on_done then on_done(false,{
+                reason="not_better",old_w=old_w,old_h=old_h,new_w=new_w,new_h=new_h,
+            }) end
+            return
+        end
+
         local index=self.store:get("cover_index",{})
         index[tostring(id)]=path
         self.store:set("cover_index",index)
@@ -6777,26 +6908,28 @@ function Plugin:_home_force_refresh_current_cover(book,on_done)
             for _,row in ipairs(section.rows or {}) do
                 if tostring(row.bookId or row.book_id or "")==id then
                     row.cover_path=path
+                    row.home_cover_path=nil
                     self:_home_bump_section_revision(key)
                     break
                 end
             end
         end
 
-        self:_home_remove_lockscreen_cover_cache(book)
-        local home=self:_home_preferences()
-        if home.lockscreen_recent~=false then
-            local hero=self._home_hero
-            if hero and tostring(hero.bookId or hero.book_id or "")==id then
-                hero.cover_path=path
-                local screensaver=self:_home_prepare_lockscreen_cover(hero)
-                HOME_SESSION.screensaver_file=screensaver
-                local current=HomeView.current()
-                if current and current.opts then current.opts.screensaver_file=screensaver end
-                UIManager:scheduleIn(.25,function()
-                    if HomeView.is_shown() and not self:_active_reader_ui() then self:_home_schedule_cover_derivatives({hero}) end
-                end)
-            end
+        -- A successful source replacement invalidates only disposable MiuRead
+        -- presentation caches. EPUB contents, KOReader custom covers and KOReader
+        -- BookInfo data remain untouched.
+        self:_home_remove_cover_derivative_cache(book)
+        self:_home_remove_lockscreen_cover_cache(book) -- beta.9 legacy only
+        local hero=self._home_hero
+        if hero and tostring(hero.bookId or hero.book_id or "")==id then
+            hero.cover_path=path
+            hero.home_cover_path=nil
+            self:_home_update_lockscreen_session(hero)
+            UIManager:scheduleIn(.25,function()
+                if HomeView.is_shown() and not self:_active_reader_ui() then
+                    self:_home_schedule_cover_derivatives({hero})
+                end
+            end)
         end
 
         if old_cached and old_cached~=path then os.remove(old_cached) end
@@ -6806,8 +6939,9 @@ function Plugin:_home_force_refresh_current_cover(book,on_done)
             end
             HomeView.update_book(id)
         end
-        logger.info("[MiuRead][Cover] manual refresh complete",tostring(id),tostring(path))
-        if on_done then on_done(true) end
+        logger.info("[MiuRead][Cover] manual refresh complete",
+            "book=",tostring(id),"size=",tostring(new_w).."x"..tostring(new_h),"path=",tostring(path))
+        if on_done then on_done(true,{new_w=new_w,new_h=new_h}) end
     end,background and 35 or 14)
     return started==true
 end
@@ -6820,11 +6954,19 @@ function Plugin:_home_refresh_current_network_metadata(book)
     end
 
     self:toast("正在更新这本书的信息和封面…",2)
-    local state={metadata_done=false,metadata_ok=false,metadata_partial=false,cover_done=false,cover_ok=false,finished=false}
+    local state={metadata_done=false,metadata_ok=false,metadata_partial=false,cover_done=false,cover_ok=false,cover_unchanged=false,finished=false}
     local function finish()
         if state.finished or not state.metadata_done or not state.cover_done then return end
         state.finished=true
-        if state.metadata_ok and state.cover_ok then
+        if state.cover_unchanged then
+            if state.metadata_ok then
+                self:toast(state.metadata_partial
+                    and "书籍信息已刷新，部分资料暂未找到；未发现更高清封面"
+                    or "书籍信息已更新；未发现更高清封面",2)
+            else
+                self:toast("未发现更高清封面，网络书籍信息更新失败",2)
+            end
+        elseif state.metadata_ok and state.cover_ok then
             self:toast(state.metadata_partial
                 and "封面和书籍信息已刷新，部分资料暂未找到"
                 or "书籍信息和封面已更新",2)
@@ -6847,9 +6989,10 @@ function Plugin:_home_refresh_current_network_metadata(book)
     end,true)==true
     if not metadata_started then state.metadata_done=true end
 
-    local cover_started=self:_home_force_refresh_current_cover(book,function(ok)
+    local cover_started=self:_home_force_refresh_current_cover(book,function(ok,detail)
         state.cover_done=true
         state.cover_ok=ok==true
+        state.cover_unchanged=type(detail)=="table" and detail.reason=="not_better"
         finish()
     end)==true
     if not cover_started then state.cover_done=true end
@@ -8470,6 +8613,8 @@ function Plugin:_home_open_miuread(book)
     local id=tostring(book and (book.bookId or book.book_id) or "")
     local record=id~="" and self:_preferred_record(id) or nil
     if record and record.file and U.file_exists(record.file) then
+        book.file=record.file
+        self:_home_update_lockscreen_session(book)
         return self:_open_file_direct(record.file)
     end
     if id~="" then self:book_menu(book) else self:info("本地书籍记录不存在") end
@@ -8478,6 +8623,7 @@ end
 function Plugin:_home_open_local(book)
     local path=tostring(book and book.file or "")
     if path=="" or not U.file_exists(path) then self:info("本地文件不存在"); return end
+    self:_home_update_lockscreen_session(book)
     self:_home_stop_background("opening local book")
     return self:_open_file_direct(path)
 end
@@ -11600,13 +11746,16 @@ function Plugin:_reader_is_reflowable()
     return info.has_pages~=true and self.ui.font~=nil
 end
 
+function Plugin:_reader_native_setting_begin(label,seconds)
+    READER_NATIVE_SETTING.until_clock=monotonic_wall_time()+math.max(.5,tonumber(seconds) or 3.5)
+    READER_NATIVE_SETTING.label=tostring(label or "reader setting")
+    READER_NATIVE_SETTING.file=normalized_reader_file(self:_current_document_path())
+    self:_mark_reader_busy(math.ceil(tonumber(seconds) or 4))
+end
+
 function Plugin:_reader_emit_config(event,value,value2)
     local ui=self.ui
-    if not (ui and type(ui.handleEvent)=="function") then return false end
-    -- Mirror KOReader ConfigDialog:onConfigChoose(): the native dialog first
-    -- emits ConfigChange so ReaderCoptListener updates document.configurable,
-    -- then emits the concrete action. Keeping this exact order means MiuRead
-    -- has no second copy of the reading setting.
+    if not (ui and ui.document and type(ui.handleEvent)=="function") then return false end
     local option_names={
         SetPageHorizMargins="h_page_margins",
         SetPageTopMargin="t_page_margin",
@@ -11615,8 +11764,32 @@ function Plugin:_reader_emit_config(event,value,value2)
         SetCJKWidthScaling="cjk_width_scaling",
         SetBlockRenderingMode="block_rendering_mode",
     }
+    local native_methods={
+        SetPageHorizMargins="onSetPageHorizMargins",
+        SetPageTopMargin="onSetPageTopMargin",
+        SetPageBottomMargin="onSetPageBottomMargin",
+        SetBlockRenderingMode="onSetBlockRenderingMode",
+    }
     local option_name=option_names[event]
-    self:_mark_reader_busy(5)
+    self:_reader_native_setting_begin(event,4.0)
+
+    -- Prefer KOReader's live ReaderTypeset module when it owns the setting.
+    -- MiuRead only writes the same document.configurable field ConfigChange
+    -- would update, then lets the native module apply/reflow the document.
+    local method=native_methods[event]
+    local typeset=ui.typeset
+    if method and typeset and type(typeset[method])=="function" then
+        if option_name and ui.document.configurable then ui.document.configurable[option_name]=value end
+        local ok,result=pcall(typeset[method],typeset,value,value2)
+        if ok then
+            logger.info("[MiuRead][ReaderSetting] native",tostring(event),"value=",tostring(value))
+            return result~=false
+        end
+        logger.warn("[MiuRead][ReaderSetting] native apply failed; using dispatcher",tostring(event),tostring(result))
+    end
+
+    -- Options owned by ReaderCoptListener (word/CJK spacing), and compatibility
+    -- fallbacks on older KOReader builds, still use KOReader's own dispatcher.
     if option_name then ui:handleEvent(Event:new("ConfigChange",option_name,value)) end
     if value2~=nil then ui:handleEvent(Event:new(event,value,value2))
     else ui:handleEvent(Event:new(event,value)) end
@@ -11625,9 +11798,19 @@ end
 
 function Plugin:_reader_set_margin_sync(enabled)
     local ui=self.ui
-    if not (ui and type(ui.handleEvent)=="function") then return false end
+    if not (ui and ui.document and type(ui.handleEvent)=="function") then return false end
     enabled=enabled==true
-    self:_mark_reader_busy(5)
+    self:_reader_native_setting_begin("SyncPageTopBottomMargins",4.0)
+    if ui.document.configurable then ui.document.configurable.sync_t_b_page_margins=enabled and 1 or 0 end
+    local typeset=ui.typeset
+    if typeset and type(typeset.onSyncPageTopBottomMargins)=="function" then
+        local ok,result=pcall(typeset.onSyncPageTopBottomMargins,typeset,enabled)
+        if ok then
+            logger.info("[MiuRead][ReaderSetting] native SyncPageTopBottomMargins","enabled=",tostring(enabled))
+            return result~=false
+        end
+        logger.warn("[MiuRead][ReaderSetting] native margin sync failed; using dispatcher",tostring(result))
+    end
     ui:handleEvent(Event:new("ConfigChange","sync_t_b_page_margins",enabled and 1 or 0))
     ui:handleEvent(Event:new("SyncPageTopBottomMargins",enabled))
     return true
@@ -12805,8 +12988,7 @@ function Plugin:_home_refresh_recent_hero_cached()
     self._home_visible_metadata_targets=metadata_targets
     self._home_visible_cover_targets=cover_targets
     local home=self:_home_preferences()
-    HOME_SESSION.lockscreen_recent_enabled=home.lockscreen_recent~=false
-    HOME_SESSION.screensaver_file=home.lockscreen_recent~=false and self:_home_prepare_lockscreen_cover(hero) or nil
+    self:_home_update_lockscreen_session(hero)
     if home.network_metadata~=false then
         local key=self:_home_network_metadata_key(hero)
         if key~="" then self._home_pending_network_metadata_key=key end
@@ -12900,9 +13082,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     end
     local tabs=self:_home_build_tabs(active)
 
-    local screensaver_file=home.lockscreen_recent~=false and self:_home_prepare_lockscreen_cover(hero) or nil
-    HOME_SESSION.lockscreen_recent_enabled=home.lockscreen_recent~=false
-    HOME_SESSION.screensaver_file=screensaver_file
+    local screensaver_file,screensaver_sources=self:_home_update_lockscreen_session(hero)
     local home_alerts=self:_home_alerts()
     self._home_panel_sync_label=self:progress_sync_label()
     self._home_panel_download_detail=""
@@ -12927,7 +13107,10 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         -- account/health alerts occupy the home notice strip.
         alerts=home_alerts,
         lockscreen_enabled=home.lockscreen_recent~=false,
+        lockscreen_style=tostring(home.lockscreen_style or "frame"),
+        screensaver_sources=screensaver_sources,
         screensaver_file=screensaver_file,
+        screensaver_book_file=normalized_reader_file(hero and hero.file or nil),
         on_quick_panel=function() self:show_home_quick_panel() end,
         on_interaction=function(first,kind) self:_home_note_interaction(first,kind) end,
         on_account=function() self:_home_leave_and_run("account status",function() self:show_account_status() end) end,
@@ -17801,25 +17984,14 @@ function Plugin:_set_home_lockscreen_style(style)
     if home.lockscreen_style==style then return true end
     home.lockscreen_style=style
     self:_save_home_preferences(home,preferences)
-    if self._home_hero then
-        self:_home_remove_lockscreen_cover_cache(self._home_hero)
-        local cover=self:_home_prepare_lockscreen_cover(self._home_hero)
-        HOME_SESSION.screensaver_file=cover
-        local current=HomeView.current()
-        if current and current.opts then current.opts.screensaver_file=cover end
-        UIManager:scheduleIn(.05,function()
-            if HomeView.is_shown() and not self:_active_reader_ui() then
-                self:_home_schedule_cover_derivatives({self._home_hero})
-            end
-        end)
-    end
+    self:_home_update_lockscreen_session(self._home_hero)
     self:toast("锁屏封面："..self:_home_lockscreen_style_label(home),1.5)
     return true
 end
 
 function Plugin:home_lockscreen_style_menu()
     local labels={frame="画框",fit="完整",fill="铺满"}
-    local notes={frame="84% · 正中 · 完整封面",fit="尽量放大 · 不裁切",fill="铺满屏幕 · 居中裁切"}
+    local notes={frame="76% · 正中 · 完整封面",fit="尽量放大 · 不裁切",fill="铺满屏幕 · 居中裁切"}
     local items={}
     for _,style in ipairs({"frame","fit","fill"}) do
         local key=style
@@ -20280,12 +20452,16 @@ function Plugin:onCloseDocument()
     -- rebuild candidate and stay out of Home/FileManager lifecycle until KOReader
     -- either returns a Reader or the bounded deadline proves it really closed.
     self:_prepare_reader_disappearance("reader rebuild candidate")
-    local internal_hint=self.ui and self.ui.tearing_down==true
+    local setting_hint=reader_native_setting_active(closing_path)
+    local tearing_down=self.ui and self.ui.tearing_down==true
+    local internal_hint=tearing_down or setting_hint
     logger.info("[MiuRead][Lifecycle] document disappeared","cause=unknown",
         "book=",tostring(closing_path or ""),"session=",tostring(session_generation),
-        "tearing_down=",tostring(internal_hint))
+        "tearing_down=",tostring(tearing_down),
+        "native_setting=",tostring(setting_hint),
+        "setting=",setting_hint and tostring(READER_NATIVE_SETTING.label or "") or "")
     return self:_start_reader_rebuild_candidate(closing_path,session_generation,
-        "CloseDocument without explicit return",internal_hint)
+        setting_hint and "KOReader native setting rebuild" or "CloseDocument without explicit return",internal_hint)
 end
 
 function Plugin:onFlushSettings()
