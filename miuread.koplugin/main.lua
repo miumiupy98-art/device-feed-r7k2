@@ -6357,7 +6357,7 @@ end
 function Plugin:show_home_search_dialog()
     local d
     d=InputDialog:new{
-        title="搜索全部书籍",input="",
+        title="搜索我的书籍",input="",
         buttons={{
             {text=_("Cancel"),id="close",callback=function() UIManager:close(d) end},
             {text=_("Search"),is_enter_default=true,callback=function()
@@ -6372,6 +6372,195 @@ function Plugin:show_home_search_dialog()
     }
     UIManager:show(d)
     d:onShowKeyboard()
+end
+
+
+function Plugin:_annotation_book_title_map()
+    local map = {}
+    for _, book in ipairs(self:_home_all_rows()) do
+        local id = tostring(book.bookId or book.book_id or "")
+        if id ~= "" then
+            map[id] = {title=tostring(book.title or "未命名"), author=tostring(book.author or ""), book=book}
+        end
+    end
+    for id, book in pairs(self.store:library() or {}) do
+        id = tostring(id)
+        if not map[id] then
+            map[id] = {title=tostring(book.title or "未命名"), author=tostring(book.author or ""), book=book}
+        end
+    end
+    return map
+end
+
+function Plugin:show_annotation_search_dialog(back_callback)
+    local d
+    d=InputDialog:new{
+        title="搜索批注",
+        description="搜索全部书籍的划线、想法和书签",
+        input=tostring(self._annotation_last_search or ""),
+        buttons={{
+            {text="取消",id="close",callback=function()
+                UIManager:close(d)
+                if back_callback then UIManager:scheduleIn(.05,back_callback) end
+            end},
+            {text="搜索",is_enter_default=true,callback=function()
+                local query=U.trim(d:getInputText())
+                UIManager:close(d)
+                if query=="" then
+                    if back_callback then UIManager:scheduleIn(.05,back_callback) end
+                    return
+                end
+                self._annotation_last_search=query
+                UIManager:nextTick(function() self:_annotation_run_search(query,back_callback) end)
+            end},
+        }},
+    }
+    UIManager:show(d)
+    d:onShowKeyboard()
+    return true
+end
+
+function Plugin:_annotation_run_search(query,back_callback)
+    local results,err=LocalAnnotationDatabase.search_all(self.store,query,200)
+    if type(results)~="table" then
+        self:info("批注搜索失败：\n"..tostring(err or "无法读取本地批注"))
+        if back_callback then UIManager:scheduleIn(.05,back_callback) end
+        return false
+    end
+    return self:_annotation_search_results(query,results,back_callback)
+end
+
+function Plugin:_annotation_search_excerpt(result)
+    result=type(result)=="table" and result or {}
+    local text=tostring(result.matched_text or "")
+    if text=="" then
+        for _,value in ipairs({result.note,result.selected_text,result.anchor_text,result.text}) do
+            value=tostring(value or "")
+            if value~="" then text=value break end
+        end
+    end
+    text=U.trim(text:gsub("%s+"," "))
+    if text=="" then text="无文字内容" end
+    return U.utf8_truncate(text,140,"…")
+end
+
+function Plugin:_annotation_current_book_id()
+    local current=self:_current_book_record()
+    return current and current.book and tostring(current.book.book_id or current.book.bookId or "") or ""
+end
+
+function Plugin:_annotation_pending_jump(result,manage)
+    HOME_SESSION.pending_annotation_jump={
+        requested_at=os.time(),
+        book_id=tostring(result.book_id or ""),
+        local_id=tostring(result.local_id or ""),
+        kind=tostring(result.kind or ""),
+        pos0=tostring(result.pos0 or ""), pos1=tostring(result.pos1 or ""),
+        xpointer=tostring(result.xpointer or ""), page=tonumber(result.page),
+        text=tostring(result.text or ""), selected_text=tostring(result.selected_text or ""),
+        note=tostring(result.note or ""), datetime=tostring(result.datetime or ""),
+        source_path=tostring(result.source_path or ""), manage=manage==true,
+    }
+end
+
+function Plugin:_annotation_find_reader_item(result)
+    local annotations=(self.ui and self.ui.annotation and self.ui.annotation.annotations)
+        or (self.ui and self.ui.bookmark and self.ui.bookmark.bookmarks) or {}
+    local target_kind=tostring(result and result.kind or "")
+    local target_pos=tostring(result and (result.pos0 or result.start) or "")
+    local target_xp=tostring(result and result.xpointer or "")
+    local target_page=tonumber(result and result.page)
+    local target_text=tostring(result and result.selected_text or "")
+    if target_text=="" then target_text=tostring(result and result.text or "") end
+    target_text=U.trim(target_text:gsub("%s+"," "))
+    local target_note=U.trim(tostring(result and result.note or ""):gsub("%s+"," "))
+    local best,best_score=nil,-1
+    for _,item in ipairs(type(annotations)=="table" and annotations or {}) do
+        local kind=self:_reader_annotation_type(item)
+        if target_kind=="" or kind==target_kind then
+            local score=0
+            local pos=tostring(item.pos0 or item.start or "")
+            local xp=tostring(item.xpointer or ((type(item.page)=="string" and not tonumber(item.page)) and item.page or ""))
+            local page=self:_reader_annotation_page(item)
+            if target_pos~="" and pos==target_pos then score=score+12 end
+            if target_xp~="" and xp==target_xp then score=score+10 end
+            if target_page and page and tonumber(page)==target_page then score=score+2 end
+            local item_text=U.trim(tostring(item.text or item.notes or ""):gsub("%s+"," "))
+            local item_note=U.trim(tostring(item.note or ""):gsub("%s+"," "))
+            if target_text~="" and item_text==target_text then score=score+4 end
+            if target_note~="" and item_note==target_note then score=score+4 end
+            if score>best_score then best,best_score=item,score end
+        end
+    end
+    return best_score>=4 and best or nil
+end
+
+function Plugin:_annotation_open_result(result,book_info,manage,after_manage)
+    result=type(result)=="table" and result or {}
+    local target_id=tostring(result.book_id or "")
+    if target_id~="" and target_id==self:_annotation_current_book_id() and self.ui and self.ui.document then
+        self:_reader_goto_annotation(result)
+        if manage==true then
+            UIManager:scheduleIn(.12,function()
+                local item=self:_annotation_find_reader_item(result)
+                if item then self:_show_reader_annotation_actions(item,self:_reader_annotation_type(item),nil,after_manage)
+                else self:toast("已跳到批注位置；当前记录暂时无法直接编辑",2) end
+            end)
+        end
+        return true
+    end
+
+    self:_annotation_pending_jump(result,manage)
+    local source=tostring(result.source_path or "")
+    if source~="" and U.file_exists(source) then return self:_open_file_direct(source) end
+    local target_book=book_info and book_info.book or nil
+    if not target_book then
+        for _,book in ipairs(self:_home_all_rows()) do
+            if tostring(book.bookId or book.book_id or "")==target_id then target_book=book break end
+        end
+    end
+    if target_book then
+        local opened=self:_home_open_book(target_book)
+        if opened~=false then return true end
+    end
+    HOME_SESSION.pending_annotation_jump=nil
+    self:info("《"..tostring(book_info and book_info.title or "未知书籍").."》的本地书籍文件不存在，暂时无法跳转。")
+    return false
+end
+
+function Plugin:_annotation_search_results(query,results,back_callback)
+    local title_map=self:_annotation_book_title_map()
+    local kind_labels={bookmark="书签",highlight="划线",thought="想法"}
+    local kind_icons={bookmark="bookmark",highlight="highlight",thought="thought"}
+    local rows={}
+    for _,result in ipairs(type(results)=="table" and results or {}) do
+        local current=result
+        local info=title_map[tostring(current.book_id or "")] or {
+            title="未知书籍",author="",book=nil,
+        }
+        local value=kind_labels[current.kind] or "批注"
+        if current.page then value=value.." · 第 "..tostring(current.page).." 页" end
+        rows[#rows+1]={
+            icon=kind_icons[current.kind] or "highlight",
+            label=self:_annotation_search_excerpt(current),
+            detail=U.utf8_truncate(info.title,42,"…")
+                ..(info.author~="" and (" · "..U.utf8_truncate(info.author,18,"…")) or ""),
+            value=value,
+            callback=function() self:_annotation_open_result(current,info,false) end,
+            hold_callback=function() self:_annotation_open_result(current,info,true,function()
+                self:_capture_local_annotation_snapshot("annotation_search_manage")
+                UIManager:scheduleIn(.06,function() self:_annotation_run_search(query,back_callback) end)
+            end) end,
+        }
+    end
+    ReaderListDialog.show{
+        title="批注搜索",
+        subtitle="“"..tostring(query).."” · "..tostring(#rows).." 处 · 点击跳转，长按管理",
+        items=rows,page_size=5,empty_text="没有找到匹配的批注",
+        on_back=function() self:show_annotation_search_dialog(back_callback) end,
+        on_home=self:_home_enabled() and function() return self:return_to_miuread_home("annotation search") end or nil,
+    }
+    return true
 end
 
 function Plugin:_home_local_book_details(book)
@@ -6715,12 +6904,13 @@ function Plugin:_show_home_search_popup(anchor)
         cache_key="home_search",
         anchor=anchor,
         preferred_direction="below",
-        width_ratio=.58,
+        width_ratio=.62,
         title="搜索",
-        subtitle="从主页直接查找或浏览书籍",
+        subtitle="微信书库、我的书籍与批注分开搜索",
         actions={
-            {icon="⌕",label="搜索书籍",detail="按书名或作者查找",callback=function() self:show_home_search_dialog() end},
-            {icon="▦",label="全部书籍",detail="打开完整书架",callback=function() self:show_home_all_books() end},
+            {icon="⌕",label="搜索微信读书",detail="全库搜索，未加入书架也能下载",callback=function() self:search_dialog("搜索微信读书") end},
+            {icon="▦",label="搜索我的书籍",detail="书架、已生成和本地书籍",callback=function() self:show_home_search_dialog() end},
+            {icon="highlight",label="搜索批注",detail="全部划线、想法和书签",callback=function() self:show_annotation_search_dialog() end},
         },
     }
 end
@@ -6931,7 +7121,9 @@ function Plugin:_home_action_function_actions(key,anchor)
         {icon="▤",label="全屏刷新",detail="整屏刷新并清除墨水屏残影",callback=function() self:_home_full_refresh(true) end},
     } end
     if key=="search" then return {
-        {icon="⌕",label="搜索书籍",detail="按书名或作者查找",callback=function() self:show_home_search_dialog() end},
+        {icon="⌕",label="搜索微信读书",detail="全库搜索，未加入书架也能下载",callback=function() self:search_dialog("搜索微信读书") end},
+        {icon="▦",label="搜索我的书籍",detail="书架、已生成和本地书籍",callback=function() self:show_home_search_dialog() end},
+        {icon="highlight",label="搜索批注",detail="全部划线、想法和书签",callback=function() self:show_annotation_search_dialog() end},
         {icon="▦",label="全部书籍",detail="打开完整书架",callback=function() self:show_home_all_books() end},
         {icon="◷",label="阅读历史",detail="查看最近阅读记录",callback=function() self:show_home_reading_history() end},
         {icon="▤",label="本地书库",detail="浏览本地书籍",callback=function() self:show_home_local_library() end},
@@ -10122,14 +10314,19 @@ function Plugin:_reader_annotation_excerpt(item,kind)
 end
 
 function Plugin:_reader_goto_annotation(item)
-    local bookmark=self.ui and self.ui.bookmark or nil
+    local ui=self.ui
+    local bookmark=ui and ui.bookmark or nil
     if bookmark and type(bookmark.gotoBookmark)=="function" then
-        local primary=item and (item.page or item.pos0 or item.start or item.xpointer) or nil
+        local primary
+        if ui and ui.paging then
+            primary=item and (tonumber(item.page) or item.page or item.pos0 or item.start or item.xpointer) or nil
+        else
+            primary=item and (item.pos0 or item.start or item.xpointer or item.page) or nil
+        end
         local marker=item and (item.pos0 or item.start or item.xpointer) or nil
         local ok,result=pcall(bookmark.gotoBookmark,bookmark,primary,marker)
-        if ok and result~=false then return true end
+        if ok and result~=false and primary~=nil and primary~="" then return true end
     end
-    local ui=self.ui
     local target=item and (item.pos0 or item.start or item.xpointer)
     if ui and type(ui.handleEvent)=="function" then
         if type(target)=="string" and target~="" then ui:handleEvent(Event:new("GotoXPointer",target)); return true end
@@ -10140,7 +10337,158 @@ function Plugin:_reader_goto_annotation(item)
     return false
 end
 
-function Plugin:_reader_record_rows(kind)
+
+function Plugin:_reader_annotation_index(item)
+    local annotations=(self.ui and self.ui.annotation and self.ui.annotation.annotations)
+        or (self.ui and self.ui.bookmark and self.ui.bookmark.bookmarks) or {}
+    for index,candidate in ipairs(type(annotations)=="table" and annotations or {}) do
+        if candidate==item then return index end
+    end
+    local target_pos=tostring(item and (item.pos0 or item.start or item.xpointer) or "")
+    local target_date=tostring(item and (item.datetime or item.date) or "")
+    for index,candidate in ipairs(type(annotations)=="table" and annotations or {}) do
+        local pos=tostring(candidate and (candidate.pos0 or candidate.start or candidate.xpointer) or "")
+        local date=tostring(candidate and (candidate.datetime or candidate.date) or "")
+        if target_pos~="" and pos==target_pos and (target_date=="" or date==target_date) then return index end
+    end
+    return nil
+end
+
+function Plugin:_reader_annotation_changed(reason,refresh_callback)
+    -- The KOReader mutation is authoritative. Refresh the local mirror only
+    -- after it has changed so the existing upload/delete state machine sees
+    -- exactly the same edit as one made from the page itself. Editing note text
+    -- does not always emit AnnotationsModified, so explicitly checkpoint too.
+    self._reader_checkpoint_dirty=true
+    self:_schedule_reader_checkpoint(reason or "annotation_manage",.25)
+    self:_capture_local_annotation_snapshot(reason or "annotation_manage")
+    if refresh_callback then UIManager:scheduleIn(.08,refresh_callback) end
+    return true
+end
+
+function Plugin:_reader_edit_annotation_note(item,is_new,refresh_callback)
+    local bookmark=self.ui and self.ui.bookmark or nil
+    local index=self:_reader_annotation_index(item)
+    if not (bookmark and index and type(bookmark.setBookmarkNote)=="function") then
+        self:info("当前版本暂时无法从这里编辑想法")
+        if refresh_callback then UIManager:scheduleIn(.05,refresh_callback) end
+        return false
+    end
+    local completed=false
+    local function after_edit()
+        if completed then return end
+        completed=true
+        self:_reader_annotation_changed(is_new and "annotation_add_note" or "annotation_edit_note",refresh_callback)
+    end
+    local ok,err=pcall(bookmark.setBookmarkNote,bookmark,index,false,nil,after_edit)
+    if not ok then
+        self:info("无法打开想法编辑：\n"..U.first_line(err,120))
+        if refresh_callback then UIManager:scheduleIn(.05,refresh_callback) end
+        return false
+    end
+    return true
+end
+
+function Plugin:_reader_delete_annotation_note(item,refresh_callback)
+    local bookmark=self.ui and self.ui.bookmark or nil
+    if not (bookmark and type(bookmark.deleteItemNote)=="function") then
+        self:info("当前版本暂时无法单独删除想法")
+        if refresh_callback then UIManager:scheduleIn(.05,refresh_callback) end
+        return false
+    end
+    local ok,err=pcall(bookmark.deleteItemNote,bookmark,item)
+    if not ok then
+        self:info("删除想法失败：\n"..U.first_line(err,120))
+        if refresh_callback then UIManager:scheduleIn(.05,refresh_callback) end
+        return false
+    end
+    return self:_reader_annotation_changed("annotation_delete_note",refresh_callback)
+end
+
+function Plugin:_reader_delete_annotation_item(item,refresh_callback)
+    local bookmark=self.ui and self.ui.bookmark or nil
+    local index=self:_reader_annotation_index(item)
+    if not bookmark then
+        self:info("当前版本暂时无法从这里删除批注")
+        if refresh_callback then UIManager:scheduleIn(.05,refresh_callback) end
+        return false
+    end
+    local ok,err
+    if type(bookmark.removeItem)=="function" then
+        ok,err=pcall(bookmark.removeItem,bookmark,item,index)
+    elseif item and item.drawer and self.ui and self.ui.highlight and type(self.ui.highlight.deleteHighlight)=="function" and index then
+        ok,err=pcall(self.ui.highlight.deleteHighlight,self.ui.highlight,index)
+    elseif type(bookmark.removeItemByIndex)=="function" and index then
+        ok,err=pcall(bookmark.removeItemByIndex,bookmark,index)
+    else
+        ok,err=false,"没有可用的删除入口"
+    end
+    if not ok then
+        self:info("删除批注失败：\n"..U.first_line(err,120))
+        if refresh_callback then UIManager:scheduleIn(.05,refresh_callback) end
+        return false
+    end
+    return self:_reader_annotation_changed("annotation_delete_item",refresh_callback)
+end
+
+function Plugin:_reader_confirm_annotation_action(text,ok_text,action,refresh_callback)
+    UIManager:show(ConfirmBox:new{
+        text=text,ok_text=ok_text or "删除",cancel_text="取消",
+        ok_callback=action,
+        cancel_callback=refresh_callback,
+    })
+    return true
+end
+
+function Plugin:_show_reader_annotation_actions(item,kind,anchor,refresh_callback)
+    if type(item)~="table" then return false end
+    kind=kind or self:_reader_annotation_type(item)
+    local excerpt=self:_reader_annotation_excerpt(item,kind)
+    if excerpt=="" then excerpt=kind=="bookmark" and "书页书签" or "无文字内容" end
+    local function refresh()
+        if refresh_callback then refresh_callback() end
+    end
+    local actions={}
+    if kind=="highlight" then
+        actions[#actions+1]={icon="thought",label="添加想法",detail="保留当前划线并写下想法",callback=function()
+            self:_reader_edit_annotation_note(item,true,refresh_callback)
+        end}
+        actions[#actions+1]={icon="!",label="删除划线",detail="从本书移除这条划线",danger=true,callback=function()
+            self:_reader_confirm_annotation_action("删除这条划线？","删除划线",function()
+                self:_reader_delete_annotation_item(item,refresh_callback)
+            end,refresh_callback)
+        end}
+    elseif kind=="thought" then
+        actions[#actions+1]={icon="thought",label="修改想法",detail="编辑当前想法内容",callback=function()
+            self:_reader_edit_annotation_note(item,false,refresh_callback)
+        end}
+        actions[#actions+1]={icon="×",label="删除想法",detail="只删除想法，保留原划线",danger=true,callback=function()
+            self:_reader_confirm_annotation_action("删除这条想法？\n\n原划线会继续保留。","删除想法",function()
+                self:_reader_delete_annotation_note(item,refresh_callback)
+            end,refresh_callback)
+        end}
+        actions[#actions+1]={icon="!",label="删除整条批注",detail="划线和想法都会删除",danger=true,callback=function()
+            self:_reader_confirm_annotation_action("删除整条批注？\n\n划线和想法都会被删除。","全部删除",function()
+                self:_reader_delete_annotation_item(item,refresh_callback)
+            end,refresh_callback)
+        end}
+    else
+        actions[#actions+1]={icon="!",label="删除书签",detail="从当前书籍移除这枚书签",danger=true,callback=function()
+            self:_reader_confirm_annotation_action("删除这枚书签？","删除书签",function()
+                self:_reader_delete_annotation_item(item,refresh_callback)
+            end,refresh_callback)
+        end}
+    end
+    actions[#actions+1]={icon="×",label="取消",detail="返回批注列表",callback=refresh}
+    ActionSheet.show{
+        anchor=anchor,preferred_direction="above",width_ratio=.66,
+        title=kind=="thought" and "管理想法" or (kind=="highlight" and "管理划线" or "管理书签"),
+        subtitle=U.utf8_truncate(excerpt,80,"…"),actions=actions,
+    }
+    return true
+end
+
+function Plugin:_reader_record_rows(kind,back_callback)
     local annotations=(self.ui and self.ui.annotation and self.ui.annotation.annotations)
         or (self.ui and self.ui.bookmark and self.ui.bookmark.bookmarks) or {}
     local rows={}
@@ -10154,6 +10502,12 @@ function Plugin:_reader_record_rows(kind)
                 value=page and ("第 "..tostring(page).." 页") or "",
                 detail=tostring(item.datetime or item.date or ""),
                 callback=function() self:_reader_goto_annotation(target) end,
+                hold_callback=function(anchor)
+                    self:_show_reader_annotation_actions(target,kind,anchor,function()
+                        local next_kind=self:_reader_annotation_type(target) or kind
+                        self:_show_reader_records(next_kind,back_callback)
+                    end)
+                end,
             }
         end
     end
@@ -10223,6 +10577,7 @@ function Plugin:_show_reader_annotation_panel(back_callback)
                     {icon="bookmark",label="书签",value=tostring(visible_counts.bookmark or 0),callback=function() self:_show_reader_records("bookmark",return_to_panel) end},
                     {icon="highlight",label="划线",value=tostring(visible_counts.highlight or 0),callback=function() self:_show_reader_records("highlight",return_to_panel) end},
                     {icon="thought",label="想法",value=tostring(visible_counts.thought or 0),callback=function() self:_show_reader_records("thought",return_to_panel) end},
+                    {icon="search",label="搜索全部批注",value="划线 想法 书签",callback=function() self:show_annotation_search_dialog(return_to_panel) end},
                 }},
                 self:annotation_sync_diagnostic_only() and {title="批注坐标诊断 · beta.11",rows={
                     {icon="warning",label="云端批注写入",value="已暂停 · 防止错误 range",value_bold=true,enabled=false},
@@ -10260,12 +10615,13 @@ function Plugin:_show_reader_records(initial_kind,back_callback)
     local labels={bookmark="书签",highlight="划线",thought="想法"}
     ReaderListDialog.show{
         title="阅读记录",
+        subtitle="点击跳转 · 长按管理",
         initial_category=labels[initial_kind] and initial_kind or "bookmark",
         categories=function()
             return {
-                {key="bookmark",label="书签",items=self:_reader_record_rows("bookmark"),empty_text="当前书籍还没有书签"},
-                {key="highlight",label="划线",items=self:_reader_record_rows("highlight"),empty_text="当前书籍还没有划线"},
-                {key="thought",label="想法",items=self:_reader_record_rows("thought"),empty_text="当前书籍还没有自己的想法"},
+                {key="bookmark",label="书签",items=self:_reader_record_rows("bookmark",back_callback),empty_text="当前书籍还没有书签"},
+                {key="highlight",label="划线",items=self:_reader_record_rows("highlight",back_callback),empty_text="当前书籍还没有划线"},
+                {key="thought",label="想法",items=self:_reader_record_rows("thought",back_callback),empty_text="当前书籍还没有自己的想法"},
             }
         end,
         page_size=5,
@@ -12770,11 +13126,11 @@ function Plugin:return_to_miuread_home(reason)
     return true
 end
 
-function Plugin:search_dialog()
+function Plugin:search_dialog(title)
     if not self:require_login() then return end
     local d
     d=InputDialog:new{
-        title=_("Search books"), input="",
+        title=tostring(title or _("Search books")), input="",
         buttons={{
             {text=_("Cancel"),id="close",callback=function() UIManager:close(d) end},
             {text=_("Search"),is_enter_default=true,callback=function()
@@ -18522,6 +18878,37 @@ function Plugin:onReaderReady()
         if record and (record.annotation_requested==true or tostring(variant or record.variant or ""):find("notes",1,true)) then
             self:_setup_thought_tap()
             logger.info("[MiuRead][ThoughtPopup] local tap ready before cloud sync")
+        end
+        local pending=HOME_SESSION.pending_annotation_jump
+        if type(pending)=="table" then
+            local age=os.time()-(tonumber(pending.requested_at) or 0)
+            if age<0 or age>45 then
+                HOME_SESSION.pending_annotation_jump=nil
+            else
+                local current_id=book and tostring(book.book_id or book.bookId or "") or ""
+                local same_book=current_id~="" and current_id==tostring(pending.book_id or "")
+                local same_file=normalized_reader_file(path)==normalized_reader_file(pending.source_path)
+                if same_book or same_file then
+                    HOME_SESSION.pending_annotation_jump=nil
+                    UIManager:scheduleIn(.16,function()
+                        if not (self.ui and self.ui.document) or reader_close_active() then return end
+                        self:_reader_goto_annotation(pending)
+                        if pending.manage==true then
+                            UIManager:scheduleIn(.14,function()
+                                local item=self:_annotation_find_reader_item(pending)
+                                if item then
+                                    local kind=self:_reader_annotation_type(item)
+                                    self:_show_reader_annotation_actions(item,kind,nil,function()
+                                        self:_show_reader_records(self:_reader_annotation_type(item) or kind,function() self:show_reader_quick_panel() end)
+                                    end)
+                                else
+                                    self:toast("已跳到批注位置；当前记录暂时无法直接编辑",2)
+                                end
+                            end)
+                        end
+                    end)
+                end
+            end
         end
     end)
     -- Prime only lightweight page/chapter data. No toolbar widget survives a

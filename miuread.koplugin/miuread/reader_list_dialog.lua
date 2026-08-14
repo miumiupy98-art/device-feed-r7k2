@@ -25,10 +25,17 @@ function OffsetContainer:paintTo(bb, x, y)
     self[1]:paintTo(bb, x + self.x_off, y + self.y_off)
 end
 
-local TapBox = InputContainer:extend{dimen = nil, callback = nil, enabled = true}
+local TapBox = InputContainer:extend{
+    dimen = nil, callback = nil, hold_callback = nil, enabled = true,
+    _hold_handled = false, _pending_hold_anchor = nil, _miu_tap_block_until = 0,
+}
 function TapBox:init()
     self.dimen = self.dimen or Geom:new{w = 1, h = 1}
-    self.ges_events = {TapSelect = {GestureRange:new{ges = "tap", range = self.dimen}}}
+    self.ges_events = {
+        TapSelect = {GestureRange:new{ges = "tap", range = self.dimen}},
+        HoldSelect = {GestureRange:new{ges = "hold", range = self.dimen}},
+        HoldReleaseSelect = {GestureRange:new{ges = "hold_release", range = self.dimen}},
+    }
 end
 function TapBox:getSize() return Geom:new{w = self.dimen.w, h = self.dimen.h} end
 function TapBox:paintTo(bb, x, y)
@@ -36,8 +43,34 @@ function TapBox:paintTo(bb, x, y)
     if self[1] then self[1]:paintTo(bb, x, y) end
 end
 function TapBox:onTapSelect()
-    if self.enabled ~= false and self.callback then self.callback() end
+    if self._hold_handled then
+        self._hold_handled = false
+        return true
+    end
+    local now = os.clock()
+    if now < (tonumber(self._miu_tap_block_until) or 0) then return true end
+    self._miu_tap_block_until = now + .20
+    if self.enabled ~= false and self.callback then
+        self.callback(self.dimen and self.dimen:copy() or nil)
+    end
     return true
+end
+function TapBox:onHoldSelect()
+    if self.enabled == false or not self.hold_callback then return false end
+    self._hold_handled = true
+    self._pending_hold_anchor = self.dimen and self.dimen:copy() or nil
+    return true
+end
+function TapBox:onHoldReleaseSelect()
+    if self._hold_handled then
+        local anchor = self._pending_hold_anchor
+        self._hold_handled = false
+        self._pending_hold_anchor = nil
+        self._miu_tap_block_until = os.clock() + .20
+        if self.enabled ~= false and self.hold_callback then self.hold_callback(anchor) end
+        return true
+    end
+    return false
 end
 function TapBox:handleEvent(event) return InputContainer.handleEvent(self, event) end
 
@@ -184,6 +217,12 @@ function Dialog:_row_widget(item, width, height)
     local tap = TapBox:new{
         dimen = Geom:new{w = width, h = height}, enabled = enabled,
         callback = function() self:_run_item(item) end,
+        hold_callback = item.hold_callback and function(anchor)
+            -- A held row is a complete action in its own right. Close this
+            -- list before opening its management sheet so two modal surfaces
+            -- can never overlap on slow E-ink devices.
+            return self:_close(function() item.hold_callback(anchor) end)
+        end or nil,
     }
     tap[1] = CenterContainer:new{dimen = Geom:new{w = width, h = height}, row}
     return tap

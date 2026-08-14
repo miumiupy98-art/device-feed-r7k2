@@ -621,6 +621,42 @@ local function build_footnote_section(img_notes, anchor_notes)
     return table.concat(parts)
 end
 
+
+-- A converted EPUB3 footnote replaces the publisher's original endnote
+-- container. Keep unresolved source notes, but remove only source containers
+-- whose id/name was actually converted so the same note is not rendered twice.
+local function strip_converted_footnote_sources(html, notes)
+    local converted = {}
+    for _, note in ipairs(notes or {}) do
+        local anchor = tostring(note and note.anchor or "")
+        if anchor ~= "" then converted[anchor] = true end
+    end
+    if not next(converted) then return html, 0 end
+
+    local removed = 0
+    local tags = { "p", "li", "aside", "dd", "div" }
+    for _, tag in ipairs(tags) do
+        html = html:gsub("<" .. tag .. "(%s+[^>]*)>(.-)</" .. tag .. "%s*>", function(attrs, inner)
+            local cls = (get_attr(attrs, "class") or ""):lower()
+            if not (has_token(cls, "footnote") or has_token(cls, "endnote") or has_token(cls, "note")) then
+                return nil
+            end
+            local id = get_attr(attrs, "id") or get_attr(attrs, "name") or ""
+            if converted[id] then
+                removed = removed + 1
+                return ""
+            end
+            return nil
+        end)
+    end
+
+    if removed > 0 then
+        html = html:gsub('<[hH][rR][^>]*%sclass="[^"]*footnote%-separator[^"]*"[^>]*%s*/?>', "")
+            :gsub("<[hH][rR][^>]*%sclass='[^']*footnote%-separator[^']*'[^>]*%s*/?>", "")
+    end
+    return html, removed
+end
+
 function Footnotes.process(html, meta)
     local empty_stats={
         candidates=0,refs=0,converted=0,backlinks=0,image_notes=0,
@@ -686,6 +722,8 @@ function Footnotes.process(html, meta)
 
     local html1,img_notes=Footnotes.convert_img_footnotes(html)
     local html2,anchor_notes=convert_anchor_refs(html1,anchor_texts,#img_notes)
+    local stripped_sources=0
+    html2,stripped_sources=strip_converted_footnote_sources(html2,anchor_notes)
 
     -- Some WeRead books omit the source-reference id while still emitting one
     -- reverse link for every note. The resulting signature is exact pairing:
@@ -705,7 +743,8 @@ function Footnotes.process(html, meta)
     local stats={
         candidates=#refs,
         refs=math.max(0,#refs-#backlinks),
-        converted=#anchor_notes,backlinks=#backlinks,inferred_backlinks=inferred_backlinks,image_notes=#img_notes,
+        converted=#anchor_notes,backlinks=#backlinks,inferred_backlinks=inferred_backlinks,
+        image_notes=#img_notes,stripped=stripped_sources,
         unresolved=#unresolved,deferred=#deferred,
         missing_anchors=unresolved,missing_targets=deferred,backlink_targets=backlinks,
         fallback=false,
@@ -713,7 +752,8 @@ function Footnotes.process(html, meta)
     log_info("candidates=",tostring(stats.candidates),"refs=",tostring(stats.refs),
         "converted=",tostring(stats.converted),"backlinks=",tostring(stats.backlinks),
         "inferred_backlinks=",tostring(stats.inferred_backlinks),
-        "images=",tostring(stats.image_notes),"missing=",tostring(stats.unresolved),
+        "images=",tostring(stats.image_notes),"stripped=",tostring(stats.stripped),
+        "missing=",tostring(stats.unresolved),
         "deferred=",tostring(stats.deferred))
     if stats.unresolved>0 then
         local sample={}

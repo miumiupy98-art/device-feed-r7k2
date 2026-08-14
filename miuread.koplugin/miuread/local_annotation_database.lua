@@ -1,6 +1,7 @@
 local SQLiteStore = require("miuread.sqlite_store")
 local Digests = require("miuread.digests")
 local lfs = require("libs/libkoreader-lfs")
+local logger = require("logger")
 
 local LocalAnnotationDatabase = {}
 
@@ -540,6 +541,127 @@ end
 -- Aggregate pending local mutations across every generated book. The home
 -- screen uses this instead of pretending there is a "current book" while no
 -- reader is open.
+
+local function escape_like(value)
+    return (tostring(value or ""):gsub("[%%_\\]", "\\%0"))
+end
+
+-- Read-only full-text search across every cached book annotation database.
+-- Multiple whitespace-separated terms are AND-ed, while each term may occur
+-- in any searchable text field of the same annotation row.
+function LocalAnnotationDatabase.search_all(store, query, limit)
+    limit = math.max(1, math.min(500, tonumber(limit) or 200))
+    local plain_terms, escaped_terms = {}, {}
+    for term in tostring(query or ""):gmatch("%S+") do
+        if term ~= "" then
+            plain_terms[#plain_terms + 1] = term
+            escaped_terms[#escaped_terms + 1] = escape_like(term)
+        end
+    end
+    if #plain_terms == 0 then return {} end
+
+    local columns = {
+        "selected_text", "note", "anchor_text", "text",
+        "context_before", "context_after",
+    }
+    local clauses, bindings = {}, {}
+    for _, term in ipairs(escaped_terms) do
+        local choices = {}
+        for _, column in ipairs(columns) do
+            choices[#choices + 1] = column .. " LIKE ? ESCAPE '\\'"
+            bindings[#bindings + 1] = "%" .. term .. "%"
+        end
+        clauses[#clauses + 1] = "(" .. table.concat(choices, " OR ") .. ")"
+    end
+
+    local sql = [[
+        SELECT local_id, book_id, kind, pos0, pos1, xpointer, page,
+               text, selected_text, note, anchor_text, context_before,
+               context_after, datetime, updated_at, source_path, sync_state
+          FROM local_annotations
+         WHERE present = 1 AND ]] .. table.concat(clauses, " AND ") .. [[
+         ORDER BY updated_at DESC
+         LIMIT ?
+    ]]
+
+    local out = {}
+    for _, path in ipairs(database_paths(store)) do
+        local ok_conn, conn = pcall(SQLiteStore.open, path, true)
+        if ok_conn and conn then
+            local ok, err = xpcall(function()
+                local statement = conn:prepare(sql)
+                local values = {}
+                for _, value in ipairs(bindings) do values[#values + 1] = value end
+                values[#values + 1] = limit
+                statement:bind(unpack(values))
+                while true do
+                    local row = statement:step()
+                    if not row then break end
+                    local fields = {
+                        selected_text = tostring(row[9] or ""),
+                        note = tostring(row[10] or ""),
+                        anchor_text = tostring(row[11] or ""),
+                        text = tostring(row[8] or ""),
+                        context_before = tostring(row[12] or ""),
+                        context_after = tostring(row[13] or ""),
+                    }
+                    -- Pick the field containing the most query terms for the
+                    -- visible excerpt. SQL already guarantees all terms exist
+                    -- somewhere on this row.
+                    local matched_field, matched_text, matched_score = "", "", -1
+                    for _, name in ipairs({"note","selected_text","anchor_text","text","context_before","context_after"}) do
+                        local value = fields[name]
+                        if value ~= "" then
+                            local lower = value:lower()
+                            local score = 0
+                            for _, term in ipairs(plain_terms) do
+                                if lower:find(term:lower(), 1, true) then score = score + 1 end
+                            end
+                            if score > matched_score then
+                                matched_field, matched_text, matched_score = name, value, score
+                            end
+                        end
+                    end
+                    out[#out + 1] = {
+                        local_id = tostring(row[1] or ""),
+                        book_id = tostring(row[2] or ""),
+                        kind = tostring(row[3] or ""),
+                        pos0 = tostring(row[4] or ""),
+                        pos1 = tostring(row[5] or ""),
+                        xpointer = tostring(row[6] or ""),
+                        page = tonumber(row[7]),
+                        text = fields.text,
+                        selected_text = fields.selected_text,
+                        note = fields.note,
+                        anchor_text = fields.anchor_text,
+                        context_before = fields.context_before,
+                        context_after = fields.context_after,
+                        datetime = tostring(row[14] or ""),
+                        updated_at = tonumber(row[15] or 0) or 0,
+                        source_path = tostring(row[16] or ""),
+                        sync_state = tostring(row[17] or ""),
+                        matched_field = matched_field,
+                        matched_text = matched_text,
+                    }
+                end
+                statement:close()
+            end, debug.traceback)
+            pcall(conn.close, conn)
+            if not ok then
+                logger.warn("[MiuRead][LocalAnnotations] search skipped database", tostring(path), tostring(err))
+            end
+        end
+    end
+
+    table.sort(out, function(a, b)
+        if a.updated_at ~= b.updated_at then return a.updated_at > b.updated_at end
+        if a.book_id ~= b.book_id then return a.book_id < b.book_id end
+        return a.local_id < b.local_id
+    end)
+    while #out > limit do table.remove(out) end
+    return out
+end
+
 function LocalAnnotationDatabase.global_summary(store)
     local out = {pending=0, failed=0, delete_pending=0, bookmark=0, highlight=0, thought=0, books=0}
     for _, path in ipairs(database_paths(store)) do

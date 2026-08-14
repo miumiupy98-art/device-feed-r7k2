@@ -667,9 +667,30 @@ local function catalog_has_children(source, index)
     return level ~= nil and next_level ~= nil and next_level > level
 end
 
+local function txt_catalog_title(title, chapter_idx)
+    local idx = tonumber(chapter_idx)
+    if not idx then return tostring(title or "") end
+    title = tostring(title or "")
+    -- Some legacy or cached responses may already contain a chapter prefix.
+    -- Never add another one; the official TXT response normally omits it.
+    if title:match("^%s*第%s*[%d零〇一二三四五六七八九十百千万两]+%s*章") then return title end
+    return title == "" and ("第" .. tostring(idx) .. "章")
+        or ("第" .. tostring(idx) .. "章 " .. title)
+end
+
 function Downloader:catalog(id)
     local catalog = self.reader:catalog(id)
     local source = catalog.updated or catalog.chapterInfos or catalog.chapters or {}
+    -- chapterInfos does not reliably expose the book format. Use the reader
+    -- page context when available; on failure keep the source titles unchanged.
+    local book_format
+    local ok_state, state = pcall(self.reader.state, self.reader, id)
+    if ok_state and type(state) == "table" and type(state.book) == "table" then
+        book_format = tostring(state.book.format or ""):lower()
+    else
+        logger.warn("[MiuRead][Download] book format unavailable; keeping raw catalog titles",
+            "book=", tostring(id), "error=", ok_state and "reader context has no book info" or tostring(state))
+    end
     local out, seen = {}, {}
     for index, chapter in ipairs(source) do
         local uid = tostring(chapter.chapterUid or chapter.uid or "")
@@ -682,6 +703,9 @@ function Downloader:catalog(id)
             and not self.reader._is_cover_chapter(chapter)
             and not self.reader._is_unavailable_chapter(chapter) then
             seen[uid] = true
+            if book_format == "txt" then
+                chapter.title = txt_catalog_title(chapter.title, chapter.chapterIdx)
+            end
             if tostring(chapter.title or ""):gsub("%s+", "") == "" then
                 chapter.title = "第 " .. tostring(#out + 1) .. " 节"
             end
