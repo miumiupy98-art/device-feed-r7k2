@@ -214,6 +214,39 @@ function Http:_observe_download_network(url, delay, code)
     if trigger then self:_verify_ipv4_advantage(url,trigger) end
 end
 
+function Http:probe_download_recovery()
+    local policy=self.network_policy
+    local base=probe_origin(self.last_request_url) or "https://weread.qq.com/"
+    local mode=policy and policy:current_mode() or "auto"
+
+    if mode=="ipv4" then
+        local elapsed,code=self:_probe_once(base,true)
+        return elapsed~=nil,{mode="ipv4",seconds=elapsed,code=code}
+    end
+
+    local auto_elapsed,auto_code=self:_probe_once(base,false)
+    if auto_elapsed~=nil then
+        return true,{mode="auto",seconds=auto_elapsed,code=auto_code}
+    end
+
+    local ipv4_elapsed,ipv4_code=self:_probe_once(base,true)
+    if ipv4_elapsed~=nil then
+        local detail={
+            recovery_ipv4=true, ipv4_only=true, ipv4_seconds=ipv4_elapsed,
+            ipv4_code=ipv4_code, auto_unavailable=true,
+        }
+        if policy and not policy.suggestion_suppressed and not policy.suggestion_sent then
+            policy.suggestion_sent=true
+            if type(self.on_network_suggestion)=="function" then
+                local ok,err=pcall(self.on_network_suggestion,detail)
+                if not ok then logger.warn("[MiuRead][NetworkPolicy] recovery suggestion callback failed",tostring(err)) end
+            end
+        end
+        return false,detail
+    end
+    return false,{mode="offline",auto_unavailable=true,ipv4_unavailable=true}
+end
+
 function Http:_pacing_path(scope)
     local path=tostring(self.shared_pacing_path or "")
     if path=="" then return "" end
@@ -444,6 +477,7 @@ end
 function Http:_request_once(opt)
     local redirects = tonumber(opt.redirects) or 5
     local current = assert(opt.url, "url required")
+    self.last_request_url=current
     local method = opt.method or (opt.body and "POST" or "GET")
     local body = opt.body
     local auth_snapshot=self.store:auth()
@@ -502,7 +536,10 @@ function Http:_request_once(opt)
             local response_delay=(first_data_at or request_finished)-request_started
             self:_observe_download_network(current,response_delay,code)
         end
-        if not code then return text, nil, resp_headers, current, tostring(status or ok) end
+        if not code then
+            self.last_request_url=current
+            return text, nil, resp_headers, current, tostring(status or ok)
+        end
 
         local set_cookie = hget(resp_headers, "set-cookie")
         if set_cookie and opt.auth ~= false then
@@ -529,6 +566,7 @@ function Http:_request_once(opt)
                 headers["Content-Length"] = nil
             end
         else
+            self.last_request_url=current
             return text, code, resp_headers, current
         end
     end

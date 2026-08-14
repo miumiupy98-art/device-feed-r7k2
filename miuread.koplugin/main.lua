@@ -4823,13 +4823,18 @@ function Plugin:_show_download_ipv4_suggestion(runtime,state)
     end
     local auto=tonumber(state and state.network_auto_seconds)
     local ipv4=tonumber(state and state.network_ipv4_seconds)
+    local recovery=state and state.network_ipv4_recovery==true
     local comparison=""
     if auto and ipv4 then
         comparison="\n\n自动线路约 "..string.format("%.1f",auto).." 秒，IPv4 约 "..string.format("%.1f",ipv4).." 秒。"
+    elseif recovery and ipv4 then
+        comparison="\n\n当前线路无法连接；IPv4 测试可正常访问服务器。"
     end
     local dialog
     dialog=ButtonDialog:new{
-        title="检测到 IPv4 下载更快\n\n当前下载多次响应较慢。觅阅已对同一服务器进行了两组网络对照，两组测试中 IPv4 都明显更快。"..comparison.."\n\n是否切换到 IPv4？",
+        title=(recovery and "当前网络可尝试切换 IPv4\n\n下载已经暂停在断点，没有继续请求后面的章节。"
+            or "检测到 IPv4 下载更快\n\n当前下载多次响应较慢。觅阅已对同一服务器进行了两组网络对照，两组测试中 IPv4 都明显更快。")
+            ..comparison.."\n\n是否切换到 IPv4？",
         title_align="center",
         buttons={
             {{text="切换 IPv4",callback=function()
@@ -13361,7 +13366,7 @@ end
 local DOWNLOAD_STAGE_LABELS={
     prepare="准备下载",catalog="读取目录",resume="恢复断点",content="下载正文",
     underlines="获取划线",thoughts="获取想法",footnotes="处理脚注",
-    images="处理图片",package="生成 EPUB",restart="断点恢复",done="下载完成",error="下载失败",
+    images="处理图片",package="生成 EPUB",restart="断点恢复",waiting_network="等待网络",done="下载完成",error="下载失败",
     cancelled="下载已取消",
 }
 function Plugin:_download_dialog_is_shown(runtime)
@@ -13403,8 +13408,8 @@ function Plugin:_on_download_progress(runtime,state)
             wait>0 and ("请求受限 · "..tostring(wait).."秒") or "请求受限 · 等待恢复")
     elseif state and state.stage=="restart" then
         self:_update_open_shelf_download_status(runtime.book.bookId,"从断点自动恢复")
-    elseif state and state.waiting_network==true then
-        self:_update_open_shelf_download_status(runtime.book.bookId,"等待网络")
+    elseif state and (state.waiting_network==true or state.stage=="waiting_network") then
+        self:_update_open_shelf_download_status(runtime.book.bookId,"等待网络 · 已保存进度")
     end
     if runtime.background and self.store:preferences().download_notice_enabled~=false then
         runtime.notified_milestones=runtime.notified_milestones or {}
@@ -13638,7 +13643,7 @@ function Plugin:_download_status_label()
             return wait>0 and ("后台下载 · 请求受限，"..tostring(wait).."秒后继续") or "后台下载 · 请求受限，等待恢复"
         end
         if state.stage=="restart" then return "后台下载 · 正在从断点恢复" end
-        if state.waiting_network==true then return "后台下载 · 等待网络" end
+        if state.waiting_network==true or state.stage=="waiting_network" then return "后台下载 · 等待网络，已保存进度" end
         local title=U.utf8_truncate(state.title or "未命名",9)
         return "后台下载：《"..title.."》 "..tostring(self:_download_percent(state)).."%"
     end
@@ -13681,7 +13686,7 @@ function Plugin:_active_download_payload(runtime,state)
         percent=state and state.percent or 0,
         chapter=state and state.chapter or "",
         message=state and state.message or "",
-        waiting_network=state and state.waiting_network==true or nil,
+        waiting_network=state and (state.waiting_network==true or state.stage=="waiting_network") or nil,
         wait_seconds=state and state.wait_seconds or nil,
         rate_limit_code=state and state.rate_limit_code or nil,
         started_at=runtime.started_at,
@@ -19045,14 +19050,13 @@ function Plugin:onSuspend()
         self._download_resume_task=nil
     end
     -- No interaction/helper timer is allowed to wake or poll background work
-    -- after Suspend has taken ownership.  Clear the temporary reader pause only
-    -- after the stronger suspend pause is installed, so resume starts cleanly.
+    -- after Suspend has taken ownership. DownloadTask:on_suspend() already
+    -- removed all UI-only pause reasons in the same marker write.
     self._reader_interaction_resume_generation=(tonumber(self._reader_interaction_resume_generation) or 0)+1
     if self._reader_interaction_resume_task then
         UIManager:unschedule(self._reader_interaction_resume_task)
         self._reader_interaction_resume_task=nil
     end
-    if self.download_task then self.download_task:resume("reader_interaction") end
     if self._reader_toolbar_state_task then
         UIManager:unschedule(self._reader_toolbar_state_task)
         self._reader_toolbar_state_task=nil

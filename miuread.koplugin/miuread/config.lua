@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.5.0-beta.2",
+    VERSION = "4.5.0-beta.3",
     SCHEMA = 112,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -83,6 +83,16 @@ local C = {
     AUTH_NOTICE_FAILURE_THRESHOLD = 2,
     DOWNLOAD_AUTO_RESTARTS = 2,
     DOWNLOAD_DIAGNOSTIC_KEEP = 3,
+
+    -- beta.3 treats download connectivity as a task-level state instead of
+    -- letting every remaining chapter exhaust its own retry tree. Three
+    -- consecutive chapter-level network failures enter one recovery wait; the
+    -- worker then probes the same host until the route is usable again.
+    DOWNLOAD_NETWORK_FAILURE_BREAKER = 3,
+    DOWNLOAD_NETWORK_RECOVERY_POLL_SECONDS = 6,
+    DOWNLOAD_NETWORK_RECOVERY_MAX_POLL_SECONDS = 15,
+    DOWNLOAD_BACKGROUND_KEEPALIVE_SECONDS = 12,
+    DOWNLOAD_BACKGROUND_STALL_SLEEP_SECONDS = 300,
 
     -- Download networking stays automatic by default. A compatibility prompt
     -- is considered only after several genuinely slow responses, then confirmed

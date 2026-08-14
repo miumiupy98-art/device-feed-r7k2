@@ -1139,6 +1139,7 @@ function Downloader:book(input, opt, progress)
     opt.title_transform_version=tonumber(cache.manifest.title_transform_version) or TITLE_TRANSFORM_VERSION
     session = cache.manifest.session
     local failure_map, restricted_map = {}, {}
+    local network_failure_streak=0
     local requested_annotations=opt.annotations==true
     opt.download_run_id=tostring(opt.download_run_id or (os.time().."-"..math.random(100000,999999)))
     local annotation_account_key=DownloadDatabase.account_key(self.store)
@@ -1380,6 +1381,39 @@ function Downloader:book(input, opt, progress)
         return cache_save_final(cache, chapter, body, annotation, style, foot_stats)
     end
 
+    local function wait_for_network_recovery(chapter,index,last_error)
+        local started=os.time()
+        local poll=math.max(3,tonumber(Config.DOWNLOAD_NETWORK_RECOVERY_POLL_SECONDS) or 6)
+        local max_poll=math.max(poll,tonumber(Config.DOWNLOAD_NETWORK_RECOVERY_MAX_POLL_SECONDS) or 15)
+        local attempts=0
+        while true do
+            if opt.cancelled and opt.cancelled() then error("download cancelled") end
+            respect_reader_priority("network_wait")
+            attempts=attempts+1
+            progress("waiting_network",index,expected,chapter.title,{
+                message="网络连接中断，已保存进度，等待网络恢复",
+                waiting_network=true,
+            })
+            local ready,detail=false,nil
+            if self.http and type(self.http.probe_download_recovery)=="function" then
+                local ok,value,info=pcall(self.http.probe_download_recovery,self.http)
+                if ok then ready=value==true; detail=info end
+            end
+            if ready then
+                logger.info("[MiuRead][Download] network route recovered",
+                    "wait=",tostring(os.time()-started),"attempts=",tostring(attempts),
+                    "mode=",tostring(detail and detail.mode or "unknown"))
+                progress("resume",index,expected,chapter.title,{message="网络已恢复，正在从断点继续"})
+                network_failure_streak=0
+                return true
+            end
+            logger.warn("[MiuRead][Download] network recovery wait",
+                "chapter=",chapter_uid(chapter),"attempt=",tostring(attempts),
+                "waited=",tostring(os.time()-started),"error=",tostring(last_error))
+            pause(math.min(max_poll,poll+math.max(0,attempts-1)*2))
+        end
+    end
+
     local function process_one(chapter, index, retry_round)
         if opt.cancelled and opt.cancelled() then error("download cancelled") end
         respect_reader_priority("chapter")
@@ -1485,12 +1519,29 @@ function Downloader:book(input, opt, progress)
                 self.reader.chapter, self.reader, book, chapter, format, {images=opt.images})
             if not ok then
                 if Http.is_rate_limit_error(downloaded) then error(downloaded) end
+                if Http.is_auth_error(downloaded) then error(downloaded) end
+                if Http.is_network_error(downloaded) then
+                    network_failure_streak=network_failure_streak+1
+                    mark_failure(chapter,downloaded)
+                    local threshold=math.max(2,tonumber(Config.DOWNLOAD_NETWORK_FAILURE_BREAKER) or 3)
+                    if network_failure_streak>=threshold then
+                        logger.warn("[MiuRead][Download] network circuit breaker opened",
+                            "streak=",tostring(network_failure_streak),"chapter=",uid)
+                        wait_for_network_recovery(chapter,index,downloaded)
+                        -- Retry the current chapter after the route is confirmed.
+                        -- Previously completed checkpoints are untouched.
+                        return process_one(chapter,index,retry_round)
+                    end
+                    return false
+                end
+                network_failure_streak=0
                 if not opt.chapter_uid and type(self.reader.is_access_denied_error)=="function"
                     and self.reader.is_access_denied_error(downloaded) then
                     return mark_restricted(chapter, downloaded)
                 end
                 return mark_failure(chapter, downloaded)
             end
+            network_failure_streak=0
             if state then
                 local discovered_version = tonumber(state.book_version
                     or (type(state.book)=="table" and

@@ -63,12 +63,13 @@ end
 
 function DownloadTask:set_backgrounded(value)
     self.backgrounded = value == true
-    -- A background task must never keep Kindle awake indefinitely. Foreground
-    -- progress pages may hold the lock, but background work releases it at once.
-    if self.backgrounded then
-        self:_release_awake()
-    elseif self.job and not self:is_paused() then
+    -- beta.3 keeps an actively progressing background download awake. The
+    -- worker releases this lock when it is paused or has been waiting without
+    -- progress for several minutes, so a dead network cannot drain the battery.
+    if self.job and not self:is_paused() then
         self:_hold_awake()
+    else
+        self:_release_awake()
     end
 end
 
@@ -204,8 +205,39 @@ function DownloadTask:resume(reason)
     return not still_paused
 end
 
-function DownloadTask:on_suspend() return self:pause("suspend") end
-function DownloadTask:on_resume() return self:resume("suspend") end
+local TRANSIENT_PAUSE_REASONS = {
+    home_interaction=true, reader_interaction=true, page_transition=true,
+    thought_popup=true, transient_ui=true,
+}
+
+function DownloadTask:_replace_transient_pause_reasons(add_suspend)
+    local path=self:_control_pause_path()
+    local reasons=self:_merged_pause_reasons(path)
+    for reason in pairs(TRANSIENT_PAUSE_REASONS) do reasons[reason]=nil end
+    if add_suspend==true then reasons.suspend=true else reasons.suspend=nil end
+    local still_paused=next(reasons)~=nil
+    self:_write_pause_marker(path,reasons)
+    if still_paused then self:_release_awake()
+    elseif self.job then self:_hold_awake() end
+    logger.info("[MiuRead][DownloadTask] lifecycle pause reasons normalized",
+        "suspend=",tostring(add_suspend==true),"still_paused=",tostring(still_paused))
+    if self.job then self:_schedule() end
+    return not still_paused
+end
+
+function DownloadTask:on_suspend()
+    -- Install the strong suspend reason and discard UI-only reasons atomically.
+    -- Otherwise an unscheduled interaction timer can leave the worker paused
+    -- forever after wake. Manual/network/auth pauses are intentionally kept.
+    return self:_replace_transient_pause_reasons(true)
+end
+
+function DownloadTask:on_resume()
+    -- Wake is also a cleanup boundary: clear stale interaction/transition
+    -- reasons together with suspend, but never override an explicit manual or
+    -- recovery pause.
+    return self:_replace_transient_pause_reasons(false)
+end
 
 function DownloadTask:stop_for_foreground(reason)
     reason=tostring(reason or "foreground_recovery")
@@ -386,6 +418,12 @@ function DownloadTask:_read_progress(job)
         job.last_progress_raw = raw
         job.last_progress_state = state
         job.last_progress_at = tonumber(state.updated_at) or file_mtime(job.progress_path) or os.time()
+        if state.stage=="waiting_network" or state.waiting_network==true then
+            job.waiting_started_at=job.waiting_started_at or job.last_progress_at
+        else
+            job.waiting_started_at=nil
+            job.last_effective_progress_at=job.last_progress_at
+        end
         job.waiting_notified = false
         if self.keep_awake_enabled and not self.backgrounded and not self:is_paused()
             and not self.standby_held then self:_hold_awake() end
@@ -571,11 +609,26 @@ function DownloadTask:_poll()
     if read_json(job.result_path) then self:_finish(job); return end
 
     local now=os.time()
-    if not self.backgrounded and not self:is_paused()
-        and (not job.last_keepalive or now-job.last_keepalive>=5) then
-        job.last_keepalive=now
-        local reset=self:_reset_device_timeout()
-        if reset then logger.dbg("[MiuRead][DownloadTask] Kindle T1 timer reset") end
+    local stall_sleep=math.max(120,tonumber(Config.DOWNLOAD_BACKGROUND_STALL_SLEEP_SECONDS) or 300)
+    local effective_activity=tonumber(job.last_effective_progress_at or job.started_at) or now
+    local effective_idle=math.max(0,now-effective_activity)
+    local waiting_since=tonumber(job.waiting_started_at)
+    local waiting_too_long=waiting_since and now-waiting_since>=stall_sleep
+    local stalled_too_long=effective_idle>=stall_sleep
+    if not self:is_paused() and not waiting_too_long and not stalled_too_long then
+        local keepalive_gap=self.backgrounded
+            and math.max(8,tonumber(Config.DOWNLOAD_BACKGROUND_KEEPALIVE_SECONDS) or 12) or 5
+        if not job.last_keepalive or now-job.last_keepalive>=keepalive_gap then
+            job.last_keepalive=now
+            if not self.standby_held then self:_hold_awake() end
+            local reset=self:_reset_device_timeout()
+            if reset then logger.dbg("[MiuRead][DownloadTask] Kindle T1 timer reset") end
+        end
+    elseif (waiting_too_long or stalled_too_long) and self.standby_held then
+        self:_release_awake()
+        logger.info("[MiuRead][DownloadTask] stalled download may sleep",
+            "pid=",tostring(job.pid),"idle=",tostring(effective_idle),
+            "waiting=",tostring(waiting_since and now-waiting_since or 0))
     end
 
     local alive=process_exists(job.pid)
@@ -619,9 +672,11 @@ function DownloadTask:_poll()
             state.updated_at=now
             if job.on_progress then job.on_progress(state) end
         end
-        if idle>=300 and self.standby_held then
+        if effective_idle>=stall_sleep and self.standby_held then
             self:_release_awake()
-            logger.info("[MiuRead][DownloadTask] standby lock released while waiting", "pid=", tostring(job.pid))
+            logger.info("[MiuRead][DownloadTask] standby lock released while stalled",
+                "pid=",tostring(job.pid),"idle=",tostring(effective_idle),
+                "stage=",tostring(job.last_progress_state and job.last_progress_state.stage or "unknown"))
         end
         self:_schedule()
         return
@@ -718,7 +773,7 @@ function DownloadTask:attach(descriptor,on_progress,on_done,restart_book,restart
         cancel_path=descriptor.cancel_path,pause_path=descriptor.pause_path,network_path=descriptor.network_path,
         worker_settings_path=descriptor.worker_settings_path,
         on_progress=on_progress,on_done=on_done,last_progress_raw=nil,last_progress_state=nil,
-        last_progress_at=nil,last_keepalive=0,started_at=descriptor.started_at,dead_seen_at=nil,
+        last_progress_at=nil,last_effective_progress_at=nil,waiting_started_at=nil,last_keepalive=0,started_at=descriptor.started_at,dead_seen_at=nil,
         unknown_seen_at=nil,waiting_notified=false,rechecking_notified=false,
         task_token=descriptor.task_token,
         restart_count=tonumber(descriptor.restart_count) or 0,
@@ -896,6 +951,8 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                     network_suggestion_detail=nil
                 else
                     state.network_ipv4_suggested=true
+                    state.network_ipv4_recovery=network_suggestion_detail.recovery_ipv4==true or nil
+                    state.network_auto_unavailable=network_suggestion_detail.auto_unavailable==true or nil
                     state.network_auto_seconds=tonumber(network_suggestion_detail.auto_seconds)
                     state.network_ipv4_seconds=tonumber(network_suggestion_detail.ipv4_seconds)
                     state.network_gain_seconds=tonumber(network_suggestion_detail.gain_seconds)
@@ -1007,6 +1064,7 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                         thoughts = detail.thoughts,
                         percent = percent,
                         message = detail.message,
+                        waiting_network = detail.waiting_network==true or stage=="waiting_network" or nil,
                     }
                 end)
                 return {
@@ -1091,6 +1149,8 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
         last_progress_raw = nil,
         last_progress_state = nil,
         last_progress_at = nil,
+        last_effective_progress_at = nil,
+        waiting_started_at = nil,
         last_keepalive = 0,
         dead_seen_at = nil,
         unknown_seen_at = nil,
