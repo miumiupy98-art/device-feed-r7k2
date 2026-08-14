@@ -49,6 +49,7 @@ local MAP = {
     ["⏻"] = "power", power = "power", quit = "power",
     ["↺"] = "restart", restart = "restart",
     rotate = "rotate", ["旋转"] = "rotate",
+    ["orientation-lock"] = "orientation-lock", ["orientation-auto"] = "orientation-auto",
     night = "night", warmth = "warmth", battery = "battery",
     ["full-refresh"] = "full-refresh",
     ["return"] = "return",

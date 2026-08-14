@@ -750,12 +750,23 @@ function HomeWidget:handleEvent(event)
             and self:_open_quick_panel_from_gesture(ges) then
             return true
         end
-        -- Forward unowned swipe-style gestures before the fullscreen home can
-        -- stop propagation. Taps and holds remain owned by books and buttons.
         local pointer_action=gesture=="tap" or gesture=="hold" or gesture=="hold_release"
             or gesture=="double_tap" or gesture=="two_finger_tap"
-        if not pointer_action and not shelf_owned
-            and GestureBridge.dispatch(ges) then return true end
+
+        -- Visible MiuRead controls get pointer input first. If no child consumes
+        -- the pointer gesture, hand it to KOReader's configured Gesture Manager
+        -- before this fullscreen page stops propagation.
+        if pointer_action then
+            if self:propagateEvent(event) then return true end
+            if GestureBridge.dispatch(ges) then return true end
+            return true
+        end
+
+        -- Configured edge/corner gestures take priority over the shelf's broad
+        -- horizontal swipe area. This keeps left/right edge actions available
+        -- without letting ordinary shelf swipes leak through to KOReader.
+        if GestureBridge.dispatchEdge and GestureBridge.dispatchEdge(ges) then return true end
+        if not shelf_owned and GestureBridge.dispatch(ges) then return true end
     end
     return InputContainer.handleEvent(self,event)
 end

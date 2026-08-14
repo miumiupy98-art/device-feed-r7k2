@@ -50,6 +50,7 @@ local ActionSheet=require("miuread.action_sheet")
 local TransientGuard=require("miuread.transient_guard")
 local ScreenshotMode=require("miuread.screenshot_mode")
 local GestureBridge=require("miuread.gesture_bridge")
+local Orientation=require("miuread.orientation_controller")
 local HomeData=require("miuread.home_data")
 local TimeZone=require("miuread.timezone")
 local UiScale=require("miuread.ui_scale")
@@ -177,7 +178,7 @@ if type(READER_REBUILD)~="table" then
         state="idle",generation=0,session_generation=0,reader_file=nil,
         started_at=0,started_clock=0,max_wait=0,reason=nil,owner=nil,
         recent_book=nil,recent_started_at=0,recent_count=0,safe_until=0,
-        pending_width=nil,pending_height=nil,pending_rotation=nil,
+        pending_width=nil,pending_height=nil,pending_rotation=nil,internal_hint=false,
     }
     rawset(_G,"__MIUREAD_READER_REBUILD",READER_REBUILD)
 end
@@ -4490,7 +4491,7 @@ local HOME_ACTION_LABELS={
     miuread_settings="觅阅设置",all_books="全部书籍",history="阅读历史",file_manager="文件管理",screenshot="截图",
 }
 local HOME_PANEL_LABELS={
-    wifi="Wi-Fi",rotate="旋转屏幕",screenshot="截图",koreader_settings="KOReader 设置",
+    wifi="Wi-Fi",rotate="方向锁定",screenshot="截图",koreader_settings="KOReader 设置",
     return_koreader="返回 KOReader",quit="退出 KOReader",frontlight="前光",sync="同步",
     miuread_settings="觅阅设置",downloads="下载",restart="重启 KOReader",sleep="休眠",full_refresh="全屏刷新",
 }
@@ -4867,6 +4868,7 @@ end
 
 function Plugin:_home_close_to_native(show_notice)
     -- This is the only temporary path that intentionally reveals FileManager.
+    Orientation.release_session("return to KOReader")
     self:_cancel_native_menu_guard()
     HOME_SESSION_SUPPRESSED=false
     HOME_NATIVE_VISIT=true
@@ -8752,21 +8754,57 @@ function Plugin:_home_toggle_night()
     return true
 end
 
-function Plugin:_home_rotate()
-    local Screen=Device.screen
-    local current=Screen:getRotationMode()
-    local next_mode
-    if current==Screen.DEVICE_ROTATED_CLOCKWISE then
-        next_mode=Screen.DEVICE_ROTATED_UPSIDE_DOWN
-    elseif current==Screen.DEVICE_ROTATED_UPSIDE_DOWN then
-        next_mode=Screen.DEVICE_ROTATED_COUNTER_CLOCKWISE
-    elseif current==Screen.DEVICE_ROTATED_COUNTER_CLOCKWISE then
-        next_mode=Screen.DEVICE_ROTATED_UPRIGHT
-    else
-        next_mode=Screen.DEVICE_ROTATED_CLOCKWISE
+function Plugin:_orientation_status_label()
+    return Orientation.status_label()
+end
+
+function Plugin:_orientation_icon_key()
+    return Orientation.icon_key()
+end
+
+function Plugin:_orientation_feedback(ok,message)
+    message=U.trim(tostring(message or ""))
+    if message~="" then self:status_toast("屏幕方向",message,3) end
+    return ok==true
+end
+
+function Plugin:_orientation_toggle_lock()
+    local ok,message=Orientation.toggle_session_lock()
+    return self:_orientation_feedback(ok,message)
+end
+
+function Plugin:_show_orientation_panel()
+    local dialog
+    local function run(action)
+        if dialog then UIManager:close(dialog) end
+        local ok,message=action()
+        self:_orientation_feedback(ok,message)
     end
-    UIManager:broadcastEvent(Event:new("SetRotationMode",next_mode))
+    local buttons={
+        {{text="跟随 KOReader",callback=function() run(Orientation.follow_koreader) end}},
+        {{text="锁定当前方向",callback=function() run(Orientation.lock_current) end}},
+        {
+            {text="固定竖屏",callback=function() run(Orientation.set_portrait) end},
+            {text="固定横屏",callback=function() run(Orientation.set_landscape) end},
+        },
+    }
+    if Orientation.has_gsensor() then
+        buttons[#buttons+1]={{text="恢复自动旋转",callback=function() run(Orientation.enable_auto_rotation) end}}
+    end
+    buttons[#buttons+1]={{text="取消",callback=function() UIManager:close(dialog) end}}
+    dialog=ButtonDialog:new{
+        title="屏幕方向\n\n当前："..Orientation.status_label(),
+        title_align="center",
+        buttons=buttons,
+    }
+    UIManager:show(dialog)
     return true
+end
+
+-- Compatibility entry for older internal callers. Rotation is no longer a
+-- blind 90-degree step: it now opens the direction controls.
+function Plugin:_home_rotate()
+    return self:_show_orientation_panel()
 end
 
 function Plugin:_home_full_refresh(confirmed)
@@ -8956,7 +8994,11 @@ function Plugin:show_home_quick_panel(more_expanded)
             callback=function() self:_home_wifi_toggle() end,
             hold_callback=function() self:_home_wifi_settings() end
         },
-        rotate={icon="↻",icon_key="rotate",label="旋转",detail="",callback=function() self:_home_rotate() end},
+        rotate={
+            icon="方向",icon_key=self:_orientation_icon_key(),label="方向锁定",detail=self:_orientation_status_label(),
+            callback=function() self:_orientation_toggle_lock() end,
+            hold_callback=function() self:_show_orientation_panel() end
+        },
         screenshot={icon="▣",icon_key="screenshot",label="截图",detail="",callback=function(anchor) ScreenshotMode.start(self,anchor) end},
         koreader_settings={icon="⚙",icon_key="ko-reader",label="KO设置",detail="",callback=function() self:_show_native_koreader_menu() end},
         return_koreader={icon="←",icon_key="return",label="返回KO",detail="",callback=function() self:_home_close_to_native(true) end},
@@ -9031,6 +9073,7 @@ function Plugin:show_home_quick_panel(more_expanded)
 end
 
 function Plugin:_begin_koreader_exit(reason)
+    Orientation.release_session(reason or "KOReader exit")
     self:_cancel_interactive_network(reason or "KOReader exit")
     self:_cancel_native_menu_guard()
     HOME_EXITING=true
@@ -9811,12 +9854,7 @@ function Plugin:_reader_night_label()
 end
 
 function Plugin:_reader_rotation_label()
-    local screen=Device.screen
-    local mode=screen and screen:getRotationMode() or nil
-    if mode==screen.DEVICE_ROTATED_CLOCKWISE then return "向右横屏" end
-    if mode==screen.DEVICE_ROTATED_UPSIDE_DOWN then return "倒置" end
-    if mode==screen.DEVICE_ROTATED_COUNTER_CLOCKWISE then return "向左横屏" end
-    return "竖屏"
+    return Orientation.status_label()
 end
 
 function Plugin:_reader_status_bar_label()
@@ -10769,7 +10807,7 @@ function Plugin:_show_reader_page_display_panel(back_callback)
             local behavior_rows={
                 {label="刷新频率",value=self:_reader_refresh_rate_label(),value_bold=true,keep_open=true,callback=function() self:_reader_cycle_refresh_rate() end},
                 {label="全屏刷新",value="立即执行",callback=function() self:_home_full_refresh() end},
-                {label="屏幕方向",value=self:_reader_rotation_label(),keep_open=true,callback=function() self:_home_rotate() end},
+                {label="屏幕方向",value=self:_reader_rotation_label(),callback=function() self:_show_orientation_panel() end},
                 {label="夜间模式",value=self:_reader_night_label(),keep_open=true,callback=function() self:_home_toggle_night() end},
             }
             if Device:hasFrontlight() then
@@ -10814,7 +10852,7 @@ function Plugin:_reader_recent_action_definitions()
         page_display={icon="▤",label="页面显示",callback=function() self:_show_reader_page_display_panel() end},
         current_book={icon="□",label="当前书籍",callback=function() self:_show_reader_current_book_panel(function() self:show_reader_quick_panel() end) end},
         downloads={icon="⇩",label="下载管理",callback=function() self:show_downloads(function() self:show_reader_quick_panel() end) end},
-        rotation={icon="↻",label="屏幕方向",callback=function() self:_home_rotate() end},
+        rotation={icon=self:_orientation_icon_key(),label="屏幕方向",callback=function() self:_orientation_toggle_lock() end,hold_callback=function() self:_show_orientation_panel() end},
     }
 end
 
@@ -11131,7 +11169,7 @@ function Plugin:_reader_control_categories()
         {key="device",label="设备",sections={{items={
             {icon="frontlight",label="前光与色温",value=Device:hasFrontlight() and "直接调节" or "当前设备不支持",enabled=Device:hasFrontlight(),callback=function() self:_show_reader_frontlight_panel(back_to("device")) end},
             {icon="wifi",label="Wi-Fi",value=(self:_reader_wifi_summary()),callback=function() self:_show_reader_wifi_quick_panel(back_to("device")) end},
-            {icon="rotate",label="屏幕方向",value=self:_reader_rotation_label(),callback=function() self:_home_rotate() end},
+            {icon=self:_orientation_icon_key(),label="屏幕方向",value=self:_reader_rotation_label(),callback=function() self:_show_orientation_panel() end},
             {icon="screenshot",label="截图",value="截取当前屏幕",callback=function() ScreenshotMode.start(self) end},
             {icon="full-refresh",label="全屏刷新",value="清除残影",callback=function() self:_home_full_refresh() end},
             {icon="sleep",label="休眠",value="立即休眠",enabled=Device:canSuspend(),callback=function() self:_home_sleep() end},
@@ -11310,7 +11348,7 @@ function Plugin:_reader_quick_panel_options()
 
     local device_actions={
         {icon="night",label="夜间模式",active=self:_reader_night_enabled(),callback=function() self:_home_toggle_night() end},
-        {icon="rotate",label="旋转",callback=function() self:_home_rotate() end},
+        {icon=self:_orientation_icon_key(),label="方向锁定",active=Orientation.is_session_locked(),callback=function() self:_orientation_toggle_lock() end,hold_callback=function() self:_show_orientation_panel() end},
         {icon="screenshot",label="截图",callback=function() ScreenshotMode.start(self) end},
         {icon="full-refresh",label="全屏刷新",callback=function() self:_home_full_refresh(true) end},
     }
@@ -18064,6 +18102,10 @@ function Plugin:_thought_edge_page_turn(ges)
 end
 
 function Plugin:_on_thought_tap(ges)
+    -- Reader Gesture Manager keeps priority in configured corner regions.
+    -- This prevents the annotation edge guard from turning a corner action
+    -- into a page turn when a comment link happens to sit under that corner.
+    if GestureBridge.dispatch(ges) then return true end
     if not self.ui or not self.ui.link or not self.ui.link.getLinkFromGes then return false end
     local ok,link=pcall(self.ui.link.getLinkFromGes,self.ui.link,ges); if not ok or not link then return false end
     local href=extract_thought_href(link,{},0); if not href then return false end
@@ -18165,6 +18207,7 @@ function Plugin:_reader_rebuild_cancel(reason,clear_shared)
         READER_REBUILD.pending_width=nil
         READER_REBUILD.pending_height=nil
         READER_REBUILD.pending_rotation=nil
+        READER_REBUILD.internal_hint=false
     end
     if reason then logger.info("[MiuRead][Lifecycle] rebuild watcher cancelled",tostring(reason)) end
     return true
@@ -18323,7 +18366,7 @@ function Plugin:_finish_reader_rebuild_candidate(generation,reason)
         {reason=reason or "rebuild candidate timeout"})
 end
 
-function Plugin:_start_reader_rebuild_candidate(closing_path,session_generation,reason)
+function Plugin:_start_reader_rebuild_candidate(closing_path,session_generation,reason,internal_hint)
     self:_reader_rebuild_cancel(nil,true)
     local now=monotonic_wall_time()
     local path=normalized_reader_file(closing_path)
@@ -18347,16 +18390,23 @@ function Plugin:_start_reader_rebuild_candidate(closing_path,session_generation,
     READER_REBUILD.started_clock=now
     READER_REBUILD.reason=tostring(reason or "CloseDocument without explicit return")
     READER_REBUILD.owner=self
+    READER_REBUILD.internal_hint=internal_hint==true
 
     local recent_dimension=now-(tonumber(HOME_SESSION.last_dimension_event_clock) or 0)<=5
     local recent_resume=now-(tonumber(HOME_SESSION.last_resume_clock) or 0)<=8
     local fuse=(tonumber(READER_REBUILD.safe_until) or 0)>now
-    READER_REBUILD.max_wait=fuse and 5.5 or ((recent_dimension or recent_resume) and 4.2 or 2.4)
+    -- ReaderUI marks reloadDocument()/switchDocument() with tearing_down=true.
+    -- A same-book internal reload on slower Kindle devices can legitimately
+    -- take several seconds, so give that explicit signal a longer bounded
+    -- window without delaying ordinary unrequested closes.
+    READER_REBUILD.max_wait=READER_REBUILD.internal_hint and 18.0
+        or (fuse and 5.5 or ((recent_dimension or recent_resume) and 4.2 or 2.4))
     self:_set_foreground("reader")
     logger.info("[MiuRead][Lifecycle] rebuild candidate",
         "book=",tostring(path or ""),"session=",tostring(READER_REBUILD.session_generation),
         "recent_dimensions=",tostring(recent_dimension),"recent_resume=",tostring(recent_resume),
-        "fuse=",tostring(fuse),"deadline_ms=",tostring(math.floor(READER_REBUILD.max_wait*1000+.5)))
+        "internal_hint=",tostring(READER_REBUILD.internal_hint),"fuse=",tostring(fuse),
+        "deadline_ms=",tostring(math.floor(READER_REBUILD.max_wait*1000+.5)))
 
     local task
     task=function()
@@ -19380,10 +19430,12 @@ function Plugin:onCloseDocument()
     -- rebuild candidate and stay out of Home/FileManager lifecycle until KOReader
     -- either returns a Reader or the bounded deadline proves it really closed.
     self:_prepare_reader_disappearance("reader rebuild candidate")
+    local internal_hint=self.ui and self.ui.tearing_down==true
     logger.info("[MiuRead][Lifecycle] document disappeared","cause=unknown",
-        "book=",tostring(closing_path or ""),"session=",tostring(session_generation))
+        "book=",tostring(closing_path or ""),"session=",tostring(session_generation),
+        "tearing_down=",tostring(internal_hint))
     return self:_start_reader_rebuild_candidate(closing_path,session_generation,
-        "CloseDocument without explicit return")
+        "CloseDocument without explicit return",internal_hint)
 end
 
 function Plugin:onFlushSettings()

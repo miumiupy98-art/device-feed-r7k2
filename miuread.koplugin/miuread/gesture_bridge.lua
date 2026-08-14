@@ -72,7 +72,7 @@ local function configured(gm, id, ges)
     return gm.gestures[id] ~= nil
 end
 
-function Bridge.dispatch(ges)
+function Bridge.dispatch(ges, options)
     if dispatching or type(ges) ~= "table" then return false end
     local ui = active_ui()
     local gm = gesture_manager(ui)
@@ -83,7 +83,12 @@ function Bridge.dispatch(ges)
     for _, zone in ipairs(zones) do
         local def = zone and zone.def
         local id = def and def.id
-        if configured(gm, id, ges) and zone.gs_range and type(zone.handler) == "function" then
+        local allowed = true
+        if type(options) == "table" and type(options.id_filter) == "function" then
+            local ok_filter, value = pcall(options.id_filter, id)
+            allowed = ok_filter and value == true
+        end
+        if allowed and configured(gm, id, ges) and zone.gs_range and type(zone.handler) == "function" then
             local ok_match, matches = pcall(zone.gs_range.match, zone.gs_range, ges)
             if ok_match and matches then
                 local ok_action, consumed = xpcall(function()
@@ -110,6 +115,17 @@ function Bridge.dispatch(ges)
     return false
 end
 
+
+function Bridge.dispatchEdge(ges)
+    return Bridge.dispatch(ges, {
+        id_filter = function(id)
+            if type(id) ~= "string" then return false end
+            return id:find("_corner", 1, true) ~= nil
+                or id:find("_edge_", 1, true) ~= nil
+        end,
+    })
+end
+
 function Bridge.handle(base, widget, event)
     if event and event.handler == "onGesture" then
         local ges = event.args and event.args[1]
@@ -117,11 +133,29 @@ function Bridge.handle(base, widget, event)
         local pointer_action = gesture == "tap" or gesture == "hold"
             or gesture == "hold_release" or gesture == "double_tap"
             or gesture == "two_finger_tap"
-        -- Buttons, title bars and close icons on the visible MiuRead page must
-        -- receive pointer input before anything below it. Forwarding these
-        -- gestures first is what made native Menu title-bar close buttons look
-        -- tappable while their tap was actually consumed underneath.
-        if pointer_action then return base.handleEvent(widget, event) end
+        -- Buttons, cards and title-bar controls on the visible MiuRead surface
+        -- always get pointer input first. Temporarily disable the fullscreen
+        -- propagation fence while asking the widget tree whether it actually
+        -- consumed the gesture; otherwise that fence would make every blank
+        -- tap look consumed and KOReader corner gestures could never run.
+        if pointer_action then
+            local old_stop = widget.stop_events_propagation
+            if old_stop == true then widget.stop_events_propagation = false end
+            local ok_base, consumed = xpcall(function()
+                return base.handleEvent(widget, event)
+            end, debug.traceback)
+            widget.stop_events_propagation = old_stop
+            if not ok_base then
+                logger.warn("[MiuRead][GestureBridge] visible surface handler failed", tostring(consumed))
+                return old_stop == true
+            end
+            if consumed then return true end
+            if Bridge.dispatch(ges) then return true end
+            -- A fullscreen MiuRead surface still owns otherwise-unused taps;
+            -- only configured Gesture Manager actions are allowed through.
+            if old_stop == true then return true end
+            return consumed
+        end
         if Bridge.dispatch(ges) then return true end
     end
     return base.handleEvent(widget, event)

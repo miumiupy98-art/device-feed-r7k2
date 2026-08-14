@@ -251,7 +251,7 @@ local function plain_action_item(entry, width, height, activate, hold_activate)
     return tap
 end
 
-local function compact_action_item(entry, width, height, activate)
+local function compact_action_item(entry, width, height, activate, hold_activate)
     entry = type(entry) == "table" and entry or {}
     local enabled = entry.enabled ~= false
     local icon_w = Skin.dp(34, 29, 44)
@@ -270,6 +270,9 @@ local function compact_action_item(entry, width, height, activate)
         dimen = Geom:new{w = width, h = height},
         enabled = enabled,
         callback = function() activate(entry.callback, entry.label or "功能") end,
+        hold_callback = entry.hold_callback and function()
+            hold_activate(entry.hold_callback, entry.label or "功能")
+        end or nil,
     }
     tap[1] = CenterContainer:new{dimen = Geom:new{w = width, h = height}, content}
     return tap
@@ -581,7 +584,8 @@ function Toolbar:_device_row(root, entries, x, y, width, height)
         root[#root + 1] = OffsetContainer:new{
             x_off = cell_x, y_off = y,
             compact_action_item(entry, actual_w, height,
-                function(action, label) self:_activate(action, label) end),
+                function(action, label) self:_activate(action, label) end,
+                function(action, label) self:_activate_hold(action, label) end),
         }
     end
 end

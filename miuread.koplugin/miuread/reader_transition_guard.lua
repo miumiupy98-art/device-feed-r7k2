@@ -1,3 +1,5 @@
+local Blitbuffer = require("ffi/blitbuffer")
+local Device = require("device")
 local Geom = require("ui/geometry")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -8,26 +10,38 @@ local live_guard
 local Guard = WidgetContainer:extend{
     name = "miuread_reader_transition_guard",
     _miuread_transition_guard = true,
-    covers_fullscreen = false,
+    covers_fullscreen = true,
     modal = false,
-    stop_events_propagation = false,
+    stop_events_propagation = true,
 }
 
 function Guard:init()
-    self.dimen = Geom:new{x = 0, y = 0, w = 0, h = 0}
+    self.dimen = Geom:new{x = 0, y = 0, w = Device.screen:getWidth(), h = Device.screen:getHeight()}
 end
 
 function Guard:getSize()
+    self.dimen.w = Device.screen:getWidth()
+    self.dimen.h = Device.screen:getHeight()
     return self.dimen
 end
 
-function Guard:paintTo()
-    -- Intentionally invisible. This widget only keeps UIManager's stack alive
-    -- while ReaderUI hands control back to FileManager/MiuRead.
+function Guard:paintTo(bb)
+    -- Keep the parked MiuRead home completely hidden between two ReaderUI
+    -- instances. The new reader paints over this as soon as it is ready.
+    local w, h = Device.screen:getWidth(), Device.screen:getHeight()
+    self.dimen.w, self.dimen.h = w, h
+    bb:paintRect(0, 0, w, h, Blitbuffer.COLOR_WHITE)
 end
 
 function Guard:handleEvent()
-    return false
+    -- During normal reading the real ReaderUI remains above this guard and owns
+    -- input. Between ReaderUI instances, consume input so taps cannot reach the
+    -- parked home underneath.
+    local ok_reader, ReaderUI = pcall(require, "apps/reader/readerui")
+    if ok_reader and ReaderUI and ReaderUI.instance and ReaderUI.instance.document then
+        return false
+    end
+    return true
 end
 
 function Guard:onCloseWidget()
