@@ -68,6 +68,7 @@ local ReaderListDialog=require("miuread.reader_list_dialog")
 local ReaderControlCenter=require("miuread.reader_control_center")
 local ReaderProgressDialog=require("miuread.reader_progress_dialog")
 local ReaderSettingsDialog=require("miuread.reader_settings_dialog")
+local ReaderTypographyDialog=require("miuread.reader_typography_dialog")
 local ReaderTocDialog=require("miuread.reader_toc_dialog")
 local ReaderFrontlightDialog=require("miuread.reader_frontlight_dialog")
 local DataMigration=require("miuread.data_migration")
@@ -9945,28 +9946,40 @@ function Plugin:_thoughts_enabled_label()
     return self:_thoughts_enabled() and "已开启" or "已关闭"
 end
 
-function Plugin:_thought_font_size_label()
-    local level=tostring((self.store:preferences().thoughts or {}).font or "standard")
-    local labels={small="小（18）",standard="标准（22）",large="大（26）",xlarge="特大（30）"}
-    return labels[level] or labels.standard
+function Plugin:_thought_font_size_value(prefs)
+    prefs=prefs or (self.store:preferences().thoughts or {})
+    local numeric=tonumber(prefs.font_size)
+    if numeric then return math.max(12,math.min(48,math.floor(numeric+.5))) end
+    local legacy={small=18,standard=22,large=26,xlarge=30}
+    return legacy[tostring(prefs.font or "standard")] or 22
 end
 
-function Plugin:_set_thought_font_size(level)
-    local allowed={small=true,standard=true,large=true,xlarge=true}
-    level=allowed[tostring(level or "")] and tostring(level) or "standard"
+function Plugin:_thought_font_size_label()
+    return tostring(self:_thought_font_size_value())
+end
+
+function Plugin:_set_thought_font_size(value,quiet)
     local p=self.store:preferences(); p.thoughts=p.thoughts or {}
-    p.thoughts.font=level
-    self:_save_ui_preferences(p,"thought_font")
+    local target=math.max(12,math.min(48,math.floor((tonumber(value) or self:_thought_font_size_value(p.thoughts))+.5)))
+    p.thoughts.font_size=target
+    -- Keep the legacy field readable for one compatibility cycle, but the
+    -- continuous numeric value is authoritative from beta.8 onward.
+    p.thoughts.font=nil
+    self:_save_ui_preferences(p,"thought_font_size")
     self:_refresh_thought_display(p.thoughts)
-    self:toast("评论字号已设为："..self:_thought_font_size_label(),2)
+    if quiet~=true then self:toast("评论字号："..tostring(target),1.2) end
     return true
+end
+
+function Plugin:_adjust_thought_font_size(delta)
+    return self:_set_thought_font_size(self:_thought_font_size_value()+(tonumber(delta) or 0),true)
 end
 
 function Plugin:_refresh_thought_display(prefs)
     prefs=prefs or (self.store:preferences().thoughts or {})
     if ThoughtNativePopup and type(ThoughtNativePopup.refresh_font)=="function" then
         pcall(ThoughtNativePopup.refresh_font,
-            self:_thought_font_size(prefs.font or "standard"),
+            self:_thought_font_size(self:_thought_font_size_value(prefs)),
             self:_thought_font_name(prefs))
     end
 end
@@ -9981,29 +9994,55 @@ end
 
 function Plugin:_show_reader_comment_settings(back_callback)
     local return_to_comments=function() self:_show_reader_comment_settings(back_callback) end
-    ReaderSettingsDialog.show{
+    local function comment_preview_text()
+        return "这是一段评论文字，用来预览当前字体、字号和实际阅读效果。"
+    end
+    ReaderTypographyDialog.show{
         title="评论显示",
         subtitle=function()
-            if not self:_thoughts_enabled() then return "阅读评论已关闭, 划线与本地评论数据仍保留" end
+            if not self:_thoughts_enabled() then return "阅读评论已关闭 · 划线与评论数据仍保留" end
             local prefs=self.store:preferences().thoughts or {}
-            return (prefs.follow_body_font==true and "字体跟随正文" or self:_thought_font_face_label(prefs)).." · "..self:_thought_font_size_label()
+            return (prefs.follow_body_font==true and "字体跟随正文" or self:_thought_font_face_label(prefs)).." · 字号 "..self:_thought_font_size_label()
         end,
         on_back=back_callback or function() self:show_reader_quick_panel() end,
         on_home=function() return self:return_to_miuread_home("reader surface") end,
-        rows=function()
+        controls=function()
             local prefs=self.store:preferences().thoughts or {}
             local follow=prefs.follow_body_font==true
-            local level=tostring(prefs.font or "standard")
             return {
-                {label="阅读评论",value=self:_thoughts_enabled_label(),value_bold=true,keep_open=true,callback=function() self:_toggle_thoughts_enabled() end},
-                {label="评论字体跟随正文",value=follow and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:_toggle_thought_follow_body_font() end},
-                {label="固定字体",value=self:_thought_font_face_label(prefs),enabled=not follow,callback=function()
+                {kind="select",label="阅读评论",value=self:_thoughts_enabled_label(),value_bold=true,callback=function() self:_toggle_thoughts_enabled() end},
+                {kind="select",label="评论字体",value=follow and ("跟随正文 · "..self:_reader_font_label()) or self:_thought_font_face_label(prefs),close=true,callback=function()
                     self:_show_reader_menu_table("评论字体",self:thought_font_face_menu(),return_to_comments)
                 end},
-                {label="小",value=level=="small" and "18 · 已选择" or "18",checked=level=="small",keep_open=true,callback=function() self:_set_thought_font_size("small") end},
-                {label="标准",value=level=="standard" and "22 · 已选择" or "22",checked=level=="standard",keep_open=true,callback=function() self:_set_thought_font_size("standard") end},
-                {label="大",value=level=="large" and "26 · 已选择" or "26",checked=level=="large",keep_open=true,callback=function() self:_set_thought_font_size("large") end},
-                {label="特大",value=level=="xlarge" and "30 · 已选择" or "30",checked=level=="xlarge",keep_open=true,callback=function() self:_set_thought_font_size("xlarge") end},
+                {kind="step",label="字号",value=function() return self:_thought_font_size_label() end,
+                    on_decrease=function() self:_adjust_thought_font_size(-1) end,
+                    on_increase=function() self:_adjust_thought_font_size(1) end,
+                    on_decrease_hold=function() self:_adjust_thought_font_size(-3) end,
+                    on_increase_hold=function() self:_adjust_thought_font_size(3) end},
+                {kind="select",label="跟随正文字体",value=follow and "已开启" or "已关闭",value_bold=true,callback=function() self:_toggle_thought_follow_body_font() end},
+            }
+        end,
+        preview_label="评论预览",
+        preview_text=comment_preview_text,
+        preview_font=function() return self:_thought_font_name(self.store:preferences().thoughts or {}) end,
+        preview_size=function() return self:_thought_font_size_value() end,
+        preview_line_height=.18,
+        actions=function()
+            return {
+                {label="恢复默认",callback=function()
+                    local p=self.store:preferences(); p.thoughts=p.thoughts or {}
+                    p.thoughts.font_size=22; p.thoughts.font=nil; p.thoughts.font_face=""; p.thoughts.follow_body_font=false
+                    self:_save_ui_preferences(p,"thought_font_reset")
+                    self:_refresh_thought_display(p.thoughts)
+                    self:toast("评论显示已恢复默认",1.5)
+                end},
+                {label="应用到全部评论",primary=true,callback=function()
+                    -- 评论显示偏好本身就是觅阅全局偏好；这里显式保存并
+                    -- 给用户一个明确的“应用到全部”操作，而不再另造一份状态。
+                    local p=self.store:preferences(); p.thoughts=p.thoughts or {}
+                    self:_save_ui_preferences(p,"thought_font_global")
+                    self:toast("已应用到全部评论",1.5)
+                end},
             }
         end,
     }
@@ -10019,13 +10058,17 @@ function Plugin:_reader_font_label()
     return name~="" and name or "KOReader 默认"
 end
 
-function Plugin:_reader_font_size_label()
+function Plugin:_reader_font_size_value()
     local ui=self.ui
     local font=ui and ui.font
     local configurable=ui and ui.document and ui.document.configurable or nil
-    local current=font and tonumber(font.font_size)
+    return font and tonumber(font.font_size)
         or (ui and ui.rolling and tonumber(ui.rolling.font_size))
         or (configurable and tonumber(configurable.font_size))
+end
+
+function Plugin:_reader_font_size_label()
+    local current=self:_reader_font_size_value()
     return current and tostring(math.floor(current+.5)) or "未知"
 end
 
@@ -10900,29 +10943,78 @@ function Plugin:_reader_show_history(back_callback)
         return false
     end,back_callback or function() self:show_reader_quick_panel() end)
 end
+function Plugin:_reader_apply_typography_defaults()
+    if not (G_reader_settings and type(G_reader_settings.saveSetting)=="function") then
+        self:info("当前 KOReader 暂时无法保存全局排版默认")
+        return false
+    end
+    local face=self:_reader_font_label()
+    local size=self:_reader_font_size_value()
+    local weight=self:_reader_font_weight_value()
+    local spacing=self:_reader_line_spacing_value()
+    if face and face~="" and face~="KOReader 默认" then G_reader_settings:saveSetting("cre_font",face) end
+    if size then G_reader_settings:saveSetting("copt_font_size",size) end
+    G_reader_settings:saveSetting("copt_font_base_weight",weight)
+    G_reader_settings:saveSetting("copt_line_spacing",spacing)
+    if type(G_reader_settings.flush)=="function" then pcall(G_reader_settings.flush,G_reader_settings) end
+    self:toast("已设为 KOReader 全部书籍默认",1.8)
+    return true
+end
+
+function Plugin:_reader_restore_typography_defaults()
+    local size=G_reader_settings and tonumber(G_reader_settings:readSetting("copt_font_size")) or nil
+    local weight=G_reader_settings and tonumber(G_reader_settings:readSetting("copt_font_base_weight")) or nil
+    local spacing=G_reader_settings and tonumber(G_reader_settings:readSetting("copt_line_spacing")) or nil
+    if size then
+        local current=self:_reader_font_size_value()
+        if current then self:_reader_adjust_font_size(size-current) end
+    end
+    if weight then self:_reader_set_font_weight(weight) end
+    if spacing then self:_reader_set_line_spacing(spacing) end
+    local default_face=G_reader_settings and tostring(G_reader_settings:readSetting("cre_font") or "") or ""
+    local font=self.ui and self.ui.font or nil
+    if default_face~="" and font and type(font.onSetFont)=="function" then pcall(font.onSetFont,font,default_face) end
+    self:toast("已恢复 KOReader 默认排版",1.5)
+    return true
+end
+
 function Plugin:_show_reader_font_panel(back_callback)
     local return_to_font=function() self:_show_reader_font_panel(back_callback) end
-    ReaderSettingsDialog.show{
-        title="字体",
+    ReaderTypographyDialog.show{
+        title="字体与排版",
         subtitle=function() return self:_reader_font_label().." · 字号 "..self:_reader_font_size_label() end,
-        hero=function()
-            return {
-                value=self:_reader_font_size_label(),
-                on_decrease=function() self:_reader_adjust_font_size(-1) end,
-                on_increase=function() self:_reader_adjust_font_size(1) end,
-            }
-        end,
         on_back=back_callback or function() self:show_reader_quick_panel() end,
         on_home=function() return self:return_to_miuread_home("reader surface") end,
-        sections=function()
+        controls=function()
             return {
-                {title="字体",rows={
-                    {label="正文字体",value=self:_reader_font_label(),callback=function() self:_show_reader_font_face_menu(return_to_font) end},
-                    {label="字体粗细",value=self:_reader_font_weight_label(),callback=function() self:_show_reader_weight_panel(return_to_font) end},
-                }},
-                {title="更多",rows={
-                    {label="高级排版",value="版式与字符间距",callback=function() self:_show_reader_advanced_typeset_panel(return_to_font) end},
-                }},
+                {kind="select",label="字体",value=self:_reader_font_label(),close=true,callback=function() self:_show_reader_font_face_menu(return_to_font) end},
+                {kind="step",label="字号",value=function() return self:_reader_font_size_label() end,
+                    on_decrease=function() self:_reader_adjust_font_size(-1) end,on_increase=function() self:_reader_adjust_font_size(1) end,
+                    on_decrease_hold=function() self:_reader_adjust_font_size(-3) end,on_increase_hold=function() self:_reader_adjust_font_size(3) end},
+                {kind="step",label="字重",value=function() return string.format("%.2f",self:_reader_font_weight_value()) end,
+                    on_decrease=function() self:_reader_adjust_font_weight(-.25) end,on_increase=function() self:_reader_adjust_font_weight(.25) end,
+                    on_decrease_hold=function() self:_reader_adjust_font_weight(-.5) end,on_increase_hold=function() self:_reader_adjust_font_weight(.5) end},
+                {kind="step",label="行距",value=function() return tostring(math.floor(self:_reader_line_spacing_value()+.5)).."%" end,
+                    on_decrease=function() self:_reader_adjust_line_spacing(-5) end,on_increase=function() self:_reader_adjust_line_spacing(5) end,
+                    on_decrease_hold=function() self:_reader_adjust_line_spacing(-10) end,on_increase_hold=function() self:_reader_adjust_line_spacing(10) end},
+                {kind="select",label="高级排版",value="字符间距与更多版式",close=true,callback=function() self:_show_reader_advanced_typeset_panel(return_to_font) end},
+            }
+        end,
+        preview_label="正文预览",
+        preview_text="阅读是一件很私人的事情。合适的字体、字号和行距，会直接影响长时间阅读体验。",
+        preview_font=function()
+            local font=self.ui and self.ui.font or nil
+            return font and font.font_face or nil
+        end,
+        preview_size=function() return math.max(12,math.min(48,self:_reader_font_size_value() or 22)) end,
+        preview_line_height=function()
+            local spacing=self:_reader_line_spacing_value()
+            return math.max(.05,math.min(.60,(spacing-100)/180+.12))
+        end,
+        actions=function()
+            return {
+                {label="恢复当前书籍",callback=function() self:_reader_restore_typography_defaults() end},
+                {label="设为全部书籍默认",primary=true,callback=function() self:_reader_apply_typography_defaults() end},
             }
         end,
     }
@@ -11256,37 +11348,121 @@ function Plugin:_reader_refresh_rate_label()
     return "每 "..tostring(math.floor(rate+.5)).." 页"
 end
 
+function Plugin:_reader_refresh_rates()
+    local day,night
+    if type(UIManager.getRefreshRate)=="function" then
+        local ok,a,b=pcall(UIManager.getRefreshRate,UIManager)
+        if ok then day,night=tonumber(a),tonumber(b) end
+    end
+    if day==nil then day=tonumber(UIManager.FULL_REFRESH_COUNT) end
+    if night==nil then night=day end
+    return day,night
+end
+
+function Plugin:_reader_set_refresh_rates(day,night)
+    if UIManager and type(UIManager.broadcastEvent)=="function" then
+        UIManager:broadcastEvent(Event:new("SetRefreshRates",day,night))
+        return true
+    end
+    return false
+end
+
+function Plugin:_reader_set_both_refresh_rates(rate)
+    if UIManager and type(UIManager.broadcastEvent)=="function" then
+        UIManager:broadcastEvent(Event:new("SetBothRefreshRates",rate))
+        return true
+    end
+    return false
+end
+
+function Plugin:_reader_refresh_custom_values(index)
+    index=math.max(1,math.min(3,math.floor(tonumber(index) or 1)))
+    local key="refresh_rate_"..tostring(index)
+    local defaults={12,22,99}
+    local day=G_reader_settings and tonumber(G_reader_settings:readSetting(key)) or nil
+    local night=G_reader_settings and tonumber(G_reader_settings:readSetting("night_"..key)) or nil
+    day=day or defaults[index]
+    night=night or day
+    return day,night,key
+end
+
+function Plugin:_reader_edit_refresh_custom(index,back_callback)
+    local day,night,key=self:_reader_refresh_custom_values(index)
+    local ok,DoubleSpinWidget=pcall(require,"ui/widget/doublespinwidget")
+    if not ok or not DoubleSpinWidget then self:info("当前 KOReader 暂时无法编辑自定义刷新频率"); return false end
+    local widget
+    widget=DoubleSpinWidget:new{
+        title_text="自定义刷新 "..tostring(index),
+        info_text="普通与夜间模式分别设置全刷间隔；-1 表示每章。",
+        left_value=day,left_min=-1,left_max=200,left_step=1,left_hold_step=10,left_text="普通",
+        right_value=night,right_min=-1,right_max=200,right_step=1,right_hold_step=10,right_text="夜间",
+        ok_text="保存",
+        callback=function(left,right)
+            if G_reader_settings then
+                G_reader_settings:saveSetting(key,left)
+                G_reader_settings:saveSetting("night_"..key,right)
+            end
+            self:_reader_set_refresh_rates(left,right)
+        end,
+        close_callback=function() if back_callback then UIManager:scheduleIn(.05,back_callback) end end,
+    }
+    UIManager:show(widget)
+    return true
+end
+
+function Plugin:_show_reader_refresh_settings(back_callback)
+    local return_to_refresh=function() self:_show_reader_refresh_settings(back_callback) end
+    ReaderSettingsDialog.show{
+        title="刷新设置",
+        subtitle=function()
+            local day,night=self:_reader_refresh_rates()
+            local function label(v)
+                if v==nil then return "默认" end
+                if v==0 then return "从不" end
+                if v<0 then return "每章" end
+                if v==1 then return "每页" end
+                return "每 "..tostring(math.floor(v+.5)).." 页"
+            end
+            return "普通 "..label(day).." · 夜间 "..label(night)
+        end,
+        on_back=back_callback or function() self:_show_reader_page_display_panel() end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
+        sections=function()
+            local day,night=self:_reader_refresh_rates()
+            local rows={
+                {label="从不全刷",value="0",checked=day==0 and night==0,keep_open=true,callback=function() self:_reader_set_both_refresh_rates(0) end},
+                {label="每页",value="1",checked=day==1 and night==1,keep_open=true,callback=function() self:_reader_set_both_refresh_rates(1) end},
+                {label="每 6 页",value="6",checked=day==6 and night==6,keep_open=true,callback=function() self:_reader_set_both_refresh_rates(6) end},
+            }
+            for index=1,3 do
+                local d,n=self:_reader_refresh_custom_values(index)
+                local i=index
+                rows[#rows+1]={label="自定义 "..tostring(i),value=tostring(d).." / "..tostring(n),checked=day==d and night==n,callback=function()
+                    self:_reader_edit_refresh_custom(i,return_to_refresh)
+                end}
+            end
+            rows[#rows+1]={label="每章",value="-1",checked=day==-1 and night==-1,keep_open=true,callback=function() self:_reader_set_both_refresh_rates(-1) end}
+            local chapter=G_reader_settings and G_reader_settings:isTrue("refresh_on_chapter_boundaries") or false
+            local second=G_reader_settings and G_reader_settings:isTrue("no_refresh_on_second_chapter_page") or false
+            local images=G_reader_settings and G_reader_settings:nilOrTrue("refresh_on_pages_with_images") or true
+            return {
+                {title="全刷频率",rows=rows},
+                {title="附加规则",rows={
+                    {label="章节开始始终全刷",value=chapter and "已开启" or "已关闭",keep_open=true,callback=function() UIManager:broadcastEvent(Event:new("ToggleFlashOnChapterBoundaries")) end},
+                    {label="新章节第二页不全刷",value=second and "已开启" or "已关闭",keep_open=true,callback=function() UIManager:broadcastEvent(Event:new("ToggleNoFlashOnSecondChapterPage")) end},
+                    {label="含图片页面始终全刷",value=images and "已开启" or "已关闭",keep_open=true,callback=function() UIManager:broadcastEvent(Event:new("ToggleFlashOnPagesWithImages")) end},
+                    {label="立即全屏刷新",value="清除当前残影",callback=function() self:_home_full_refresh() end},
+                }},
+            }
+        end,
+    }
+    return true
+end
+
 function Plugin:_reader_cycle_refresh_rate()
-    local listener=self:_koreader_device_listener()
-    if not listener then
-        self:info("当前 KOReader 暂时无法调整刷新频率")
-        return false
-    end
-    local values={1,6,12,24,48}
-    local current=tonumber(UIManager.FULL_REFRESH_COUNT)
-    if not current and type(UIManager.getRefreshRate)=="function" then
-        local ok,value=pcall(UIManager.getRefreshRate,UIManager)
-        if ok then current=tonumber(value) end
-    end
-    local target=values[1]
-    for index,value in ipairs(values) do
-        if current and current<=value then
-            target=current<value and value or values[index%#values+1]
-            break
-        end
-    end
-    local night=self:_reader_night_enabled()
-    local method=night and listener.onSetNightRefreshRate or listener.onSetDayRefreshRate
-    if type(method)~="function" then
-        self:info("当前 KOReader 暂时无法调整刷新频率")
-        return false
-    end
-    local ok,err=pcall(method,listener,target)
-    if not ok then
-        logger.warn("[MiuRead][Refresh] native refresh-rate change failed",tostring(err))
-        self:info("刷新频率调整失败")
-    end
-    return ok
+    -- Kept for compatibility with old dispatcher callbacks. The visible entry
+    -- now opens the complete KOReader-compatible refresh settings page.
+    return self:_show_reader_refresh_settings()
 end
 
 function Plugin:_show_reader_page_display_panel(back_callback)
@@ -11308,7 +11484,7 @@ function Plugin:_show_reader_page_display_panel(back_callback)
                 info_rows[#info_rows+1]={label="电量",value=self:_reader_footer_setting_label("battery"),keep_open=true,callback=function() self:_reader_toggle_footer_setting("battery") end}
             end
             local behavior_rows={
-                {label="刷新频率",value=self:_reader_refresh_rate_label(),value_bold=true,keep_open=true,callback=function() self:_reader_cycle_refresh_rate() end},
+                {label="刷新频率",value=self:_reader_refresh_rate_label(),value_bold=true,callback=function() self:_show_reader_refresh_settings(function() self:_show_reader_page_display_panel(back_callback) end) end},
                 {label="全屏刷新",value="立即执行",callback=function() self:_home_full_refresh() end},
                 {label="屏幕方向",value=self:_reader_rotation_label(),callback=function() self:_show_orientation_panel() end},
                 {label="夜间模式",value=self:_reader_night_label(),keep_open=true,callback=function() self:_home_toggle_night() end},
@@ -11537,7 +11713,7 @@ function Plugin:_show_reader_refresh_panel(back_callback)
         on_home=function() return self:return_to_miuread_home("reader surface") end,
         rows=function()
             return {
-                {label="刷新频率",value=self:_reader_refresh_rate_label(),value_bold=true,keep_open=true,callback=function() self:_reader_cycle_refresh_rate() end},
+                {label="刷新频率",value=self:_reader_refresh_rate_label(),value_bold=true,callback=function() self:_show_reader_refresh_settings(function() self:_show_reader_refresh_panel(back_callback) end) end},
                 {label="全屏刷新",value="立即执行",callback=function() self:_home_full_refresh() end},
                 {label="夜间模式",value=self:_reader_night_label(),keep_open=true,callback=function() self:_home_toggle_night() end},
                 {label="页面显示",value="状态栏与阅读信息",callback=function() self:_show_reader_page_display_panel(function() self:_show_reader_refresh_panel(back_callback) end) end},
@@ -17811,7 +17987,7 @@ function Plugin:thought_font_settings_menu()
         {text="固定字体",post_text=self:_thought_font_face_label(prefs),enabled_func=function()
             return (self.store:preferences().thoughts or {}).follow_body_font~=true
         end,sub_item_table_func=function() return self:thought_font_face_menu() end},
-        {text="字体大小",sub_item_table_func=function() return self:thought_font_menu() end},
+        {text="字体大小",post_text=self:_thought_font_size_label(),sub_item_table_func=function() return self:thought_font_menu() end},
     }
 end
 
@@ -17906,16 +18082,18 @@ function Plugin:thought_font_face_menu()
     return rows
 end
 function Plugin:thought_font_menu()
-    local choices={{"small","小"},{"standard","标准（默认）"},{"large","大"},{"xlarge","特大"}}
+    local choices={18,22,26,30}
     local rows={}
-    for _,choice in ipairs(choices) do
-        local key,label=choice[1],choice[2]
-        rows[#rows+1]={text=label,radio=true,checked_func=function() return tostring((self.store:preferences().thoughts or {}).font or "standard")==key end,callback=function()
-            self:_set_thought_font_size(key)
+    for _,value in ipairs(choices) do
+        local target=value
+        rows[#rows+1]={text=tostring(target),radio=true,checked_func=function() return self:_thought_font_size_value()==target end,callback=function()
+            self:_set_thought_font_size(target)
         end}
     end
+    rows[#rows+1]={text="阅读界面可用 − / + 精细调整",enabled=false}
     return rows
 end
+
 function Plugin:_download_dir_path()
     local custom=U.trim((self.store:preferences() or {}).download_dir or "")
     if custom~="" then return custom end
@@ -18336,14 +18514,24 @@ function Plugin:_teardown_thought_tap()
     if self._thought_tap_setup and self.ui and self.ui.unRegisterTouchZones then pcall(function() self.ui:unRegisterTouchZones({{id="miuread_thought_popup",overrides={"tap_link"}}}) end) end
     self._thought_tap_setup=nil
 end
-function Plugin:_thought_font_size(level)
-    -- These are final KOReader font-size values, matching the scale used by
-    -- document text. Each level is scaled exactly once for the current device;
-    -- no hidden ratio or legacy level conversion is applied afterwards.
-    local nominal={small=18,standard=22,large=26,xlarge=30}
-    local value=nominal[tostring(level or "standard")] or nominal.standard
-    return math.max(value,Device.screen:scaleBySize(value))
+function Plugin:_thought_font_size(value)
+    -- The native comment popup uses this same final size for layout metrics and
+    -- glyph rendering. The popup explicitly uses ThoughtFaceFactory:getFinalFace()
+    -- so the device scale is applied exactly once. UI preview callers stay logical.
+    local logical
+    if tonumber(value) then logical=math.max(12,math.min(48,math.floor(tonumber(value)+.5)))
+    else
+        local legacy={small=18,standard=22,large=26,xlarge=30}
+        logical=legacy[tostring(value or "standard")] or 22
+    end
+    local scaled=logical
+    if Device and Device.screen and type(Device.screen.scaleBySize)=="function" then
+        local ok,result=pcall(Device.screen.scaleBySize,Device.screen,logical)
+        if ok and tonumber(result) then scaled=math.max(logical,math.floor(tonumber(result)+.5)) end
+    end
+    return scaled
 end
+
 local function usable_font_name(value)
     if type(value)~="string" then return nil end
     value=value:match("^%s*(.-)%s*$")
@@ -18501,7 +18689,7 @@ function Plugin:_open_thought_info(info,generation)
                 tostring(info.book_id or ""), tostring(info.chapter_uid or ""),
                 tostring(info.range or ""), tostring(native_signature or ""),
             }, "|"),
-            font_size=self:_thought_font_size(prefs.font),
+            font_size=self:_thought_font_size(self:_thought_font_size_value(prefs)),
             font_name=self:_thought_font_name(prefs),
             width_ratio=tonumber(prefs.width_ratio) or 0.91,
             height_ratio=tonumber(prefs.height_ratio) or 0.55,

@@ -244,7 +244,7 @@ end
 local function make_face(name, size, fallback)
     local requested = clean(name)
     if requested == "" then requested = nil end
-    local ok, value = pcall(ThoughtFaceFactory.getFace, ThoughtFaceFactory, requested, size, fallback or "cfont")
+    local ok, value = pcall(ThoughtFaceFactory.getFinalFace, ThoughtFaceFactory, requested, size, fallback or "cfont")
     if ok and value then return value end
     if requested then
         ok, value = pcall(function() return Font:getFace(requested, size) end)
@@ -393,8 +393,9 @@ function NativePopup:_measure_piece(piece, width, metrics)
 end
 
 function NativePopup:_layout_metrics(base_size)
-    -- font_size already contains KOReader's device scaling. Preserve the four
-    -- user-visible levels instead of squeezing every device into 16–22 px.
+    -- font_size already contains KOReader's device scaling. beta.8 keeps this
+    -- final-size contract and asks ThoughtFaceFactory:getFinalFace() to avoid
+    -- scaling the glyph face a second time.
     local body_size = math.max(12, math.floor((tonumber(base_size) or 15) + .5))
     local meta_size = math.max(10, math.floor(body_size * .72 + .5))
     local source_size = math.max(11, math.floor(body_size * .82 + .5))
