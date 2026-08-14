@@ -52,7 +52,6 @@ local ScreenshotMode=require("miuread.screenshot_mode")
 local GestureBridge=require("miuread.gesture_bridge")
 local Orientation=require("miuread.orientation_controller")
 local HomeData=require("miuread.home_data")
-local Bluetooth=require("miuread.bluetooth")
 local TimeZone=require("miuread.timezone")
 local UiScale=require("miuread.ui_scale")
 local LocalLibrary=require("miuread.local_library")
@@ -410,7 +409,6 @@ function Plugin:init()
     math.randomseed(os.time()+math.floor(collectgarbage("count")))
     sync_home_session()
     self.store=Store:new()
-    Bluetooth.prime(.75)
     local runtime_mode=rawget(_G,RUNTIME_MODE_KEY)
     if runtime_mode~="desktop" and runtime_mode~="plugin" then
         local configured=((self.store:preferences().home_ui or {}).enabled~=false)
@@ -2344,14 +2342,22 @@ function Plugin:show_shelf(mp_mode,force_remote,section)
 end
 
 
-function Plugin:_bluetooth_state(force)
-    if force==true then return Bluetooth.refresh(true) end
-    return Bluetooth.peek()
+function Plugin:_bluetooth_state(_force)
+    -- Bluetooth is owned by KOReader's loaded Bluetooth controller/plugin.
+    -- MiuRead only exposes the existing capability in its toolbar.
+    local manager=rawget(_G,"KOBluetoothStateManager")
+    local controller=rawget(_G,"_bt_controller_instance")
+    if not manager or not controller or type(manager.isOn)~="function" then
+        return {known=true,supported=false,enabled=false}
+    end
+    local ok,enabled=pcall(function() return manager:isOn()==true end)
+    if not ok then return {known=false,supported=true,enabled=false} end
+    return {known=true,supported=true,enabled=enabled==true}
 end
 
 function Plugin:_bluetooth_supported()
     local state=self:_bluetooth_state(false)
-    return state.known==true and state.supported==true
+    return state.supported==true
 end
 
 function Plugin:_home_panel_item_available(key)
@@ -2361,26 +2367,12 @@ function Plugin:_home_panel_item_available(key)
 end
 
 function Plugin:_bluetooth_toggle()
-    local state=Bluetooth.refresh(true)
-    if state.supported~=true then
-        self:toast("当前设备暂不支持觅阅蓝牙控制",2)
+    if not self:_bluetooth_supported() then
+        self:toast("当前 KOReader 未提供蓝牙控制",2)
         return false
     end
-    local target=state.enabled~=true
-    local ok=Bluetooth.set_enabled(target)
-    if not ok then
-        self:toast("蓝牙切换失败，请在设备设置中操作",3)
-        return false
-    end
-    self:toast(target and "正在开启蓝牙…" or "正在关闭蓝牙…",1.5)
-    UIManager:scheduleIn(.45,function()
-        local latest=Bluetooth.refresh(true)
-        if latest.supported==true and latest.enabled==target then
-            self:toast(target and "蓝牙已开启" or "蓝牙已关闭",2)
-        else
-            self:toast("蓝牙状态未确认，请在设备设置中检查",3)
-        end
-    end)
+    -- Reuse the Bluetooth controller's registered KOReader event.
+    UIManager:sendEvent(Event:new("ToggleBluetooth"))
     return true
 end
 
