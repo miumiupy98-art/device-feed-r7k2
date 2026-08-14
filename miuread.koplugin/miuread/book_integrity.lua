@@ -1,6 +1,7 @@
 local Digests=require("miuread.digests")
 local EpubInstaller=require("miuread.epub_installer")
 local DownloadDatabase=require("miuread.download_database")
+local DownloadResult=require("miuread.download_result")
 local U=require("miuread.util")
 
 local M={}
@@ -190,7 +191,7 @@ end
 local function partial_manifest_pending(manifest, has_record)
     if type(manifest)~="table" then return false end
     if manifest.final_repair_required==true then return true end
-    if manifest.annotation_pending==true then return true end
+    if DownloadResult.annotation_pending(manifest) then return true end
     for _,entry in pairs(type(manifest.chapters)=="table" and manifest.chapters or {}) do
         if type(entry)=="table" and (entry.complete~=true or tostring(entry.error or "")~="") then return true end
     end
@@ -237,7 +238,8 @@ function M.inspect(store,book_id,record)
         book_id=book_id,
         file_ok=false,
         core_map_valid=false,
-        annotation_pending=type(record)=="table" and record.annotation_pending==true or false,
+        annotation_pending=DownloadResult.annotation_pending(record),
+        annotation_unresolved=DownloadResult.annotation_unresolved(record),
         annotation_error_kind=type(record)=="table" and record.annotation_error_kind or nil,
         repair_kind="none",
     }
@@ -277,7 +279,8 @@ function M.inspect(store,book_id,record)
     local hash=M.core_map_hash(book_id,full_map,local_map)
     out.core_map_hash=hash
     out.core_map_valid=hash~="" and #local_map>0 and #full_map>0
-    out.annotation_pending=out.annotation_pending or meta.annotation_pending==true
+    out.annotation_pending=out.annotation_pending or DownloadResult.annotation_pending(meta)
+    out.annotation_unresolved=out.annotation_unresolved or DownloadResult.annotation_unresolved(meta)
     if out.annotation_pending then
         out.repair_kind="annotations"
     elseif not out.core_map_valid then

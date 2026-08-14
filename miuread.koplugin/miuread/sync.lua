@@ -217,28 +217,29 @@ local function positions_match(submitted,remote,threshold)
     if submitted_uid~="" and remote_uid~="" and submitted_uid~=remote_uid then
         return false,"chapter_uid_mismatch"
     end
+
+    -- chapterUid + chapterOffset are the authoritative reading coordinates.
+    -- Whole-book percentages may differ when the catalog contains a different
+    -- number of structural chapters, so never reject an exact coordinate match
+    -- merely because the derived percentages disagree.
+    if submitted_uid~="" and remote_uid~="" then
+        local a,b=tonumber(submitted.offset or submitted.chapter_offset),tonumber(remote.offset or remote.chapter_offset)
+        local chapter_words=tonumber(submitted.chapter_word_count) or 0
+        if a~=nil and b~=nil then
+            local tolerance=submitted.native_offset==true and 12
+                or math.max(12,math.floor(chapter_words*0.005))
+            if math.abs(a-b)<=tolerance then return true,"chapter_offset_match" end
+            return false,"chapter_offset_mismatch"
+        end
+    end
+
     local submitted_percent=tonumber(submitted.progress)
     local remote_percent=tonumber(remote.percent)
     if submitted_percent~=nil and remote_percent~=nil
         and math.abs(submitted_percent-remote_percent)>threshold then
         return false,"progress_mismatch"
     end
-    if submitted_uid~="" and remote_uid~="" then
-        local a,b=tonumber(submitted.offset or submitted.chapter_offset),tonumber(remote.offset or remote.chapter_offset)
-        local chapter_words=tonumber(submitted.chapter_word_count) or 0
-        if a~=nil and b~=nil then
-            -- Cloud getprogress exposes the native chapter offset, so a
-            -- progress-only upload is confirmed primarily by chapterUid + co.
-            -- Keep a small tolerance for service-side normalization, but do
-            -- not let a broad whole-book percent threshold hide a bad offset.
-            local tolerance=submitted.native_offset==true and 12
-                or math.max(12,math.floor(chapter_words*0.005))
-            if math.abs(a-b)>tolerance then
-                return false,"chapter_offset_mismatch"
-            end
-        end
-    end
-    return true
+    return true,"percent_match"
 end
 
 local function context_from(state, fallback)
@@ -373,7 +374,8 @@ function Sync:new(reader, api, store, host, async, identity_async)
         daemon=nil, daemon_poll=nil, daemon_status_stamp=nil,
         daemon_context=nil, daemon_last_persist=0, daemon_generation=0,
         daemon_restart_count=0, auth_recovery_busy=false, auth_recovery_at=0,
-        auto_repair_busy=false, daemon_auth_retry_at=0, auth_transitioning=false,
+        auto_repair_busy=false, repair_busy=false, repair_book_id=nil, repair_generation=0,
+        daemon_auth_retry_at=0, auth_transitioning=false,
         control_write_task=nil, session_started_at=0,
         precise_position_cache={}, precise_due_refreshed=0,
         record_generation=0, record_retry_task=nil, record_checked_path=nil,
@@ -831,6 +833,29 @@ function Sync:_prepare_progress_catalog(callback)
             return
         end
         context.core_map_hash = core_hash
+
+        -- Keep a catalog that has already produced a verified cloud position
+        -- stable for the rest of the verification TTL. A transient Web Reader
+        -- catalog that adds/removes structural chapters must not silently change
+        -- the whole-book percentage basis from e.g. 22 to 23 chapters.
+        local verified_at=tonumber(session.verified_at or 0) or 0
+        local verified_age=os.time()-verified_at
+        local saved_verified=session.remote_verified==true
+            and verified_at>0 and verified_age>=0 and verified_age<=(tonumber(self.verification_ttl) or 14400)
+            and type(saved)=="table" and saved.catalog_complete==true
+            and type(saved.chapters)=="table" and #saved.chapters>0
+        if saved_verified then
+            local saved_hash=BookIntegrity.core_map_hash(book_id,saved.chapters,{})
+            local new_hash=BookIntegrity.core_map_hash(book_id,context.chapters,{})
+            if saved_hash~="" and new_hash~="" and saved_hash~=new_hash then
+                logger.warn("[MiuRead][ProgressMap] catalog drift ignored during verified session",
+                    "book=",book_id,"kept=",tostring(#saved.chapters),
+                    "new=",tostring(#context.chapters))
+                context=U.copy(saved)
+                context.core_map_hash=core_hash
+            end
+        end
+
         if value.cookies_changed and type(value.cookies) == "table" then
             local latest_auth = self.store:auth()
             latest_auth.cookies = value.cookies
@@ -1091,11 +1116,38 @@ end
 
 function Sync:is_verified(book_id)
     book_id = tostring(book_id or "")
+    if book_id=="" then return false end
     local auth=self.store:auth()
-    if book_id == "" or tostring(self.verified_book_id or "") ~= book_id
-        or tostring(self.verified_login_session_id or "")~=tostring(auth.login_session_id or "") then return false end
-    local age = os.time() - (tonumber(self.verified_at or 0) or 0)
-    return age >= 0 and age <= (tonumber(self.verification_ttl) or 14400)
+    local login=tostring(auth.login_session_id or "")
+    local ttl=tonumber(self.verification_ttl) or 14400
+
+    if tostring(self.verified_book_id or "")==book_id
+        and tostring(self.verified_login_session_id or "")==login then
+        local age=os.time()-(tonumber(self.verified_at or 0) or 0)
+        if age>=0 and age<=ttl then return true end
+    end
+
+    -- Verification must survive closing/reopening the book and KOReader restarts.
+    -- Restore it only for the same account and the same generated book mapping.
+    local session=self.store:session(book_id) or {}
+    local verified_at=tonumber(session.verified_at or 0) or 0
+    local age=os.time()-verified_at
+    if session.remote_verified~=true or verified_at<=0 or age<0 or age>ttl
+        or tostring(session.verification_login_session_id or "")~=login then return false end
+    local record=self:record()
+    if not record or tostring(record.book and record.book.book_id or "")~=book_id then return false end
+    local current_core=self:_core_map_hash(record)
+    local verified_core=tostring(session.verified_core_map_hash or session.report_core_map_hash or "")
+    if current_core=="" or verified_core=="" or verified_core~=current_core then return false end
+
+    self.verified_book_id=book_id
+    self.verified_at=verified_at
+    self.verified_local_percent=tonumber(session.verified_local_percent)
+    self.verified_remote_percent=tonumber(session.verified_remote_percent)
+    self.verified_login_session_id=login
+    logger.info("[MiuRead][Sync] restored verified state",
+        "book=",book_id,"age=",tostring(age),"core=",current_core:sub(1,12))
+    return true
 end
 
 function Sync:is_current_verified()
@@ -1118,6 +1170,8 @@ function Sync:clear_verified(reason)
         self.store:save_session(tostring(old_book), {
             remote_verified=false, verified_at=nil, verified_reason=tostring(reason or "cleared"),
             verified_local_percent=nil, verified_remote_percent=nil,
+            verified_chapter_uid=nil, verified_chapter_offset=nil,
+            verified_core_map_hash=nil, verified_catalog_hash=nil,
         })
     end
     logger.info("[MiuRead][Sync] progress verification cleared", tostring(reason or "cleared"))
@@ -1247,7 +1301,7 @@ function Sync:remote(book_id, callback, options)
     if not ok then callback(nil, err) end
 end
 
-function Sync:mark_verified(book_id, reason, local_percent, remote_percent)
+function Sync:mark_verified(book_id, reason, local_percent, remote_percent, position)
     book_id = tostring(book_id or "")
     if book_id == "" then return false end
     self.verified_book_id = book_id
@@ -1255,20 +1309,31 @@ function Sync:mark_verified(book_id, reason, local_percent, remote_percent)
     self.verified_local_percent = tonumber(local_percent)
     self.verified_remote_percent = tonumber(remote_percent)
     self.verified_login_session_id = tostring(self.store:auth().login_session_id or "")
+    local core_hash=self:_core_map_hash()
+    position=type(position)=="table" and position or nil
+    local catalog=select(1,self:_progress_catalog(self:record()))
+    local catalog_hash=(type(catalog)=="table" and #catalog>0)
+        and BookIntegrity.core_map_hash(book_id,catalog,{}) or ""
     self.store:save_session(book_id, {
         remote_verified=true, verified_at=self.verified_at,
         verified_reason=tostring(reason or "confirmed"),
         verified_local_percent=self.verified_local_percent,
         verified_remote_percent=self.verified_remote_percent,
+        verified_chapter_uid=position and tostring(position.chapter_uid or position.chapterUid or "") or nil,
+        verified_chapter_offset=position and tonumber(position.chapter_offset or position.offset) or nil,
         verification_login_session_id=self.verified_login_session_id,
-        report_core_map_hash=self:_core_map_hash(),
+        verified_core_map_hash=core_hash,
+        verified_catalog_hash=catalog_hash~="" and catalog_hash or nil,
+        report_core_map_hash=core_hash,
         progress_local_percent=self.verified_local_percent, pending=false,
     })
     self.store:update_cached_progress(book_id, self.verified_local_percent)
     logger.info("[MiuRead][Sync] cloud progress verified",
         "book=", book_id, "reason=", tostring(reason or "confirmed"),
         "local=", tostring(self.verified_local_percent or "-"),
-        "remote=", tostring(self.verified_remote_percent or "-"))
+        "remote=", tostring(self.verified_remote_percent or "-"),
+        "chapter=",tostring(position and position.chapter_uid or "-"),
+        "offset=",tostring(position and (position.chapter_offset or position.offset) or "-"))
     return true
 end
 
@@ -1495,6 +1560,37 @@ function Sync:repair_current(callback)
     local core_hash=self:_core_map_hash(record)
     if core_hash=="" then if callback then callback(false,"当前书籍章节映射不完整") end; return false end
 
+    -- Automatic repair, manual repair and repeated taps must share one job.
+    -- Starting a second transaction used to leave an old verification callback
+    -- alive after the first repair had already succeeded.
+    if self.repair_busy==true then
+        if tostring(self.repair_book_id or "")==book_id then
+            logger.info("[MiuRead][SyncRepair] duplicate repair ignored","book=",book_id)
+            if callback then callback(false,"检查与修复正在进行",nil,{error_kind="busy",already_running=true}) end
+            return true
+        end
+        logger.info("[MiuRead][SyncRepair] repair busy for another book",
+            "active=",tostring(self.repair_book_id or "-"),"requested=",book_id)
+        if callback then callback(false,"上一项检查与修复正在结束") end
+        return false
+    end
+    self.repair_busy=true
+    self.repair_book_id=book_id
+    self.repair_generation=(tonumber(self.repair_generation) or 0)+1
+    local generation=self.repair_generation
+
+    local function active()
+        return self.repair_busy==true
+            and tostring(self.repair_book_id or "")==book_id
+            and generation==tonumber(self.repair_generation or 0)
+    end
+    local function release()
+        if generation==tonumber(self.repair_generation or 0) then
+            self.repair_busy=false
+            self.repair_book_id=nil
+        end
+    end
+
     local daemon=self.daemon
     if daemon and daemon.active then
         daemon.active=false
@@ -1514,9 +1610,18 @@ function Sync:repair_current(callback)
     self.failure_notified=false
 
     local finished=false
-    local function fail(result,value)
-        if finished then return end
+    local function cancel(result,value)
+        if finished or not active() then return end
         finished=true
+        release()
+        self.state="waiting"
+        logger.info("[MiuRead][SyncRepair] cancelled","book=",book_id,"reason=",tostring(result or "cancelled"))
+        if callback then callback(false,tostring(result or "检查与修复已取消"),nil,value or {error_kind="cancelled"}) end
+    end
+    local function fail(result,value)
+        if finished or not active() then return end
+        finished=true
+        release()
         local err=tostring(result or "阅读同步修复失败")
         local kind=(value and value.error_kind) or nil
         if Http.is_auth_error(err) then kind="authentication" end
@@ -1527,7 +1632,7 @@ function Sync:repair_current(callback)
     end
 
     local function commit(result,position,value,remote)
-        if finished then return end
+        if finished or not active() then return end
         local auth=self.store:auth()
         local login=tostring(auth.login_session_id or "")
         local candidate=value and value.legacy_context
@@ -1537,6 +1642,7 @@ function Sync:repair_current(callback)
         end
         candidate.core_map_hash=core_hash
         finished=true
+        release()
         self.store:save_session(book_id,{
             legacy_report_context=U.copy(candidate),
             report_login_session_id=login,
@@ -1562,10 +1668,15 @@ function Sync:repair_current(callback)
         self.last_error_kind=nil
         self.consecutive_failures=0
         self.failure_notified=false
-        self:mark_verified(book_id,"repair_cloud_verified",position and position.progress,remote and remote.percent)
+        self:mark_verified(book_id,"repair_cloud_verified",position and position.progress,remote and remote.percent,position)
         self.state="waiting"
         if self.store:preferences().sync.time_enabled==true and not self.suspended then
-            UIManager:scheduleIn(1,function() self:start("manual_repair_success") end)
+            UIManager:scheduleIn(1,function()
+                local current=self:record()
+                if current and tostring(current.book and current.book.book_id or "")==book_id then
+                    self:start("manual_repair_success")
+                end
+            end)
         end
         logger.info("[MiuRead][SyncRepair] cloud verification accepted",
             "book=",book_id,
@@ -1575,17 +1686,18 @@ function Sync:repair_current(callback)
     end
 
     local function verify(result,position,value,attempt)
+        if not active() then return end
         attempt=tonumber(attempt) or 1
         self.store:save_session(book_id,{last_stage="正在回读微信读书云端位置确认修复结果"})
         UIManager:scheduleIn(attempt==1 and 1.4 or 2.4,function()
-            if finished then return end
+            if finished or not active() then return end
             local current=self:record()
             if not current or tostring(current.book.book_id or "")~=book_id then
-                fail("书籍已切换，已取消旧书同步修复",{error_kind="context"})
+                cancel("书籍已切换，已取消旧书同步修复",{error_kind="cancelled"})
                 return
             end
             self:remote(book_id,function(remote,remote_error)
-                if finished then return end
+                if finished or not active() then return end
                 local matched,reason=positions_match(position,remote,self.store:preferences().sync.threshold)
                 if matched then
                     commit(result,position,value,remote)
@@ -1608,6 +1720,7 @@ function Sync:repair_current(callback)
     end
 
     local function run_upload(force_context,label)
+        if not active() then return false end
         logger.info("[MiuRead][SyncRepair] "..tostring(label or "testing context"),
             "book=",book_id,"core=",core_hash:sub(1,12))
         self.store:save_session(book_id,{last_stage=force_context and "正在重新建立当前书籍章节同步信息" or "正在验证原有章节同步信息"})
@@ -1616,6 +1729,7 @@ function Sync:repair_current(callback)
             if daemon and daemon.paths and daemon.paths.context then os.remove(daemon.paths.context) end
         end
         local started=self:upload(0,function(ok,result,position,value)
+            if not active() then return end
             if ok then
                 verify(result,position,value,1)
                 return
@@ -1641,6 +1755,7 @@ function Sync:repair_current(callback)
         and tostring(session.report_core_map_hash or "")==core_hash
 
     local function after_auth()
+        if not active() then return end
         if can_preserve then
             run_upload(false,"testing preserved context")
         else
@@ -1654,6 +1769,7 @@ function Sync:repair_current(callback)
             "previous_kind=",prior_kind~="" and prior_kind or "unknown")
         self.store:save_session(book_id,{last_stage="正在验证微信读书登录状态"})
         local started=self:_recover_auth_once("read_report",prior_error,function(recovered,detail)
+            if not active() then return end
             if recovered then after_auth()
             else fail(tostring(detail or "微信读书登录验证失败"),{error_kind="authentication"}) end
         end,true)

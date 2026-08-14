@@ -1,7 +1,21 @@
 local Result = {}
 
+local function annotation_kind(record)
+    if type(record) ~= "table" then return "" end
+    return tostring(record.annotation_error_kind or ((record.annotation_summary or {}).error_kind) or "")
+end
+
+function Result.annotation_unresolved(record)
+    if type(record) ~= "table" or record.annotation_pending ~= true then return false end
+    local kind=annotation_kind(record)
+    -- These failures are tied to the returned annotation data itself. Retrying
+    -- the whole book indefinitely does not make them safer to place.
+    return kind=="data" or kind=="forbidden" or kind=="unrecoverable"
+end
+
 function Result.annotation_pending(record)
     return type(record) == "table" and record.annotation_pending == true
+        and not Result.annotation_unresolved(record)
 end
 
 function Result.annotation_fallback(record)
@@ -13,10 +27,11 @@ function Result.variant_label(label, record)
 end
 
 function Result.aggregate(records)
-    local result={annotation_pending=false,annotation_fallback=false}
+    local result={annotation_pending=false,annotation_fallback=false,annotation_unresolved=false}
     for _,record in ipairs(records or {}) do
         if Result.annotation_pending(record) then result.annotation_pending=true end
         if Result.annotation_fallback(record) then result.annotation_fallback=true end
+        if Result.annotation_unresolved(record) then result.annotation_unresolved=true end
     end
     return result
 end
@@ -46,7 +61,10 @@ end
 
 function Result.summary_note(record)
     if Result.annotation_pending(record) then
-        return "正文已生成；划线与想法暂未完整，可使用修复书籍补全。"
+        return "正文已生成；划线与想法暂未完整，可使用检查与修复补全。"
+    end
+    if Result.annotation_unresolved(record) then
+        return "正文与书籍文件完整；少量旧批注无法可靠恢复，已保留现状且不会反复要求修复。"
     end
     return nil
 end

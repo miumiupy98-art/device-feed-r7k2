@@ -1462,7 +1462,6 @@ end
 
 function Plugin:current_book_rebuild_menu(book)
     return {
-        {text="检查与修复本书",callback=function() self:repair_current_book() end},
         {text="重新生成纯净版",callback=function() self:_confirm_current_book_rebuild(book,false) end},
         {text="重新生成划线与想法版",callback=function() self:_confirm_current_book_rebuild(book,true) end},
     }
@@ -1475,7 +1474,7 @@ function Plugin:current_book_menu()
     return {
         {text="书籍详情",callback=function() self:book_details(b) end},
         {text="下载章节",sub_item_table_func=function() return self:current_book_download_menu(b) end},
-        {text="重新生成与修复",sub_item_table_func=function() return self:current_book_rebuild_menu(b) end},
+        {text="重新生成",sub_item_table_func=function() return self:current_book_rebuild_menu(b) end},
         {text="管理本地文件",callback=function() self:downloaded_book_menu(tostring(b.bookId)) end},
     }
 end
@@ -7187,7 +7186,7 @@ function Plugin:_home_hold_book(book,anchor)
         {icon="↻",label="更新书籍信息",detail="微信读书详情与网络补全",callback=function() self:_home_refresh_one_book_metadata(target,true) end},
     }
     if available then
-        primary_actions[#primary_actions+1]={icon="✚",label="修复这本书",detail="检查正文、目录和生成记录",callback=function() self:_home_repair_book(target) end}
+        primary_actions[#primary_actions+1]={icon="✚",label="检查这本书",detail="检查正文、目录和生成记录",callback=function() self:_home_repair_book(target) end}
         primary_actions[#primary_actions+1]={icon="⌫",label="删除书籍",detail="选择删除当前或全部版本",danger=true,callback=function()
             self:_show_home_delete_book_popup(target,anchor)
         end}
@@ -10429,7 +10428,6 @@ function Plugin:_show_reader_sync_panel(back_callback)
                 {title="立即操作",rows={
                     {icon="upload",label="上传当前进度",value="执行",callback=function() self:upload_local_progress(true) end},
                     {icon="download",label="读取云端进度",value="执行",callback=function() self:manual_sync() end},
-                    {icon="repair",label="修复当前书籍同步",value="执行",callback=function() self:repair_current_sync() end},
                 }},
                 {title="自动同步",rows={
                     {label="阅读进度",value=sync.progress_enabled~=false and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_progress_sync() end},
@@ -10437,7 +10435,7 @@ function Plugin:_show_reader_sync_panel(back_callback)
                     {label="成功提醒",value=self:_sync_success_notice_enabled() and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_sync_success_notice() end},
                 }},
                 {title="诊断",rows={
-                    {icon="diagnostics",label="同步诊断",value="检查与修复",callback=function() self:_show_reader_sync_diagnostics_panel(return_to_sync) end},
+                    {icon="diagnostics",label="同步诊断",value="查看详情",callback=function() self:_show_reader_sync_diagnostics_panel(return_to_sync) end},
                 }},
             }
         end,
@@ -11123,7 +11121,7 @@ function Plugin:_reader_control_categories()
             {icon="comment",label="评论数据",value="迁移与显示设置",callback=function()
                 self:_show_reader_menu_table("评论数据",self:book_repair_settings_menu(),back_to("book"))
             end},
-            {icon="repair",label="修复书籍",value="检查当前书籍",callback=function() self:repair_current_book() end},
+            {icon="repair",label="检查与修复",value="书籍与阅读同步",callback=function() self:check_and_repair_current() end},
         }}}},
         {key="device",label="设备",sections={{items={
             {icon="frontlight",label="前光与色温",value=Device:hasFrontlight() and "直接调节" or "当前设备不支持",enabled=Device:hasFrontlight(),callback=function() self:_show_reader_frontlight_panel(back_to("device")) end},
@@ -13504,7 +13502,7 @@ function Plugin:_finish_download_runtime(runtime,result)
     self:_mark_auth_channel_ok("download")
     local rec=self:_merge_download_result(result,b,opt)
     if opt.annotations==true then
-        if DownloadResult.annotation_pending(rec) then
+        if rec.annotation_pending==true then
             local kind=tostring(rec.annotation_error_kind or ((rec.annotation_summary or {}).error_kind) or "incomplete")
             local errors=type(rec.annotation_summary)=="table" and rec.annotation_summary.errors or nil
             local detail="划线与想法未完整获取"
@@ -13516,8 +13514,12 @@ function Plugin:_finish_download_runtime(runtime,result)
                 self:_mark_auth_access_denied("annotations",detail,true)
             elseif kind=="authentication" then
                 self:_mark_auth_problem("annotations",detail,true)
-            else
+            elseif DownloadResult.annotation_pending(rec) then
                 self:_mark_auth_channel_error("annotations",detail)
+            else
+                -- Data-specific annotation failures are preserved as unresolved
+                -- items but do not mean the annotation endpoint itself is down.
+                self:_mark_auth_channel_ok("annotations")
             end
         else
             self:_mark_auth_channel_ok("annotations")
@@ -13997,7 +13999,7 @@ function Plugin:_install_pending_downloads(notify)
         local any_fallback=aggregate.annotation_fallback==true
         local pending_record,last_record=nil,installed_records[#installed_records]
         for _,record in ipairs(installed_records) do
-            if record.annotation_pending==true and not pending_record then pending_record=record end
+            if DownloadResult.annotation_pending(record) and not pending_record then pending_record=record end
         end
         if #remaining==0 then
             state.status=any_pending and "annotation_pending" or "completed"
@@ -15395,7 +15397,6 @@ function Plugin:sync_menu()
     }
     for _,row in ipairs(self:sync_settings_menu()) do rows[#rows+1]=row end
     if self:_current_book_record() then
-        rows[#rows+1]={text="修复当前书籍同步",callback=function() self:repair_current_sync() end}
         rows[#rows+1]={text="重新读取当前书籍云端进度",callback=function() self:manual_sync() end}
     end
     return rows
@@ -15570,12 +15571,16 @@ function Plugin:ensure_read_report_progress(reason,automatic)
                 return
             end
             local remotep=math.floor((tonumber(remote.percent) or 0)+.5)
+            local coordinate_match=self:_remote_matches(remote,local_position)
             local cmp=self.sync:compare(localp,remote)
-            if cmp=="same" then
-                self.sync:mark_verified(id,"positions_aligned",localp,remotep)
-                self:_save_progress_state(id,"aligned","本机与云端位置接近",localp,remotep)
-                self.sync:end_progress_sync("位置接近，阅读时间开始同步")
-                if not automatic then self:info("本机位置："..localp.."%\n云端位置："..remotep.."%\n\n位置接近，无需处理。") end
+            if coordinate_match or cmp=="same" then
+                self.sync:mark_verified(id,"positions_aligned",localp,remotep,local_position)
+                self:_save_progress_state(id,"aligned",coordinate_match and "章节位置一致" or "本机与云端位置接近",localp,remotep)
+                self.sync:end_progress_sync("位置已确认，阅读时间开始同步")
+                if not automatic then
+                    local detail=coordinate_match and "章节和章节内位置一致，无需处理。" or "位置接近，无需处理。"
+                    self:info("本机位置："..localp.."%\n云端位置："..remotep.."%\n\n"..detail)
+                end
                 return
             end
             self:_save_progress_state(id,"different","检测到本机与云端位置不同",localp,remotep)
@@ -15721,7 +15726,7 @@ function Plugin:upload_local_progress(manual,callback)
                             "matched=",tostring(matched==true))
                         if matched then
                             actual=math.floor((tonumber(actual) or target)+.5)
-                            self.sync:mark_verified(id,"local_progress_uploaded",target,actual)
+                            self.sync:mark_verified(id,"local_progress_uploaded",target,actual,submitted_position)
                             self:_save_progress_state(id,"local_uploaded","本机进度已上传并确认",target,actual)
                             self.store:save_session(id,{
                                 progress_upload_state="verified",
@@ -15792,7 +15797,7 @@ function Plugin:_use_remote_position(id,localp,remote)
         local actual=actual_position and actual_position.progress and math.floor(actual_position.progress+.5) or localp
         local threshold=tonumber(self.store:preferences().sync.threshold) or 2
         if math.abs(actual-remotep)<=threshold then
-            self.sync:mark_verified(id,"remote_position_selected",actual,remotep)
+            self.sync:mark_verified(id,"remote_position_selected",actual,remotep,actual_position)
             self:_save_progress_state(id,"remote_selected","已采用云端位置",actual,remotep)
             self.sync:end_progress_sync("已采用云端位置，阅读时间开始同步")
             self:status_toast("阅读进度同步","已切换到云端进度："..remotep.."%",4)
@@ -15942,8 +15947,13 @@ end
 function Plugin:repair_current_sync()
     local r=self:_current_book_record()
     if not r or not r.book then self:info("请先打开一本觅阅下载的书籍。"); return false end
+    local book_id=tostring(r.book.book_id or "")
     local title=tostring(r.book.title or "当前书籍")
-    self:status_toast("修复阅读同步","正在检查《"..title.."》的登录和章节同步状态",4)
+    if self.sync.repair_busy==true and tostring(self.sync.repair_book_id or "")==book_id then
+        self:status_toast("检查与修复","《"..title.."》正在处理，请勿重复操作",3)
+        return true
+    end
+    self:status_toast("检查与修复","正在检查《"..title.."》的登录和章节同步状态",4)
     local started=self.sync:repair_current(function(ok,result)
         if ok then
             self._sync_repair_prompt_book=nil
@@ -15977,6 +15987,7 @@ end
 function Plugin:_show_sync_repair_prompt(err,kind,book_id)
     kind=tostring(kind or "")
     if kind~="context" and kind~="position" then return false end
+    if self.sync and self.sync.repair_busy==true then return false end
     local r=self:_current_book_record()
     local current_id=r and r.book and tostring(r.book.book_id or "") or ""
     book_id=tostring(book_id or current_id)
@@ -16485,6 +16496,39 @@ function Plugin:repair_current_book()
     local current=self:_current_book_record()
     if not current or not current.book then self:info("请先打开一本觅阅书籍") return false end
     return self:_repair_downloaded_book(current.book.book_id)
+end
+
+function Plugin:check_and_repair_current()
+    local current=self:_current_book_record()
+    if not current or not current.book then self:info("请先打开一本觅阅书籍") return false end
+    local id=tostring(current.book.book_id or current.book.bookId or "")
+    if id=="" then self:info("当前书籍无法识别") return false end
+
+    self.store:reload()
+    local partials=BookIntegrity.partial_repairs(self.store,id)
+    local record=self:_preferred_record(id) or current.record
+    local report=record and BookIntegrity.inspect(self.store,id,record) or nil
+    if #partials>0 or (report and report.repair_kind~="none") then
+        return self:_repair_downloaded_book(id)
+    end
+
+    local session=self.store:session(id) or {}
+    local repair_kind=tostring(session.sync_repair_kind or "")
+    if session.sync_repair_required==true and (repair_kind=="context" or repair_kind=="position") then
+        return self:repair_current_sync()
+    end
+
+    if self.sync:is_current_verified() then
+        if report and report.annotation_unresolved==true then
+            self:info("检查完成。\n\n书籍内容和阅读同步正常。少量旧批注无法可靠恢复，已保留现状，不会因此反复要求修复。")
+        else
+            self:info("检查完成。\n\n书籍内容、批注和阅读同步都正常，无需修复。")
+        end
+        return true
+    end
+
+    self:status_toast("检查与修复","书籍内容正常，正在核对阅读位置",3)
+    return self:manual_sync()
 end
 
 function Plugin:scan_downloaded_books_for_integrity_repair()
@@ -18076,14 +18120,18 @@ function Plugin:on_sync_record_ready(current)
         self:_schedule_current_book_repair_check(current,false)
     end
     if self.store:preferences().sync.progress_enabled~=false then
-        self:_wait_for_network("reader-ready-progress",function(ready)
-            if ready and self.ui and self.ui.document then
-                self:ensure_read_report_progress("reader_ready",true)
-            elseif self.ui and self.ui.document then
-                self:_save_progress_state(tostring(current.book.book_id),"waiting_network",
-                    "等待 Wi-Fi 恢复后读取云端位置",nil,nil)
-            end
-        end,{minimum_delay=4.0,max_wait=60,interval=2.5})
+        if self.sync:is_current_verified() then
+            self.sync:end_progress_sync("已恢复本书最近验证成功的阅读位置")
+        else
+            self:_wait_for_network("reader-ready-progress",function(ready)
+                if ready and self.ui and self.ui.document then
+                    self:ensure_read_report_progress("reader_ready",true)
+                elseif self.ui and self.ui.document then
+                    self:_save_progress_state(tostring(current.book.book_id),"waiting_network",
+                        "等待 Wi-Fi 恢复后读取云端位置",nil,nil)
+                end
+            end,{minimum_delay=4.0,max_wait=60,interval=2.5})
+        end
     end
 end
 function Plugin:on_sync_record_missing()

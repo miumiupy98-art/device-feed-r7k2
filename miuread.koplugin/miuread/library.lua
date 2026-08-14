@@ -1,6 +1,7 @@
 local Protocol=require("miuread.protocol")
 local Codec=require("miuread.codec")
 local U=require("miuread.util")
+local DownloadResult=require("miuread.download_result")
 local logger=require("logger")
 local Library={}; Library.__index=Library
 function Library:new(api,http,store)
@@ -269,7 +270,7 @@ local function record_state(row)
                     if kind=="clean" or kind=="range_clean" or kind=="preview_clean" then has_clean=true end
                     if kind=="notes" or kind=="range_notes" or kind=="preview_notes" then
                         has_notes=true
-                        if record.annotation_pending==true then annotation_pending=true end
+                        if DownloadResult.annotation_pending(record) then annotation_pending=true end
                         if record.annotation_fallback==true then annotation_fallback=true end
                     end
                 else

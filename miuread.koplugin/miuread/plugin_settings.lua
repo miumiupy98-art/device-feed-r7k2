@@ -12,7 +12,6 @@ function M.sync(plugin)
     }
     append(rows,plugin:sync_settings_menu())
     if plugin:_current_book_record() then
-        rows[#rows+1]={text="修复当前书籍同步",callback=function() plugin:repair_current_sync() end}
         rows[#rows+1]={text="重新读取当前书籍云端进度",callback=function() plugin:manual_sync() end}
     end
     return rows
