@@ -4,7 +4,7 @@ local lfs = require("libs/libkoreader-lfs")
 
 local LocalAnnotationDatabase = {}
 
-LocalAnnotationDatabase.SCHEMA_VERSION = 4
+LocalAnnotationDatabase.SCHEMA_VERSION = 5
 LocalAnnotationDatabase.FILE_NAME = "local_annotations.sqlite3"
 
 local function database_path(store, book_id)
@@ -48,6 +48,7 @@ local function initialize(conn)
             coord_version INTEGER NOT NULL DEFAULT 0,
             coord_source TEXT NOT NULL DEFAULT '',
             coord_verify TEXT NOT NULL DEFAULT '',
+            sync_kind TEXT NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL DEFAULT 0
         );
@@ -66,15 +67,18 @@ local function initialize(conn)
     safe_alter(conn, "ALTER TABLE local_annotations ADD COLUMN coord_version INTEGER NOT NULL DEFAULT 0;")
     safe_alter(conn, "ALTER TABLE local_annotations ADD COLUMN coord_source TEXT NOT NULL DEFAULT '';")
     safe_alter(conn, "ALTER TABLE local_annotations ADD COLUMN coord_verify TEXT NOT NULL DEFAULT '';")
+    safe_alter(conn, "ALTER TABLE local_annotations ADD COLUMN sync_kind TEXT NOT NULL DEFAULT '';")
 
     if previous > 0 and previous < LocalAnnotationDatabase.SCHEMA_VERSION then
-        -- beta.6 may have marked records as locate_failed before context-aware
-        -- chapter/range resolution was available. Retry only records that are
-        -- definitely still local; never reset unknown mutations or remote IDs.
+        -- 4.5.0 changes coordinate confidence, bookmark recovery and sync-time
+        -- kind inference. Re-evaluate only mutations that are definitely local.
+        -- `unknown`/delete_unknown may already exist remotely and must never be
+        -- reset into a blind retry.
         conn:exec([[
             UPDATE local_annotations
                SET sync_state = 'local_only', last_stage = '', last_error = ''
-             WHERE present = 1 AND remote_id = '' AND sync_state = 'locate_failed';
+             WHERE present = 1 AND remote_id = ''
+               AND sync_state IN ('locate_failed','metadata_failed','coord_failed');
         ]])
     end
 
@@ -288,7 +292,8 @@ local SELECT_COLUMNS = [[
     selected_text, context_before, context_after, anchor_text, note,
     datetime, drawer, source_path, present, sync_state, range_key,
     remote_id, chapter_uid, chapter_idx, book_version, last_stage, last_error,
-    last_attempt_at, coord_version, coord_source, coord_verify, created_at, updated_at
+    last_attempt_at, coord_version, coord_source, coord_verify, created_at, updated_at,
+    sync_kind
 ]]
 
 local function row_from_sql(row)
@@ -308,7 +313,7 @@ local function row_from_sql(row)
         last_error=tostring(row[25] or ""), last_attempt_at=tonumber(row[26] or 0) or 0,
         coord_version=tonumber(row[27] or 0) or 0, coord_source=tostring(row[28] or ""),
         coord_verify=tostring(row[29] or ""), created_at=tonumber(row[30] or 0) or 0,
-        updated_at=tonumber(row[31] or 0) or 0,
+        updated_at=tonumber(row[31] or 0) or 0, sync_kind=tostring(row[32] or ""),
     }
 end
 
@@ -417,6 +422,26 @@ end
 
 function LocalAnnotationDatabase.mark_state(store, book_id, local_id, state, fields)
     return update_state(store, book_id, local_id, state, fields)
+end
+
+function LocalAnnotationDatabase.set_sync_kind(store, book_id, local_id, kind)
+    kind = tostring(kind or "")
+    if kind ~= "" and kind ~= "bookmark" and kind ~= "highlight" and kind ~= "thought" then
+        return nil, "invalid sync kind"
+    end
+    local conn = open(store, book_id, false)
+    local ok, err = xpcall(function()
+        local statement = conn:prepare([[
+            UPDATE local_annotations
+               SET sync_kind = ?, updated_at = ?
+             WHERE local_id = ?
+        ]])
+        statement:bind(kind, os.time(), tostring(local_id or "")):step()
+        statement:close()
+    end, debug.traceback)
+    pcall(conn.close, conn)
+    if not ok then return nil, tostring(err) end
+    return true
 end
 
 function LocalAnnotationDatabase.delete_row(store, book_id, local_id)
