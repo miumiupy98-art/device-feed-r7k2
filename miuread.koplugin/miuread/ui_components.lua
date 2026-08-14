@@ -83,6 +83,7 @@ function Ui.icon(value, width, height, size, opts)
         face = opts.face,
         bold = opts.bold,
         fgcolor = opts.fgcolor,
+        fallback_text = opts.fallback_text,
     })
     return Ui.align(child, width, height, opts.halign or "center", opts.valign or "center")
 end

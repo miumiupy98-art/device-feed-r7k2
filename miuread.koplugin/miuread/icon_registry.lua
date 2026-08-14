@@ -55,6 +55,7 @@ local MAP = {
     ["return"] = "return",
     ["ko-reader"] = "ko-reader", koreader = "ko-reader",
     display = "display", tools = "tools", device = "device", book = "book", folder = "folder", ["📁"] = "folder", wifi = "wifi", ["⌁"] = "wifi",
+    bluetooth = "bluetooth", bt = "bluetooth",
 }
 
 function Registry.key(value)
@@ -89,7 +90,7 @@ function Registry.widget(value, size, opts)
         if image and type(image.free) == "function" then pcall(image.free, image) end
     end
     return TextWidget:new{
-        text = tostring(value or "•"),
+        text = tostring(opts.fallback_text or value or "•"),
         face = opts.face,
         bold = opts.bold ~= false,
         fgcolor = opts.fgcolor or Blitbuffer.COLOR_BLACK,

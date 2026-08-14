@@ -19,6 +19,8 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
 local TransientGuard = require("miuread.transient_guard")
 local UiScale = require("miuread.ui_scale")
+local Ui = require("miuread.ui_components")
+local U = require("miuread.util")
 
 local live_sheet
 local MAX_PRIMARY_ACTIONS = 10
@@ -131,6 +133,7 @@ end
 function SheetWidget:_card(action, width, height, seed)
     local enabled = action.enabled ~= false
     local icon = tostring(action.icon or (action.danger and "!" or "•"))
+    local fallback_icon = action.danger and "!" or (U.utf8_len(icon) <= 2 and icon or "•")
     local label = tostring(action.label or action.text or "")
     local detail = tostring(action.detail or "")
     local pad = UiScale.dp(6, 5, 9)
@@ -170,12 +173,16 @@ function SheetWidget:_card(action, width, height, seed)
 
     local content = HorizontalGroup:new{
         align = "center",
-        CenterContainer:new{dimen = Geom:new{w = icon_w, h = inner_h}, TextWidget:new{
-            text = icon,
+        Ui.icon(icon, icon_w, inner_h, UiScale.dp(24, 21, 31), {
+            icon_key = tostring(action.icon_key or icon),
+            icon_path = action.icon_path,
             face = UiScale.iconFace("cfont", 14.2, 20.5, 12),
             bold = true,
             fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
-        }},
+            -- Internal icon names such as "highlight" must never leak into the
+            -- visible card if an SVG is unavailable or malformed.
+            fallback_text = fallback_icon,
+        }),
         LeftContainer:new{dimen = Geom:new{w = text_w, h = inner_h}, text_group},
     }
     if arrow_w > 0 then

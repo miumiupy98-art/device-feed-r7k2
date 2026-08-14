@@ -204,24 +204,25 @@ local function panel_button(entry, width, height, close_callback, compact, owner
     local icon = tostring(entry.icon_key or entry.icon or "")
     local enabled = entry.enabled ~= false
     local has_detail = detail ~= ""
-    local pad = UiScale.dp(compact and 3 or 4, 2, 6)
+    local dense = compact and width < UiScale.dp(104, 90, 136)
+    local pad = UiScale.dp(dense and 2 or (compact and 3 or 4), 2, dense and 4 or 6)
     local inner_w = math.max(1, width - pad * 2)
-    local gap_h = UiScale.dp(3, 2, 5)
-    local icon_slot_h = UiScale.dp(compact and 34 or 38, compact and 30 or 34, compact and 44 or 50)
-    local label_slot_h = UiScale.dp(compact and 31 or 34, compact and 27 or 30, compact and 40 or 44)
+    local gap_h = UiScale.dp(dense and 2 or 3, 2, dense and 4 or 5)
+    local icon_slot_h = UiScale.dp(dense and 31 or (compact and 34 or 38), dense and 28 or (compact and 30 or 34), dense and 40 or (compact and 44 or 50))
+    local label_slot_h = UiScale.dp(dense and 30 or (compact and 31 or 34), dense and 27 or (compact and 27 or 30), dense and 38 or (compact and 40 or 44))
     -- Reserve the same third line in every cell. Without this, Wi-Fi (which
     -- has an SSID detail) becomes taller and its icon is vertically shifted.
-    local detail_slot_h = UiScale.dp(compact and 20 or 22, compact and 18 or 20, compact and 26 or 29)
-    local icon_size = UiScale.dp(compact and 27 or 30, compact and 24 or 27, compact and 35 or 39)
+    local detail_slot_h = UiScale.dp(dense and 19 or (compact and 20 or 22), dense and 17 or (compact and 18 or 20), dense and 24 or (compact and 26 or 29))
+    local icon_size = UiScale.dp(dense and 24 or (compact and 27 or 30), dense and 22 or (compact and 24 or 27), dense and 31 or (compact and 35 or 39))
 
     local label_box=Ui.textbox(label, inner_w, label_slot_h,
-        face("smallinfofont", compact and 11.6 or 12.3, compact and 14.8 or 16.0, compact and 10.1 or 10.7), {
+        face("smallinfofont", dense and 10.5 or (compact and 11.6 or 12.3), dense and 13.6 or (compact and 14.8 or 16.0), dense and 9.2 or (compact and 10.1 or 10.7)), {
             bold = true, alignment = "center", halign = "center",
             height_overflow_show_ellipsis = true,
             fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
         })
     local detail_box=Ui.textbox(has_detail and detail or " ", inner_w, detail_slot_h,
-        face("smallinfofont", compact and 9.2 or 9.8, compact and 12.0 or 12.8, compact and 8.0 or 8.5), {
+        face("smallinfofont", dense and 8.5 or (compact and 9.2 or 9.8), dense and 11.1 or (compact and 12.0 or 12.8), dense and 7.4 or (compact and 8.0 or 8.5)), {
             alignment = "center", halign = "center",
             height_overflow_show_ellipsis = true,
             fgcolor = enabled and Blitbuffer.COLOR_DARK_GRAY or Blitbuffer.COLOR_GRAY,
@@ -234,8 +235,9 @@ local function panel_button(entry, width, height, close_callback, compact, owner
         Ui.icon(icon, inner_w, icon_slot_h, icon_size, {
             icon_key = icon,
             icon_path = entry.icon_path,
-            face = UiScale.iconFace("cfont", compact and 22 or 25, compact and 29 or 33, compact and 18 or 20),
+            face = UiScale.iconFace("cfont", dense and 19.5 or (compact and 22 or 25), dense and 26 or (compact and 29 or 33), dense and 16.5 or (compact and 18 or 20)),
             fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+            fallback_text = "•",
         }),
         VerticalSpan:new{height = gap_h},
         label_box,
@@ -366,11 +368,12 @@ function QuickPanelWidget:_build()
     local sw, sh = scale.sw, scale.sh
     local margin = math.max(UiScale.dp(11, 9, 18), math.floor(scale.short * .018))
     local gap = UiScale.dp(6, 5, 10)
+    local button_gap = UiScale.dp(4, 3, 6)
     local buttons = type(self.opts.buttons) == "table" and self.opts.buttons or {}
     local line = UiScale.line("thin")
 
-    -- The pull-down shortcut strip is always one horizontal row of six.
-    local columns = 6
+    -- The pull-down shortcut strip is one horizontal row of up to eight.
+    local columns = 8
     local rows = #buttons > 0 and 1 or 0
     local frontlight=type(self.opts.frontlight)=="table" and self.opts.frontlight or nil
     local warmth=frontlight and type(frontlight.warmth)=="table" and frontlight.warmth or nil
@@ -448,12 +451,12 @@ function QuickPanelWidget:_build()
     y = y + line + gap
 
     if rows > 0 then
-        local button_w = math.floor((sw - margin * 2 - gap * (columns - 1)) / columns)
+        local button_w = math.floor((sw - margin * 2 - button_gap * (columns - 1)) / columns)
         for index, entry in ipairs(buttons) do
-            if index > 6 then break end
+            if index > 8 then break end
             local row = math.floor((index - 1) / columns)
             local col = (index - 1) % columns
-            self:_add(children, margin + col * (button_w + gap), y + row * (button_h + gap),
+            self:_add(children, margin + col * (button_w + button_gap), y + row * (button_h + gap),
                 panel_button(entry, button_w, button_h, function(action) self:_close(action) end, true, self, index))
         end
         y = y + rows * button_h + math.max(0, rows - 1) * gap + gap
@@ -521,7 +524,7 @@ function QuickPanelWidget:_build()
         y=math.max(y,margin+title_h+line+gap*2+rows*button_h+gap+frontlight_h)
     end
 
-    -- Keep the frontlight controls immediately below the six horizontal
+    -- Keep the frontlight controls immediately below the horizontal
     -- shortcuts. Any transient status message follows the controls instead
     -- of splitting that relationship.
     if status_h > 0 and y + status_h <= self.panel_h then

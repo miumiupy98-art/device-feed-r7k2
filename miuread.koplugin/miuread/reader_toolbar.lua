@@ -8,6 +8,7 @@ local HorizontalSpan = require("ui/widget/horizontalspan")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local LineWidget = require("ui/widget/linewidget")
 local OverlapGroup = require("ui/widget/overlapgroup")
+local TextBoxWidget = require("ui/widget/textboxwidget")
 local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
 local VerticalGroup = require("ui/widget/verticalgroup")
@@ -18,6 +19,7 @@ local TransientGuard = require("miuread.transient_guard")
 local Skin = require("miuread.reader_skin")
 local Ui = require("miuread.ui_components")
 local UiScale = require("miuread.ui_scale")
+local U = require("miuread.util")
 
 local Screen = Device.screen
 local live_toolbar
@@ -186,23 +188,90 @@ function SliderBar:onPanSlide(_, ges)
 end
 function SliderBar:handleEvent(event) return InputContainer.handleEvent(self, event) end
 
+local function text_pixel_width(text, face, bold)
+    local widget = TextWidget:new{
+        text = tostring(text or ""), face = face, bold = bold == true,
+        fgcolor = Blitbuffer.COLOR_BLACK,
+    }
+    local size = widget:getSize()
+    return tonumber(size and size.w) or 0
+end
+
+local function fit_line(text, width, face, bold, ellipsis)
+    text = tostring(text or "")
+    width = math.max(1, tonumber(width) or 1)
+    if text_pixel_width(text, face, bold) <= width then return text end
+    local suffix = ellipsis == false and "" or "…"
+    local length = U.utf8_len(text)
+    local low, high, best = 0, length, 0
+    while low <= high do
+        local middle = math.floor((low + high) / 2)
+        local candidate = U.utf8_sub(text, 1, middle) .. suffix
+        if text_pixel_width(candidate, face, bold) <= width then
+            best = middle
+            low = middle + 1
+        else
+            high = middle - 1
+        end
+    end
+    return U.utf8_sub(text, 1, best) .. suffix
+end
+
+local function fit_two_lines(text, width, face, bold)
+    text = tostring(text or ""):gsub("[\r\n]+", " ")
+    if text_pixel_width(text, face, bold) <= width then return text end
+    local length = U.utf8_len(text)
+    local low, high, best = 1, length, 1
+    while low <= high do
+        local middle = math.floor((low + high) / 2)
+        local candidate = U.utf8_sub(text, 1, middle)
+        if text_pixel_width(candidate, face, bold) <= width then
+            best = middle
+            low = middle + 1
+        else
+            high = middle - 1
+        end
+    end
+    local first = U.utf8_sub(text, 1, best)
+    local rest = U.utf8_sub(text, best + 1)
+    if rest == "" then return first end
+    return first .. "\n" .. fit_line(rest, width, face, bold, true)
+end
+
 local function status_item(entry, width, height, callback, hold_callback, owner, ref_key)
     entry = type(entry) == "table" and entry or {}
     local enabled = entry.enabled ~= false
-    local icon_w = entry.icon and Skin.dp(31, 27, 40) or 0
-    local gap = entry.icon and Skin.dp(5, 4, 7) or 0
+    local icon_w = entry.icon and Skin.dp(29, 25, 38) or 0
+    local gap = entry.icon and Skin.dp(4, 3, 6) or 0
     local text_w = math.max(1, width - icon_w - gap)
     local text_align = entry.text_align or (entry.icon and "left" or "center")
-    local label_box=Ui.textbox(tostring(entry.label or ""), text_w, height,
-        Skin.face("cfont", 10.8, 14.3, 9.2), {
-            alignment = text_align, halign = text_align,
-            bold = entry.bold ~= false or entry.alert == true,
-            fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
-        })
-    if owner and ref_key and label_box and label_box[1] then owner._text_refs[ref_key]=label_box[1] end
+    local bold = entry.bold ~= false or entry.alert == true
+    local label_face = entry.multiline
+        and Skin.face("cfont", 9.8, 12.8, 8.4)
+        or Skin.face("cfont", 10.5, 13.8, 8.9)
+    local function format_label(value)
+        local raw = tostring(value or "")
+        if entry.multiline then return fit_two_lines(raw, text_w, label_face, bold) end
+        return raw
+    end
+    local label_widget = TextBoxWidget:new{
+        text = format_label(entry.label or ""),
+        face = label_face,
+        bold = bold,
+        width = text_w,
+        height_adjust = true,
+        height_overflow_show_ellipsis = true,
+        alignment = text_align,
+        fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+    }
+    local label_box = Ui.align(label_widget, text_w, height, text_align, "center")
+    if owner and ref_key then
+        owner._text_refs[ref_key] = label_widget
+        owner._text_formatters[ref_key] = format_label
+    end
     local content = HorizontalGroup:new{
         align = "center",
-        entry.icon and icon_box(entry.icon, icon_w, height, enabled, Skin.dp(21, 18, 28)) or HorizontalSpan:new{width = 0},
+        entry.icon and icon_box(entry.icon, icon_w, height, enabled, Skin.dp(20, 17, 26)) or HorizontalSpan:new{width = 0},
         entry.icon and HorizontalSpan:new{width = gap} or HorizontalSpan:new{width = 0},
         label_box,
     }
@@ -341,36 +410,59 @@ end
 
 function Toolbar:_top_status_row(root, header, x, y, width, height)
     header = type(header) == "table" and header or {}
-    -- Keep navigation compact and give the SSID the widest slot. Icons and
-    -- labels sit next to each other instead of being visually separated by a
-    -- full-width text box. "More" is text-only: the old three-dot icon merely
-    -- duplicated the label and consumed useful width.
-    local weights = {31, 24, 14, 15, 16}
-    local entries = {
-        {icon = "wifi", label = header.wifi_label or "Wi-Fi", enabled = type(header.wifi_callback) == "function", alert = header.wifi_alert == true, bold = true},
-        {icon = "sync", label = header.sync_label or "同步", enabled = type(header.sync_callback) == "function", alert = header.sync_alert == true, bold = true},
-        {icon = "battery", label = header.battery_label or "", enabled = true, bold = true},
-        {icon = "home", label = header.home_label or "首页", enabled = type(header.home_callback) == "function", bold = true},
-        {label = header.more_label or "更多", enabled = type(header.more_callback) == "function", text_align = "center", bold = true},
-    }
-    local callbacks = {
-        function() self:_activate(header.wifi_callback, "Wi-Fi") end,
-        function() self:_activate(header.sync_callback, "同步") end,
-        nil,
-        function() self:_activate(header.home_callback, "首页") end,
-        function() self:_activate(header.more_callback, "更多") end,
-    }
-    local holds = {
-        type(header.wifi_hold_callback) == "function" and function() self:_activate_hold(header.wifi_hold_callback, "Wi-Fi 设置") end or nil,
-        nil,nil,nil,nil,
-    }
+    local has_bluetooth = header.bluetooth_visible == true
+    local entries, callbacks, holds, ref_keys, weights
+    if has_bluetooth then
+        weights = {29, 13, 21, 11, 13, 13}
+        entries = {
+            {icon = "wifi", label = header.wifi_label or "Wi-Fi", enabled = type(header.wifi_callback) == "function", alert = header.wifi_alert == true, bold = true, multiline = true},
+            {icon = "bluetooth", label = header.bluetooth_label or "蓝牙", enabled = type(header.bluetooth_callback) == "function", bold = true},
+            {icon = "sync", label = header.sync_label or "同步", enabled = type(header.sync_callback) == "function", alert = header.sync_alert == true, bold = true},
+            {icon = "battery", label = header.battery_label or "", enabled = true, bold = true},
+            {icon = "home", label = header.home_label or "首页", enabled = type(header.home_callback) == "function", bold = true},
+            {label = header.more_label or "更多", enabled = type(header.more_callback) == "function", text_align = "center", bold = true},
+        }
+        callbacks = {
+            function() self:_activate(header.wifi_callback, "Wi-Fi") end,
+            function() self:_activate(header.bluetooth_callback, "蓝牙") end,
+            function() self:_activate(header.sync_callback, "同步") end,
+            nil,
+            function() self:_activate(header.home_callback, "首页") end,
+            function() self:_activate(header.more_callback, "更多") end,
+        }
+        holds = {
+            type(header.wifi_hold_callback) == "function" and function() self:_activate_hold(header.wifi_hold_callback, "Wi-Fi 设置") end or nil,
+            nil,nil,nil,nil,nil,
+        }
+        ref_keys = {"wifi","bluetooth","sync","battery","home","more"}
+    else
+        weights = {33, 23, 14, 15, 15}
+        entries = {
+            {icon = "wifi", label = header.wifi_label or "Wi-Fi", enabled = type(header.wifi_callback) == "function", alert = header.wifi_alert == true, bold = true, multiline = true},
+            {icon = "sync", label = header.sync_label or "同步", enabled = type(header.sync_callback) == "function", alert = header.sync_alert == true, bold = true},
+            {icon = "battery", label = header.battery_label or "", enabled = true, bold = true},
+            {icon = "home", label = header.home_label or "首页", enabled = type(header.home_callback) == "function", bold = true},
+            {label = header.more_label or "更多", enabled = type(header.more_callback) == "function", text_align = "center", bold = true},
+        }
+        callbacks = {
+            function() self:_activate(header.wifi_callback, "Wi-Fi") end,
+            function() self:_activate(header.sync_callback, "同步") end,
+            nil,
+            function() self:_activate(header.home_callback, "首页") end,
+            function() self:_activate(header.more_callback, "更多") end,
+        }
+        holds = {
+            type(header.wifi_hold_callback) == "function" and function() self:_activate_hold(header.wifi_hold_callback, "Wi-Fi 设置") end or nil,
+            nil,nil,nil,nil,
+        }
+        ref_keys = {"wifi","sync","battery","home","more"}
+    end
     local used = 0
     for index, entry in ipairs(entries) do
         local w = index == #entries and (width - used) or math.floor(width * weights[index] / 100)
         root[#root + 1] = OffsetContainer:new{
             x_off = x + used, y_off = y,
-            status_item(entry, w, height, callbacks[index], holds[index], self,
-                ({"wifi","sync","battery","home","more"})[index]),
+            status_item(entry, w, height, callbacks[index], holds[index], self, ref_keys[index]),
         }
         used = used + w
     end
@@ -599,7 +691,7 @@ function Toolbar:_build_content()
     local content_w = math.max(1, sw - side_pad * 2)
     local divider_h = math.max(1, Skin.line("thin"))
 
-    local status_h = math.max(Skin.dp(46, 40, 59), math.floor(sh * (portrait and .040 or .060)))
+    local status_h = math.max(Skin.dp(54, 47, 69), math.floor(sh * (portrait and .047 or .068)))
     local title_h = math.max(Skin.dp(54, 46, 69), math.floor(sh * (portrait and .046 or .072)))
     local chapter_h = math.max(Skin.dp(44, 38, 57), math.floor(sh * (portrait and .038 or .058)))
     local content_h = math.max(Skin.dp(76, 65, 97), math.floor(sh * (portrait and .064 or .094)))
@@ -682,6 +774,7 @@ function Toolbar:_signature(opts)
     return table.concat({
         opts.frontlight and "f1" or "f0",
         opts.warmth and "w1" or "w0",
+        (type(opts.header)=="table" and opts.header.bluetooth_visible==true) and "bt1" or "bt0",
         tostring(#(type(opts.actions)=="table" and opts.actions or {})),
         tostring(#(type(opts.device_actions)=="table" and opts.device_actions or {})),
         tostring(Screen:getWidth()),tostring(Screen:getHeight()),
@@ -690,8 +783,10 @@ function Toolbar:_signature(opts)
     },"|")
 end
 
-local function set_ref(ref,value)
-    if ref and type(ref.setText)=="function" then ref:setText(tostring(value or "")) end
+local function set_ref(ref,value,formatter)
+    if not (ref and type(ref.setText)=="function") then return end
+    local text=type(formatter)=="function" and formatter(value) or tostring(value or "")
+    ref:setText(text)
 end
 
 function Toolbar:updateFromOptions(opts)
@@ -704,8 +799,9 @@ function Toolbar:updateFromOptions(opts)
     UIManager:nextTick(function() if not self.closed and live_toolbar==self then self._controls_ready=true end end)
     self.pending_action=nil
     local header=type(opts.header)=="table" and opts.header or {}
-    set_ref(self._text_refs.wifi,header.wifi_label or "Wi-Fi")
-    set_ref(self._text_refs.sync,header.sync_label or "同步")
+    set_ref(self._text_refs.wifi,header.wifi_label or "Wi-Fi",self._text_formatters.wifi)
+    set_ref(self._text_refs.bluetooth,header.bluetooth_label or "蓝牙",self._text_formatters.bluetooth)
+    set_ref(self._text_refs.sync,header.sync_label or "同步",self._text_formatters.sync)
     set_ref(self._text_refs.battery,header.battery_label or "")
     set_ref(self._text_refs.home,header.home_label or "首页")
     set_ref(self._text_refs.more,header.more_label or "更多")
@@ -737,6 +833,7 @@ function Toolbar:init()
     self.action_locked = false
     self._controls_ready=false
     self._text_refs={}
+    self._text_formatters={}
     self._sliders={}
     self._layout_signature=self:_signature(self.opts)
     self:_build_content()

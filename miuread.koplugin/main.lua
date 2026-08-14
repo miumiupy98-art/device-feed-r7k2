@@ -52,6 +52,7 @@ local ScreenshotMode=require("miuread.screenshot_mode")
 local GestureBridge=require("miuread.gesture_bridge")
 local Orientation=require("miuread.orientation_controller")
 local HomeData=require("miuread.home_data")
+local Bluetooth=require("miuread.bluetooth")
 local TimeZone=require("miuread.timezone")
 local UiScale=require("miuread.ui_scale")
 local LocalLibrary=require("miuread.local_library")
@@ -116,10 +117,15 @@ local HOME_ACTION_ITEM_ORDER={"refresh","search","downloads","sync","sleep","miu
 local HOME_ACTION_ITEM_DEFAULT={refresh=true,search=true,downloads=true,sync=true,sleep=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false}
 local HOME_ACTION_LAYOUT_VERSION=3
 local HOME_PANEL_ITEM_V1_ORDER={"wifi","rotate","screenshot","koreader_settings","return_koreader","quit","frontlight","sync","miuread_settings","downloads","restart","sleep","full_refresh"}
-local HOME_PANEL_ITEM_ORDER={"wifi","rotate","screenshot","koreader_settings","return_koreader","quit","sync","miuread_settings","downloads","restart","sleep","full_refresh"}
 local HOME_PANEL_ITEM_V1_DEFAULT={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=true,frontlight=false,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=false,full_refresh=false}
-local HOME_PANEL_ITEM_DEFAULT={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=true,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=false,full_refresh=false}
-local HOME_PANEL_LAYOUT_VERSION=2
+local HOME_PANEL_ITEM_V2_ORDER={"wifi","rotate","screenshot","koreader_settings","return_koreader","quit","sync","miuread_settings","downloads","restart","sleep","full_refresh"}
+local HOME_PANEL_ITEM_V2_DEFAULT={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=true,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=false,full_refresh=false}
+-- The pull-down row can use eight slots. Bluetooth is a conditional candidate:
+-- supported Kindle devices receive it, while unsupported devices fall through
+-- to Sync as the eighth useful control.
+local HOME_PANEL_ITEM_ORDER={"wifi","bluetooth","rotate","screenshot","full_refresh","koreader_settings","return_koreader","quit","sync","miuread_settings","downloads","restart","sleep"}
+local HOME_PANEL_ITEM_DEFAULT={wifi=true,bluetooth=true,rotate=true,screenshot=true,full_refresh=true,koreader_settings=true,return_koreader=true,quit=true,sync=true,miuread_settings=false,downloads=false,restart=false,sleep=false}
+local HOME_PANEL_LAYOUT_VERSION=3
 local READER_QUICK_ITEM_LEGACY_ORDER={"home","toc","progress","font","typeset","sync","current_book","downloads","full_refresh","koreader_menu","sleep","more"}
 local READER_QUICK_ITEM_LEGACY_DEFAULT={home=true,toc=true,progress=true,font=true,typeset=true,sync=true,current_book=true,downloads=false,full_refresh=false,koreader_menu=false,sleep=false,more=true}
 local READER_QUICK_ITEM_V2_ORDER={"home","toc","progress","font","sync","more","typeset","current_book","downloads","full_refresh","koreader_menu","sleep"}
@@ -404,6 +410,7 @@ function Plugin:init()
     math.randomseed(os.time()+math.floor(collectgarbage("count")))
     sync_home_session()
     self.store=Store:new()
+    Bluetooth.prime(.75)
     local runtime_mode=rawget(_G,RUNTIME_MODE_KEY)
     if runtime_mode~="desktop" and runtime_mode~="plugin" then
         local configured=((self.store:preferences().home_ui or {}).enabled~=false)
@@ -2337,6 +2344,46 @@ function Plugin:show_shelf(mp_mode,force_remote,section)
 end
 
 
+function Plugin:_bluetooth_state(force)
+    if force==true then return Bluetooth.refresh(true) end
+    return Bluetooth.peek()
+end
+
+function Plugin:_bluetooth_supported()
+    local state=self:_bluetooth_state(false)
+    return state.known==true and state.supported==true
+end
+
+function Plugin:_home_panel_item_available(key)
+    if key=="bluetooth" then return self:_bluetooth_supported() end
+    if key=="sleep" then return Device:canSuspend()==true end
+    return true
+end
+
+function Plugin:_bluetooth_toggle()
+    local state=Bluetooth.refresh(true)
+    if state.supported~=true then
+        self:toast("当前设备暂不支持觅阅蓝牙控制",2)
+        return false
+    end
+    local target=state.enabled~=true
+    local ok=Bluetooth.set_enabled(target)
+    if not ok then
+        self:toast("蓝牙切换失败，请在设备设置中操作",3)
+        return false
+    end
+    self:toast(target and "正在开启蓝牙…" or "正在关闭蓝牙…",1.5)
+    UIManager:scheduleIn(.45,function()
+        local latest=Bluetooth.refresh(true)
+        if latest.supported==true and latest.enabled==target then
+            self:toast(target and "蓝牙已开启" or "蓝牙已关闭",2)
+        else
+            self:toast("蓝牙状态未确认，请在设备设置中检查",3)
+        end
+    end)
+    return true
+end
+
 function Plugin:_home_preferences()
     local preferences=self.store:preferences()
     preferences.home_ui=type(preferences.home_ui)=="table" and preferences.home_ui or {}
@@ -2499,25 +2546,34 @@ function Plugin:_home_preferences()
     -- Never reintroduce the retired homepage-frontlight key from merged legacy
     -- preferences. Direct frontlight control is rendered by HomeQuickPanel.
     if home.action_items.frontlight~=nil then home.action_items.frontlight=nil; changed=true end
-    -- Pull-down layout v2 keeps one horizontal row of six controls. Migrate
-    -- the old recommended row before frontlight is removed from the selectable
-    -- shortcut list; customized rows keep their enabled choices when possible.
+    -- Pull-down layout v3 expands the control strip from six to eight slots.
+    -- Old recommended layouts move to the new recommendation. Customized
+    -- layouts keep their choices and receive Bluetooth as an opt-in candidate.
     if (tonumber(home.panel_layout_version) or 0)<HOME_PANEL_LAYOUT_VERSION then
         home.panel_items=type(home.panel_items)=="table" and home.panel_items or {}
         home.panel_order=type(home.panel_order)=="table" and home.panel_order or U.copy(HOME_PANEL_ITEM_V1_ORDER)
-        local old_recommended=quick_boolean_layout_matches(home.panel_items,HOME_PANEL_ITEM_V1_DEFAULT,HOME_PANEL_ITEM_V1_ORDER)
+        local old_v1_recommended=quick_boolean_layout_matches(home.panel_items,HOME_PANEL_ITEM_V1_DEFAULT,HOME_PANEL_ITEM_V1_ORDER)
             and quick_order_matches(home.panel_order,HOME_PANEL_ITEM_V1_ORDER)
-        -- Preserve the existing six shortcut choices. Only the old optional
-        -- frontlight tile is removed because frontlight now has its own direct
-        -- control section immediately below this row.
-        if old_recommended then
-            home.panel_items.quit=true
-            home.panel_items.sleep=false
+        local old_v2_recommended=quick_boolean_layout_matches(home.panel_items,HOME_PANEL_ITEM_V2_DEFAULT,HOME_PANEL_ITEM_V2_ORDER)
+            and quick_order_matches(home.panel_order,HOME_PANEL_ITEM_V2_ORDER)
+        if old_v1_recommended or old_v2_recommended then
+            home.panel_items={}
+            for _,key in ipairs(HOME_PANEL_ITEM_ORDER) do home.panel_items[key]=HOME_PANEL_ITEM_DEFAULT[key]==true end
+            home.panel_order=U.copy(HOME_PANEL_ITEM_ORDER)
+        else
+            home.panel_items.frontlight=nil
+            if home.panel_items.bluetooth==nil then home.panel_items.bluetooth=false end
+            local seen,kept={},{}
+            for _,name in ipairs(home.panel_order) do
+                if name~="frontlight" and HOME_PANEL_ITEM_DEFAULT[name]~=nil and not seen[name] then
+                    seen[name]=true; kept[#kept+1]=name
+                end
+            end
+            for _,name in ipairs(HOME_PANEL_ITEM_ORDER) do
+                if not seen[name] then seen[name]=true; kept[#kept+1]=name end
+            end
+            home.panel_order=kept
         end
-        home.panel_items.frontlight=nil
-        local kept={}
-        for _,name in ipairs(home.panel_order) do if name~="frontlight" then kept[#kept+1]=name end end
-        home.panel_order=kept
         home.panel_layout_version=HOME_PANEL_LAYOUT_VERSION
         changed=true
     end
@@ -2529,9 +2585,9 @@ function Plugin:_home_preferences()
     end
     local panel_enabled=0
     for _,key in ipairs(home.panel_order or HOME_PANEL_ITEM_ORDER) do
-        if home.panel_items[key]==true then
+        if home.panel_items[key]==true and self:_home_panel_item_available(key) then
             panel_enabled=panel_enabled+1
-            if panel_enabled>6 then home.panel_items[key]=false; changed=true end
+            if panel_enabled>8 then home.panel_items[key]=false; changed=true end
         end
     end
     if type(home.hidden_local_files)~="table" then home.hidden_local_files={}; changed=true end
@@ -2698,7 +2754,7 @@ function Plugin:_home_bump_section_revision(section)
 end
 
 function Plugin:_home_enabled()
-    return tostring(self._runtime_mode or rawget(_G,RUNTIME_MODE_KEY) or "desktop")=="desktop"
+    return tostring(self._runtime_mode or rawget(_G,RUNTIME_MODE_KEY) or "plugin")=="desktop"
 end
 
 function Plugin:_configured_home_enabled()
@@ -4491,8 +4547,8 @@ local HOME_ACTION_LABELS={
     miuread_settings="觅阅设置",all_books="全部书籍",history="阅读历史",file_manager="文件管理",screenshot="截图",
 }
 local HOME_PANEL_LABELS={
-    wifi="Wi-Fi",rotate="方向锁定",screenshot="截图",koreader_settings="KOReader 设置",
-    return_koreader="返回 KOReader",quit="退出 KOReader",frontlight="前光",sync="同步",
+    wifi="Wi-Fi",bluetooth="蓝牙",rotate="方向锁定",screenshot="截图",koreader_settings="KOReader 设置",
+    return_koreader="返回 KOReader",quit="退出 KO",frontlight="前光",sync="同步",
     miuread_settings="觅阅设置",downloads="下载",restart="重启 KOReader",sleep="休眠",full_refresh="全屏刷新",
 }
 
@@ -4501,13 +4557,15 @@ function Plugin:_home_toggle_group_item(group,key)
     local is_action=group=="action"
     local items_key=is_action and "action_items" or "panel_items"
     local order=is_action and HOME_ACTION_ITEM_ORDER or HOME_PANEL_ITEM_ORDER
-    local max_count=6
+    local max_count=is_action and 6 or 8
     local items=home[items_key] or {}
     local currently=items[key]==true
     local count=0
-    for _,name in ipairs(order) do if items[name]==true then count=count+1 end end
+    for _,name in ipairs(order) do
+        if items[name]==true and (is_action or self:_home_panel_item_available(name)) then count=count+1 end
+    end
     if not currently and count>=max_count then
-        self:toast((is_action and "主页快捷栏最多显示六项" or "下滑工具栏最多显示六项"),2)
+        self:toast((is_action and "主页快捷栏最多显示六项" or "下滑工具栏最多显示八项"),2)
         return false
     end
     items[key]=not currently
@@ -4521,12 +4579,17 @@ function Plugin:_home_move_group_item(group,key,delta)
     local home,preferences=self:_home_preferences()
     local order_key=group=="action" and "action_order" or "panel_order"
     local order=home[order_key] or {}
-    local index
-    for i,name in ipairs(order) do if name==key then index=i; break end end
-    if not index then return false end
-    local target=index+(tonumber(delta) or 0)
-    if target<1 or target>#order then return false end
-    order[index],order[target]=order[target],order[index]
+    local positions={}
+    for index,name in ipairs(order) do
+        if group=="action" or self:_home_panel_item_available(name) then positions[#positions+1]=index end
+    end
+    local visible_index
+    for index,position in ipairs(positions) do if order[position]==key then visible_index=index; break end end
+    if not visible_index then return false end
+    local target_visible=visible_index+(tonumber(delta) or 0)
+    if target_visible<1 or target_visible>#positions then return false end
+    local source_position,target_position=positions[visible_index],positions[target_visible]
+    order[source_position],order[target_position]=order[target_position],order[source_position]
     home[order_key]=order
     self:_save_home_preferences(home,preferences)
     if HomeView.is_shown() then self:_refresh_home_view(nil,"content") end
@@ -4538,21 +4601,30 @@ function Plugin:_home_group_order_menu(group)
     local order=group=="action" and (home.action_order or HOME_ACTION_ITEM_ORDER) or (home.panel_order or HOME_PANEL_ITEM_ORDER)
     local labels=group=="action" and HOME_ACTION_LABELS or HOME_PANEL_LABELS
     local rows={}
-    for index,key in ipairs(order) do
-        local item_key,item_index=key,index
-        rows[#rows+1]={
-            text=labels[item_key] or item_key,post_text=tostring(item_index),
-            sub_item_table_func=function()
-                local current=self:_home_preferences()[group=="action" and "action_order" or "panel_order"] or order
-                local current_index
-                for i,name in ipairs(current) do if name==item_key then current_index=i; break end end
-                current_index=current_index or item_index
-                return {
-                    {text="上移",enabled_func=function() return current_index>1 end,callback=function() self:_home_move_group_item(group,item_key,-1) end},
-                    {text="下移",enabled_func=function() return current_index<#current end,callback=function() self:_home_move_group_item(group,item_key,1) end},
-                }
-            end,
-        }
+    local visible_index=0
+    for _,key in ipairs(order) do
+        local item_key=key
+        if group=="action" or self:_home_panel_item_available(item_key) then
+            visible_index=visible_index+1
+            local item_index=visible_index
+            rows[#rows+1]={
+                text=labels[item_key] or item_key,post_text=tostring(item_index),
+                sub_item_table_func=function()
+                    local current=self:_home_preferences()[group=="action" and "action_order" or "panel_order"] or order
+                    local visible={}
+                    for _,name in ipairs(current) do
+                        if group=="action" or self:_home_panel_item_available(name) then visible[#visible+1]=name end
+                    end
+                    local current_index
+                    for i,name in ipairs(visible) do if name==item_key then current_index=i; break end end
+                    current_index=current_index or item_index
+                    return {
+                        {text="上移",enabled_func=function() return current_index>1 end,callback=function() self:_home_move_group_item(group,item_key,-1) end},
+                        {text="下移",enabled_func=function() return current_index<#visible end,callback=function() self:_home_move_group_item(group,item_key,1) end},
+                    }
+                end,
+            }
+        end
     end
     return rows
 end
@@ -4568,12 +4640,14 @@ function Plugin:_home_group_settings_menu(group)
     local rows={}
     for _,key in ipairs(order) do
         local item_key=key
-        rows[#rows+1]={
-            text=labels[item_key] or item_key,
-            checked_func=function() return self:_home_preferences()[items_key][item_key]==true end,
-            keep_menu_open=true,
-            callback=function() self:_home_toggle_group_item(group,item_key) end,
-        }
+        if is_action or self:_home_panel_item_available(item_key) then
+            rows[#rows+1]={
+                text=labels[item_key] or item_key,
+                checked_func=function() return self:_home_preferences()[items_key][item_key]==true end,
+                keep_menu_open=true,
+                callback=function() self:_home_toggle_group_item(group,item_key) end,
+            }
+        end
     end
     rows[#rows+1]={text="调整顺序",sub_item_table_func=function() return self:_home_group_order_menu(group) end}
     rows[#rows+1]={text="恢复推荐布局",callback=function()
@@ -4598,8 +4672,10 @@ function Plugin:_home_group_enabled_count(group)
     local order=is_action and HOME_ACTION_ITEM_ORDER or HOME_PANEL_ITEM_ORDER
     local items=home[is_action and "action_items" or "panel_items"] or {}
     local count=0
-    for _,key in ipairs(order) do if items[key]==true then count=count+1 end end
-    return count
+    for _,key in ipairs(order) do
+        if items[key]==true and (is_action or self:_home_panel_item_available(key)) then count=count+1 end
+    end
+    return math.min(count,is_action and 6 or 8)
 end
 
 function Plugin:_home_restore_all_quick_defaults()
@@ -4621,7 +4697,7 @@ end
 function Plugin:home_customization_menu()
     return {
         {text="主页快捷栏",post_text=tostring(self:_home_group_enabled_count("action")).." / 6",sub_item_table_func=function() return self:home_action_settings_menu() end},
-        {text="下滑工具栏",post_text=tostring(self:_home_group_enabled_count("panel")).." / 6",sub_item_table_func=function() return self:home_panel_settings_menu() end},
+        {text="下滑工具栏",post_text=tostring(self:_home_group_enabled_count("panel")).." / 8",sub_item_table_func=function() return self:home_panel_settings_menu() end},
         {text="恢复全部推荐布局",post_text="主页 + 下滑工具栏",callback=function() self:_home_restore_all_quick_defaults() end},
     }
 end
@@ -9178,6 +9254,7 @@ function Plugin:show_home_quick_panel(more_expanded)
     else wifi_detail="未连接" end
     local download_detail=tostring(self._home_panel_download_detail or "")
     local sync_label=self:_home_sync_status_label()
+    local bluetooth_state=self:_bluetooth_state(false)
     local definitions={
         wifi={
             icon="Wi-Fi",
@@ -9186,6 +9263,10 @@ function Plugin:show_home_quick_panel(more_expanded)
             callback=function() self:_home_wifi_toggle() end,
             hold_callback=function() self:_home_wifi_settings() end
         },
+        bluetooth=bluetooth_state.supported==true and {
+            icon="bluetooth",icon_key="bluetooth",label="蓝牙",detail=bluetooth_state.enabled==true and "已开启" or "已关闭",
+            callback=function() self:_bluetooth_toggle() end
+        } or nil,
         rotate={
             icon="方向",icon_key=self:_orientation_icon_key(),label="方向锁定",detail=self:_orientation_status_label(),
             callback=function() self:_orientation_toggle_lock() end,
@@ -9194,7 +9275,7 @@ function Plugin:show_home_quick_panel(more_expanded)
         screenshot={icon="▣",icon_key="screenshot",label="截图",detail="",callback=function(anchor) ScreenshotMode.start(self,anchor) end},
         koreader_settings={icon="⚙",icon_key="ko-reader",label="KO设置",detail="",callback=function() self:_show_native_koreader_menu() end},
         return_koreader={icon="←",icon_key="return",label="返回KO",detail="",callback=function() self:_home_close_to_native(true) end},
-        quit={icon="⏻",icon_key="power",label="退出 KOReader",detail="",callback=function() self:_quit_koreader() end},
+        quit={icon="⏻",icon_key="power",label="退出 KO",detail="",callback=function() self:_quit_koreader() end},
         sync={icon="⇅",icon_key="sync",label="同步",detail=sync_label,callback=function() self:_sync_home_pending() end,hold_callback=function(anchor) self:_show_home_sync_popup(anchor) end},
         miuread_settings={icon="⚙",icon_key="settings",label="觅阅设置",detail="",callback=function() self:_show_home_settings_center() end},
         downloads={icon="⇩",icon_key="download",label="下载",detail=download_detail,
@@ -9211,7 +9292,7 @@ function Plugin:show_home_quick_panel(more_expanded)
     local buttons={}
     for _,key in ipairs(home.panel_order or HOME_PANEL_ITEM_ORDER) do
         if home.panel_items[key]==true and definitions[key] then buttons[#buttons+1]=definitions[key] end
-        if #buttons>=6 then break end
+        if #buttons>=8 then break end
     end
 
     local battery=tonumber(state.battery) and (tostring(math.floor(state.battery+.5)).."%") or "未知"
@@ -9949,7 +10030,7 @@ function Plugin:_reader_wifi_summary()
     if state.wifi_on==false then return "Wi-Fi关",false end
     if state.wifi_on==nil then return "Wi-Fi",true end
     local ssid=U.trim(tostring(state.wifi_name or ""))
-    if ssid~="" then return U.utf8_truncate(ssid,18,"…"),false end
+    if ssid~="" then return ssid,false end
     if state.online==true then return "已连接",false end
     return "Wi-Fi!",true
 end
@@ -9987,6 +10068,7 @@ function Plugin:_reader_toolbar_header(title)
     elseif wifi_label=="Wi-Fi!" then wifi_text="未连接"
     elseif wifi_label=="Wi-Fi" then wifi_text="状态未知" end
     local battery=self:_reader_battery_label()
+    local bluetooth_state=self:_bluetooth_state(false)
     local device_ms=math.floor((os.clock()-device_started)*1000+.5)
 
     local state_started=os.clock()
@@ -10018,6 +10100,9 @@ function Plugin:_reader_toolbar_header(title)
         wifi_label=wifi_text,wifi_alert=wifi_alert,
         wifi_callback=function() return self:_show_reader_wifi_quick_panel(function() self:show_reader_quick_panel() end) end,
         wifi_hold_callback=function() return self:_reader_wifi_settings(function() self:show_reader_quick_panel() end) end,
+        bluetooth_visible=bluetooth_state.supported==true,
+        bluetooth_label=bluetooth_state.enabled==true and "蓝牙开" or "蓝牙关",
+        bluetooth_callback=bluetooth_state.supported==true and function() return self:_bluetooth_toggle() end or nil,
         sync_label=sync_text,sync_alert=sync_alert,
         sync_callback=function() return self:_show_reader_sync_panel(function() self:show_reader_quick_panel() end) end,
         battery_label=battery,
