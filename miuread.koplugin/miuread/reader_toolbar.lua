@@ -432,7 +432,8 @@ function Toolbar:_top_status_row(root, header, x, y, width, height)
         }
         holds = {
             type(header.wifi_hold_callback) == "function" and function() self:_activate_hold(header.wifi_hold_callback, "Wi-Fi 设置") end or nil,
-            nil,nil,nil,nil,nil,
+            type(header.bluetooth_hold_callback) == "function" and function() self:_activate_hold(header.bluetooth_hold_callback, "蓝牙设备") end or nil,
+            nil,nil,nil,nil,
         }
         ref_keys = {"wifi","bluetooth","sync","battery","home","more"}
     else
@@ -562,10 +563,6 @@ end
 
 function Toolbar:_typeset_row(root, typeset, x, y, width, height)
     typeset = type(typeset) == "table" and typeset or {}
-    if typeset.fixed_page==true then
-        self:_content_row(root, typeset.fixed_actions or {}, x, y, width, height)
-        return
-    end
     local page_w = math.floor(width * .22)
     local left = width - page_w
     local half = math.floor(left / 2)

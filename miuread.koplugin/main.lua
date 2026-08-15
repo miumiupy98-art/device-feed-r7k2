@@ -51,6 +51,7 @@ local TransientGuard=require("miuread.transient_guard")
 local ScreenshotMode=require("miuread.screenshot_mode")
 local GestureBridge=require("miuread.gesture_bridge")
 local Orientation=require("miuread.orientation_controller")
+local Bluetooth=require("miuread.bluetooth")
 local HomeData=require("miuread.home_data")
 local TimeZone=require("miuread.timezone")
 local UiScale=require("miuread.ui_scale")
@@ -120,9 +121,9 @@ local HOME_PANEL_ITEM_V1_ORDER={"wifi","rotate","screenshot","koreader_settings"
 local HOME_PANEL_ITEM_V1_DEFAULT={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=true,frontlight=false,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=false,full_refresh=false}
 local HOME_PANEL_ITEM_V2_ORDER={"wifi","rotate","screenshot","koreader_settings","return_koreader","quit","sync","miuread_settings","downloads","restart","sleep","full_refresh"}
 local HOME_PANEL_ITEM_V2_DEFAULT={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=true,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=false,full_refresh=false}
--- The pull-down row can use eight slots. Bluetooth is a conditional candidate:
--- supported Kindle devices receive it, while unsupported devices fall through
--- to Sync as the eighth useful control.
+-- The pull-down row can use eight slots. Bluetooth is conditional on a
+-- working platform backend. Capability is probed once per KOReader session;
+-- opening the pull-down never performs a Bluetooth system query.
 local HOME_PANEL_ITEM_ORDER={"wifi","bluetooth","rotate","screenshot","full_refresh","koreader_settings","return_koreader","quit","sync","miuread_settings","downloads","restart","sleep"}
 local HOME_PANEL_ITEM_DEFAULT={wifi=true,bluetooth=true,rotate=true,screenshot=true,full_refresh=true,koreader_settings=true,return_koreader=true,quit=true,sync=true,miuread_settings=false,downloads=false,restart=false,sleep=false}
 local HOME_PANEL_LAYOUT_VERSION=3
@@ -487,6 +488,10 @@ function Plugin:init()
     math.randomseed(os.time()+math.floor(collectgarbage("count")))
     sync_home_session()
     self.store=Store:new()
+    -- Probe Bluetooth once for the whole KOReader session, just like a device
+    -- capability flag. Pull-down rendering only reads the shared memory cache.
+    local bluetooth_startup_state=Bluetooth.probe(false)
+    self:_bluetooth_migrate_panel(bluetooth_startup_state)
     local lockscreen_direct_version=tonumber(self.store:get("lockscreen_direct_version",0)) or 0
     if lockscreen_direct_version<1 then
         -- beta.10 no longer writes pre-rendered sleep-screen PNGs. Remove only
@@ -2429,22 +2434,48 @@ function Plugin:show_shelf(mp_mode,force_remote,section)
 end
 
 
-function Plugin:_bluetooth_state(_force)
-    -- Bluetooth is owned by KOReader's loaded Bluetooth controller/plugin.
-    -- MiuRead only exposes the existing capability in its toolbar.
-    local manager=rawget(_G,"KOBluetoothStateManager")
-    local controller=rawget(_G,"_bt_controller_instance")
-    if not manager or not controller or type(manager.isOn)~="function" then
-        return {known=true,supported=false,enabled=false}
+function Plugin:_bluetooth_migrate_panel(state)
+    state=type(state)=="table" and state or Bluetooth.peek()
+    if state.supported~=true or not self.store then return end
+    local preferences=self.store:preferences()
+    preferences.home_ui=type(preferences.home_ui)=="table" and preferences.home_ui or {}
+    local home=preferences.home_ui
+    if (tonumber(home.bluetooth_shortcut_version) or 0)>=1 then return end
+    home.panel_items=type(home.panel_items)=="table" and home.panel_items or {}
+    home.panel_order=type(home.panel_order)=="table" and home.panel_order or U.copy(HOME_PANEL_ITEM_ORDER)
+    -- beta.6 added Bluetooth as opt-in for customized layouts before the real
+    -- backend existed. Turn it on once now that the capability is confirmed;
+    -- after this migration an explicit user disable is preserved.
+    home.panel_items.bluetooth=true
+    local normalized,seen={},{}
+    local inserted=false
+    for _,key in ipairs(home.panel_order) do
+        if key~="bluetooth" and HOME_PANEL_ITEM_DEFAULT[key]~=nil and not seen[key] then
+            seen[key]=true
+            normalized[#normalized+1]=key
+            if key=="wifi" then normalized[#normalized+1]="bluetooth"; inserted=true end
+        end
     end
-    local ok,enabled=pcall(function() return manager:isOn()==true end)
-    if not ok then return {known=false,supported=true,enabled=false} end
-    return {known=true,supported=true,enabled=enabled==true}
+    if not inserted then table.insert(normalized,1,"bluetooth") end
+    for _,key in ipairs(HOME_PANEL_ITEM_ORDER) do
+        if key~="bluetooth" and not seen[key] then seen[key]=true; normalized[#normalized+1]=key end
+    end
+    home.panel_order=normalized
+    home.bluetooth_shortcut_version=1
+    self.store:save_preferences(preferences)
+    logger.info("[MiuRead][Bluetooth] toolbar entry enabled after capability probe",
+        "backend=",tostring(state.backend or "unknown"))
+end
+
+function Plugin:_bluetooth_state(force)
+    if force==true then return Bluetooth.refresh() end
+    -- Never probe here. Both home and reader pull-downs are high-frequency UI
+    -- paths and must be memory-only.
+    return Bluetooth.peek()
 end
 
 function Plugin:_bluetooth_supported()
-    local state=self:_bluetooth_state(false)
-    return state.supported==true
+    return self:_bluetooth_state(false).supported==true
 end
 
 function Plugin:_home_panel_item_available(key)
@@ -2454,13 +2485,98 @@ function Plugin:_home_panel_item_available(key)
 end
 
 function Plugin:_bluetooth_toggle()
-    if not self:_bluetooth_supported() then
-        self:toast("当前 KOReader 未提供蓝牙控制",2)
+    local state=self:_bluetooth_state(false)
+    if state.supported~=true then
+        self:toast("当前设备没有可用的蓝牙控制后端",2)
         return false
     end
-    -- Reuse the Bluetooth controller's registered KOReader event.
-    UIManager:sendEvent(Event:new("ToggleBluetooth"))
+    local target=state.enabled~=true
+    local ok,err=Bluetooth.setEnabled(target)
+    if not ok then
+        self:toast("蓝牙"..(target and "开启" or "关闭").."失败",2)
+        logger.warn("[MiuRead][Bluetooth] toggle failed",tostring(err or "unknown"))
+        return false
+    end
+    self:toast(target and "蓝牙已开启" or "蓝牙已关闭",1.5)
+    -- The cache is updated immediately by setEnabled. A delayed readback
+    -- verifies the platform result without making the next pull-down wait.
+    UIManager:scheduleIn(.45,function()
+        local refreshed=Bluetooth.refresh()
+        logger.info("[MiuRead][Bluetooth] toggle readback",
+            "enabled=",tostring(refreshed.enabled==true),"backend=",tostring(refreshed.backend or ""))
+    end)
     return true
+end
+
+local BLUETOOTH_SOURCE_LABEL={connected="已连接",paired="已配对",discovered="附近设备"}
+
+function Plugin:_bluetooth_device_action(device)
+    device=type(device)=="table" and device or {}
+    local source=tostring(device.source or "discovered")
+    local action,success
+    if source=="connected" then
+        action="断开"
+        success=Bluetooth.disconnect(device)
+    elseif source=="paired" then
+        action="连接"
+        success=Bluetooth.connect(device)
+    else
+        action="配对"
+        success=Bluetooth.pair(device)
+        if success then
+            UIManager:scheduleIn(.35,function() Bluetooth.connect(device) end)
+        end
+    end
+    self:toast(tostring(device.name or "蓝牙设备")..(success and (" · "..action.."中") or (" · "..action.."失败")),2)
+    if success then
+        UIManager:scheduleIn(.7,function() self:_bluetooth_show_devices() end)
+    end
+    return success==true
+end
+
+function Plugin:_bluetooth_show_devices()
+    local state=self:_bluetooth_state(false)
+    if state.supported~=true then
+        self:toast("当前设备没有可用的蓝牙控制后端",2)
+        return false
+    end
+    local items={}
+    items[#items+1]={
+        text=state.enabled==true and "蓝牙 · 已开启" or "蓝牙 · 已关闭",
+        callback=function() self:_bluetooth_toggle(); UIManager:scheduleIn(.55,function() self:_bluetooth_show_devices() end) end,
+    }
+    if state.can_scan==true then
+        items[#items+1]={
+            text="扫描附近设备",
+            callback=function()
+                local ok=Bluetooth.scan()
+                if not ok then self:toast("无法开始蓝牙扫描",2); return end
+                self:toast("正在扫描蓝牙设备…",2)
+                UIManager:scheduleIn(2.5,function() self:_bluetooth_show_devices() end)
+            end,
+        }
+    end
+    if state.can_list~=true then
+        items[#items+1]={text="当前后端仅支持蓝牙开关",enabled=false}
+        return self:list("蓝牙设备",items)
+    end
+    local devices,err=Bluetooth.listDevices()
+    if devices==nil then devices={} end
+    if #devices==0 then
+        items[#items+1]={text=state.enabled==true and "暂无设备 · 可点击上方扫描" or "开启蓝牙后可扫描设备",enabled=false}
+    else
+        for _,entry in ipairs(devices) do
+            local device=entry
+            local status=BLUETOOTH_SOURCE_LABEL[tostring(device.source or "")] or "设备"
+            items[#items+1]={
+                text=tostring(device.name or device.address or "蓝牙设备").." · "..status,
+                post_text=device.source=="connected" and "断开" or (device.source=="paired" and "连接" or "配对"),
+                callback=function() return self:_bluetooth_device_action(device) end,
+            }
+        end
+    end
+    if err then logger.warn("[MiuRead][Bluetooth] device list warning",tostring(err)) end
+    return self:list("蓝牙设备",items)
 end
 
 function Plugin:_home_preferences()
@@ -9457,7 +9573,8 @@ function Plugin:show_home_quick_panel(more_expanded)
         },
         bluetooth=bluetooth_state.supported==true and {
             icon="bluetooth",icon_key="bluetooth",label="蓝牙",detail=bluetooth_state.enabled==true and "已开启" or "已关闭",
-            callback=function() self:_bluetooth_toggle() end
+            callback=function() self:_bluetooth_toggle() end,
+            hold_callback=function() self:_bluetooth_show_devices() end
         } or nil,
         rotate={
             icon="方向",icon_key=self:_orientation_icon_key(),label="方向锁定",detail=self:_orientation_status_label(),
@@ -10337,6 +10454,7 @@ function Plugin:_reader_toolbar_header(title)
         bluetooth_visible=bluetooth_state.supported==true,
         bluetooth_label=bluetooth_state.enabled==true and "蓝牙开" or "蓝牙关",
         bluetooth_callback=bluetooth_state.supported==true and function() return self:_bluetooth_toggle() end or nil,
+        bluetooth_hold_callback=bluetooth_state.supported==true and function() return self:_bluetooth_show_devices() end or nil,
         sync_label=sync_text,sync_alert=sync_alert,
         sync_callback=function() return self:_show_reader_sync_panel(function() self:show_reader_quick_panel() end) end,
         battery_label=battery,
