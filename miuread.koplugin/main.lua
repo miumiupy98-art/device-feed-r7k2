@@ -682,6 +682,12 @@ function Plugin:init()
         disable_fallback=true})
     self.repair_async=Async:new(self.store,{poll_interval=.35,allow_android=true})
     self.annotation_async=Async:new(self.store,{poll_interval=.30,allow_android=true,disable_fallback=true})
+    -- Current-chapter thought prewarming is read-only and optional. Keep it on
+    -- its own worker so SQLite cold opens never compete with taps or sync.
+    self.thought_async=Async:new(self.store,{poll_interval=.35,allow_android=true,disable_fallback=true})
+    self._thought_prewarm_task=nil
+    self._thought_prewarm_generation=0
+    self._thought_prewarm_key=nil
     -- Update manifest/package network I/O must never occupy the UI loop.
     -- Installation itself stays foreground because it replaces the live plugin tree.
     self.updater_async=Async:new(self.store,{poll_interval=.30,allow_android=true,disable_fallback=true})
@@ -756,6 +762,7 @@ function Plugin:init()
     self._local_browser_fallback_scanner=nil
     self._home_inline_navigation_generation=0
     self._home_cover_inflight={}
+    self._cover_retry_backoff={}
     self._home_cover_render_generation=0
     self._home_cover_render_retry_task=nil
     self._home_suspended=false
@@ -2079,6 +2086,52 @@ function Plugin:_cancel_cover_loading()
     end
     self:_clear_cover_guard()
 end
+function Plugin:_cover_retry_identity(book)
+    local id=tostring(type(book)=="table" and (book.bookId or book.book_id) or "")
+    local cover=tostring(type(book)=="table" and (book.cover or book.coverUrl) or "")
+    return id,cover
+end
+
+function Plugin:_cover_retry_allowed(book)
+    self._cover_retry_backoff=type(self._cover_retry_backoff)=="table" and self._cover_retry_backoff or {}
+    local id,cover=self:_cover_retry_identity(book)
+    if id=="" or cover=="" then return true end
+    local entry=self._cover_retry_backoff[id]
+    if type(entry)~="table" or tostring(entry.cover or "")~=cover then
+        self._cover_retry_backoff[id]=nil
+        return true
+    end
+    return os.time()>=(tonumber(entry.next_at) or 0)
+end
+
+function Plugin:_cover_retry_failed(book,err)
+    self._cover_retry_backoff=type(self._cover_retry_backoff)=="table" and self._cover_retry_backoff or {}
+    local id,cover=self:_cover_retry_identity(book)
+    if id=="" or cover=="" then return end
+    local entry=self._cover_retry_backoff[id]
+    local attempt=(type(entry)=="table" and tostring(entry.cover or "")==cover)
+        and ((tonumber(entry.attempt) or 0)+1) or 1
+    local delays=type(Config.COVER_RETRY_DELAYS)=="table" and Config.COVER_RETRY_DELAYS or {30,120,600,1800}
+    local delay=tonumber(delays[math.min(attempt,#delays)] or delays[#delays]) or 30
+    self._cover_retry_backoff[id]={cover=cover,attempt=attempt,next_at=os.time()+delay}
+    logger.warn("[MiuRead][CoverRetry] deferred",
+        "book=",id,"attempt=",tostring(attempt),"retry_in=",tostring(delay),
+        "error=",U.first_line(tostring(err or "download_failed"),120))
+end
+
+function Plugin:_cover_retry_succeeded(book)
+    local id=self:_cover_retry_identity(book)
+    if id~="" and type(self._cover_retry_backoff)=="table" then self._cover_retry_backoff[id]=nil end
+end
+
+function Plugin:_cover_retry_reset(book,reason)
+    local id=self:_cover_retry_identity(book)
+    if id~="" and type(self._cover_retry_backoff)=="table" then
+        self._cover_retry_backoff[id]=nil
+        logger.info("[MiuRead][CoverRetry] reset","book=",id,"reason=",tostring(reason or "manual"))
+    end
+end
+
 function Plugin:_schedule_shelf_cover_refresh(view,generation,delay)
     if self._cover_refresh_task then return end
     local task
@@ -2129,6 +2182,10 @@ function Plugin:_cache_shelf_page_covers(rows,view,page,first,last,generation,in
         self:_schedule_cover_continue(rows,view,page,first,last,generation,index+1,.04)
         return
     end
+    if not self:_cover_retry_allowed(book) then
+        self:_schedule_cover_continue(rows,view,page,first,last,generation,index+1,.04)
+        return
+    end
     if not self.cover_async then return end
     if self.cover_async:busy() then
         self:_schedule_cover_continue(rows,view,page,first,last,generation,index,.25)
@@ -2167,15 +2224,18 @@ function Plugin:_cache_shelf_page_covers(rows,view,page,first,last,generation,in
     local started=self.cover_async:run("shelf_cover_page",worker,function(result)
         if generation~=self._cover_generation or not view or view._miu_closed or tonumber(view.page or 1)~=tonumber(page) then return end
         if result and result.ok and result.value then
+            self:_cover_retry_succeeded(book)
             if background_available then self:_remember_cover_path(book.bookId,result.value) end
             book.cover_path=result.value
             for _,entry in ipairs(view.item_table or {}) do
                 if tostring(entry.book_id)==tostring(book.bookId) then entry.cover_path=result.value; break end
             end
             self:_schedule_shelf_cover_refresh(view,generation,.18)
-        elseif result and result.error then
+        else
+            local cover_error=tostring(result and result.error or "download_failed")
+            self:_cover_retry_failed(book,cover_error)
             logger.warn("[MiuRead][Cover] download failed","book_id=",tostring(book.bookId),
-                "error=",U.first_line(result.error,160))
+                "error=",U.first_line(cover_error,160))
         end
         self:_schedule_cover_continue(rows,view,page,first,last,generation,index+1,background_available and .06 or .18)
     end,background_available and 35 or 14)
@@ -7098,6 +7158,7 @@ function Plugin:_home_force_refresh_current_cover(book,on_done)
     local old_cached=self.library:cached_cover_path(id)
     local refresh_token="manual-"..tostring(os.time()).."-"..tostring(math.floor((os.clock()%1)*1000))
     local item={bookId=id,cover=cover}
+    self:_cover_retry_reset(item,"manual_refresh")
     local background=self.home_cover_async:available()
     local covers_dir=self.store.covers_dir
     local worker
@@ -7128,6 +7189,7 @@ function Plugin:_home_force_refresh_current_cover(book,on_done)
 
     local started=self.home_cover_async:run("home-cover-manual-refresh",worker,function(result)
         if not result or result.ok~=true or not result.value then
+            self:_cover_retry_failed(item,tostring(result and result.error or "unknown"))
             logger.warn("[MiuRead][Cover] manual refresh failed",tostring(id),
                 tostring(result and result.error or "unknown"))
             if on_done then on_done(false,{reason="download_failed"}) end
@@ -7138,6 +7200,7 @@ function Plugin:_home_force_refresh_current_cover(book,on_done)
         local new_w,new_h=CoverRender.image_size(path)
         if not new_w or not new_h or new_w<=0 or new_h<=0 then
             os.remove(path)
+            self:_cover_retry_failed(item,"invalid_image")
             logger.warn("[MiuRead][Cover] manual refresh rejected invalid image",tostring(id))
             if on_done then on_done(false,{reason="invalid_image"}) end
             return
@@ -7203,6 +7266,7 @@ function Plugin:_home_force_refresh_current_cover(book,on_done)
             end
             HomeView.update_book(id)
         end
+        self:_cover_retry_succeeded(item)
         logger.info("[MiuRead][Cover] manual refresh complete",
             "book=",tostring(id),"size=",tostring(new_w).."x"..tostring(new_h),"path=",tostring(path))
         if on_done then on_done(true,{new_w=new_w,new_h=new_h}) end
@@ -8823,7 +8887,8 @@ function Plugin:_home_schedule_remote_covers(books)
     for _,book in ipairs(books or {}) do
         local id=tostring(book and (book.bookId or book.book_id) or "")
         if id~="" and not seen[id] and not self._home_cover_inflight[id]
-            and book.cover and book.cover~="" and not book.cover_path then
+            and book.cover and book.cover~="" and not book.cover_path
+            and self:_cover_retry_allowed(book) then
             seen[id]=true
             queue[#queue+1]={bookId=id,cover=book.cover,book=book}
             if #queue>=queue_limit then break end
@@ -8955,6 +9020,7 @@ function Plugin:_home_schedule_remote_covers(books)
             end
             if generation~=self._home_cover_generation then release("stale") return end
             if result and result.ok and result.value then
+                self:_cover_retry_succeeded(item)
                 self:_remember_cover_path(item.bookId,result.value)
                 local changed=self:_home_apply_cover_path(item.bookId,result.value)
                 if item.book then
@@ -8966,8 +9032,10 @@ function Plugin:_home_schedule_remote_covers(books)
                     changed_count=changed_count+1
                     mark_changed(item.bookId)
                 end
-            elseif result and result.error then
-                logger.warn("[MiuRead][Home] cover download failed",tostring(item.bookId),U.first_line(result.error,120))
+            else
+                local cover_error=tostring(result and result.error or "download_failed")
+                self:_cover_retry_failed(item,cover_error)
+                logger.warn("[MiuRead][Home] cover download failed",tostring(item.bookId),U.first_line(cover_error,120))
             end
             index=index+1
             if queue[index] then UIManager:scheduleIn(cover_gap,next_cover) else finish() end
@@ -19301,6 +19369,10 @@ function Plugin:_run_update_check(automatic,on_done)
         return manifest
     end,function(result)
         if result and result.ok==true and type(result.value)=="table" then
+            local source=tostring(result.value._manifest_source_url or "")
+            if source~="" and self.updater and type(self.updater.remember_manifest_route)=="function" then
+                pcall(self.updater.remember_manifest_route,self.updater,source)
+            end
             if on_done then on_done(result.value,nil) end
         else
             if on_done then on_done(nil,tostring(result and result.error or "后台更新检查失败")) end
@@ -19597,6 +19669,75 @@ function Plugin:_finish_thought_popup(generation)
         UIManager:scheduleIn(.45,function() self:_show_performance_prompt() end)
     end
     UIManager:scheduleIn(1.2,function() collectgarbage("step",48) end)
+end
+
+function Plugin:_cancel_thought_prewarm(reason)
+    self._thought_prewarm_generation=(tonumber(self._thought_prewarm_generation) or 0)+1
+    if self._thought_prewarm_task then
+        UIManager:unschedule(self._thought_prewarm_task)
+        self._thought_prewarm_task=nil
+    end
+    if self.thought_async and self.thought_async:busy() then
+        self.thought_async:cancel(reason or "thought prewarm cancelled")
+    end
+end
+
+function Plugin:_schedule_thought_prewarm()
+    if self._thought_prewarm_task then
+        UIManager:unschedule(self._thought_prewarm_task)
+        self._thought_prewarm_task=nil
+    end
+    self._thought_prewarm_generation=(tonumber(self._thought_prewarm_generation) or 0)+1
+    local generation=self._thought_prewarm_generation
+    local task
+    task=function()
+        if self._thought_prewarm_task~=task or generation~=self._thought_prewarm_generation then return end
+        self._thought_prewarm_task=nil
+        if not self:_thoughts_enabled() or not self:_active_reader_ui()
+            or self._miuread_suspended==true or HOME_SESSION.suspended==true
+            or PowerState.state()~="NORMAL" or self._thought_popup_busy or self._thought_popup
+            or RuntimePressure.active() then return end
+        if self.download_task and self.download_task:busy() then return end
+        if (tonumber(self._reader_busy_until) or 0)>os.time() then return end
+        if not self.thought_async or not self.thought_async:available() or self.thought_async:busy() then return end
+        local current=self.sync and self.sync.current or nil
+        local book_id=tostring(current and current.book and current.book.book_id or "")
+        if book_id=="" then return end
+        local ok,position=pcall(self.sync.local_position,self.sync)
+        local chapter_uid=ok and type(position)=="table" and tostring(position.chapter_uid or "") or ""
+        if chapter_uid=="" then return end
+        local key=book_id.."|"..chapter_uid
+        if self._thought_prewarm_key==key then return end
+        local limit=math.max(1,math.min(12,tonumber(Config.THOUGHT_PREWARM_GROUPS) or 6))
+        local store=self.store
+        local started,err=self.thought_async:run("thought-prewarm",function()
+            local DB=require("miuread.thought_database")
+            local value,db_err=DB.prewarm_chapter(store,book_id,chapter_uid,limit)
+            if not value then error(tostring(db_err or "thought_prewarm_failed")) end
+            return value
+        end,function(result)
+            if generation~=self._thought_prewarm_generation or not self:_active_reader_ui()
+                or self._miuread_suspended==true or HOME_SESSION.suspended==true
+                or PowerState.state()~="NORMAL" then return end
+            if not result or result.ok~=true or type(result.value)~="table" then
+                logger.warn("[MiuRead][ThoughtPrewarm] failed",
+                    "book=",book_id,"chapter=",chapter_uid,
+                    "error=",tostring(result and result.error or "unknown"))
+                return
+            end
+            local groups=type(result.value.groups)=="table" and result.value.groups or {}
+            local warmed,comments=Thoughts.prewarm_groups(self.store,book_id,chapter_uid,groups)
+            self._thought_prewarm_key=key
+            logger.info("[MiuRead][ThoughtPrewarm] ready",
+                "book=",book_id,"chapter=",chapter_uid,
+                "groups=",tostring(warmed),"comments=",tostring(comments))
+        end,20)
+        if not started then
+            logger.warn("[MiuRead][ThoughtPrewarm] worker unavailable",tostring(err or "unknown"))
+        end
+    end
+    self._thought_prewarm_task=task
+    UIManager:scheduleIn(math.max(1.8,tonumber(Config.THOUGHT_PREWARM_DELAY) or 2.8),task)
 end
 
 function Plugin:_close_active_thought_popup(reason)
@@ -20378,6 +20519,7 @@ function Plugin:onPageUpdate(page)
     -- free of optional work.
     self:_schedule_reader_toolbar_state_refresh(current,.55)
     self.sync:on_page(page)
+    self:_schedule_thought_prewarm()
 end
 function Plugin:_annotation_sync_preferences()
     local p=self.store:preferences()
@@ -20782,6 +20924,7 @@ function Plugin:onSuspend()
     self:_set_foreground("suspended")
     StatusToast.set_blocked(true)
     StatusToast.close()
+    self:_cancel_thought_prewarm("suspend")
     self:_cancel_interactive_network("suspend")
     if self._local_annotation_snapshot_task then
         UIManager:unschedule(self._local_annotation_snapshot_task)

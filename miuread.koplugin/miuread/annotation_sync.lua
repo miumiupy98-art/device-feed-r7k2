@@ -940,6 +940,18 @@ local function auth_like_error(value)
         or lower:find("-2012", 1, true) ~= nil
 end
 
+local function retryable_post_error(value)
+    if Http.is_network_error(value) or Http.is_rate_limit_error(value) or Http.is_auth_error(value) then return true end
+    local lower=tostring(value or ""):lower()
+    return lower:find("http 408",1,true)~=nil
+        or lower:find("http 425",1,true)~=nil
+        or lower:find("http 500",1,true)~=nil
+        or lower:find("http 502",1,true)~=nil
+        or lower:find("http 503",1,true)~=nil
+        or lower:find("http 504",1,true)~=nil
+        or lower:find("temporarily unavailable",1,true)~=nil
+end
+
 local function fetch_cloud_bookmarks(api, book_id)
     local ok, value = pcall(api.bookmark_list, api, book_id)
     if not ok then return nil, tostring(value) end
@@ -1299,13 +1311,26 @@ function AnnotationSync:sync_book(book, record, options)
                                     stage_log(row, "post", true, remote_id ~= "" and "remote_id_saved" or "review_saved")
                                 end
                             elseif Http.is_network_error(value) then
+                                -- A lost response may still have reached WeRead. Reconcile
+                                -- before any retry so a duplicate annotation cannot be posted.
                                 remember_error(row, "unknown", value, "post", {
                                     range_key=located.range, book_version=write_version or 0,
                                     chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
                                     coord_version=COORD_VERSION, coord_source=COORD_SOURCE, coord_verify=effective_verify,
                                 })
-                            else
+                            elseif retryable_post_error(value) then
+                                -- Authentication/rate-limit/5xx failures are recoverable and
+                                -- remain eligible for a later manual sync attempt.
                                 remember_error(row, "local_only", value, "post", {
+                                    range_key=located.range, book_version=write_version or 0,
+                                    chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
+                                    coord_version=COORD_VERSION, coord_source=COORD_SOURCE, coord_verify=effective_verify,
+                                })
+                            else
+                                -- Deterministic server rejection is not fixed by hammering the
+                                -- same payload again. Park it in the existing action-required
+                                -- state; the user can explicitly retry after metadata repair.
+                                remember_error(row, "metadata_failed", value, "post_rejected", {
                                     range_key=located.range, book_version=write_version or 0,
                                     chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,
                                     coord_version=COORD_VERSION, coord_source=COORD_SOURCE, coord_verify=effective_verify,

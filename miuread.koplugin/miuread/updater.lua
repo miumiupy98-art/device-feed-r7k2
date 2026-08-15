@@ -44,7 +44,25 @@ function Updater:manifest_urls()
     else
         with_github_mirrors(Config.UPDATE_MANIFEST,out,seen)
     end
+    local preferred=tostring(self.store and self.store:get("update_last_good_manifest_url","") or "")
+    if preferred~="" and seen[preferred] then
+        for index,url in ipairs(out) do
+            if url==preferred then
+                table.remove(out,index)
+                table.insert(out,1,preferred)
+                break
+            end
+        end
+    end
     return out
+end
+
+function Updater:remember_manifest_route(url)
+    url=tostring(url or "")
+    if not valid_https(url) or not self.store then return false end
+    self.store:set("update_last_good_manifest_url",url)
+    logger.info("[MiuRead][Updater] remembered manifest route",url)
+    return true
 end
 
 function Updater:manifest_url()
@@ -184,14 +202,25 @@ function Updater:check()
     local fallback
     for _,url in ipairs(urls) do
         local ok,m=pcall(function()
-            return self.http:get_json(url,{auth=false,retries=1,redirects=8,timeout={15,45}})
+            return self.http:get_json(url,{
+                auth=false,
+                retries=tonumber(Config.UPDATE_MANIFEST_RETRIES) or 0,
+                redirects=8,
+                timeout={
+                    tonumber(Config.UPDATE_MANIFEST_CONNECT_TIMEOUT) or 4,
+                    tonumber(Config.UPDATE_MANIFEST_TOTAL_TIMEOUT) or 8,
+                },
+            })
         end)
         if ok then
             local valid,reason=validate_manifest(m)
             if valid then
                 local cleaned,text_error=clean_manifest_text(m)
                 if not cleaned then
-                    fallback=fallback or U.copy(m)
+                    if not fallback then
+                        fallback=U.copy(m)
+                        fallback._manifest_source_url=url
+                    end
                     fallback.notes="更新说明显示异常 可继续下载安装"
                     fallback.summary=fallback.notes
                     fallback.name=tostring(m.name or "")
@@ -206,8 +235,9 @@ function Updater:check()
                     logger.info("[MiuRead][Updater] manifest loaded",url,"version=",tostring(m.version),
                         "notes_utf8_valid=true")
                     if not U.semver_newer(m.version,self.version) then
-                        return {current=true,version=m.version,name=m.name,notes=m.notes}
+                        return {current=true,version=m.version,name=m.name,notes=m.notes,_manifest_source_url=url}
                     end
+                    m._manifest_source_url=url
                     return m
                 end
             else
@@ -220,7 +250,8 @@ function Updater:check()
     end
     if fallback then
         if not U.semver_newer(fallback.version,self.version) then
-            return {current=true,version=fallback.version,name=fallback.name,notes=fallback.notes}
+            return {current=true,version=fallback.version,name=fallback.name,notes=fallback.notes,
+                _manifest_source_url=fallback._manifest_source_url}
         end
         return fallback
     end

@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.5.0-beta.17",
+    VERSION = "4.5.0-beta.18",
     SCHEMA = 112,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -25,6 +25,22 @@ local C = {
 
     AUTO_UPDATE_INTERVAL = 24 * 60 * 60,
     AUTO_UPDATE_RETRY_INTERVAL = 6 * 60 * 60,
+
+    -- Manifest files are tiny. Fail over quickly between the official route and
+    -- mirrors, while package downloads keep their existing generous timeout.
+    UPDATE_MANIFEST_RETRIES = 0,
+    UPDATE_MANIFEST_CONNECT_TIMEOUT = 4,
+    UPDATE_MANIFEST_TOTAL_TIMEOUT = 8,
+
+    -- Warm only a small number of current-chapter comment groups after the
+    -- reader has been idle. This removes SQLite cold-open latency from taps
+    -- without moving large comment layouts into the foreground.
+    THOUGHT_PREWARM_DELAY = 2.8,
+    THOUGHT_PREWARM_GROUPS = 6,
+
+    -- Failed automatic cover fetches must not restart on every home gesture.
+    -- A manual refresh bypasses the runtime backoff once.
+    COVER_RETRY_DELAYS = {30, 120, 600, 1800},
 
     READ_INTERVAL = 60,
     IDLE_TIMEOUT = 600,

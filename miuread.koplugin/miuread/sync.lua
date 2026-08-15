@@ -182,28 +182,61 @@ local function sourced_progress(value, expected_book_id, source)
     return progress
 end
 
+local function remote_coordinate(progress)
+    if type(progress)~="table" then return nil,nil end
+    local uid=tostring(progress.chapter_uid or progress.chapterUid or "")
+    local offset=tonumber(progress.offset or progress.chapter_offset or progress.chapterOffset)
+    if uid=="" or offset==nil then return nil,nil end
+    return uid,offset
+end
+
 local function choose_remote_progress(web,agent,threshold)
     threshold=math.max(0,tonumber(threshold) or 2)
     if web and agent then
+        local web_uid,web_offset=remote_coordinate(web)
+        local agent_uid,agent_offset=remote_coordinate(agent)
+        local wt,at=normalize_timestamp(web.updated_at) or 0,normalize_timestamp(agent.updated_at) or 0
+        local function newest()
+            local selected=wt>at and web or agent
+            if wt==at then selected=web end
+            selected.sources={web=web,agent=agent}
+            selected.source=(wt==at and "web_cookie" or selected.source)
+            return selected
+        end
+        if web_uid and agent_uid then
+            if web_uid~=agent_uid or math.abs(web_offset-agent_offset)>12 then
+                return {
+                    conflict=true,conflict_reason="coordinate_mismatch",
+                    web=web,agent=agent,source="conflict",fetched_at=os.time(),
+                }
+            end
+            local selected=newest()
+            selected.selection_reason="coordinate_match"
+            return selected
+        end
+        if web_uid or agent_uid then
+            local selected=web_uid and web or agent
+            selected.sources={web=web,agent=agent}
+            selected.selection_reason="coordinate_preferred"
+            return selected
+        end
         local delta=math.abs((tonumber(web.percent) or 0)-(tonumber(agent.percent) or 0))
         if delta>threshold then
             return {
-                conflict=true,
-                web=web,
-                agent=agent,
-                source="conflict",
-                fetched_at=os.time(),
+                conflict=true,conflict_reason="percent_mismatch",
+                web=web,agent=agent,source="conflict",fetched_at=os.time(),
             }
         end
-        local wt,at=normalize_timestamp(web.updated_at) or 0,normalize_timestamp(agent.updated_at) or 0
-        local selected=wt>at and web or agent
-        if wt==at then selected=web end
-        selected.sources={web=web,agent=agent}
-        selected.source=(wt==at and "web_cookie" or selected.source)
+        local selected=newest()
+        selected.selection_reason="percent_match"
         return selected
     end
     local selected=web or agent
-    if selected then selected.sources={web=web,agent=agent} end
+    if selected then
+        selected.sources={web=web,agent=agent}
+        local uid=remote_coordinate(selected)
+        selected.selection_reason=uid and "single_coordinate_source" or "single_percent_source"
+    end
     return selected
 end
 

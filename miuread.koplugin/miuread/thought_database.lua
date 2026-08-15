@@ -278,6 +278,52 @@ function ThoughtDatabase.load_chapter(store, book_id, chapter_uid)
     return result
 end
 
+function ThoughtDatabase.prewarm_chapter(store, book_id, chapter_uid, limit)
+    if not ThoughtDatabase.exists(store, book_id) then return {groups={}, comments=0} end
+    limit=math.max(1,math.min(12,tonumber(limit) or 6))
+    local conn=open(store,book_id,true)
+    local ok,result=xpcall(function()
+        local key=chapter_key(chapter_uid)
+        if key=="" then return {groups={},comments=0} end
+        local groups={}
+        local group_stmt=conn:prepare([[
+            SELECT range_key FROM thought_groups
+             WHERE chapter_uid = ? ORDER BY ordinal LIMIT ?
+        ]])
+        group_stmt:bind(key,limit)
+        while true do
+            local row=group_stmt:step()
+            if not row then break end
+            groups[#groups+1]={range=tostring(row[1] or ""),texts={}}
+        end
+        group_stmt:close()
+        local comments=0
+        for _,group in ipairs(groups) do
+            local comment_stmt=conn:prepare([[
+                SELECT content, abstract, author, likes, created, review_id
+                  FROM thought_comments
+                 WHERE chapter_uid = ? AND range_key = ? ORDER BY ordinal
+            ]])
+            comment_stmt:bind(key,group.range)
+            while true do
+                local row=comment_stmt:step()
+                if not row then break end
+                group.texts[#group.texts+1]={
+                    content=tostring(row[1] or ""), abstract=tostring(row[2] or ""),
+                    author=tostring(row[3] or ""), likes=tonumber(row[4] or 0) or 0,
+                    created=tonumber(row[5] or 0) or 0, review_id=tostring(row[6] or ""),
+                }
+                comments=comments+1
+            end
+            comment_stmt:close()
+        end
+        return {groups=groups,comments=comments}
+    end,debug.traceback)
+    pcall(conn.close,conn)
+    if not ok then return nil,tostring(result) end
+    return result
+end
+
 function ThoughtDatabase.find(store, book_id, chapter_uid, range)
     if not ThoughtDatabase.exists(store, book_id) then return nil, "想法数据库不存在" end
     local conn = open(store, book_id, true)

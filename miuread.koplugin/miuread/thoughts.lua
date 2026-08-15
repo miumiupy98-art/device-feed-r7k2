@@ -5,10 +5,13 @@ local lfs = require("libs/libkoreader-lfs")
 
 local Thoughts = {}
 
-local POPUP_CACHE_LIMIT = 8
-local POPUP_CACHE_VERSION = "3"
+local POPUP_CACHE_LIMIT = 16
+local POPUP_CACHE_VERSION = "4"
+local GROUP_CACHE_LIMIT = 24
 local popup_cache = {}
 local popup_cache_order = {}
+local group_cache = {}
+local group_cache_order = {}
 
 local function cache_touch(order, key)
     for i = #order, 1, -1 do
@@ -193,6 +196,7 @@ function Thoughts.save(store, book_id, chapter_uid, groups)
     if not saved then return nil, tostring(err or "想法数据库写入失败") end
     local path = ThoughtDatabase.path(store, book_id)
     invalidate_path(path)
+    Thoughts.clear_memory_cache()
     return tonumber(saved.groups or 0) or 0, path
 end
 
@@ -210,11 +214,23 @@ function Thoughts.load(store, book_id, chapter_uid)
 end
 
 function Thoughts.find(store, book_id, chapter_uid, range)
+    local path=ThoughtDatabase.path(store,book_id)
+    local signature=file_signature(path) or "missing"
+    local range_key=tostring(range or "")
+    local cache_key=table.concat({tostring(book_id or ""),tostring(chapter_uid or ""),range_key,signature},"|")
+    local cached=group_cache[cache_key]
+    if cached then
+        cache_touch(group_cache_order,cache_key)
+        return cached,nil,{path=path,database=path,signature=signature,index_hit=true,authoritative=true,cache_hit=true}
+    end
     local group, err, token = ThoughtDatabase.find(store, book_id, chapter_uid, range)
     if group then
         token = type(token) == "table" and token or {}
-        token.path = token.database or ThoughtDatabase.path(store, book_id)
-        token.signature = file_signature(token.path)
+        token.path = token.database or path
+        token.signature = signature
+        group_cache[cache_key]=group
+        cache_touch(group_cache_order,cache_key)
+        cache_trim(group_cache,group_cache_order,GROUP_CACHE_LIMIT)
         return group, nil, token
     end
     if type(token)=="table" and token.authoritative==true then return nil,err end
@@ -585,9 +601,32 @@ end
 
 
 
+function Thoughts.prewarm_groups(store, book_id, chapter_uid, groups)
+    local path=ThoughtDatabase.path(store,book_id)
+    local signature=file_signature(path) or "missing"
+    local warmed,comments=0,0
+    for _,group in ipairs(type(groups)=="table" and groups or {}) do
+        local range=tostring(type(group)=="table" and group.range or "")
+        if range~="" and type(group.texts)=="table" and #group.texts>0 then
+            local cache_key=table.concat({tostring(book_id or ""),tostring(chapter_uid or ""),range,signature},"|")
+            group_cache[cache_key]=group
+            cache_touch(group_cache_order,cache_key)
+            cache_trim(group_cache,group_cache_order,GROUP_CACHE_LIMIT)
+            local _,_,count=Thoughts.native_parts_cached(store,book_id,chapter_uid,range,group,{
+                path=path,database=path,signature=signature,index_hit=true,authoritative=true,cache_hit=true,
+            })
+            warmed=warmed+1
+            comments=comments+(tonumber(count) or 0)
+        end
+    end
+    return warmed,comments
+end
+
 function Thoughts.clear_memory_cache()
     popup_cache = {}
     popup_cache_order = {}
+    group_cache = {}
+    group_cache_order = {}
 end
 
 function Thoughts.full_html(group)
