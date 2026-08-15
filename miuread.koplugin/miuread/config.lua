@@ -125,6 +125,17 @@ local C = {
     DOWNLOAD_BACKGROUND_KEEPALIVE_SECONDS = 12,
     DOWNLOAD_BACKGROUND_STALL_SLEEP_SECONDS = 300,
 
+    -- beta.19 heavy-resource arbitration. Ordinary background protection keeps
+    -- the beta.16 48/28 MB thresholds; only Native/FileManager transitions use
+    -- the higher guard because a resident download child plus FileManager can
+    -- exhaust old Kindle memory well before the global critical threshold.
+    HEAVY_NATIVE_HIBERNATE_KB = 96 * 1024,
+    HEAVY_NATIVE_CRITICAL_KB = 64 * 1024,
+    HEAVY_DOWNLOAD_RESUME_MIN_KB = 72 * 1024,
+    DOWNLOAD_HIBERNATE_WAIT_SECONDS = 8,
+    DOWNLOAD_INTERACTION_RESUME_DELAY = 2.5,
+    HEAVY_WATCH_SECONDS = 10,
+
     -- beta.17 power lifecycle: short resumes are diagnosed but never forced
     -- back to sleep. Resume keeps optional background work quiet briefly.
     SHORT_WAKE_SECONDS = 5,

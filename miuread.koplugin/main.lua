@@ -3260,6 +3260,10 @@ function Plugin:home_mode_menu()
     return rows
 end
 
+local HEAVY_BACKGROUND_KEYS={
+    home_shelf=true,home_scan=true,home_metadata=true,home_cover_render=true,
+}
+
 function Plugin:_background_block_reason(options)
     options=options or {}
     if HOME_EXITING or UIManager._exit_code~=nil then return "exiting" end
@@ -3303,7 +3307,43 @@ end
 function Plugin:_background_claim(key,options,retry)
     if not self.background_scheduler then return true,nil,false end
     options=options or {}
+    key=tostring(key or "background")
     options.blocked_reason=self:_background_block_reason(options)
+
+    -- beta.19 extends the single-heavy-worker rule to the independent download
+    -- subprocess. Automatic heavy maintenance simply waits. A user-requested
+    -- heavy task asks the downloader to reach a cooperative pause checkpoint;
+    -- on critically tight memory it hibernates the child instead of keeping its
+    -- Lua heap resident beside another subprocess.
+    if not options.blocked_reason and HEAVY_BACKGROUND_KEYS[key]
+        and self.download_task and self.download_task:busy() and not self.download_task:is_hibernated()
+        and self.download_task:is_heavy_stage() then
+        local memory=RuntimePressure.memory_snapshot(false)
+        if options.user_requested==true then
+            local critical=math.max(1,tonumber(Config.HEAVY_NATIVE_CRITICAL_KB) or 64*1024)
+            if memory and memory.available_kb<critical then
+                local requested=self.download_task:request_hibernate("background:"..key)
+                if requested then
+                    options.blocked_reason=self.download_task:is_hibernated() and nil or "download_hibernating"
+                    self._heavy_background_download_hibernated=self._heavy_background_download_hibernated or {}
+                    self._heavy_background_download_hibernated[key]=true
+                else
+                    self.download_task:pause("heavy_resource")
+                    options.blocked_reason=self.download_task:worker_pause_acknowledged() and nil or "download_yielding"
+                    self._heavy_background_download_paused=self._heavy_background_download_paused or {}
+                    self._heavy_background_download_paused[key]=true
+                end
+            else
+                self.download_task:pause("heavy_resource")
+                options.blocked_reason=self.download_task:worker_pause_acknowledged() and nil or "download_yielding"
+                self._heavy_background_download_paused=self._heavy_background_download_paused or {}
+                self._heavy_background_download_paused[key]=true
+            end
+        else
+            options.blocked_reason="download_heavy"
+        end
+    end
+
     local active=self.background_scheduler.active
     if options.user_requested==true and active and active.user_requested~=true then
         self:_background_cancel_worker(active.key,"foreground request: "..tostring(key))
@@ -3316,6 +3356,9 @@ function Plugin:_background_claim(key,options,retry)
     if retryable and type(retry)=="function" then
         local retry_delay=options.retry_delay or tonumber(Config.BACKGROUND_RETRY_SECONDS) or .9
         if reason=="memory_critical" then retry_delay=math.max(4.0,tonumber(retry_delay) or .9) end
+        if reason=="download_yielding" or reason=="download_hibernating" or reason=="download_heavy" then
+            retry_delay=math.max(.4,math.min(1.5,tonumber(retry_delay) or .9))
+        end
         self.background_scheduler:defer(key,retry,{
             delay=retry_delay,
             priority=options.priority or (options.user_requested==true and 80 or 20),
@@ -3327,10 +3370,24 @@ function Plugin:_background_claim(key,options,retry)
 end
 
 function Plugin:_background_release(key,token,reason)
+    local released=true
     if self.background_scheduler and token~=true then
-        return self.background_scheduler:release(key,token,reason)
+        released=self.background_scheduler:release(key,token,reason)
     end
-    return true
+    key=tostring(key or "")
+    if self._heavy_background_download_paused and self._heavy_background_download_paused[key] then
+        self._heavy_background_download_paused[key]=nil
+        if self.download_task then self.download_task:resume("heavy_resource") end
+    end
+    if self._heavy_background_download_hibernated and self._heavy_background_download_hibernated[key] then
+        self._heavy_background_download_hibernated[key]=nil
+        if self.download_task and self.download_task:is_hibernated() then
+            UIManager:scheduleIn(math.max(1.0,tonumber(Config.DOWNLOAD_INTERACTION_RESUME_DELAY) or 2.5),function()
+                if self.download_task then self.download_task:resume_hibernated("background task finished") end
+            end)
+        end
+    end
+    return released
 end
 
 function Plugin:_background_cancel_all(reason,include_user,workers_already_cancelled)
@@ -3341,6 +3398,16 @@ function Plugin:_background_cancel_all(reason,include_user,workers_already_cance
         self.background_scheduler:force_release(reason)
     end
     self.background_scheduler:cancel_pending(reason)
+    if self._heavy_background_download_paused then
+        self._heavy_background_download_paused={}
+        if self.download_task then self.download_task:resume("heavy_resource") end
+    end
+    if self._heavy_background_download_hibernated then
+        self._heavy_background_download_hibernated={}
+        if self.download_task and self.download_task:is_hibernated() then
+            self:_schedule_hibernated_download_resume("background cancelled")
+        end
+    end
     return true
 end
 
@@ -5355,7 +5422,8 @@ function Plugin:show_home_layout_dialog()
     })
 end
 
-function Plugin:_home_close_to_native(show_notice)
+function Plugin:_home_close_to_native_now(show_notice)
+    self._native_heavy_transition_pending=false
     -- This is the only temporary path that intentionally reveals FileManager.
     Orientation.release_session("return to KOReader")
     self:_cancel_native_menu_guard()
@@ -5377,6 +5445,82 @@ function Plugin:_home_close_to_native(show_notice)
     if show_notice~=false then
         self:toast("已进入 KOReader；可从“返回觅阅主页”回到觅阅",3)
     end
+    return true
+end
+
+function Plugin:_home_close_to_native(show_notice)
+    if self._native_heavy_transition_pending==true then
+        self:status_toast("正在准备文件管理","后台下载正在安全让路，请稍候",2)
+        return true
+    end
+    self:_home_stop_background("preparing native visit")
+    local task=self.download_task
+    if not task or not task:busy() or task:is_hibernated() then
+        return self:_home_close_to_native_now(show_notice)
+    end
+
+    self._native_heavy_transition_pending=true
+    local memory=RuntimePressure.memory_snapshot(true)
+    local available=memory and tonumber(memory.available_kb) or nil
+    local hibernate_line=math.max(1,tonumber(Config.HEAVY_NATIVE_HIBERNATE_KB) or 96*1024)
+    local critical_line=math.max(1,tonumber(Config.HEAVY_NATIVE_CRITICAL_KB) or 64*1024)
+    local download_stage=tostring(task:stage() or "unknown")
+    local memory_heavy_stage=download_stage=="transform" or download_stage=="package"
+        or download_stage=="annotation_batch" or download_stage=="annotation_apply"
+    local should_hibernate=(available and available<hibernate_line) or memory_heavy_stage
+
+    if should_hibernate then
+        task:request_hibernate((available and available<hibernate_line) and "native_low_memory" or "native_heavy_stage")
+        self:status_toast("正在释放下载资源","下载正在保存安全断点，准备进入 KOReader 文件管理",3)
+    else
+        task:pause("heavy_resource")
+    end
+
+    local started=monotonic_wall_time()
+    local wait_limit=math.max(2,tonumber(Config.DOWNLOAD_HIBERNATE_WAIT_SECONDS) or 8)
+    local waiter
+    waiter=function()
+        if HOME_EXITING or UIManager._exit_code~=nil then
+            self._native_heavy_transition_pending=false
+            return
+        end
+        local elapsed=monotonic_wall_time()-started
+        if should_hibernate and task:is_hibernated() then
+            logger.info("[MiuRead][HeavyGuard] native transition released",
+                "mode=hibernated","wait_ms=",tostring(math.floor(elapsed*1000+.5)),
+                "memory_kb=",tostring(available or "unknown"))
+            self:_home_close_to_native_now(show_notice)
+            return
+        end
+        if not should_hibernate and task:worker_pause_acknowledged() then
+            logger.info("[MiuRead][HeavyGuard] native transition released",
+                "mode=paused","wait_ms=",tostring(math.floor(elapsed*1000+.5)),
+                "memory_kb=",tostring(available or "unknown"))
+            self:_home_close_to_native_now(show_notice)
+            return
+        end
+        if elapsed>=wait_limit then
+            local current=RuntimePressure.memory_snapshot(true)
+            local current_kb=current and tonumber(current.available_kb) or available
+            if should_hibernate and not task:is_hibernated() then
+                self._native_heavy_transition_pending=false
+                task:resume("heavy_resource")
+                self:status_toast("暂缓打开文件管理","下载正在完成安全写入，稍后再试不会丢失下载进度",4)
+                logger.warn("[MiuRead][HeavyGuard] native transition aborted",
+                    "reason=hibernate_timeout","memory_kb=",tostring(current_kb or "unknown"),
+                    "critical=",tostring(current_kb and current_kb<critical_line or false))
+                return
+            end
+            logger.warn("[MiuRead][HeavyGuard] native transition timeout; proceeding guarded",
+                "hibernated=",tostring(task:is_hibernated()),
+                "pause_ack=",tostring(task:worker_pause_acknowledged()),
+                "memory_kb=",tostring(current_kb or "unknown"))
+            self:_home_close_to_native_now(show_notice)
+            return
+        end
+        UIManager:scheduleIn(.25,waiter)
+    end
+    UIManager:scheduleIn(.05,waiter)
     return true
 end
 
@@ -13147,8 +13291,35 @@ function Plugin:_navigation_token_valid(token,allowed_states)
     return false
 end
 
+function Plugin:_schedule_hibernated_download_resume(reason)
+    if self._hibernated_download_resume_task then
+        UIManager:unschedule(self._hibernated_download_resume_task)
+        self._hibernated_download_resume_task=nil
+    end
+    if not self.download_task or not self.download_task:is_hibernated() then return false end
+    local generation=tonumber(NAVIGATION.generation) or 0
+    local task
+    task=function()
+        if self._hibernated_download_resume_task~=task then return end
+        self._hibernated_download_resume_task=nil
+        local state=self:_navigation_state()
+        if generation~=(tonumber(NAVIGATION.generation) or 0) or state=="native" or state=="native_menu"
+            or state=="suspended" or state=="opening_reader" or state=="closing_reader" then
+            return
+        end
+        local ok,err=self.download_task:resume_hibernated(reason or "foreground stable")
+        if not ok and err=="low_memory" then
+            self:_schedule_hibernated_download_resume(reason or "foreground stable")
+        end
+    end
+    self._hibernated_download_resume_task=task
+    UIManager:scheduleIn(math.max(2.0,tonumber(Config.DOWNLOAD_INTERACTION_RESUME_DELAY) or 2.5),task)
+    return true
+end
+
 function Plugin:_set_foreground(owner)
     local value=tostring(owner or "native")
+    local previous=tostring(HOME_SESSION.foreground or "")
     if HOME_SESSION.foreground~=value then
         HOME_SESSION.foreground=value
         HOME_SESSION.foreground_changed_at=os.time()
@@ -13157,6 +13328,17 @@ function Plugin:_set_foreground(owner)
     if value=="home_pending" and not reader_close_active() then state="recovering" end
     if value=="reader_transition" and not reader_close_active() then state="opening_reader" end
     self:_set_navigation_state(state,"foreground "..value)
+    if value=="native" or value=="native_menu" then
+        if self._hibernated_download_resume_task then
+            UIManager:unschedule(self._hibernated_download_resume_task)
+            self._hibernated_download_resume_task=nil
+        end
+    elseif (value=="home" or value=="reader") and (previous=="native" or previous=="native_menu") then
+        if self.download_task and self.download_task:busy() and not self.download_task:is_hibernated() then
+            self.download_task:resume("heavy_resource")
+        end
+        self:_schedule_hibernated_download_resume("return from native to "..value)
+    end
     return HOME_SESSION.foreground
 end
 
@@ -14868,7 +15050,7 @@ local DOWNLOAD_STAGE_LABELS={
     prepare="准备下载",catalog="读取目录",resume="恢复断点",content="下载正文",
     underlines="获取划线",thoughts="获取想法",footnotes="处理脚注",
     images="处理图片",package="生成 EPUB",restart="断点恢复",waiting_network="等待网络",done="下载完成",error="下载失败",
-    cancelled="下载已取消",
+    cancelled="下载已取消",hibernated="安全休眠",
 }
 function Plugin:_download_dialog_is_shown(runtime)
     runtime=runtime or self._download_runtime
@@ -14909,6 +15091,8 @@ function Plugin:_on_download_progress(runtime,state)
             wait>0 and ("请求受限 · "..tostring(wait).."秒") or "请求受限 · 等待恢复")
     elseif state and state.stage=="restart" then
         self:_update_open_shelf_download_status(runtime.book.bookId,"从断点自动恢复")
+    elseif state and state.stage=="hibernated" then
+        self:_update_open_shelf_download_status(runtime.book.bookId,"已安全释放资源 · 稍后继续")
     elseif state and (state.waiting_network==true or state.stage=="waiting_network") then
         self:_update_open_shelf_download_status(runtime.book.bookId,"等待网络 · 已保存进度")
     end
@@ -15095,7 +15279,11 @@ function Plugin:_recover_download_state()
             self.download_task:set_backgrounded(true)
             self:_write_download_state("active",self:_active_download_payload(runtime,runtime.last_state),true)
             logger.info("[MiuRead][Download] active task recovered","pid=",tostring(runtime.task.pid),
-                "book=",tostring(runtime.book.bookId or ""))
+                "book=",tostring(runtime.book.bookId or ""),
+                "hibernated=",tostring(self.download_task:is_hibernated()))
+            if self.download_task:is_hibernated() then
+                self:_schedule_hibernated_download_resume("recovered hibernated task")
+            end
             return true
         end
         self._download_runtime=nil

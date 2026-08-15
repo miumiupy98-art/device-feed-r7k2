@@ -84,7 +84,20 @@ local function unique_candidates(value)
 end
 
 function Api:new(http, store, reader)
-    return setmetatable({http = http, store = store, reader = reader}, self)
+    return setmetatable({http = http, store = store, reader = reader, web_annotation_auth_dead=false}, self)
+end
+
+function Api:_note_web_annotation_failure(value)
+    local code=tonumber(Http.auth_error_code(value))
+    if code==-2012 then
+        if self.web_annotation_auth_dead~=true then
+            logger.warn("[MiuRead][API] web annotation circuit opened",
+                "code=",tostring(code),"reason=session_timeout")
+        end
+        self.web_annotation_auth_dead=true
+        return true
+    end
+    return false
 end
 
 function Api:call(name, params, request_options)
@@ -354,8 +367,14 @@ function Api:_agent_underlines(id,chapter_uid)
 end
 
 function Api:underlines(id, chapter_uid)
+    if self.web_annotation_auth_dead==true then
+        logger.dbg("[MiuRead][API] web underlines skipped; annotation circuit open",
+            "book=",tostring(id),"chapter=",tostring(chapter_uid))
+        return self:_agent_underlines(id,chapter_uid)
+    end
     local ok,value=pcall(self._web_underlines,self,id,chapter_uid)
-    if ok then return value end
+    if ok then self.web_annotation_auth_dead=false; return value end
+    self:_note_web_annotation_failure(value)
     logger.warn("[MiuRead][API] web underlines unavailable; using Skill Gateway",
         "book=",tostring(id),"chapter=",tostring(chapter_uid),"error=",tostring(value))
     return self:_agent_underlines(id,chapter_uid)
@@ -407,8 +426,14 @@ function Api:_agent_readreviews(id,chapter_uid,batch)
 end
 
 function Api:readreviews(id, chapter_uid, batch)
+    if self.web_annotation_auth_dead==true then
+        logger.dbg("[MiuRead][API] web readReviews skipped; annotation circuit open",
+            "book=",tostring(id),"chapter=",tostring(chapter_uid),"ranges=",tostring(#(batch or {})))
+        return self:_agent_readreviews(id,chapter_uid,batch)
+    end
     local ok,value=pcall(self._web_readreviews,self,id,chapter_uid,batch)
-    if ok then return value end
+    if ok then self.web_annotation_auth_dead=false; return value end
+    self:_note_web_annotation_failure(value)
     -- Batch-shape failures must go back to the adaptive splitter. Falling
     -- through to the Skill Gateway would repeat the same rejected payload and
     -- spend the tighter Agent request budget without improving the result.

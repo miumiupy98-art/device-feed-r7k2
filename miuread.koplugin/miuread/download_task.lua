@@ -5,6 +5,7 @@ local UIManager = require("ui/uimanager")
 local Device = require("device")
 local logger = require("logger")
 local Config = require("miuread.config")
+local RuntimePressure = require("miuread.runtime_pressure")
 local lfs = require("libs/libkoreader-lfs")
 
 local DownloadTask = {}
@@ -45,24 +46,49 @@ local function serializable_copy(value, seen)
 end
 
 function DownloadTask:new(store)
-    return setmetatable({
+    local object=setmetatable({
         store = store,
         job = nil,
+        hibernated = nil,
         poll_task = nil,
         standby_held = false,
         keep_awake_enabled = true,
         backgrounded = false,
         pause_reasons = {},
+        deferred_resume_tasks = {},
         foreground_poll_interval = 0.40,
         background_poll_interval = 1.50,
         paused_poll_interval = 2.00,
         owner_path = store.temp_dir .. "/download-task-owner.json",
+        heavy_watch_path = store.temp_dir .. "/download-heavy-watch.json",
         owner_token = tostring(os.time()) .. "-" .. tostring(math.random(100000,999999)),
+        last_heavy_watch_at = 0,
     }, self)
+    local raw=U.read_file(object.heavy_watch_path,true)
+    if raw then
+        local ok,previous=pcall(Json.decode,raw)
+        if ok and type(previous)=="table" and tonumber(previous.updated_at or 0)>0 then
+            local pid=tonumber(previous.pid)
+            local alive=pid and lfs.attributes("/proc/"..tostring(pid),"mode")=="directory"
+            if previous.hibernated==true then
+                logger.info("[MiuRead][HeavyWatch] previous hibernated snapshot",
+                    "stage=",tostring(previous.stage or "unknown"),
+                    "reason=",tostring(previous.reason or "unknown"))
+            elseif not alive then
+                logger.warn("[MiuRead][CrashRecovery] previous heavy worker disappeared",
+                    "owner=",tostring(previous.owner or "unknown"),
+                    "stage=",tostring(previous.stage or "unknown"),
+                    "memory_kb=",tostring(previous.memory_kb or "unknown"),
+                    "pid=",tostring(previous.pid or ""))
+            end
+        end
+    end
+    return object
 end
 
 function DownloadTask:set_backgrounded(value)
     self.backgrounded = value == true
+    if self.hibernated then self.hibernated.backgrounded=self.backgrounded end
     -- beta.3 keeps an actively progressing background download awake. The
     -- worker releases this lock when it is paused or has been waiting without
     -- progress for several minutes, so a dead network cannot drain the battery.
@@ -75,6 +101,7 @@ end
 
 function DownloadTask:_control_descriptor()
     if self.job then return self.job end
+    if self.hibernated then return self:descriptor() end
     -- FileManager and ReaderUI own different plugin instances. Read the active
     -- task descriptor from the persisted download state so either instance can
     -- pause or stop the same child process during a foreground recovery.
@@ -174,8 +201,24 @@ function DownloadTask:_write_pause_marker(path,reasons)
     }),true)==true
 end
 
+
+local TRANSIENT_PAUSE_REASONS = {
+    home_interaction=true, reader_interaction=true, page_transition=true,
+    thought_popup=true, transient_ui=true, heavy_resource=true,
+}
+
+function DownloadTask:_cancel_deferred_resume(reason)
+    reason=tostring(reason or "")
+    local task=self.deferred_resume_tasks and self.deferred_resume_tasks[reason]
+    if task then
+        UIManager:unschedule(task)
+        self.deferred_resume_tasks[reason]=nil
+    end
+end
+
 function DownloadTask:pause(reason)
     reason=tostring(reason or "manual")
+    self:_cancel_deferred_resume(reason)
     local path=self:_control_pause_path()
     local reasons=self:_merged_pause_reasons(path)
     reasons[reason]=true
@@ -187,7 +230,7 @@ function DownloadTask:pause(reason)
     return wrote
 end
 
-function DownloadTask:resume(reason)
+function DownloadTask:_resume_now(reason)
     local path=self:_control_pause_path()
     local reasons=self:_merged_pause_reasons(path)
     if reason==nil then
@@ -205,10 +248,25 @@ function DownloadTask:resume(reason)
     return not still_paused
 end
 
-local TRANSIENT_PAUSE_REASONS = {
-    home_interaction=true, reader_interaction=true, page_transition=true,
-    thought_popup=true, transient_ui=true,
-}
+function DownloadTask:resume(reason)
+    local key=reason and tostring(reason) or nil
+    if key and TRANSIENT_PAUSE_REASONS and TRANSIENT_PAUSE_REASONS[key] then
+        self:_cancel_deferred_resume(key)
+        local delay=math.max(.5,tonumber(Config.DOWNLOAD_INTERACTION_RESUME_DELAY) or 2.5)
+        local task
+        task=function()
+            if self.deferred_resume_tasks[key]~=task then return end
+            self.deferred_resume_tasks[key]=nil
+            self:_resume_now(key)
+        end
+        self.deferred_resume_tasks[key]=task
+        UIManager:scheduleIn(delay,task)
+        logger.info("[MiuRead][DownloadTask] resume debounced",
+            "reason=",key,"delay=",tostring(delay))
+        return false
+    end
+    return self:_resume_now(reason)
+end
 
 function DownloadTask:_replace_transient_pause_reasons(add_suspend)
     local path=self:_control_pause_path()
@@ -273,7 +331,7 @@ function DownloadTask:stop_for_foreground(reason)
 end
 
 function DownloadTask:last_state()
-    return self.job and self.job.last_progress_state or nil
+    return (self.job and self.job.last_progress_state) or (self.hibernated and self.hibernated.last_state) or nil
 end
 
 local function read_json(path)
@@ -310,6 +368,7 @@ local function process_exists(pid)
 end
 
 function DownloadTask:can_continue_locked()
+    if self.hibernated then return false,"hibernated" end
     if self.store:preferences().download_keep_awake == false then return false, "disabled" end
     local task = self:_control_descriptor()
     if type(task) ~= "table" then return false, "no_task" end
@@ -396,11 +455,17 @@ end
 
 function DownloadTask:descriptor()
     local job=self.job
-    if not job then return nil end
+    if not job then
+        local h=self.hibernated
+        if not h then return nil end
+        return {hibernated=true,hibernate_reason=h.reason,stage=h.stage,started_at=h.started_at,
+            restart_count=tonumber(h.restart_count) or 0}
+    end
     return {
         pid=job.pid,progress_path=job.progress_path,result_path=job.result_path,
         recovery_path=job.recovery_path,diagnostic_path=job.diagnostic_path,
-        cancel_path=job.cancel_path,pause_path=job.pause_path,network_path=job.network_path,
+        cancel_path=job.cancel_path,pause_path=job.pause_path,pause_ack_path=job.pause_ack_path,
+        hibernate_path=job.hibernate_path,network_path=job.network_path,
         worker_settings_path=job.worker_settings_path,
         started_at=job.started_at,owner_token=self.owner_token,task_token=job.task_token,
         restart_count=tonumber(job.restart_count) or 0,
@@ -443,7 +508,53 @@ function DownloadTask:available()
 end
 
 function DownloadTask:busy()
-    return self.job ~= nil
+    return self.job ~= nil or self.hibernated ~= nil
+end
+
+function DownloadTask:is_hibernated()
+    return self.hibernated ~= nil
+end
+
+function DownloadTask:stage()
+    local state=self.job and self.job.last_progress_state or nil
+    return tostring((state and state.stage) or (self.hibernated and self.hibernated.stage) or "unknown")
+end
+
+local HEAVY_STAGES={
+    content=true,underlines=true,thoughts=true,footnotes=true,images=true,package=true,
+    annotation_batch=true,annotation_apply=true,transform=true,
+}
+function DownloadTask:is_heavy_stage()
+    return HEAVY_STAGES[self:stage()]==true
+end
+
+function DownloadTask:worker_pause_acknowledged()
+    local job=self.job
+    if not job or not job.pause_ack_path then return self.hibernated~=nil end
+    return file_exists(job.pause_ack_path)
+end
+
+function DownloadTask:_heavy_watch(force)
+    local job=self.job
+    if not job then return false end
+    local now=os.time()
+    local gap=math.max(5,tonumber(Config.HEAVY_WATCH_SECONDS) or 10)
+    if force~=true and now-(tonumber(self.last_heavy_watch_at) or 0)<gap then return false end
+    local memory=RuntimePressure.memory_snapshot(force==true)
+    local stage=self:stage()
+    if not self:is_heavy_stage() and not (memory and memory.available_kb<(tonumber(Config.HEAVY_NATIVE_HIBERNATE_KB) or 96*1024)) then
+        return false
+    end
+    self.last_heavy_watch_at=now
+    local snapshot={updated_at=now,owner="download",stage=stage,pid=job.pid,
+        memory_kb=memory and memory.available_kb or nil,paused=self:is_paused(),
+        pause_ack=self:worker_pause_acknowledged(),wake_lock=self.standby_held==true}
+    U.atomic_write(self.heavy_watch_path,Json.encode(snapshot),true)
+    logger.info("[MiuRead][HeavyWatch]",
+        "owner=download","stage=",stage,"memory_kb=",tostring(snapshot.memory_kb or "unknown"),
+        "pid=",tostring(job.pid or ""),"paused=",tostring(snapshot.paused),
+        "pause_ack=",tostring(snapshot.pause_ack),"wake_lock=",tostring(snapshot.wake_lock))
+    return true
 end
 
 function DownloadTask:_schedule()
@@ -578,15 +689,94 @@ function DownloadTask:_finish(job, forced_error)
     if job.recovery_path then os.remove(job.recovery_path) end
     os.remove(job.cancel_path)
     if job.pause_path then os.remove(job.pause_path) end
+    if job.pause_ack_path then os.remove(job.pause_ack_path) end
+    if job.hibernate_path then os.remove(job.hibernate_path) end
     if job.network_path then os.remove(job.network_path) end
     if job.worker_settings_path then os.remove(job.worker_settings_path) end
     if self:_owns_job() then os.remove(self.owner_path) end
     self.job = nil
+    os.remove(self.heavy_watch_path)
     self:_release_awake()
     if job.on_done then
         local callback_ok,callback_error=xpcall(function() job.on_done(result) end,debug.traceback)
         if not callback_ok then logger.warn("[MiuRead][DownloadTask] completion callback failed",tostring(callback_error)) end
     end
+end
+
+function DownloadTask:_handle_hibernated(job,result)
+    if not job or self.job~=job then return false end
+    local network_control=job.network_path and U.read_file(job.network_path,true) or nil
+    network_control=tostring(network_control or ""):match("^%s*([%w_%-]+)")
+    local options=serializable_copy(job.restart_options or {}) or {}
+    if network_control=="ipv4" then options.network_mode="ipv4"; options.network_suggestion_silent=nil
+    elseif network_control=="auto_silent" then options.network_mode="auto"; options.network_suggestion_silent=true end
+    local state=U.copy(job.last_progress_state or {})
+    state.stage="hibernated"
+    state.hibernated=true
+    state.hibernate_reason=tostring(result and result.reason or "heavy_resource")
+    state.message="为前台释放资源，下载已安全休眠"
+    state.updated_at=os.time()
+    local h={book=serializable_copy(job.restart_book),options=options,on_progress=job.on_progress,on_done=job.on_done,
+        restart_count=tonumber(job.restart_count) or 0,backgrounded=self.backgrounded==true,
+        reason=state.hibernate_reason,stage=tostring(result and result.stage or self:stage()),
+        started_at=job.started_at,last_state=U.copy(state)}
+    os.remove(job.progress_path); os.remove(job.result_path); if job.recovery_path then os.remove(job.recovery_path) end
+    os.remove(job.cancel_path); if job.pause_path then os.remove(job.pause_path) end
+    if job.pause_ack_path then os.remove(job.pause_ack_path) end
+    if job.hibernate_path then os.remove(job.hibernate_path) end
+    if job.network_path then os.remove(job.network_path) end
+    if job.worker_settings_path then os.remove(job.worker_settings_path) end
+    if self:_owns_job() then os.remove(self.owner_path) end
+    self.job=nil
+    self.hibernated=h
+    self:_release_awake()
+    U.atomic_write(self.heavy_watch_path,Json.encode({updated_at=os.time(),owner="download",stage=h.stage,
+        hibernated=true,reason=h.reason}),true)
+    if h.on_progress then pcall(h.on_progress,state) end
+    logger.warn("[MiuRead][HeavyGuard] action=hibernate_download",
+        "reason=",h.reason,"stage=",h.stage)
+    return true
+end
+
+function DownloadTask:request_hibernate(reason)
+    if self.hibernated then return true,"already_hibernated" end
+    local job=self.job
+    if not job or not job.hibernate_path then
+        if self:busy() then self:pause("heavy_resource") end
+        return false,"unsupported"
+    end
+    reason=tostring(reason or "heavy_resource")
+    local wrote=U.atomic_write(job.hibernate_path,Json.encode({reason=reason,requested_at=os.time()}),true)==true
+    if wrote then
+        self:pause("heavy_resource")
+        job.hibernate_requested_at=os.time()
+        logger.warn("[MiuRead][HeavyGuard] hibernate requested",
+            "reason=",reason,"stage=",self:stage(),"pid=",tostring(job.pid or ""))
+        self:_schedule()
+        return true
+    end
+    return false,"write_failed"
+end
+
+function DownloadTask:resume_hibernated(reason)
+    local h=self.hibernated
+    if not h then return false,"not_hibernated" end
+    local memory=RuntimePressure.memory_snapshot(true)
+    local minimum=math.max(1,tonumber(Config.HEAVY_DOWNLOAD_RESUME_MIN_KB) or 72*1024)
+    if memory and memory.available_kb<minimum then
+        logger.info("[MiuRead][HeavyGuard] hibernated download remains parked",
+            "reason=low_memory","memory_kb=",tostring(memory.available_kb),"minimum_kb=",tostring(minimum))
+        return false,"low_memory"
+    end
+    self.hibernated=nil
+    local ok,err=self:start(h.book,h.options,h.on_progress,h.on_done,h.restart_count)
+    if not ok then self.hibernated=h; return false,err end
+    self.backgrounded=h.backgrounded==true
+    if self.backgrounded then self:set_backgrounded(true) end
+    os.remove(self.heavy_watch_path)
+    logger.info("[MiuRead][HeavyGuard] hibernated download resumed",
+        "reason=",tostring(reason or "foreground stable"),"book=",tostring(h.book and h.book.bookId or ""))
+    return true
 end
 
 function DownloadTask:_restart_interrupted(job)
@@ -627,6 +817,8 @@ function DownloadTask:_restart_interrupted(job)
     if job.recovery_path then os.remove(job.recovery_path) end
     os.remove(job.cancel_path)
     if job.pause_path then os.remove(job.pause_path) end
+    if job.pause_ack_path then os.remove(job.pause_ack_path) end
+    if job.hibernate_path then os.remove(job.hibernate_path) end
     if job.network_path then os.remove(job.network_path) end
     if job.worker_settings_path then os.remove(job.worker_settings_path) end
     if self:_owns_job() then os.remove(self.owner_path) end
@@ -657,11 +849,30 @@ function DownloadTask:_poll()
     end
 
     self:_read_progress(job)
+    self:_heavy_watch(false)
     if job.token_mismatch then
         self:_finish(job,"后台下载任务身份不匹配；断点已保留，请重新开始下载。")
         return
     end
-    if read_json(job.result_path) then self:_finish(job); return end
+    local ready_result=read_json(job.result_path)
+    if ready_result then
+        if ready_result.hibernated==true then
+            -- The child writes the hibernation result immediately before it
+            -- exits. Do not advertise HIBERNATED until the process has really
+            -- left /proc (or waitpid confirms completion), otherwise Native may
+            -- start while the download Lua heap is still resident.
+            local done_ok,done=pcall(FFIUtil.isSubProcessDone,job.pid,false)
+            local alive=process_exists(job.pid)
+            if (done_ok and done==true) or alive==false then
+                self:_handle_hibernated(job,ready_result)
+            else
+                self:_release_awake()
+                self:_schedule()
+            end
+            return
+        end
+        self:_finish(job); return
+    end
 
     local now=os.time()
     local stall_sleep=math.max(120,tonumber(Config.DOWNLOAD_BACKGROUND_STALL_SLEEP_SECONDS) or 300)
@@ -795,6 +1006,13 @@ function DownloadTask:_poll()
 end
 
 function DownloadTask:cancel()
+    if self.hibernated then
+        local h=self.hibernated
+        self.hibernated=nil
+        os.remove(self.heavy_watch_path)
+        if h.on_done then pcall(h.on_done,{ok=false,error="下载已取消"}) end
+        return true
+    end
     local job = self.job
     if not job or job.cancel_requested_at or not self:_owns_job() then return end
     job.cancel_requested_at = os.time()
@@ -804,9 +1022,19 @@ function DownloadTask:cancel()
 end
 
 function DownloadTask:attach(descriptor,on_progress,on_done,restart_book,restart_options)
-    if self.job then return false,"已有下载任务正在运行" end
+    if self.job or self.hibernated then return false,"已有下载任务正在运行" end
     if not self:available() then return false,"当前 KOReader 不支持下载子进程" end
     descriptor=type(descriptor)=="table" and descriptor or nil
+    if descriptor and descriptor.hibernated==true then
+        self.hibernated={book=serializable_copy(restart_book),options=serializable_copy(restart_options or {}) or {},
+            on_progress=on_progress,on_done=on_done,restart_count=tonumber(descriptor.restart_count) or 0,
+            backgrounded=true,reason=tostring(descriptor.hibernate_reason or "recovered"),
+            stage=tostring(descriptor.stage or "hibernated"),started_at=descriptor.started_at}
+        self.backgrounded=true
+        logger.warn("[MiuRead][DownloadTask] recovered hibernated task",
+            "book=",tostring(restart_book and restart_book.bookId or ""),"reason=",self.hibernated.reason)
+        return true,"hibernated"
+    end
     local pid=descriptor and tonumber(descriptor.pid)
     if not pid or not descriptor.progress_path or not descriptor.result_path
         or not descriptor.cancel_path then return false,"下载任务记录不完整" end
@@ -825,7 +1053,8 @@ function DownloadTask:attach(descriptor,on_progress,on_done,restart_book,restart
     self.job={
         pid=pid,progress_path=descriptor.progress_path,result_path=descriptor.result_path,
         recovery_path=recovery_path,diagnostic_path=diagnostic_path,
-        cancel_path=descriptor.cancel_path,pause_path=descriptor.pause_path,network_path=descriptor.network_path,
+        cancel_path=descriptor.cancel_path,pause_path=descriptor.pause_path,pause_ack_path=descriptor.pause_ack_path,
+        hibernate_path=descriptor.hibernate_path,network_path=descriptor.network_path,
         worker_settings_path=descriptor.worker_settings_path,
         on_progress=on_progress,on_done=on_done,last_progress_raw=nil,last_progress_state=nil,
         last_progress_at=nil,last_effective_progress_at=nil,waiting_started_at=nil,last_keepalive=0,started_at=descriptor.started_at,dead_seen_at=nil,
@@ -879,7 +1108,7 @@ function DownloadTask:attach(descriptor,on_progress,on_done,restart_book,restart
 end
 
 function DownloadTask:start(book, options, on_progress, on_done, restart_count)
-    if self.job then return false, "已有下载任务正在运行" end
+    if self.job or self.hibernated then return false, "已有下载任务正在运行" end
     if not self:available() then return false, "当前 KOReader 不支持下载子进程" end
 
     local stamp = tostring(os.time()) .. "-" .. tostring(math.random(10000, 99999))
@@ -889,6 +1118,8 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
     local diagnostic_path = self.store.temp_dir .. "/download-diagnostic-" .. stamp .. ".txt"
     local cancel_path = self.store.temp_dir .. "/download-cancel-" .. stamp
     local pause_path = self.store.temp_dir .. "/download-pause-" .. stamp .. ".json"
+    local pause_ack_path = self.store.temp_dir .. "/download-pause-ack-" .. stamp .. ".json"
+    local hibernate_path = self.store.temp_dir .. "/download-hibernate-" .. stamp .. ".json"
     local network_path = self.store.temp_dir .. "/download-network-" .. stamp
     local worker_settings_path = self.store.temp_dir .. "/download-settings-" .. stamp .. ".lua"
     self.store:flush()
@@ -902,6 +1133,8 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
     clean_options.reader_active_path="/tmp/miuread-reader-active.flag"
     clean_options.reader_busy_path="/tmp/miuread-reader-busy.until"
     clean_options.pause_path=pause_path
+    clean_options.pause_ack_path=pause_ack_path
+    clean_options.hibernate_path=hibernate_path
     clean_options.network_mode=tostring(clean_options.network_mode or "auto")=="ipv4" and "ipv4" or "auto"
     clean_options.network_mode_path=network_path
     clean_options.performance_mode_path=Config.LIGHTWEIGHT_MODE_FLAG
@@ -1066,6 +1299,16 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                 clean_options.paused = function()
                     return UChild.file_exists(pause_path)
                 end
+                clean_options.hibernating = function()
+                    return UChild.file_exists(hibernate_path)
+                end
+                clean_options.pause_ack = function(stage,paused)
+                    if paused then
+                        write_json(pause_ack_path,{paused=true,stage=tostring(stage or "work"),updated_at=os.time()},"pause_ack")
+                    else
+                        os.remove(pause_ack_path)
+                    end
+                end
                 http.cancelled = clean_options.cancelled
                 http.rate_limit_retries = 3
                 http.min_weread_interval = 0.45
@@ -1151,12 +1394,27 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                     recovery_saved = recovery_ok==true, recovery_error = recovery_ok and nil or tostring(recovery_error)}
             else
                 local raw_error = tostring(value)
-                LoggerChild.warn("[MiuRead][DownloadTask] child failed", raw_error)
-                local friendly=display_error(raw_error)
-                emit{stage = UChild.file_exists(cancel_path) and "cancelled" or "error",
-                    percent = last_progress_percent, chapter = clean_book.title or "", message = friendly}
-                payload = {ok = false, error = friendly}
-                append_diagnostic("download_failed",raw_error)
+                if raw_error:find("__MIUREAD_HIBERNATE__",1,true) then
+                    local request_raw=UChild.read_file(hibernate_path,true)
+                    local request_reason="heavy_resource"
+                    if request_raw then
+                        local decoded_ok,decoded=pcall(JsonChild.decode,request_raw)
+                        if decoded_ok and type(decoded)=="table" then request_reason=tostring(decoded.reason or request_reason) end
+                    end
+                    LoggerChild.info("[MiuRead][DownloadTask] child hibernating",
+                        "stage=",tostring(current_stage),"reason=",request_reason)
+                    os.remove(pause_ack_path)
+                    emit{stage="hibernated",percent=last_progress_percent,chapter=clean_book.title or "",
+                        message="为前台释放资源，下载已安全休眠",hibernated=true,hibernate_reason=request_reason}
+                    payload={ok=false,hibernated=true,reason=request_reason,stage=current_stage,percent=last_progress_percent}
+                else
+                    LoggerChild.warn("[MiuRead][DownloadTask] child failed", raw_error)
+                    local friendly=display_error(raw_error)
+                    emit{stage = UChild.file_exists(cancel_path) and "cancelled" or "error",
+                        percent = last_progress_percent, chapter = clean_book.title or "", message = friendly}
+                    payload = {ok = false, error = friendly}
+                    append_diagnostic("download_failed",raw_error)
+                end
             end
 
             local result_ok,result_error=write_json(result_path,payload,"result")
@@ -1186,10 +1444,14 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
     end
 
     os.remove(pause_path)
+    os.remove(pause_ack_path)
+    os.remove(hibernate_path)
     local ok, pid, err = pcall(FFIUtil.runInSubProcess, child, false, false)
     if not ok or not pid then
         os.remove(worker_settings_path)
         os.remove(pause_path)
+        os.remove(pause_ack_path)
+        os.remove(hibernate_path)
         os.remove(network_path)
         return false, tostring(err or pid or "无法启动下载子进程")
     end
@@ -1202,6 +1464,8 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
         diagnostic_path = diagnostic_path,
         cancel_path = cancel_path,
         pause_path = pause_path,
+        pause_ack_path = pause_ack_path,
+        hibernate_path = hibernate_path,
         network_path = network_path,
         network_mode = clean_options.network_mode,
         worker_settings_path = worker_settings_path,

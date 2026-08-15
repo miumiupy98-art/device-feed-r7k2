@@ -1076,19 +1076,35 @@ function Downloader:book(input, opt, progress)
         local function worker_paused()
             return type(opt.paused)=="function" and opt.paused()==true
         end
+        local function hibernate_requested()
+            return type(opt.hibernating)=="function" and opt.hibernating()==true
+        end
+        local function check_hibernate()
+            if hibernate_requested() then
+                if type(opt.pause_ack)=="function" then pcall(opt.pause_ack,stage,false) end
+                error("__MIUREAD_HIBERNATE__:"..tostring(stage or "work"))
+            end
+        end
         local function lightweight_mode()
             local path=tostring(opt.performance_mode_path or "")
             return path~="" and U.file_exists(path)
         end
+        check_hibernate()
         while worker_paused() do
             if type(opt.cancelled)=="function" and opt.cancelled() then error("download cancelled") end
+            check_hibernate()
             if not pause_logged then
                 pause_logged=true
+                if type(opt.pause_ack)=="function" then pcall(opt.pause_ack,stage,true) end
                 logger.info("[MiuRead][Download] worker paused",tostring(stage or "work"))
             end
             pause(.25)
         end
-        if pause_logged then logger.info("[MiuRead][Download] worker resumed",tostring(stage or "work")) end
+        if pause_logged then
+            if type(opt.pause_ack)=="function" then pcall(opt.pause_ack,stage,false) end
+            logger.info("[MiuRead][Download] worker resumed",tostring(stage or "work"))
+        end
+        check_hibernate()
 
         local active_path=tostring(opt.reader_active_path or "")
         if active_path=="" or not U.file_exists(active_path) then return end
@@ -1096,6 +1112,7 @@ function Downloader:book(input, opt, progress)
         local waited=0
         while busy_until>os.time() and waited<30 do
             if type(opt.cancelled)=="function" and opt.cancelled() then error("download cancelled") end
+            check_hibernate()
             if worker_paused() then return respect_reader_priority(stage) end
             pause(.25)
             waited=waited+.25
@@ -1112,6 +1129,7 @@ function Downloader:book(input, opt, progress)
             delay=stage=="chapter" and .12 or .05
         end
         pause(delay)
+        check_hibernate()
     end
     local book = normalized_book(input)
     if book.bookId == "" then error("bookId missing") end
@@ -1623,6 +1641,7 @@ function Downloader:book(input, opt, progress)
                 annotation_error_map[uid]=nil
             end
             local extra_css,apply_stats
+            respect_reader_priority("annotation_apply")
             body,extra_css,apply_stats=self.annotations:apply(body,annotation,coord_body)
             entry.annotation_fallback=tonumber(apply_stats and apply_stats.fallback or 0) or 0
             entry.annotation_official=tonumber(apply_stats and apply_stats.official or 0) or 0
