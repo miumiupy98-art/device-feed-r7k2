@@ -562,4 +562,128 @@ function PosMap.rangeToTextSpan(map, range_str)
     return PosMap.htmlToText(map, html_start, html_end_pos)
 end
 
+
+-- Build the exact text stream shown after MiuRead converts image footnote
+-- markers into [N]. Unlike the old annotation fallback, this preserves a
+-- one-to-one positional relationship: only an actual footnote <img> tag may
+-- create a removable [N] token.
+local function isImageFootnoteTag(raw)
+    local lower = tostring(raw or ""):lower()
+    if not lower:match("^<%s*img[%s>/]") then return false end
+    return lower:find("qqreader-footnote", 1, true) ~= nil
+        or lower:find("footnote-icon", 1, true) ~= nil
+        or lower:find("footnote-ref", 1, true) ~= nil
+        or lower:find("note-ref", 1, true) ~= nil
+end
+
+local function textMapFromRunes(runes)
+    local norm_runes = {}
+    local norm_map = {}
+    local norm_byte_map = {}
+    local norm_bytes = 1
+    for i = 1, #runes do
+        local r = runes[i]
+        if not r:match("%s") and r ~= "*" then
+            norm_runes[#norm_runes + 1] = r
+            norm_map[#norm_runes] = i
+            norm_byte_map[norm_bytes] = #norm_runes
+            norm_bytes = norm_bytes + #r
+        end
+    end
+    return {
+        text_runes = runes,
+        text = table.concat(runes),
+        norm_text = table.concat(norm_runes),
+        norm_map = norm_map,
+        norm_byte_map = norm_byte_map,
+        text_to_html = {},
+        html_to_text = {},
+    }
+end
+
+--- Build a display bridge for image footnotes.
+-- The returned display stream is coord text plus [1], [2]... inserted exactly
+-- where qqreader/footnote image tags occur. `display_to_coord[i]` is nil for
+-- those synthetic digits and points to the original coord text rune otherwise.
+function PosMap.buildFootnoteDisplayBridge(coord_html)
+    if type(coord_html) ~= "string" or coord_html == "" then return nil end
+    local coord = PosMap.build(coord_html)
+    local html_runes = coord.runes or {}
+    local display_runes, display_to_coord = {}, {}
+    local coord_text_i, footnote_i = 0, 0
+    local i = 1
+    while i <= #html_runes do
+        local r = html_runes[i]
+        if r == "<" then
+            local j = i
+            while j <= #html_runes and html_runes[j] ~= ">" do j = j + 1 end
+            if j > #html_runes then break end
+            local raw = table.concat(html_runes, "", i, j)
+            if isImageFootnoteTag(raw) then
+                footnote_i = footnote_i + 1
+                local token_runes = Runes.toRunes("[" .. tostring(footnote_i) .. "]")
+                for _, token in ipairs(token_runes) do
+                    display_runes[#display_runes + 1] = token
+                    -- Synthetic token: deliberately no coord mapping.
+                    display_to_coord[#display_runes] = false
+                end
+            end
+            i = j + 1
+        else
+            coord_text_i = coord_text_i + 1
+            display_runes[#display_runes + 1] = r
+            display_to_coord[#display_runes] = coord_text_i
+            i = i + 1
+        end
+    end
+    if footnote_i == 0 then return nil end
+    return {
+        coord = coord,
+        display = textMapFromRunes(display_runes),
+        display_to_coord = display_to_coord,
+        footnotes = footnote_i,
+    }
+end
+
+--- Locate KOReader text in the exact footnote-display stream and return a range
+-- in the original coord HTML. Synthetic [N] runes are never converted into
+-- source coordinates, so genuine prose such as a literal "[6]" remains data.
+function PosMap.locateFootnoteDisplay(bridge, mark_text, opts)
+    opts = opts or {}
+    if not bridge or type(mark_text) ~= "string" then return nil, "invalid" end
+    mark_text = util.trim(mark_text)
+    if mark_text == "" then return nil, "empty" end
+
+    local display = bridge.display
+    local hits = findAllNorm(display.norm_text, display.norm_byte_map, display.norm_map, mark_text)
+    local rune_i, err = pickHit(hits, display, mark_text, opts.context_before, opts.context_after)
+    if not rune_i then return nil, err or "not_found" end
+    local ds, de = resolveHitToSpan(display, rune_i, mark_text)
+    if not ds then return nil, "bad_align" end
+
+    local cs, last
+    for pos = ds, de - 1 do
+        local mapped = bridge.display_to_coord[pos]
+        if type(mapped) == "number" then
+            cs = cs or mapped
+            last = mapped
+        end
+    end
+    if not cs or not last or last < cs then return nil, "synthetic_only" end
+    local ce = last + 1
+    if not Range.isValid(cs, ce) or ce - 1 > #bridge.coord.text_runes then
+        return nil, "bridge_fail"
+    end
+    local html_start, html_end_pos = PosMap.textToHtml(bridge.coord, cs, ce)
+    if not html_start then return nil, "map_fail" end
+    local range_str = Range.encode(html_start, html_end_pos, opts.page_review == true)
+    if not range_str then return nil, "encode_fail" end
+    return range_str, html_start, html_end_pos, {
+        display_start=ds, display_end_pos=de,
+        display_text=table.concat(display.text_runes, "", ds, de - 1),
+        source_text=table.concat(bridge.coord.text_runes, "", cs, ce - 1),
+        footnotes=bridge.footnotes,
+    }
+end
+
 return PosMap

@@ -130,7 +130,154 @@ local function asset_href(item)
     return href:gsub("^OEBPS/", "")
 end
 
-local function read_chapter(chapter)
+local read_chapter
+
+local TRANSPARENT_IMAGE = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="
+
+local function tag_attr(tag, name)
+    tag = tostring(tag or "")
+    local escaped = tostring(name or ""):gsub("([^%w])", "%%%1")
+    return tag:match(escaped .. '%s*=%s*"([^"]*)"')
+        or tag:match(escaped .. "%s*=%s*'([^']*)'")
+        or tag:match(escaped .. "%s*=%s*([^%s>\"']+)")
+end
+
+local function optional_image_tag(tag, reference)
+    local lower = tostring(tag or ""):lower()
+    for _, token in ipairs({"qqreader-footnote", "footnote-icon", "footnote-ref", "note-ref"}) do
+        if lower:find(token, 1, true) then return true end
+    end
+    -- Never classify by filename alone. A real正文 image is allowed to be named
+    -- note.png; only explicit footnote/helper markup is optional before repair.
+    return false
+end
+
+local function xml_escape(value)
+    return tostring(value or "")
+        :gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+        :gsub('"', "&quot;")
+end
+
+local function build_asset_set(assets)
+    local set = {}
+    for _, item in ipairs(assets or {}) do
+        local href = asset_href(item)
+        if href ~= "" then set[href] = true end
+    end
+    return set
+end
+
+local function clean_allowed_reference(reference, base_file, asset_set, allowed)
+    local target, kind = R.resolve(base_file, reference)
+    if kind ~= "local" or not target then return nil end
+    local href = tostring(target):gsub("^OEBPS/", "")
+    if asset_set[href] or (allowed and not allowed[href]) then return nil end
+    return href
+end
+
+--- Remove final local image references that are proven safe to drop.
+-- `allowed` is normally the exact missing set from a completed preflight. With
+-- `allow_orphan=false`, only known footnote/annotation helper images are
+-- removed. With `allow_orphan=true`, every still-missing local reference in the
+-- supplied allowed set is considered a stable orphan after a repair attempt.
+-- External URLs are never touched here.
+function R.cleanup_missing_local(chapters, css, assets, opt)
+    opt = opt or {}
+    local asset_set = build_asset_set(assets)
+    local allowed = type(opt.allowed) == "table" and opt.allowed or nil
+    local allow_orphan = opt.allow_orphan == true
+    local stats = {removed=0, optional=0, orphan=0, chapters=0, css=0, samples={}}
+
+    local function record(href, optional)
+        stats.removed = stats.removed + 1
+        if optional then stats.optional = stats.optional + 1 else stats.orphan = stats.orphan + 1 end
+        if #stats.samples < 8 then stats.samples[#stats.samples + 1] = href end
+    end
+
+    local function replacement_for_tag(tag, reference, base_file, svg)
+        local href = clean_allowed_reference(reference, base_file, asset_set, allowed)
+        if not href then return nil end
+        local optional = optional_image_tag(tag, reference)
+        if not optional and not allow_orphan then return nil end
+        record(href, optional)
+        if svg then return "" end
+        local alt = tag_attr(tag, "alt") or ""
+        alt = trim(alt)
+        return alt ~= "" and ('<span class="miu-image-alt">' .. xml_escape(alt) .. '</span>') or ""
+    end
+
+    local function clean_css_urls(text, base_file)
+        local changed = 0
+        local function replace_ref(prefix, ref, suffix, quote)
+            local href = clean_allowed_reference(ref, base_file, asset_set, allowed)
+            if href and allow_orphan then
+                changed = changed + 1
+                record(href, false)
+                return prefix .. "'" .. TRANSPARENT_IMAGE .. "'" .. suffix
+            end
+            return prefix .. tostring(quote or "") .. ref .. tostring(quote or "") .. suffix
+        end
+        local out = tostring(text or "")
+        out = out:gsub('([uU][rR][lL]%s*%(%s*)"([^"]+)"(%s*%))', function(prefix,ref,suffix)
+            return replace_ref(prefix,ref,suffix,'"')
+        end)
+        out = out:gsub("([uU][rR][lL]%s*%(%s*)'([^']+)'(%s*%))", function(prefix,ref,suffix)
+            return replace_ref(prefix,ref,suffix,"'")
+        end)
+        out = out:gsub("([uU][rR][lL]%s*%(%s*)([^%s%)\"']+)(%s*%))", function(prefix,ref,suffix)
+            return replace_ref(prefix,ref,suffix,"")
+        end)
+        return out, changed
+    end
+
+    for index, chapter in ipairs(chapters or {}) do
+        local raw, err = read_chapter(chapter)
+        if type(raw) ~= "string" then return nil, nil, "无法读取待清理章节资源：" .. tostring(err or index) end
+        local base_file = string.format("OEBPS/text/chapter-%04d.xhtml", index)
+        local changed = 0
+        local body = raw:gsub("<[iI][mM][gG][^>]*>", function(tag)
+            local ref = tag_attr(tag, "src")
+            if not ref or ref == "" then return tag end
+            local replacement = replacement_for_tag(tag, ref, base_file, false)
+            if replacement ~= nil then changed = changed + 1; return replacement end
+            return tag
+        end)
+        body = body:gsub("<[iI][mM][aA][gG][eE][^>]*>", function(tag)
+            local ref = tag_attr(tag, "xlink:href") or tag_attr(tag, "href")
+            if not ref or ref == "" then return tag end
+            local replacement = replacement_for_tag(tag, ref, base_file, true)
+            if replacement ~= nil then changed = changed + 1; return replacement end
+            return tag
+        end)
+        body = body:gsub("<[sS][oO][uU][rR][cC][eE][^>]*>", function(tag)
+            local srcset = tag_attr(tag, "srcset")
+            local ref = srcset and (srcset:match("^%s*([^,%s]+)")) or nil
+            if not ref then return tag end
+            local href = clean_allowed_reference(ref, base_file, asset_set, allowed)
+            if href and allow_orphan then changed = changed + 1; record(href, false); return "" end
+            return tag
+        end)
+        local css_changed
+        body, css_changed = clean_css_urls(body, base_file)
+        changed = changed + css_changed
+        if changed > 0 then
+            stats.chapters = stats.chapters + 1
+            if chapter.body_path then
+                local ok, write_error = U.atomic_write(chapter.body_path, body, true)
+                if not ok then return nil, nil, "无法保存清理后的章节：" .. tostring(write_error or index) end
+            else
+                chapter.body = body
+            end
+        end
+    end
+
+    local cleaned_css, css_changed = clean_css_urls(css or "", "OEBPS/style.css")
+    stats.css = css_changed
+    return cleaned_css, stats
+end
+
+
+read_chapter = function(chapter)
     if type(chapter) ~= "table" then return "" end
     if chapter.body_path then return U.read_file(chapter.body_path, true) end
     return tostring(chapter.body or "")

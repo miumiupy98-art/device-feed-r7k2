@@ -984,6 +984,7 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
             return display
         end
 
+        local last_progress_percent = 0
         local function run_download()
             local ok, value = xpcall(function()
                 local store = Store:new{
@@ -1013,7 +1014,6 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                 http.cancelled = clean_options.cancelled
                 http.rate_limit_retries = 3
                 http.min_weread_interval = 0.45
-                local last_progress_percent = 0
                 http.on_rate_limit = function(remaining, attempt, maximum, code)
                     emit{
                         stage = "rate_limit",
@@ -1052,7 +1052,10 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                     if stage == "package" then
                         detail.message = detail.message or "正在低内存生成并验证 EPUB"
                     end
-                    if percent ~= nil then last_progress_percent = percent end
+                    if percent ~= nil then
+                        percent = math.max(last_progress_percent or 0, percent)
+                        last_progress_percent = percent
+                    end
                     emit{
                         stage = stage,
                         current = current,
@@ -1095,7 +1098,8 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                 local raw_error = tostring(value)
                 LoggerChild.warn("[MiuRead][DownloadTask] child failed", raw_error)
                 local friendly=display_error(raw_error)
-                emit{stage = UChild.file_exists(cancel_path) and "cancelled" or "error", message = friendly}
+                emit{stage = UChild.file_exists(cancel_path) and "cancelled" or "error",
+                    percent = last_progress_percent, chapter = clean_book.title or "", message = friendly}
                 payload = {ok = false, error = friendly}
                 append_diagnostic("download_failed",raw_error)
             end
@@ -1109,7 +1113,8 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                         recovery_result = {ok=true,value=payload.value},
                         result_write_failed = true, message = "正在恢复已完成的下载结果"}
                 else
-                    emit{stage = "error", message = payload.error, result_write_failed = true}
+                    emit{stage = "error", percent = last_progress_percent,
+                        chapter = clean_book.title or "", message = payload.error, result_write_failed = true}
                 end
             end
         end
@@ -1120,7 +1125,8 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
             LoggerChild.warn("[MiuRead][DownloadTask] child fatal",tostring(child_error))
             append_diagnostic("child_fatal",child_error)
             write_json(result_path,{ok=false,error=friendly},"emergency_result")
-            emit{stage="error",message=friendly,fatal=true}
+            emit{stage="error",percent=last_progress_percent,chapter=clean_book.title or "",
+                message=friendly,fatal=true}
         end
     end
 

@@ -1385,13 +1385,28 @@ function Downloader:book(input, opt, progress)
                         style=tostring(style or "").."\n"..Footnotes.FOOTNOTES_CSS
                     end
                 else
-                    foot_stats.fallback=true
-                    foot_stats.fallback_reason="validation_error"
-                    body=original_body
-                    style=original_style
-                    logger.warn("[MiuRead][Download] footnote transform fallback",
-                        "chapter=",uid,"reason=validation_error",
-                        "error=",tostring(footnote_error))
+                    local repaired,repaired_count=transformed,0
+                    if tostring(footnote_error or ""):find("脚注目标不存在：wtref_",1,true) then
+                        repaired,repaired_count=Footnotes.repair_missing_generated_backlinks(transformed)
+                    end
+                    local repaired_valid,repaired_error=Footnotes.validate(repaired)
+                    if repaired_count>0 and repaired_valid then
+                        body=repaired
+                        foot_stats.repaired_backlinks=repaired_count
+                        if foot_section and foot_section ~= "" then
+                            style=tostring(style or "").."\n"..Footnotes.FOOTNOTES_CSS
+                        end
+                        logger.warn("[MiuRead][Download] footnote missing backlink neutralized",
+                            "chapter=",uid,"count=",tostring(repaired_count))
+                    else
+                        foot_stats.fallback=true
+                        foot_stats.fallback_reason="validation_error"
+                        body=original_body
+                        style=original_style
+                        logger.warn("[MiuRead][Download] footnote transform fallback",
+                            "chapter=",uid,"reason=validation_error",
+                            "error=",tostring(repaired_error or footnote_error))
+                    end
                 end
             end
         end
@@ -1697,41 +1712,121 @@ function Downloader:book(input, opt, progress)
     local image_summary
     chapters, assets, css_list, css_seen, annotation_summary, image_summary = rebuild_outputs()
 
-    -- The per-chapter downloader already retries missing images. A final EPUB
-    -- reference scan catches the narrower case where an image was downloaded but
-    -- a later transform/path rewrite left the final XHTML pointing at a resource
-    -- that will not be packaged. Repair only those chapters from their checkpoints.
-    local preflight,preflight_error=ResourceRefs.scan(chapters,table.concat(css_list,"\n"),assets)
+    -- Final resource verification has two responsibilities:
+    --   1) repair genuine image misses from the affected chapter checkpoints;
+    --   2) remove only references that remain local-and-missing after that repair,
+    --      proving they are stale/orphan markup rather than a transient network
+    --      failure. External URLs are never auto-dropped.
+    local function set_count_local(value)
+        local count=0
+        for _ in pairs(value or {}) do count=count+1 end
+        return count
+    end
+    local function same_set(a,b)
+        if set_count_local(a)~=set_count_local(b) then return false end
+        for key in pairs(a or {}) do if not (b and b[key]) then return false end end
+        return true
+    end
+    local function replace_css(value)
+        value=tostring(value or "")
+        css_list={}
+        css_seen={}
+        if value~="" then css_list[1]=value; css_seen[value]=true end
+    end
+
+    progress("resume", math.max(1,#chapters), math.max(1,expected), book.title,
+        {message="正在检查书籍图片完整性"})
+    local combined_css=table.concat(css_list,"\n")
+    local preflight,preflight_error=ResourceRefs.scan(chapters,combined_css,assets)
     if preflight then
+        -- Helper icons and footnote markers may be reintroduced by footnote
+        -- transforms or old checkpoints after Reader already localized images.
+        -- Drop only the known optional subset before deciding which chapters
+        -- deserve a network repair pass.
+        if set_count_local(preflight.missing)>0 then
+            local cleaned_css,cleanup_stats,cleanup_error=ResourceRefs.cleanup_missing_local(
+                chapters,combined_css,assets,{allowed=preflight.missing,allow_orphan=false})
+            if not cleaned_css then
+                logger.warn("[MiuRead][Download] optional image cleanup skipped",tostring(cleanup_error))
+            elseif tonumber(cleanup_stats.removed or 0)>0 then
+                replace_css(cleaned_css)
+                combined_css=cleaned_css
+                logger.info("[MiuRead][Download] optional final image references cleaned",
+                    "removed=",tostring(cleanup_stats.removed or 0),
+                    "chapters=",tostring(cleanup_stats.chapters or 0),
+                    "samples=",table.concat(cleanup_stats.samples or {},","))
+                preflight,preflight_error=ResourceRefs.scan(chapters,combined_css,assets)
+            end
+        end
+
+        local initial_missing=preflight and U.copy(preflight.missing or {}) or {}
         local affected={}
-        for uid in pairs(preflight.missing_chapters or {}) do affected[tostring(uid)]=true end
-        for uid in pairs(preflight.external_chapters or {}) do affected[tostring(uid)]=true end
-        local affected_count=0
-        for _ in pairs(affected) do affected_count=affected_count+1 end
+        if preflight then
+            for uid in pairs(preflight.missing_chapters or {}) do affected[tostring(uid)]=true end
+            for uid in pairs(preflight.external_chapters or {}) do affected[tostring(uid)]=true end
+        end
+        local affected_count=set_count_local(affected)
         if affected_count>0 then
-            local missing_count=0
-            for _ in pairs(preflight.missing or {}) do missing_count=missing_count+1 end
+            local missing_count=preflight and set_count_local(preflight.missing) or 0
             logger.warn("[MiuRead][Download] final image repair pass",
                 "chapters=",tostring(affected_count),
                 "missing=",tostring(missing_count),
-                "external=",tostring(#(preflight.external or {})))
+                "external=",tostring(preflight and #(preflight.external or {}) or 0))
             cache.manifest.final_repair_required=true
             cache.manifest.last_image_repair={
                 attempted_at=os.time(),chapters=affected_count,
-                missing_samples=U.copy(preflight.missing_details or {}),
-                external_samples=U.copy(preflight.external_details or {}),
+                missing_samples=U.copy(preflight and preflight.missing_details or {}),
+                external_samples=U.copy(preflight and preflight.external_details or {}),
             }
             cache_save(cache)
             for index,chapter in ipairs(selected) do
                 local uid=tostring(chapter.chapterUid or chapter.uid)
                 if affected[uid] then
-                    progress("resume",index,expected,chapter.title,{message="正在修复缺失的正文图片"})
+                    progress("resume",index,expected,chapter.title,{message="正在只修复缺失的正文图片"})
                     cache_reset_entry(cache,uid)
                     failure_map[uid]={uid=uid,title=chapter.title,error="最终图片引用需要重新获取"}
                     process_one(chapter,index,3)
                 end
             end
             chapters, assets, css_list, css_seen, annotation_summary, image_summary = rebuild_outputs()
+            combined_css=table.concat(css_list,"\n")
+
+            -- If exactly the same local references survive a completed repair
+            -- pass, they have no downloadable source in the current chapter
+            -- payload. They are stale markup (for example a template image name
+            -- or a legacy footnote icon), not a network failure. Remove only
+            -- this stable set; any new/different miss remains fatal in _save.
+            local post,post_error=ResourceRefs.scan(chapters,combined_css,assets)
+            if post and #(post.external or {})==0 and set_count_local(post.missing)>0
+                and same_set(initial_missing,post.missing)
+                and tonumber(image_summary.required_missing or 0)==0 then
+                local cleaned_css,cleanup_stats,cleanup_error=ResourceRefs.cleanup_missing_local(
+                    chapters,combined_css,assets,{allowed=post.missing,allow_orphan=true})
+                if cleaned_css and tonumber(cleanup_stats.removed or 0)>0 then
+                    replace_css(cleaned_css)
+                    combined_css=cleaned_css
+                    local verified,verified_error=ResourceRefs.scan(chapters,combined_css,assets)
+                    if verified and set_count_local(verified.missing)==0 and #(verified.external or {})==0 then
+                        cache.manifest.last_image_repair.orphan_cleaned=tonumber(cleanup_stats.orphan or 0) or 0
+                        cache.manifest.last_image_repair.optional_cleaned=tonumber(cleanup_stats.optional or 0) or 0
+                        cache.manifest.last_image_repair.cleaned_samples=U.copy(cleanup_stats.samples or {})
+                        logger.warn("[MiuRead][Download] stable orphan image references removed after repair",
+                            "removed=",tostring(cleanup_stats.removed or 0),
+                            "chapters=",tostring(cleanup_stats.chapters or 0),
+                            "samples=",table.concat(cleanup_stats.samples or {},","))
+                    elseif verified then
+                        logger.warn("[MiuRead][Download] orphan cleanup left unresolved resources",
+                            "missing=",tostring(set_count_local(verified.missing)),
+                            "external=",tostring(#(verified.external or {})))
+                    else
+                        logger.warn("[MiuRead][Download] orphan cleanup verification failed",tostring(verified_error))
+                    end
+                elseif cleanup_error then
+                    logger.warn("[MiuRead][Download] stable orphan cleanup skipped",tostring(cleanup_error))
+                end
+            elseif post_error then
+                logger.warn("[MiuRead][Download] post-repair resource scan failed",tostring(post_error))
+            end
         end
     elseif preflight_error then
         logger.warn("[MiuRead][Download] image repair preflight skipped",tostring(preflight_error))

@@ -763,6 +763,32 @@ function Footnotes.process(html, meta)
     return html2,section,stats
 end
 
+
+--- Remove only generated reverse links whose source marker no longer exists.
+-- A missing wtref_N affects "back to text" navigation, not the footnote body.
+-- Forward links to a missing wt_N are intentionally not repaired here.
+function Footnotes.repair_missing_generated_backlinks(html)
+    if type(html)~="string" then return html,0 end
+    local ids={}
+    for raw in html:gmatch("<[^>]+>") do
+        if not raw:match("^<%s*/") then
+            local id=get_attr(raw,"id")
+            if id and id~="" then ids[id]=true end
+        end
+    end
+    local repaired=0
+    local out=html:gsub("<[aA]([%s][^>]*)>(.-)</[aA]%s*>",function(attrs,inner)
+        local href=get_attr(attrs,"href")
+        local target=href and href:match("^#(wtref_[%w_%-%.]+)$")
+        if target and not ids[target] then
+            repaired=repaired+1
+            return '<span class="fn-num">'..inner..'</span>'
+        end
+        return "<a"..attrs..">"..inner.."</a>"
+    end)
+    return out,repaired
+end
+
 function Footnotes.validate(html)
     if type(html)~="string" then return nil,"章节正文无效" end
     local ids={}
