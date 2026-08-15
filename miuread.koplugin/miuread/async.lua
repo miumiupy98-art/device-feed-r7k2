@@ -1,6 +1,7 @@
 local FFIUtil=require("ffi/util")
 local Json=require("miuread.json")
 local U=require("miuread.util")
+local RuntimePressure=require("miuread.runtime_pressure")
 local UIManager=require("ui/uimanager")
 local Async={}; Async.__index=Async
 function Async:new(store, options)
@@ -68,6 +69,14 @@ function Async:run(label,fn,callback,timeout)
         return true
     end
     local path=self.store.temp_dir.."/worker-"..tostring(os.time()).."-"..tostring(math.random(10000,99999))..".json"; local child=function() local ok,x=pcall(fn); local res=ok and {ok=true,value=x} or {ok=false,error=tostring(x)}; local encoded=Json.encode(res); U.atomic_write(path,encoded,true) end
-    local ok,pid,err=pcall(FFIUtil.runInSubProcess,child,false,false); if not ok or not pid then return false,tostring(err or pid) end; self.job={pid=pid,path=path,label=label,callback=callback,started=os.time(),timeout=timeout or 45}; self:_schedule(); return true
+    local ok,pid,err=pcall(FFIUtil.runInSubProcess,child,false,false)
+    if not ok or not pid then
+        local failure=tostring(err or pid)
+        RuntimePressure.note_worker_failure(label,failure)
+        return false,failure
+    end
+    self.job={pid=pid,path=path,label=label,callback=callback,started=os.time(),timeout=timeout or 45}
+    self:_schedule()
+    return true
 end
 return Async

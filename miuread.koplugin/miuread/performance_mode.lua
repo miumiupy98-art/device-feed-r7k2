@@ -1,5 +1,5 @@
 local Config = require("miuread.config")
-local U = require("miuread.util")
+local RuntimePressure = require("miuread.runtime_pressure")
 local logger = require("logger")
 
 local PerformanceMode = {}
@@ -70,21 +70,20 @@ end
 function PerformanceMode:_sync_runtime_flag()
     local _, state = self:_preferences()
     runtime.enabled = state.enabled == true
-    local path = tostring(Config.LIGHTWEIGHT_MODE_FLAG or "/tmp/miuread-lightweight-mode.flag")
-    if runtime.enabled then
-        local ok = U.atomic_write(path, "1", true) == true
-        if not ok then logger.warn("[MiuRead][PerformanceMode] runtime flag write failed", path) end
-    else
-        os.remove(path)
-    end
-    return runtime.enabled
+    local effective = RuntimePressure.sync_flag(runtime.enabled)
+    return effective
 end
 
 function PerformanceMode:status()
     local _, state = self:_preferences()
     runtime.enabled = state.enabled == true
+    local pressure = RuntimePressure.status()
     return {
         enabled = runtime.enabled,
+        effective = runtime.enabled or pressure.active==true,
+        temporary = runtime.enabled~=true and pressure.active==true,
+        temporary_reason = pressure.reason,
+        temporary_until = tonumber(pressure.until_at) or 0,
         auto_detect = state.auto_detect ~= false,
         reminders_disabled = state.reminders_disabled == true,
         last_prompt_at = tonumber(state.last_prompt_at or 0) or 0,
@@ -95,11 +94,29 @@ function PerformanceMode:enabled()
     return runtime.enabled == true
 end
 
+function PerformanceMode:effective_enabled()
+    local effective=runtime.enabled==true or RuntimePressure.active()
+    RuntimePressure.sync_flag(runtime.enabled==true)
+    return effective
+end
+
+function PerformanceMode:activate_temporary(reason,seconds)
+    RuntimePressure.activate(reason,seconds)
+    RuntimePressure.sync_flag(runtime.enabled==true)
+    return true
+end
+
 function PerformanceMode:set_enabled(enabled)
     local preferences, state = self:_preferences()
     state.enabled = enabled == true
     preferences.performance_mode = state
     self:_save(preferences)
+    if not state.enabled and RuntimePressure.active() then
+        -- An explicit user switch back to standard mode should win over an
+        -- automatic temporary protection window. Future measured pressure can
+        -- still activate another temporary window.
+        RuntimePressure.clear("manual standard mode",false)
+    end
     self:_sync_runtime_flag()
     runtime.samples = {}
     logger.info("[MiuRead][PerformanceMode]", state.enabled and "enabled" or "disabled")
@@ -157,6 +174,10 @@ function PerformanceMode:record(kind, elapsed_ms)
     local triggered = same_kind_count >= rule.repeat_count
         or (extreme and rule.single_extreme)
     if not triggered then return nil end
+    -- Runtime protection is immediate and independent from the user-facing
+    -- prompt cooldown. A user who already dismissed the prompt still benefits
+    -- from a temporary smaller background workload when lag returns.
+    self:activate_temporary("lag:"..kind,tonumber(Config.PERFORMANCE_AUTO_PROTECT_SECONDS) or 20*60)
     if status.last_prompt_at > 0 and now - status.last_prompt_at < cooldown then return nil end
 
     local preferences, state = self:_preferences()
@@ -171,7 +192,8 @@ function PerformanceMode:record(kind, elapsed_ms)
         "count=", tostring(same_kind_count),
         "slow_ms=", tostring(rule.slow_ms),
         "extreme_ms=", tostring(rule.extreme_ms),
-        "extreme=", tostring(extreme))
+        "extreme=", tostring(extreme),
+        "temporary_protection=true")
     return {
         kind = kind,
         elapsed_ms = elapsed,

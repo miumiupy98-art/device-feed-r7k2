@@ -40,6 +40,8 @@ local EpubInstaller=require("miuread.epub_installer")
 local CacheCleanupTask=require("miuread.cache_cleanup_task")
 local MemoryMode=require("miuread.memory_mode")
 local PerformanceMode=require("miuread.performance_mode")
+local RuntimePressure=require("miuread.runtime_pressure")
+local BackgroundScheduler=require("miuread.background_scheduler")
 local Library=require("miuread.library")
 local ShelfView=require("miuread.shelf_view")
 local FullShelfView=require("miuread.full_shelf_view")
@@ -617,6 +619,7 @@ function Plugin:init()
     end
     self.memory_mode=MemoryMode:new(self.store)
     self.performance_mode=PerformanceMode:new(self.store)
+    self.background_scheduler=BackgroundScheduler:new()
     self._reader_interaction_resume_task=nil
     self._reader_interaction_resume_generation=0
     self._performance_prompt_pending=nil
@@ -3180,6 +3183,100 @@ function Plugin:home_mode_menu()
     return rows
 end
 
+function Plugin:_background_block_reason(options)
+    options=options or {}
+    if HOME_EXITING or UIManager._exit_code~=nil then return "exiting" end
+    if self._miuread_suspended==true or HOME_SESSION.suspended==true or self._home_suspended==true then return "suspended" end
+    if self:_page_transition_active() or reader_close_active() or reader_rebuild_active() then return "reader_transition" end
+    if self:_active_reader_ui() then return "reader_active" end
+    if self.annotation_async and self.annotation_async:busy() then return "annotation_sync" end
+    if options.user_requested~=true and self:_home_ui_busy() then return "foreground_priority" end
+    return nil
+end
+
+function Plugin:_background_cancel_worker(key,reason)
+    key=tostring(key or "")
+    reason=tostring(reason or "background preempted")
+    if key=="home_shelf" then
+        if self.shelf_async then self.shelf_async:cancel(reason) end
+        self._home_remote_refreshing=false
+    elseif key=="home_scan" then
+        self._home_scan_generation=(tonumber(self._home_scan_generation) or 0)+1
+        self._home_refreshing=false
+        if self.home_async then self.home_async:cancel(reason) end
+    elseif key=="home_metadata" then
+        self._home_metadata_generation=(tonumber(self._home_metadata_generation) or 0)+1
+        if self.home_metadata_async then self.home_metadata_async:cancel(reason) end
+    elseif key=="home_cover" then
+        self._home_cover_generation=(tonumber(self._home_cover_generation) or 0)+1
+        self._home_cover_inflight={}
+        if self.home_cover_async then self.home_cover_async:cancel(reason) end
+    elseif key=="home_cover_render" then
+        self._home_cover_render_generation=(tonumber(self._home_cover_render_generation) or 0)+1
+        self._home_cover_render_inflight_signature=nil
+        if self.cover_render_async then self.cover_render_async:cancel(reason) end
+    elseif key=="sync_summary" then
+        if self.sync_summary_async then self.sync_summary_async:cancel(reason) end
+        self:_home_unschedule_task("_home_sync_summary_task")
+    end
+end
+
+function Plugin:_background_claim(key,options,retry)
+    if not self.background_scheduler then return true,nil,false end
+    options=options or {}
+    options.blocked_reason=self:_background_block_reason(options)
+    local active=self.background_scheduler.active
+    if options.user_requested==true and active and active.user_requested~=true then
+        self:_background_cancel_worker(active.key,"foreground request: "..tostring(key))
+        self.background_scheduler:force_release("foreground request: "..tostring(key))
+    end
+    local token,reason=self.background_scheduler:claim(key,options)
+    if token then return token,nil,false end
+    local retryable=reason~="suspended" and reason~="exiting" and reason~="reader_active" and reason~="reader_transition"
+    if retryable and type(retry)=="function" then
+        local retry_delay=options.retry_delay or tonumber(Config.BACKGROUND_RETRY_SECONDS) or .9
+        if reason=="memory_critical" then retry_delay=math.max(4.0,tonumber(retry_delay) or .9) end
+        self.background_scheduler:defer(key,retry,{
+            delay=retry_delay,
+            priority=options.priority or (options.user_requested==true and 80 or 20),
+            reason=reason,
+        })
+        return nil,reason,true
+    end
+    return nil,reason,false
+end
+
+function Plugin:_background_release(key,token,reason)
+    if self.background_scheduler and token~=true then
+        return self.background_scheduler:release(key,token,reason)
+    end
+    return true
+end
+
+function Plugin:_background_cancel_all(reason,include_user,workers_already_cancelled)
+    if not self.background_scheduler then return false end
+    local active=self.background_scheduler.active
+    if active and (include_user==true or active.user_requested~=true) then
+        if workers_already_cancelled~=true then self:_background_cancel_worker(active.key,reason) end
+        self.background_scheduler:force_release(reason)
+    end
+    self.background_scheduler:cancel_pending(reason)
+    return true
+end
+
+function Plugin:_background_log_state(reason,force_memory)
+    local memory=RuntimePressure.memory_snapshot(force_memory==true)
+    local snapshot=self.background_scheduler and self.background_scheduler:snapshot() or {}
+    logger.info("[MiuRead][Resource] state",
+        "reason=",tostring(reason or "snapshot"),
+        "memory_kb=",tostring(memory and memory.available_kb or "unknown"),
+        "level=",tostring(memory and memory.level or "unknown"),
+        "active=",tostring(snapshot.active or "none"),
+        "pending=",tostring(snapshot.pending or 0),
+        "temporary=",tostring(RuntimePressure.active()))
+    return memory,snapshot
+end
+
 function Plugin:_home_refresh_priority(kind)
     -- "page" is a full home-state repaint with the normal UI waveform.
     -- "full" remains the heavier structural rebuild used by settings/rotation.
@@ -3393,6 +3490,7 @@ function Plugin:_home_enter_post_reader_priority_window(seconds,reason)
     if self.home_metadata_async and self.home_metadata_async:busy() then self.home_metadata_async:cancel("post-reader priority") end
     if self.home_cover_async and self.home_cover_async:busy() then self.home_cover_async:cancel("post-reader priority") end
     if self.cover_render_async and self.cover_render_async:busy() then self.cover_render_async:cancel("post-reader priority") end
+    self:_background_cancel_all("post-reader priority",false,false)
     self:_home_resume_visible_work_after_idle()
     logger.info("[MiuRead][HomePerf] post-reader priority window",
         "seconds=",tostring(duration),"reason=",tostring(reason or "reader closed"))
@@ -3416,6 +3514,7 @@ function Plugin:_home_note_interaction(first,kind)
     if self.home_metadata_async and self.home_metadata_async:busy() then self.home_metadata_async:cancel("home interaction") end
     if self.home_cover_async and self.home_cover_async:busy() then self.home_cover_async:cancel("home interaction") end
     if self.cover_render_async and self.cover_render_async:busy() then self.cover_render_async:cancel("home interaction") end
+    self:_background_cancel_all("home interaction",false,false)
     if self.download_task and self.download_task:busy() then self.download_task:pause("home_interaction") end
     self:_home_resume_visible_work_after_idle()
     if first then
@@ -3484,6 +3583,8 @@ function Plugin:_home_freeze_for_suspend()
     if self.sync_summary_async then self.sync_summary_async:cancel("device suspended") end
     self:_home_unschedule_task("_home_sync_summary_task")
     if self.shelf_async and self._home_resume_pending_work.remote then self.shelf_async:cancel("device suspended") end
+    self:_background_cancel_all("device suspended",true,false)
+    self:_background_log_state("suspend freeze",true)
 
     logger.info("[MiuRead][Resume] home tasks frozen",
         "generation=",tostring(self._home_resume_generation),
@@ -3789,10 +3890,27 @@ function Plugin:_home_refresh_remote(force,user_requested)
         if user_requested then self:toast("当前没有网络连接",3) end
         return false
     end
+
+    local retry=function()
+        if HomeView.is_shown() and not self:_active_reader_ui() then
+            self:_home_refresh_remote(force,user_requested)
+        end
+    end
+    local token,block_reason,deferred=self:_background_claim("home_shelf",{
+        user_requested=user_requested==true,
+        priority=user_requested==true and 90 or 45,
+        retry_delay=user_requested==true and .35 or 1.1,
+    },retry)
+    if not token then
+        if user_requested and not deferred then self:toast("后台任务正忙，请稍后重试",2) end
+        return deferred==true
+    end
+
     self._home_remote_refreshing=true
     if force~=true then self._home_remote_auto_attempt_at=now end
     if user_requested then self:toast("正在刷新书架…",2) end
     local started=self:_refresh_shelf_async(function(_,_,err)
+        self:_background_release("home_shelf",token,err and "failed" or "completed")
         self._home_remote_refreshing=false
         if err then
             if user_requested then self:toast(self:_friendly_remote_error(err,"书架刷新"),4) end
@@ -3803,7 +3921,10 @@ function Plugin:_home_refresh_remote(force,user_requested)
         end
         if user_requested then self:toast("书架已刷新",2) end
     end,true)
-    if not started then self._home_remote_refreshing=false end
+    if not started then
+        self._home_remote_refreshing=false
+        self:_background_release("home_shelf",token,"not started")
+    end
     return started==true
 end
 
@@ -3815,7 +3936,7 @@ function Plugin:_home_manual_refresh()
         return true
     end
     if active=="local" then
-        local started=self:_home_scan_local(true)
+        local started=self:_home_scan_local(true,true)
         if started then self:toast("正在更新本地书库…",2)
         else self:toast("本地书库暂时无法开始更新",2) end
         return true
@@ -4307,24 +4428,19 @@ function Plugin:_home_schedule_cover_derivatives(books)
         logger.info("[MiuRead][CoverRender] retry cooled down","seconds=600")
         return false
     end
-    local competing=lightweight and (
-        (self.home_metadata_async and self.home_metadata_async:busy())
+    local retry=function()
+        if HomeView.is_shown() and not self:_active_reader_ui() then self:_home_schedule_cover_derivatives(books) end
+    end
+    local token,block_reason,deferred=self:_background_claim("home_cover_render",{
+        priority=20,retry_delay=derivative_gap,
+    },retry)
+    if not token then return deferred==true end
+    local competing=(self.home_metadata_async and self.home_metadata_async:busy())
         or (self.home_cover_async and self.home_cover_async:busy())
-    )
     if self.cover_render_async:busy() or competing then
-        if not self._home_cover_render_retry_task then
-            local retry
-            retry=function()
-                if self._home_cover_render_retry_task~=retry then return end
-                self._home_cover_render_retry_task=nil
-                if HomeView.is_shown() and not self:_active_reader_ui() and not self:_home_ui_busy() then
-                    self:_home_schedule_cover_derivatives(books)
-                end
-            end
-            self._home_cover_render_retry_task=retry
-            UIManager:scheduleIn(derivative_gap,retry)
-        end
-        return false
+        self:_background_release("home_cover_render",token,"competing worker")
+        self.background_scheduler:defer("home_cover_render",retry,{delay=derivative_gap,priority=20,reason="competing worker"})
+        return true
     end
 
     self._home_cover_render_inflight_signature=request_signature
@@ -4364,6 +4480,7 @@ function Plugin:_home_schedule_cover_derivatives(books)
         "check_ms=",tostring(math.floor((monotonic_wall_time()-check_started)*1000+.5)))
     local render_started=monotonic_wall_time()
     local started=self.cover_render_async:run("home-cover-render",worker,function(result)
+        self:_background_release("home_cover_render",token,result and result.ok==true and "completed" or "failed")
         if self._home_cover_render_inflight_signature==request_signature then
             self._home_cover_render_inflight_signature=nil
         end
@@ -4417,10 +4534,15 @@ function Plugin:_home_schedule_cover_derivatives(books)
             end)
         end
     end,55)
-    if started~=true and self._home_cover_render_inflight_signature==request_signature then
-        self._home_cover_render_inflight_signature=nil
+    if started~=true then
+        self:_background_release("home_cover_render",token,"not started")
+        if self._home_cover_render_inflight_signature==request_signature then
+            self._home_cover_render_inflight_signature=nil
+        end
+        self.background_scheduler:defer("home_cover_render",retry,{delay=RuntimePressure.active() and 3.0 or derivative_gap,priority=20,reason="worker not started"})
+        return true
     end
-    return started==true
+    return true
 end
 
 function Plugin:_time_preferences()
@@ -7194,7 +7316,7 @@ function Plugin:_show_home_refresh_popup(anchor)
             {icon="▣",label="刷新整个主页",detail="核对已有状态并整页更新一次",callback=function() self:_home_refresh_whole_page() end},
             {icon="☁",label="更新微信书架",detail="重新获取微信书架变化",callback=function() self:_home_refresh_remote(true,true) end},
             {icon="⌕",label="更新本地书库",detail="检查新增、删除和移动的书籍",callback=function()
-                local started=self:_home_scan_local(true)
+                local started=self:_home_scan_local(true,true)
                 if started then self:toast("正在更新本地书库…",2) end
             end},
             {icon="i",label="更新最近阅读信息",detail="更新顶部这本书的资料和封面",callback=function()
@@ -7461,7 +7583,7 @@ function Plugin:_home_action_function_actions(key,anchor)
         {icon="▣",label="刷新整个主页",detail="核对已有状态并整页更新一次",callback=function() self:_home_refresh_whole_page() end},
         {icon="☁",label="更新微信书架",detail="重新获取微信书架变化",callback=function() self:_home_refresh_remote(true,true) end},
         {icon="⌕",label="更新本地书库",detail="检查新增、删除和移动的书籍",callback=function()
-            local started=self:_home_scan_local(true)
+            local started=self:_home_scan_local(true,true)
             if started then self:toast("正在更新本地书库…",2) end
         end},
         {icon="i",label="更新最近阅读信息",detail="更新顶部这本书的资料和封面",callback=function()
@@ -7888,6 +8010,7 @@ function Plugin:_home_stop_background(reason)
     if self.home_metadata_async then self.home_metadata_async:cancel(reason or "home hidden") end
     if self.home_cover_async then self.home_cover_async:cancel(reason or "home hidden") end
     if self.cover_render_async then self.cover_render_async:cancel(reason or "home hidden") end
+    self:_background_cancel_all(reason or "home hidden",true,false)
 end
 
 function Plugin:_home_merge_directory_snapshot(snapshot,old_snapshot)
@@ -7918,7 +8041,8 @@ function Plugin:_home_store_directory_snapshot(path,snapshot)
     return snapshot
 end
 
-function Plugin:_home_scan_local(force)
+function Plugin:_home_scan_local(force,user_requested)
+    user_requested=user_requested==true
     local home=self:_home_preferences()
     local mode="auto" -- compatibility label for existing logging
     if force~=true and home.local_auto_update~=true then return false end
@@ -7932,7 +8056,21 @@ function Plugin:_home_scan_local(force)
     end
     if self:_home_background_blocked() or self:_active_reader_ui() then return false end
     local roots=self:_home_local_roots(true)
-    if #roots==0 or not self.home_async or self.home_async:busy() or not self.home_async:available() then return false end
+    if #roots==0 or not self.home_async or not self.home_async:available() then return false end
+    local retry=function()
+        if HomeView.is_shown() and not self:_active_reader_ui() then self:_home_scan_local(force,user_requested) end
+    end
+    local scan_priority=user_requested and 85 or (force==true and 60 or 35)
+    local token,block_reason,deferred=self:_background_claim("home_scan",{
+        user_requested=user_requested,priority=scan_priority,
+        retry_delay=user_requested and .45 or 1.3,
+    },retry)
+    if not token then return deferred==true end
+    if self.home_async:busy() then
+        self:_background_release("home_scan",token,"worker busy")
+        if not deferred then self.background_scheduler:defer("home_scan",retry,{delay=.8,priority=scan_priority,reason="worker busy"}) end
+        return true
+    end
     self._home_scan_generation=(tonumber(self._home_scan_generation) or 0)+1
     local generation=self._home_scan_generation
     self._home_refreshing=true
@@ -7978,6 +8116,7 @@ function Plugin:_home_scan_local(force)
         end
         return result
     end,function(result)
+        self:_background_release("home_scan",token,result and result.ok==true and "completed" or "failed")
         if generation~=self._home_scan_generation then return end
         self._home_refreshing=false
         if not result or result.ok~=true or type(result.value)~="table" then
@@ -8005,7 +8144,13 @@ function Plugin:_home_scan_local(force)
     end,recursive and 240 or 120)
     if not started then
         self._home_refreshing=false
+        self:_background_release("home_scan",token,"not started")
+        RuntimePressure.note_worker_failure("home-local-library",err)
         logger.warn("[MiuRead][Home] local scan not started",tostring(err))
+        if self.background_scheduler then
+            self.background_scheduler:defer("home_scan",retry,{delay=RuntimePressure.active() and 3.0 or 1.2,priority=scan_priority,reason=tostring(err or "not started")})
+            return true
+        end
         return false
     end
     return true
@@ -8387,8 +8532,32 @@ function Plugin:_home_schedule_network_metadata(book,force,silent,on_done,explic
         return false
     end
     if not self:is_online() or not self.home_metadata_async or not self.home_metadata_async:available() then return false end
+    local retry=function()
+        if HomeView.is_shown() and not self:_active_reader_ui() then
+            self:_home_schedule_network_metadata(book,force,silent,on_done,explicit)
+        end
+    end
+    local token,block_reason,deferred=self:_background_claim("home_metadata",{
+        user_requested=explicit,
+        priority=explicit and 88 or 28,
+        retry_delay=explicit and .25 or tonumber(Config.BACKGROUND_RETRY_SECONDS) or .9,
+    },retry)
+    if not token then
+        if explicit and not deferred and block_reason~="suspended" and block_reason~="reader_transition" then
+            return self:_home_queue_manual_network_metadata(book,force,silent,on_done)
+        end
+        return deferred==true
+    end
     if self.home_metadata_async:busy() then
+        self:_background_release("home_metadata",token,"metadata worker busy")
         if explicit then return self:_home_queue_manual_network_metadata(book,force,silent,on_done) end
+        if self.background_scheduler then
+            self.background_scheduler:defer("home_metadata",retry,{
+                delay=tonumber(Config.BACKGROUND_RETRY_SECONDS) or .9,
+                priority=28,
+                reason="metadata_worker_busy",
+            })
+        end
         return false
     end
     local candidate=U.copy(book)
@@ -8431,6 +8600,7 @@ function Plugin:_home_schedule_network_metadata(book,force,silent,on_done,explic
         end
         return patch
     end,function(result)
+        self:_background_release("home_metadata",token,"network metadata worker finished")
         if not result or result.ok~=true then
             logger.warn("[MiuRead][HomeMetadata] network metadata unavailable",
                 "book=",id~="" and id or key,
@@ -8478,10 +8648,19 @@ function Plugin:_home_schedule_network_metadata(book,force,silent,on_done,explic
         if on_done then on_done(found,patch,detail) end
     end,35)
     if not started then
+        self:_background_release("home_metadata",token,"network metadata worker not started")
+        RuntimePressure.note_worker_failure("home-network-metadata",err)
         logger.warn("[MiuRead][HomeMetadata] network metadata worker not started",
             "book=",id~="" and id or key,"error=",tostring(err))
         if explicit and self.home_metadata_async and self.home_metadata_async:busy() then
             return self:_home_queue_manual_network_metadata(book,force,silent,on_done)
+        end
+        if self.background_scheduler then
+            self.background_scheduler:defer("home_metadata",retry,{
+                delay=RuntimePressure.active() and 3.5 or (tonumber(Config.BACKGROUND_RETRY_SECONDS) or .9),
+                priority=explicit and 88 or 28,
+                reason="worker_start_failed",
+            })
         end
     end
     return started==true
@@ -8498,8 +8677,6 @@ function Plugin:_home_schedule_local_metadata(books)
     local lightweight=self:_lightweight_enabled()
     local queue_limit=lightweight and (tonumber(Config.LIGHTWEIGHT_LOCAL_METADATA_QUEUE) or 3) or 6
     local metadata_gap=lightweight and (tonumber(Config.LIGHTWEIGHT_METADATA_GAP) or .75) or .22
-    self._home_metadata_generation=(tonumber(self._home_metadata_generation) or 0)+1
-    local generation=self._home_metadata_generation
     local queue,seen={},{}
     for _,book in ipairs(books or {}) do
         local filepath=tostring(book and book.file or "")
@@ -8514,11 +8691,28 @@ function Plugin:_home_schedule_local_metadata(books)
     end
     if #queue==0 then return false end
 
+    local retry=function()
+        if HomeView.is_shown() and not self:_active_reader_ui() then self:_home_schedule_local_metadata(books) end
+    end
+    local token,block_reason,deferred=self:_background_claim("home_metadata",{
+        priority=30,retry_delay=self:_lightweight_enabled() and 1.4 or .9,
+    },retry)
+    if not token then return deferred==true end
+    self._home_metadata_generation=(tonumber(self._home_metadata_generation) or 0)+1
+    local generation=self._home_metadata_generation
+
     local index=1
     local hero_changed=false
     local changed_book_keys={}
     local cache_dir=self:_home_local_metadata_dir()
+    local released=false
+    local function release(reason)
+        if released then return end
+        released=true
+        self:_background_release("home_metadata",token,reason)
+    end
     local function finish()
+        release("completed")
         if generation~=self._home_metadata_generation or not HomeView.is_shown() then return end
         if hero_changed and self._home_hero then
             HomeView.update_hero(self._home_hero)
@@ -8547,9 +8741,19 @@ function Plugin:_home_schedule_local_metadata(books)
         index=index+1
     end
     local function next_book()
-        if generation~=self._home_metadata_generation or not HomeView.is_shown() or self:_active_reader_ui() then return end
-        if self._download_runtime~=nil then return end
-        if self:_home_ui_busy() then UIManager:scheduleIn(math.max(.45,metadata_gap),next_book); return end
+        if generation~=self._home_metadata_generation or not HomeView.is_shown() or self:_active_reader_ui() then
+            release("cancelled")
+            return
+        end
+        if self._download_runtime~=nil then
+            release("download active")
+            return
+        end
+        if self:_home_ui_busy() then
+            release("foreground priority")
+            self.background_scheduler:defer("home_metadata",retry,{delay=math.max(.45,metadata_gap),priority=30,reason="foreground priority"})
+            return
+        end
         local item=queue[index]
         if not item then finish(); return end
         if self.home_metadata_async and self.home_metadata_async:available() then
@@ -8559,7 +8763,7 @@ function Plugin:_home_schedule_local_metadata(books)
                 local Metadata=require("miuread.local_metadata")
                 return Metadata.read(filepath,cache_dir,{open_document=true,use_bim=true})
             end,function(result)
-                if generation~=self._home_metadata_generation then return end
+                if generation~=self._home_metadata_generation then release("stale") return end
                 if result and result.ok and type(result.value)=="table" then
                     apply_metadata(item,result.value)
                 else
@@ -8567,7 +8771,10 @@ function Plugin:_home_schedule_local_metadata(books)
                 end
                 if queue[index] then UIManager:scheduleIn(metadata_gap,next_book) else finish() end
             end,45)
-            if not started then UIManager:scheduleIn(.4,next_book) end
+            if not started then
+                release("worker not started")
+                self.background_scheduler:defer("home_metadata",retry,{delay=RuntimePressure.active() and 2.5 or .8,priority=30,reason="worker not started"})
+            end
             return
         end
         -- Compatibility fallback for devices without subprocess support. Run
@@ -8591,8 +8798,6 @@ function Plugin:_home_schedule_remote_covers(books)
     local queue_limit=lightweight and (tonumber(Config.LIGHTWEIGHT_REMOTE_COVER_QUEUE) or 4) or 10
     local cover_gap=lightweight and (tonumber(Config.LIGHTWEIGHT_COVER_GAP) or .65) or .08
     local derivative_gap=lightweight and (tonumber(Config.LIGHTWEIGHT_DERIVATIVE_GAP) or 1.0) or .75
-    self._home_cover_generation=(tonumber(self._home_cover_generation) or 0)+1
-    local generation=self._home_cover_generation
     self._home_cover_inflight=type(self._home_cover_inflight)=="table" and self._home_cover_inflight or {}
     local queue,seen={},{}
     for _,book in ipairs(books or {}) do
@@ -8604,7 +8809,22 @@ function Plugin:_home_schedule_remote_covers(books)
             if #queue>=queue_limit then break end
         end
     end
-    if #queue==0 or not self.home_cover_async then return end
+    if #queue==0 or not self.home_cover_async then return false end
+    local retry=function()
+        if HomeView.is_shown() and not self:_active_reader_ui() then self:_home_schedule_remote_covers(books) end
+    end
+    local token,block_reason,deferred=self:_background_claim("home_cover",{
+        priority=25,retry_delay=lightweight and 1.4 or .9,
+    },retry)
+    if not token then return deferred==true end
+    self._home_cover_generation=(tonumber(self._home_cover_generation) or 0)+1
+    local generation=self._home_cover_generation
+    local released=false
+    local function release(reason)
+        if released then return end
+        released=true
+        self:_background_release("home_cover",token,reason)
+    end
     local index,changed_count=1,0
     local changed_sections={}
     local changed_ids={}
@@ -8642,6 +8862,7 @@ function Plugin:_home_schedule_remote_covers(books)
             "active=",tostring(active))
     end
     local function finish()
+        release("completed")
         if changed_count>0 and generation==self._home_cover_generation and HomeView.is_shown() then
             -- Let the final worker callback leave the input path before one
             -- bounded e-ink update. A later tab switch wins automatically.
@@ -8656,11 +8877,22 @@ function Plugin:_home_schedule_remote_covers(books)
         end
     end
     local function next_cover()
-        if generation~=self._home_cover_generation or not HomeView.is_shown() or self:_active_reader_ui() then return end
-        if self._download_runtime~=nil then return end
-        if self:_home_ui_busy() then UIManager:scheduleIn(math.max(.45,cover_gap),next_cover); return end
-        if lightweight and self.home_metadata_async and self.home_metadata_async:busy() then
-            UIManager:scheduleIn(math.max(.5,cover_gap),next_cover)
+        if generation~=self._home_cover_generation or not HomeView.is_shown() or self:_active_reader_ui() then
+            release("cancelled")
+            return
+        end
+        if self._download_runtime~=nil then
+            release("download active")
+            return
+        end
+        if self:_home_ui_busy() then
+            release("foreground priority")
+            self.background_scheduler:defer("home_cover",retry,{delay=math.max(.45,cover_gap),priority=25,reason="foreground priority"})
+            return
+        end
+        if self.home_metadata_async and self.home_metadata_async:busy() then
+            release("metadata busy")
+            self.background_scheduler:defer("home_cover",retry,{delay=math.max(.5,cover_gap),priority=25,reason="metadata busy"})
             return
         end
         if self.home_cover_async:busy() then UIManager:scheduleIn(math.max(.3,cover_gap),next_cover); return end
@@ -8701,7 +8933,7 @@ function Plugin:_home_schedule_remote_covers(books)
             if self._home_cover_inflight[item.bookId]==generation then
                 self._home_cover_inflight[item.bookId]=nil
             end
-            if generation~=self._home_cover_generation then return end
+            if generation~=self._home_cover_generation then release("stale") return end
             if result and result.ok and result.value then
                 self:_remember_cover_path(item.bookId,result.value)
                 local changed=self:_home_apply_cover_path(item.bookId,result.value)
@@ -8722,12 +8954,14 @@ function Plugin:_home_schedule_remote_covers(books)
         end,background and 35 or 14)
         if not started then
             if self._home_cover_inflight[item.bookId]==generation then self._home_cover_inflight[item.bookId]=nil end
-            UIManager:scheduleIn(math.max(.35,cover_gap),next_cover)
+            release("worker not started")
+            self.background_scheduler:defer("home_cover",retry,{delay=RuntimePressure.active() and 2.5 or math.max(.6,cover_gap),priority=25,reason="worker not started"})
         end
     end
     logger.info("[MiuRead][HomeCoverBatch] queued","count=",tostring(#queue),
         "lightweight=",tostring(lightweight))
     UIManager:scheduleIn(lightweight and math.max(.8,cover_gap) or .12,next_cover)
+    return true
 end
 
 function Plugin:_home_open_miuread(book)
@@ -8936,7 +9170,7 @@ function Plugin:_open_local_library_folders()
         on_close=function(closed_view)
             if self._home_directory_request_owner==closed_view then self:_cancel_home_directory_request("local root picker closed") end
         end,
-        on_refresh=function() self:_home_scan_local(true) end,
+        on_refresh=function() self:_home_scan_local(true,true) end,
     }
     return picker
 end
@@ -9496,7 +9730,7 @@ function Plugin:maintenance_menu()
         {text="书库维护",post_text="扫描 资料 封面与书架",sub_item_table_func=function()
             return {
                 {text="重新扫描全部本地书库",callback=function()
-                    local started=self:_home_scan_local(true)
+                    local started=self:_home_scan_local(true,true)
                     if started then self:toast("正在重新扫描本地书库…",2) end
                 end},
                 {text="更新缺失书籍资料",callback=function()
@@ -13101,7 +13335,10 @@ function Plugin:_complete_reader_close(generation,reason)
     self:_release_reader_transition_guard("home restored after stable close")
     self:_home_enter_post_reader_priority_window(4.0,"stable reader close")
     self:_finish_page_transition(.18,"home restored after stable close")
-    self:_resume_pending_post_reader_work("home restored after stable close",2.0)
+    -- Queue/install/download maintenance must not race the first usable Home
+    -- surface. Let the interaction quiet window release before post-reader work.
+    self:_resume_pending_post_reader_work("home restored after stable close",4.5)
+    self:_background_log_state("reader home restored",false)
     READER_CLOSE.state="completed"
     logger.info("[MiuRead][ReaderClose] home restored",
         "generation=",tostring(generation),"reason=",tostring(reason or READER_CLOSE.reason or "close"))
@@ -16489,9 +16726,17 @@ function Plugin:_schedule_home_annotation_summary_refresh(force)
         end
         self._home_sync_summary_task=nil
         if not self.sync_summary_async or not self.sync_summary_async:available() then return end
+        local retry=function()
+            if HomeView.is_shown() and not self:_active_reader_ui() then self:_schedule_home_annotation_summary_refresh(force) end
+        end
+        local token,block_reason,deferred=self:_background_claim("sync_summary",{
+            priority=10,retry_delay=1.4,
+        },retry)
+        if not token then return end
         local started,err=self.sync_summary_async:run("annotation-summary",function()
             return LocalAnnotationDatabase.global_summary(self.store) or {}
         end,function(result)
+            self:_background_release("sync_summary",token,result and result.ok==true and "completed" or "failed")
             if result and result.ok and type(result.value)=="table" then
                 self._annotation_summary_cache=result.value
                 self._annotation_summary_cache_at=os.time()
@@ -16504,7 +16749,12 @@ function Plugin:_schedule_home_annotation_summary_refresh(force)
                 logger.warn("[MiuRead][SyncSummary] refresh failed",tostring(result.error))
             end
         end,20)
-        if not started then logger.warn("[MiuRead][SyncSummary] worker unavailable",tostring(err or "unknown")) end
+        if not started then
+            self:_background_release("sync_summary",token,"not started")
+            RuntimePressure.note_worker_failure("annotation-summary",err)
+            self.background_scheduler:defer("sync_summary",retry,{delay=RuntimePressure.active() and 4.0 or 1.8,priority=10,reason=tostring(err or "not started")})
+            logger.warn("[MiuRead][SyncSummary] worker unavailable",tostring(err or "unknown"))
+        end
     end
     self._home_sync_summary_task=task
     UIManager:scheduleIn(force==true and .12 or .70,task)
@@ -18406,11 +18656,13 @@ end
 
 function Plugin:_performance_mode_label()
     local status=self.performance_mode:status()
-    return status.enabled and "轻量模式" or "标准模式"
+    if status.enabled then return "轻量模式" end
+    if status.temporary then return "临时保护" end
+    return "标准模式"
 end
 
 function Plugin:_lightweight_enabled()
-    return self.performance_mode and self.performance_mode:enabled() or false
+    return self.performance_mode and self.performance_mode:effective_enabled() or RuntimePressure.active()
 end
 
 function Plugin:_set_performance_mode(enabled)
@@ -20551,8 +20803,10 @@ function Plugin:onSuspend()
         self._post_reader_work_task=nil
         HOME_SESSION.post_reader_work_deferred_phase="suspend:"..tostring(HOME_SESSION.post_reader_work_phase or "")
     end
+    self:_background_cancel_all("suspend lifecycle",true,false)
     self:_mark_reader_busy(10)
     self._suspended_at=os.time()
+    self:_background_log_state("suspend lifecycle",true)
     logger.info("[MiuRead][Suspend] lifecycle timers cancelled",
         "rebuild=",tostring(reader_rebuild_active()),"rotation=true","resume=true")
     self.sync:on_suspend()
@@ -20574,6 +20828,7 @@ function Plugin:onResume()
     local slept=self._suspended_at and os.time()-self._suspended_at or 0
     self._suspended_at=nil
     HOME_SESSION.last_resume_clock=monotonic_wall_time()
+    self:_background_log_state("resume lifecycle",true)
     self._resume_lifecycle_generation=(tonumber(self._resume_lifecycle_generation) or 0)+1
     local resume_generation=self._resume_lifecycle_generation
 

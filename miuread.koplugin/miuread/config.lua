@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.5.0-beta.15",
+    VERSION = "4.5.0-beta.16",
     SCHEMA = 112,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -46,6 +46,21 @@ local C = {
     PERFORMANCE_WINDOW_SECONDS = 10 * 60,
     PERFORMANCE_REPEAT_COUNT = 2,
     PERFORMANCE_PROMPT_COOLDOWN = 7 * 24 * 60 * 60,
+    -- Repeated measured lag immediately enables a temporary runtime-only
+    -- protection window. The user's persistent lightweight preference is not
+    -- changed; the temporary flag also reaches an already-running downloader.
+    PERFORMANCE_AUTO_PROTECT_SECONDS = 20 * 60,
+    PERFORMANCE_MEMORY_PROTECT_SECONDS = 30 * 60,
+
+    -- Automatic home maintenance is serialized on memory-constrained Kindles.
+    -- Soft pressure enables temporary lightweight behavior; critical pressure
+    -- defers optional heavy work until memory becomes available again.
+    BACKGROUND_MEMORY_SOFT_KB = 48 * 1024,
+    BACKGROUND_MEMORY_CRITICAL_KB = 28 * 1024,
+    BACKGROUND_MEMORY_CHECK_SECONDS = 3,
+    BACKGROUND_SERIAL_GAP_SECONDS = 0.35,
+    BACKGROUND_RETRY_SECONDS = 0.9,
+    BACKGROUND_LEASE_TIMEOUT_SECONDS = 300,
 
     -- Different user-visible operations have different normal costs.
     -- Only repeated slow samples of the SAME kind are combined. A single
