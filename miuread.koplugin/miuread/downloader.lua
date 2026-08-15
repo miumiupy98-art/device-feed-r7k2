@@ -30,6 +30,8 @@ local TITLE_TRANSFORM_VERSION = 2
 local LEGACY_ANNOTATION_TRANSFORM_VERSION = 1
 local ANNOTATION_TRANSFORM_VERSION = 5
 local IMAGE_TRANSFORM_VERSION = 2
+local LEGACY_CONTENT_TRANSFORM_VERSION = 1
+local CONTENT_TRANSFORM_VERSION = 2
 
 local BASE_CSS = [[
 body { line-height: 1.75; margin: 5%; }
@@ -59,6 +61,17 @@ end
 
 local function plain(value)
     return tostring(value or ""):gsub("<[^>]+>", " "):gsub("&[%#%w]+;", " "):gsub("%s+", " ")
+end
+
+local function validate_body_fragment(fragment)
+    local lower=tostring(fragment or ""):lower()
+    local wrappers={"<body", "</body", "<html", "</html"}
+    for _,tag in ipairs(wrappers) do
+        if lower:find(tag,1,true) then
+            return nil,"章节正文仍包含 XHTML 外层标签："..tag
+        end
+    end
+    return true
 end
 
 -- Fold the full-width ASCII block (U+FF01-U+FF5E) onto plain ASCII so a title
@@ -548,6 +561,7 @@ local function cache_save_base(cache, chapter, coord_body, body, style, assets, 
     entry.image_only = state and state.image_only == true or false
     entry.image_summary = state and state.image_summary or nil
     entry.image_transform_version = IMAGE_TRANSFORM_VERSION
+    entry.content_transform_version = CONTENT_TRANSFORM_VERSION
     entry.title_transform_version = tonumber(entry.title_transform_version
         or cache.manifest.title_transform_version) or TITLE_TRANSFORM_VERSION
     entry.error = nil
@@ -579,6 +593,8 @@ local function cache_load_base(cache, entry)
                 "chapter=", tostring(entry.uid or ""))
         end
     end
+    local body_valid,body_error=validate_body_fragment(body)
+    if not body_valid then return nil,body_error end
     return body, style, assets, coord_body
 end
 
@@ -598,6 +614,7 @@ local function cache_save_final(cache, chapter, body, annotation, style, footnot
     entry.thoughts = annotation and (annotation.thought_count or 0) or 0
     entry.thought_entries = annotation and (annotation.thought_entry_count or 0) or 0
     entry.footnote_transform_version = FOOTNOTE_TRANSFORM_VERSION
+    entry.content_transform_version = CONTENT_TRANSFORM_VERSION
     entry.title_transform_version = tonumber(entry.title_transform_version
         or cache.manifest.title_transform_version) or TITLE_TRANSFORM_VERSION
     entry.annotation_transform_version = annotation and ANNOTATION_TRANSFORM_VERSION
@@ -642,6 +659,8 @@ end
 local function validate_cached_chapter(path)
     local raw, read_error=U.read_file(path,true)
     if type(raw)~="string" then return nil,read_error or "无法读取完成章节断点" end
+    local body_valid,body_error=validate_body_fragment(raw)
+    if not body_valid then raw=nil; return nil,body_error end
     local valid, validation_error=Footnotes.validate(raw)
     raw=nil
     return valid,validation_error
@@ -945,6 +964,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         core_map_hash=core_map_hash,
         images=U.copy(opt.image_summary or {}),
         image_transform_version=IMAGE_TRANSFORM_VERSION,
+        content_transform_version=CONTENT_TRANSFORM_VERSION,
         internal_links={links=link_stats.links or 0,rewritten=link_stats.rewritten or 0,
             unresolved=link_stats.unresolved or 0,critical=link_stats.unresolved_critical or 0},
     })
@@ -1012,6 +1032,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         core_map_hash=core_map_hash,
         image_count=#assets,image_summary=U.copy(opt.image_summary or {}),
         image_transform_version=IMAGE_TRANSFORM_VERSION,
+        content_transform_version=CONTENT_TRANSFORM_VERSION,
     }
     if standalone then
         record.chapter_uid = tostring(opt.chapter_uid)
@@ -1503,6 +1524,14 @@ function Downloader:book(input, opt, progress)
             })
         end
 
+        if entry and tonumber(entry.content_transform_version or LEGACY_CONTENT_TRANSFORM_VERSION)<CONTENT_TRANSFORM_VERSION then
+            logger.info("[MiuRead][Download] refreshing legacy chapter body checkpoint",
+                "chapter=",uid,"old_version=",tostring(entry.content_transform_version or LEGACY_CONTENT_TRANSFORM_VERSION),
+                "new_version=",tostring(CONTENT_TRANSFORM_VERSION))
+            cache_reset_entry(cache,uid)
+            entry=nil
+        end
+
         if entry and opt.images~=false
             and tonumber(entry.image_transform_version or cache.manifest.image_transform_version or 1)<IMAGE_TRANSFORM_VERSION then
             logger.info("[MiuRead][Download] refreshing legacy image checkpoint",
@@ -1511,9 +1540,10 @@ function Downloader:book(input, opt, progress)
             entry=nil
         end
 
-        -- Transformer version changes no longer force completed chapters to be
-        -- regenerated. The current transformers apply to new or genuinely changed
-        -- chapters, while existing XHTML remains stable for KOReader local notes.
+        -- Presentation-only transformer changes do not force completed chapters
+        -- to be regenerated. Content-normalization changes are different: keeping
+        -- legacy malformed XHTML would preserve a truncated EPUB, so those entries
+        -- are refreshed above before any completed checkpoint can be reused.
 
         if entry and entry.complete then
             local migrated=false
@@ -1614,7 +1644,18 @@ function Downloader:book(input, opt, progress)
             -- ranges are interpreted only against this immutable chapter body.
             coord_body = type(state) == "table" and tostring(state.coord_html or "") or ""
             if coord_body == "" then coord_body = AnnotationCoord.fromDownloadedXhtml(downloaded) end
-            body = Codec.body(downloaded)
+            local body_count
+            body,body_count = Codec.body_fragment(downloaded)
+            local body_valid,body_error=validate_body_fragment(body)
+            if not body_valid then
+                logger.warn("[MiuRead][Download] chapter body normalization failed",
+                    "chapter=",uid,"decoded_bytes=",tostring(#tostring(downloaded or "")),
+                    "body_count=",tostring(body_count or 0),"error=",tostring(body_error))
+                return mark_failure(chapter,"正文结构解析失败："..tostring(body_error))
+            end
+            logger.info("[MiuRead][Download] chapter body normalized",
+                "chapter=",uid,"decoded_bytes=",tostring(#tostring(downloaded or "")),
+                "body_count=",tostring(body_count or 0),"merged_bytes=",tostring(#tostring(body or "")))
             body, style, new_assets = namespace_assets(body, downloaded_style, downloaded_assets, uid)
             entry = cache_save_base(cache, chapter, coord_body, body, style, new_assets, state)
         end

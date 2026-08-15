@@ -89,9 +89,35 @@ function Codec.text_xhtml(text)
     end
     return table.concat(out,"\n")
 end
+-- WeRead EPUB chapters may decode to multiple concatenated XHTML documents.
+-- Keep every body fragment in source order; the first body can be only a
+-- title shell while the remaining bodies contain the actual chapter text.
+function Codec.body_fragment(html)
+    local source=tostring(html or "")
+    local bodies={}
+    local remaining=source
+    while remaining~="" do
+        local lower=remaining:lower()
+        local body_start=lower:find("<body",1,true)
+        if not body_start then break end
+        local body_open_end=remaining:find(">",body_start,true)
+        if not body_open_end then break end
+        local body_close=lower:find("</body>",body_open_end,true)
+        if not body_close then
+            bodies[#bodies+1]=remaining:sub(body_open_end+1)
+            break
+        end
+        bodies[#bodies+1]=remaining:sub(body_open_end+1,body_close-1)
+        remaining=remaining:sub(body_close+7)
+    end
+    if #bodies>0 then return table.concat(bodies,"\n"),#bodies end
+    source=source:gsub("<%?xml.-%?>","")
+    source=source:gsub("<!DOCTYPE.-%>","")
+    return source,0
+end
 function Codec.body(html)
-    local s=tostring(html or "")
-    local b=s:match("<body[^>]*>([%s%S]*)</body>"); return b or s
+    local fragment=Codec.body_fragment(html)
+    return fragment
 end
 function Codec.mp_body(html)
     local s=tostring(html or ""):gsub("<script[%s%S]-</script>",""):gsub("<style[%s%S]-</style>","")
