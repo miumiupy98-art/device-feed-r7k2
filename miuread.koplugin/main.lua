@@ -11038,9 +11038,10 @@ function Plugin:_show_reader_annotation_panel(back_callback)
     local visible_counts=self:_reader_annotation_counts()
     local pending_upload=tonumber(summary.pending or 0) or 0
     local pending_delete=tonumber(summary.delete_pending or 0) or 0
-    local pending_work=pending_upload+pending_delete
     local failed=(tonumber(summary.locate_failed or 0) or 0)+(tonumber(summary.metadata_failed or 0) or 0)
         +(tonumber(summary.coord_failed or 0) or 0)+(tonumber(summary.unknown or 0) or 0)
+    local action_required=tonumber(summary.action_required or 0) or 0
+    local pending_work=pending_upload+pending_delete+action_required
     local legacy_synced=tonumber(summary.legacy_synced or 0) or 0
     ReaderSettingsDialog.show{
         title="批注",
@@ -11067,12 +11068,14 @@ function Plugin:_show_reader_annotation_panel(back_callback)
                         self:sync_local_annotations_now()
                     end},
                     {icon="sync",label="待处理",value=pending_work>0
-                        and string.format("共 %d · 上传重试 %d · 删除 %d",pending_work,pending_upload,pending_delete)
+                        and string.format("共 %d · 可重试 %d · 需处理 %d",pending_work,pending_upload+pending_delete,action_required)
                         or "0 · 仍可手动对账",enabled=false},
                     {label="同步详情",value=legacy_synced>0
                         and string.format("已同步 %d · 旧坐标 %d",tonumber(summary.synced or 0) or 0,legacy_synced)
                         or string.format("已同步 %d · 失败 %d",tonumber(summary.synced or 0) or 0,failed),
                         callback=function() self:show_local_annotation_sync_status() end},
+                    {icon="warning",label="需要处理",value=action_required>0 and (tostring(action_required).." 条") or "0",
+                        value_bold=action_required>0,enabled=action_required>0,callback=function() self:show_annotation_sync_issues(book_id) end},
                     {label="自动上传",value="暂未开启 · 先完成真机验证",enabled=false},
                     {icon="diagnostics",label="坐标诊断",value="导出 raw / coord / range",callback=function()
                         self:sync_local_annotations_now(true)
@@ -11312,23 +11315,35 @@ function Plugin:_show_reader_sync_diagnostics_panel(back_callback)
     local diagnostics=self:sync_diagnostics_menu()
     local current=self.sync and self.sync:record() or nil
     local logged_in=self.auth and type(self.auth.is_logged_in)=="function" and self.auth:is_logged_in() or nil
+    local current_id=current and current.book and tostring(current.book.book_id or current.book.bookId or "") or ""
+    local annotation_summary=current_id~="" and LocalAnnotationDatabase.summary(self.store,current_id) or nil
+    annotation_summary=type(annotation_summary)=="table" and annotation_summary or {}
     ReaderSettingsDialog.show{
         title="同步诊断",
-        subtitle="所有检查都在觅阅页面内完成",
+        subtitle="进度与批注分开显示，失败不会互相覆盖",
         on_back=back_callback or function() self:_show_reader_sync_panel() end,
         on_home=function() return self:return_to_miuread_home("reader surface") end,
         sections=function()
             local state=tostring(self:progress_sync_label() or "")
+            local annotation_action=tonumber(annotation_summary.action_required or 0) or 0
+            local annotation_pending=(tonumber(annotation_summary.pending or 0) or 0)+(tonumber(annotation_summary.delete_pending or 0) or 0)
+            local annotation_state=annotation_action>0 and ("需处理 "..tostring(annotation_action))
+                or (annotation_pending>0 and ("待同步 "..tostring(annotation_pending)) or "已同步")
             return {
                 {title="当前状态",rows={
                     {label="当前书籍识别",value=current and current.book and "正常" or "未识别",callback=diagnostics[1] and diagnostics[1].callback},
                     {label="登录状态",value=logged_in==false and "未登录" or "检查",callback=diagnostics[2] and diagnostics[2].callback},
-                    {label="云端进度读取",value=state~="" and state or "检查",callback=diagnostics[3] and diagnostics[3].callback},
-                    {label="当前进度上传",value="测试",callback=diagnostics[4] and diagnostics[4].callback},
-                    {label="阅读时间上传",value="测试 30 秒",callback=diagnostics[5] and diagnostics[5].callback},
+                    {label="阅读进度",value=state~="" and state or "检查",arrow=false},
+                    {label="本书批注",value=annotation_state,callback=annotation_action>0 and function() self:show_annotation_sync_issues(current_id) end or nil},
+                }},
+                {title="测试",rows={
+                    {label="测试云端进度读取",value="执行",callback=diagnostics[3] and diagnostics[3].callback},
+                    {label="测试当前进度上传",value="执行",callback=diagnostics[4] and diagnostics[4].callback},
+                    {label="测试阅读时间上传",value="30 秒",callback=diagnostics[5] and diagnostics[5].callback},
                 }},
                 {title="恢复",rows={
-                    {label="重置当前书籍同步状态",value="不删除书籍与阅读数据",callback=diagnostics[7] and diagnostics[7].callback},
+                    {label="重置本书阅读进度同步状态",value="不影响书签、划线与想法",callback=diagnostics[7] and diagnostics[7].callback},
+                    {label="重新检查本书批注同步",value="重新定位失败记录",callback=diagnostics[8] and diagnostics[8].callback},
                 }},
             }
         end,
@@ -11391,6 +11406,59 @@ function Plugin:_show_koreader_reader_menu(back_callback)
         end
         return true
     end,back_callback or function() self:show_reader_quick_panel(true) end)
+end
+
+function Plugin:_reader_open_native_filemanager()
+    local readerui=self.ui
+    if not (readerui and readerui.document and type(readerui.showFileManager)=="function") then
+        self:info("KOReader 文件管理器暂时无法打开")
+        return false
+    end
+    local file=self:_reader_file(readerui)
+    -- This is an explicit user request to leave the book for KOReader. Mark it
+    -- before calling the native transition so the MiuRead home bridge does not
+    -- reinterpret showFileManager() as a request to return to the MiuRead home.
+    sync_home_session()
+    HOME_NATIVE_VISIT=true
+    HOME_EXPECTED_CLOSE=true
+    HOME_SESSION_SUPPRESSED=false
+    HOME_RETURN_FILE=file or HOME_RETURN_FILE
+    persist_home_session()
+    self:_set_foreground("native")
+    local opener=readerui._miuread_original_showFileManager or readerui.showFileManager
+    UIManager:nextTick(function()
+        local ok,err=xpcall(function() opener(readerui,file) end,debug.traceback)
+        if not ok then
+            HOME_NATIVE_VISIT=false
+            HOME_EXPECTED_CLOSE=false
+            persist_home_session()
+            logger.warn("[MiuRead][Reader] explicit native file manager failed",tostring(err))
+            self:info("KOReader 文件管理器暂时无法打开")
+            return
+        end
+        -- Keep expected_close long enough for KOReader's asynchronous
+        -- CloseDocument notification to be classified correctly.
+        UIManager:scheduleIn(.8,function()
+            HOME_EXPECTED_CLOSE=false
+            persist_home_session()
+        end)
+    end)
+    return true
+end
+
+function Plugin:_show_reader_koreader_actions()
+    return ActionSheet.show{
+        title="KOReader",
+        subtitle="进入原生阅读菜单，或离开当前书籍进入文件管理器",
+        actions={
+            {icon="ko-reader",label="KOReader 阅读菜单",detail="关闭后回到当前阅读位置",callback=function()
+                self:_show_koreader_reader_menu()
+            end},
+            {icon="file-manager",label="KOReader 文件管理器",detail="离开当前书籍",callback=function()
+                self:_reader_open_native_filemanager()
+            end},
+        },
+    }
 end
 function Plugin:_reader_power_device()
     if not Device:hasFrontlight() or type(Device.getPowerDevice)~="function" then return nil end
@@ -12419,6 +12487,7 @@ function Plugin:_reader_quick_panel_options()
         {icon=self:_orientation_icon_key(),label="方向锁定",active=Orientation.is_session_locked(),callback=function() self:_orientation_toggle_lock() end,hold_callback=function() self:_show_orientation_panel() end},
         {icon="screenshot",label="截图",callback=function() ScreenshotMode.start(self) end},
         {icon="full-refresh",label="全屏刷新",callback=function() self:_home_full_refresh(true) end},
+        {icon="ko-reader",label="KOReader",callback=function() self:_show_koreader_reader_menu() end,hold_callback=function() self:_show_reader_koreader_actions() end},
     }
 
     self._reader_toolbar_options_perf={
@@ -16235,11 +16304,11 @@ function Plugin:sync_diagnostics_menu()
             end)
         end},
         {text="查看详细错误",callback=function() self:show_sync_status(true) end},
-        {text="重置当前书籍同步状态",callback=function()
+        {text="重置本书阅读进度同步状态",callback=function()
             local r=self.sync:record()
             if not r or not r.book then self:info("请先打开一本觅阅下载的书籍。") return end
             local id=tostring(r.book.book_id)
-            UIManager:show(ConfirmBox:new{text="重置当前书籍的临时同步状态？\n\n不会删除书籍、本机阅读位置、划线、想法或账号。",ok_callback=function()
+            UIManager:show(ConfirmBox:new{text="重置本书的阅读进度同步状态？\n\n不会删除书籍、本机阅读位置、划线、想法或账号。批注同步状态不会改变。",ok_callback=function()
                 self.sync:stop("manual_reset",0)
                 local sessions=self.store:get("sessions",{})
                 local session=sessions[id] or {}
@@ -16267,7 +16336,142 @@ function Plugin:sync_diagnostics_menu()
                 end)
             end})
         end},
+        {text="重新检查本书批注同步",callback=function()
+            local r=self.sync:record()
+            if not r or not r.book then self:info("请先打开一本觅阅下载的书籍。") return end
+            local id=tostring(r.book.book_id or "")
+            local changed,err=LocalAnnotationDatabase.retry_failures(self.store,id)
+            if changed==nil then self:info("无法重新检查本书批注：\n"..tostring(err or "未知错误")); return end
+            self._annotation_summary_cache=nil
+            self._annotation_summary_cache_at=0
+            self._home_sync_summary_cache=nil
+            self._home_sync_summary_cache_at=nil
+            if tonumber(changed or 0)<=0 then
+                self:toast("本书没有需要重新定位的批注",2)
+                return
+            end
+            self:status_toast("批注同步","正在重新检查 "..tostring(changed).." 条记录",3)
+            UIManager:scheduleIn(.12,function()
+                if self.ui and self.ui.document then self:sync_local_annotations_now() end
+            end)
+        end},
     }
+end
+
+function Plugin:_annotation_sync_friendly_reason(item)
+    item=type(item)=="table" and item or {}
+    local state=tostring(item.state or "")
+    local error=tostring(item.error or ""):lower()
+    local stage=tostring(item.stage or ""):lower()
+    if error:find("bookmark_anchor_missing",1,true) or error:find("bookmark_not_found",1,true)
+        or error:find("bookmark_text_map_failed",1,true) then
+        return "没有找到原书签对应的正文位置"
+    end
+    if error:find("official_anchor_mismatch",1,true) or error:find("coord_basis",1,true)
+        or error:find("coordinate_evidence",1,true) or error:find("range_verify",1,true)
+        or error:find("range_roundtrip",1,true) or state=="coord_failed" then
+        return "已找到正文，但当前位置无法安全确认"
+    end
+    if error:find("chapter",1,true) or error:find("bookversion",1,true)
+        or stage=="chapter" or state=="metadata_failed" then
+        return "章节信息不足，暂时无法确认同步位置"
+    end
+    if error:find("login",1,true) or error:find("auth",1,true) or error:find("-2012",1,true) then
+        return "登录状态需要重新确认"
+    end
+    if error:find("network",1,true) or error:find("timeout",1,true) then
+        return "网络请求失败，内容仍保留在本机"
+    end
+    if state=="locate_failed" then return "无法可靠找到这条批注对应的正文位置" end
+    return "当前无法安全同步这条批注"
+end
+
+function Plugin:_annotation_issue_excerpt(item)
+    item=type(item)=="table" and item or {}
+    for _,key in ipairs({"selected_text","anchor_text","text","note"}) do
+        local value=U.trim(tostring(item[key] or ""))
+        if value~="" then return U.utf8_truncate(value,44,"…") end
+    end
+    return "无可显示的正文片段"
+end
+
+function Plugin:_invalidate_annotation_sync_summary()
+    self._annotation_summary_cache=nil
+    self._annotation_summary_cache_at=0
+    self._home_sync_summary_cache=nil
+    self._home_sync_summary_cache_at=nil
+    self:_schedule_home_annotation_summary_refresh(true)
+    if HomeView.is_shown() then self:_notify_home_data_changed("header") end
+end
+
+function Plugin:_annotation_issue_actions(item)
+    if type(item)~="table" then return false end
+    local book_id=tostring(item.book_id or "")
+    local local_id=tostring(item.local_id or "")
+    if book_id=="" or local_id=="" then return false end
+    local kind_label={bookmark="书签",highlight="划线",thought="想法"}
+    return ActionSheet.show{
+        title=(kind_label[item.kind] or "批注").."同步问题",
+        subtitle=self:_annotation_sync_friendly_reason(item),
+        actions={
+            {icon="sync",label="重新定位并重试",detail="使用当前版本重新检查正文位置",callback=function()
+                local ok,err=LocalAnnotationDatabase.retry_failure(self.store,book_id,local_id)
+                if ok~=true then
+                    self:info("这条记录暂时无法重新检查。\n\n"..tostring(err or "记录可能已发生变化"))
+                    return
+                end
+                self:_invalidate_annotation_sync_summary()
+                local current=self:_current_book_record()
+                local current_id=current and current.book and tostring(current.book.book_id or current.book.bookId or "") or ""
+                if current_id==book_id and self.ui and self.ui.document then
+                    UIManager:scheduleIn(.12,function() self:sync_local_annotations_now() end)
+                else
+                    UIManager:scheduleIn(.12,function() self:_sync_home_pending() end)
+                end
+            end},
+            {icon="bookmark",label="仅保留本地",detail="停止上传这一条，不删除 Kindle 上的记录",callback=function()
+                UIManager:show(ConfirmBox:new{
+                    text="仅在本机保留这条批注？\n\n以后普通同步不会再反复尝试上传；不会删除 Kindle 上的书签、划线或想法。",
+                    ok_text="仅保留本地",cancel_text="取消",
+                    ok_callback=function()
+                        local ok,err=LocalAnnotationDatabase.hold_local(self.store,book_id,local_id)
+                        if ok~=true then self:info("无法更新这条记录：\n"..tostring(err or "记录可能已发生变化")); return end
+                        self:_invalidate_annotation_sync_summary()
+                        self:status_toast("批注同步","已改为仅保留本地",3)
+                    end,
+                })
+            end},
+        },
+    }
+end
+
+function Plugin:show_annotation_sync_issues(book_id)
+    self.store:reload()
+    local failures
+    if book_id and tostring(book_id)~="" then
+        failures=LocalAnnotationDatabase.failures(self.store,tostring(book_id),100) or {}
+        for _,item in ipairs(failures) do item.book_id=tostring(book_id) end
+    else
+        failures=LocalAnnotationDatabase.global_failures(self.store,100) or {}
+    end
+    if #failures==0 then
+        self:info("当前没有需要人工处理的批注同步问题。")
+        return true
+    end
+    local kind_label={bookmark="书签",highlight="划线",thought="想法"}
+    local items={}
+    for _,failure in ipairs(failures) do
+        local item=failure
+        local book=self.store:book(tostring(item.book_id or "")) or {}
+        local title=U.trim(tostring(book.title or ""))
+        if title=="" then title="书籍 "..tostring(item.book_id or "") end
+        items[#items+1]={
+            text=(kind_label[item.kind] or "批注").." · "..self:_annotation_issue_excerpt(item),
+            post_text=U.utf8_truncate(title,24,"…").." · "..self:_annotation_sync_friendly_reason(item),
+            callback=function() self:_annotation_issue_actions(item) end,
+        }
+    end
+    return self:list("需要处理的批注同步",items,"当前没有需要处理的批注同步问题")
 end
 
 function Plugin:_schedule_home_annotation_summary_refresh(force)
@@ -16336,7 +16540,13 @@ function Plugin:_home_sync_summary(force)
         or (self.sync_summary_async and self.sync_summary_async:busy())==true
     local summary={
         progress=progress,time=time_count,highlight=highlight,thought=thought,bookmark=bookmark,
-        annotation_pending=tonumber(annotations.pending or 0) or 0,
+        annotation_pending=(tonumber(annotations.pending or 0) or 0)+(tonumber(annotations.upgrade_recheck or 0) or 0),
+        annotation_action_required=tonumber(annotations.action_required or 0) or 0,
+        annotation_action_bookmark=tonumber(annotations.action_bookmark or 0) or 0,
+        annotation_action_highlight=tonumber(annotations.action_highlight or 0) or 0,
+        annotation_action_thought=tonumber(annotations.action_thought or 0) or 0,
+        annotation_upgrade_recheck=tonumber(annotations.upgrade_recheck or 0) or 0,
+        annotation_held_local=tonumber(annotations.held_local or 0) or 0,
         annotation_failed=tonumber(annotations.failed or 0) or 0,
         failed=progress_failed+(tonumber(annotations.failed or 0) or 0),
         total=total,books=tonumber(annotations.books or 0) or 0,checking=checking,
@@ -16349,6 +16559,12 @@ end
 
 function Plugin:_home_sync_status_label(force)
     local summary=self:_home_sync_summary(force)
+    if summary.annotation_upgrade_recheck>0 then
+        return "待重新检查 "..tostring(summary.annotation_upgrade_recheck)
+    end
+    if summary.annotation_action_required>0 then
+        return "需处理 "..tostring(summary.annotation_action_required)
+    end
     if summary.failed>0 then return "失败 "..tostring(summary.failed) end
     if summary.total>0 then return "待同步 "..tostring(summary.total) end
     if self.annotation_async and self.annotation_async:busy() then return "同步中" end
@@ -16382,12 +16598,15 @@ function Plugin:_sync_all_pending_annotations(on_done)
         for _,job in ipairs(jobs) do
             local result=service:sync_book(job.book,job.record,{preferences=prefs,limit=200}) or {}
             total.books=total.books+1
-            if result.ok==false then total.failed=total.failed+1; total.ok=false
-            else
-                for _,key in ipairs({"synced","deleted","failed","locate_failed","metadata_failed","coord_failed","unknown"}) do
-                    total[key]=total[key]+(tonumber(result[key] or 0) or 0)
-                end
-                if tonumber(result.failed or 0)>0 then total.ok=false end
+            for _,key in ipairs({"synced","deleted","failed","locate_failed","metadata_failed","coord_failed","unknown"}) do
+                total[key]=total[key]+(tonumber(result[key] or 0) or 0)
+            end
+            if result.ok==false then
+                total.ok=false
+                total.error=total.error or result.error
+                total.auth_failed=total.auth_failed or result.auth_failed==true
+            elseif tonumber(result.failed or 0)>0 then
+                total.ok=false
             end
         end
         return total
@@ -16410,40 +16629,85 @@ function Plugin:_sync_home_pending()
             self:toast("所有待处理内容都已同步",2)
             return true
         end
-        if not self:logged_in() then self:info("请先登录微信读书账号。") return false end
-        self:toast("正在同步待处理内容…",2)
         local annotation_count=tonumber(summary.annotation_pending or 0) or 0
-        local function finish(ok,result)
-            self._home_sync_summary_cache=nil
-            self._home_sync_summary_cache_at=nil
-            if ok then
-                -- The annotation worker has just completed successfully, so use
-                -- an immediate zero snapshot instead of rescanning every book on
-                -- the UI thread merely to paint a success message.
-                self._annotation_summary_cache={pending=0,failed=0,delete_pending=0,bookmark=0,highlight=0,thought=0,books=0}
-                self._annotation_summary_cache_at=os.time()
-            else
-                self._annotation_summary_cache=nil
-                self._annotation_summary_cache_at=0
+        local action_count=tonumber(summary.annotation_action_required or 0) or 0
+        local progress_count=tonumber(summary.progress or 0) or 0
+        local time_count=tonumber(summary.time or 0) or 0
+        local reading_pending=progress_count+time_count
+        if annotation_count<=0 then
+            if action_count>0 and reading_pending>0 then
+                UIManager:show(ConfirmBox:new{
+                    text="阅读进度或阅读时间仍有 "..tostring(reading_pending).." 项待处理；打开对应书籍后会继续同步。\n\n另有 "..tostring(action_count).." 条批注需要处理，这些记录不会在普通同步中反复重试。",
+                    ok_text="查看批注",cancel_text="稍后处理",
+                    ok_callback=function() self:show_annotation_sync_issues() end,
+                })
+                return true
             end
-            self:_schedule_home_annotation_summary_refresh(true)
-            if HomeView.is_shown() then self:_notify_home_data_changed("header") end
-            local after=self:_home_sync_summary(false)
-            if ok and after.total<=0 then
-                self:status_toast("同步完成","进度 时间 划线和想法已处理",3)
-            elseif ok then
-                local message="仍有 "..tostring(after.total).." 项待处理"
-                if after.progress>0 or after.time>0 then message=message.."\n阅读进度或时间将在对应书籍同步环境恢复后继续处理" end
-                self:info(message)
-            else
-                self:info("同步未全部完成\n\n"..tostring(result and result.error or "失败项目已保留 可稍后重试"))
+            if action_count>0 then
+                UIManager:show(ConfirmBox:new{
+                    text="阅读进度没有新的待上传任务。\n\n另有 "..tostring(action_count).." 条批注需要处理；这些记录不会在普通同步中反复重试。",
+                    ok_text="查看详情",cancel_text="稍后处理",
+                    ok_callback=function() self:show_annotation_sync_issues() end,
+                })
+                return true
+            end
+            if reading_pending>0 then
+                self:info("批注没有新的待上传任务。\n\n阅读进度或阅读时间仍有 "..tostring(reading_pending).." 项待处理；打开对应书籍后会继续同步。")
+                return true
             end
         end
+        if not self:logged_in() then self:info("请先登录微信读书账号。") return false end
+        self:toast("正在同步待处理内容…",2)
+        local function finish(ok,result)
+            self:_invalidate_annotation_sync_summary()
+            result=type(result)=="table" and result or {}
+            local failed=tonumber(result.failed or 0) or 0
+            local synced=(tonumber(result.synced or 0) or 0)+(tonumber(result.deleted or 0) or 0)
+            local locate=tonumber(result.locate_failed or 0) or 0
+            local metadata=tonumber(result.metadata_failed or 0) or 0
+            local coord=tonumber(result.coord_failed or 0) or 0
+            local hard=locate+metadata+coord
+            local retryable=math.max(0,failed-hard)
+            if ok and failed<=0 then
+                if reading_pending>0 then
+                    self:info("批注已处理 "..tostring(synced).." 条。\n\n阅读进度或阅读时间仍有 "..tostring(reading_pending).." 项待处理；打开对应书籍后会继续同步。")
+                else
+                    self:status_toast("同步完成","阅读进度与批注状态已分别确认 · 批注处理 "..tostring(synced).." 条",3)
+                end
+                return
+            end
+            if hard>0 then
+                local detail={
+                    "阅读进度状态不会被批注失败覆盖。",
+                    "",
+                    "批注已处理："..tostring(synced),
+                    "需要处理："..tostring(hard),
+                }
+                if locate>0 then detail[#detail+1]="正文定位："..tostring(locate) end
+                if metadata>0 then detail[#detail+1]="章节信息："..tostring(metadata) end
+                if coord>0 then detail[#detail+1]="位置确认："..tostring(coord) end
+                if retryable>0 then detail[#detail+1]="可稍后重试："..tostring(retryable) end
+                if reading_pending>0 then detail[#detail+1]="阅读进度/时间待处理："..tostring(reading_pending) end
+                UIManager:show(ConfirmBox:new{
+                    text=table.concat(detail,"\n"),
+                    ok_text="查看详情",cancel_text="稍后处理",
+                    ok_callback=function() self:show_annotation_sync_issues() end,
+                })
+                return
+            end
+            if failed>0 then
+                local text="批注同步未全部完成。\n\n已处理："..tostring(synced)
+                    .."\n可稍后重试："..tostring(retryable)
+                if reading_pending>0 then
+                    text=text.."\n阅读进度/时间待处理："..tostring(reading_pending)
+                end
+                text=text.."\n\n失败项目仍保留在本机。"
+                self:info(text)
+                return
+            end
+            self:info("同步暂未完成\n\n"..tostring(result.error or "网络或账号状态暂时不可用，待处理内容仍保留在本机。"))
+        end
         if annotation_count>0 then return self:_sync_all_pending_annotations(finish) end
-        -- Progress/time are normally submitted as the reader closes. If a stale
-        -- pending state remains, keep it visible instead of fabricating a current
-        -- book from the home screen.
-        finish(true,{})
         return true
     end
 
@@ -16451,43 +16715,19 @@ function Plugin:_sync_home_pending()
     if type(self._annotation_summary_cache)=="table" and age<=6 then
         return proceed(self:_home_sync_summary(false))
     end
-    -- A manual sync must never claim "已同步" from an unknown annotation
-    -- snapshot. Do the exact multi-book SQLite count in a subprocess, then
-    -- continue with the result without blocking the tap animation.
-    if self.sync_summary_async and self.sync_summary_async:available() and not self.sync_summary_async:busy() then
-        self:toast("正在检查待同步内容…",2)
-        local started,err=self.sync_summary_async:run("annotation-summary-manual",function()
-            return LocalAnnotationDatabase.global_summary(self.store) or {}
-        end,function(result)
-            if result and result.ok and type(result.value)=="table" then
-                self._annotation_summary_cache=result.value
-                self._annotation_summary_cache_at=os.time()
-                proceed(self:_home_sync_summary(false))
-            else
-                self:info("无法检查本地划线与想法\n\n"..tostring(result and result.error or "后台检查失败"))
-            end
-        end,20)
-        if started then return true end
-        logger.warn("[MiuRead][SyncSummary] manual start failed",tostring(err or "unknown"))
-    elseif self.sync_summary_async and self.sync_summary_async:busy() then
+    if self.sync_summary_async and self.sync_summary_async:busy() then
         self:toast("正在检查同步状态…",2)
-        local generation=(tonumber(self._home_sync_manual_wait_generation) or 0)+1
-        self._home_sync_manual_wait_generation=generation
-        local wait
-        wait=function()
-            if generation~=self._home_sync_manual_wait_generation then return end
-            if self.sync_summary_async and self.sync_summary_async:busy() then UIManager:scheduleIn(.45,wait); return end
-            if type(self._annotation_summary_cache)=="table" then proceed(self:_home_sync_summary(false))
-            else self:info("同步状态检查未完成 请稍后重试") end
-        end
-        UIManager:scheduleIn(.45,wait)
+        UIManager:scheduleIn(.9,function()
+            proceed(self:_home_sync_summary(false))
+        end)
         return true
     end
-    -- Subprocess support is expected on Kindle. If it is unavailable, keep the
-    -- UI responsive and make the limitation explicit rather than performing a
-    -- potentially long full-database scan on the main thread.
-    self:info("当前环境无法在后台检查本地划线与想法 请稍后重试")
-    return false
+    self:toast("正在检查同步状态…",2)
+    self:_schedule_home_annotation_summary_refresh(true)
+    UIManager:scheduleIn(.8,function()
+        proceed(self:_home_sync_summary(false))
+    end)
+    return true
 end
 
 function Plugin:sync_settings_menu()
@@ -16502,10 +16742,14 @@ function Plugin:sync_settings_menu()
 end
 
 function Plugin:sync_menu()
+    local summary=self:_home_sync_summary(false)
     local rows={
         {text="同步状态",post_text=self:_home_sync_status_label(),callback=function() self:show_sync_status(false) end},
         {text="同步待处理内容",post_text="进度 时间 划线 想法",callback=function() self:_sync_home_pending() end},
     }
+    if (tonumber(summary.annotation_action_required or 0) or 0)>0 then
+        rows[#rows+1]={text="批注同步问题",post_text=tostring(summary.annotation_action_required).." 条需处理",callback=function() self:show_annotation_sync_issues() end}
+    end
     for _,row in ipairs(self:sync_settings_menu()) do rows[#rows+1]=row end
     if self:_current_book_record() then
         rows[#rows+1]={text="重新读取当前书籍云端进度",callback=function() self:manual_sync() end}
@@ -17015,18 +17259,23 @@ function Plugin:show_sync_status(detail)
 
     if HomeView.is_shown() and not self:_active_reader_ui() then
         local pending=self:_home_sync_summary(true)
-        local function pending_text(count,normal)
+        local function pending_text(count,action,normal)
             count=tonumber(count or 0) or 0
+            action=tonumber(action or 0) or 0
+            if action>0 then return "需处理 "..tostring(action) end
             return count>0 and ("待同步 "..tostring(count)) or tostring(normal or "已同步")
         end
         local rows={
             {text="总状态",post_text=self:_home_sync_status_label(),enabled=false,bold=true},
-            {text="阅读进度",post_text=pending_text(pending.progress,self:progress_sync_label()),enabled=false},
-            {text="阅读时间",post_text=pending_text(pending.time,time_text),enabled=false},
-            {text="本地划线",post_text=pending_text(pending.highlight,"已同步"),enabled=false},
-            {text="本地想法",post_text=pending_text(pending.thought,"已同步"),enabled=false},
+            {text="阅读进度",post_text=pending_text(pending.progress,0,self:progress_sync_label()),enabled=false},
+            {text="阅读时间",post_text=pending_text(pending.time,0,time_text),enabled=false},
+            {text="本地划线",post_text=pending_text(math.max(0,pending.highlight-pending.annotation_action_highlight),pending.annotation_action_highlight,"已同步"),enabled=false},
+            {text="本地想法",post_text=pending_text(math.max(0,pending.thought-pending.annotation_action_thought),pending.annotation_action_thought,"已同步"),enabled=false},
         }
-        if pending.bookmark>0 then rows[#rows+1]={text="本地书签",post_text="待同步 "..tostring(pending.bookmark),enabled=false} end
+        if pending.bookmark>0 then rows[#rows+1]={text="本地书签",post_text=pending_text(math.max(0,pending.bookmark-pending.annotation_action_bookmark),pending.annotation_action_bookmark,"已同步"),enabled=false} end
+        if pending.annotation_action_required>0 then
+            rows[#rows+1]={text="批注同步问题",post_text=tostring(pending.annotation_action_required).." 条",callback=function() self:show_annotation_sync_issues() end}
+        end
         rows[#rows+1]={text="上次同步",post_text=self:_relative_time(s.last_upload),enabled=false}
         if detail then
             rows[#rows+1]={text="详细信息",separator=true,enabled=false}
@@ -17550,7 +17799,15 @@ function Plugin:_repair_downloaded_book(book_ref,confirmed)
     local report=BookIntegrity.inspect(self.store,id,record)
     if report.repair_kind=="none" then
         local session=self.store:session(id) or {}
-        if session.sync_repair_required==true then
+        local annotation_summary=LocalAnnotationDatabase.summary(self.store,id) or {}
+        local annotation_action=tonumber(annotation_summary.action_required or 0) or 0
+        if annotation_action>0 then
+            UIManager:show(ConfirmBox:new{
+                text="书籍检查完成，没有发现内容损坏。\n\n另有 "..tostring(annotation_action).." 条批注同步需要处理；这不属于书籍损坏。",
+                ok_text="查看同步问题",cancel_text="完成",
+                ok_callback=function() self:show_annotation_sync_issues(id) end,
+            })
+        elseif session.sync_repair_required==true then
             self:info("书籍内容完整。\n\n当前异常来自阅读同步，请打开这本书后使用“修复同步”。")
         else
             self:info("检查完成，没有发现需要修复的书籍内容或批注。")
@@ -19926,9 +20183,11 @@ function Plugin:show_local_annotation_sync_status()
         "想法："..tostring(summary.thought or 0),
         "",
         "已同步："..tostring(summary.synced or 0),
-        "待上传及重试："..tostring(summary.pending or 0),
+        "可自动重试："..tostring(summary.pending or 0),
         "待删除："..tostring(summary.delete_pending or 0),
-        "待处理合计："..tostring((tonumber(summary.pending or 0) or 0)+(tonumber(summary.delete_pending or 0) or 0)),
+        "需要处理："..tostring(summary.action_required or 0),
+        "仅保留本地："..tostring(summary.held_local or 0),
+        "待处理合计："..tostring((tonumber(summary.pending or 0) or 0)+(tonumber(summary.delete_pending or 0) or 0)+(tonumber(summary.action_required or 0) or 0)),
         "定位失败："..tostring(summary.locate_failed or 0),
         "元数据失败："..tostring(summary.metadata_failed or 0),
         "坐标校验失败："..tostring(summary.coord_failed or 0),
@@ -19941,11 +20200,12 @@ function Plugin:show_local_annotation_sync_status()
         lines[#lines+1]="最近失败："
         local kind_label={bookmark="书签",highlight="划线",thought="想法"}
         for _,failure in ipairs(failures) do
-            lines[#lines+1]=string.format("- %s [%s] %s",
+            lines[#lines+1]=string.format("- %s：%s",
                 kind_label[failure.kind] or tostring(failure.kind or "批注"),
-                tostring(failure.stage or failure.state or "unknown"),
-                U.utf8_truncate(tostring(failure.error or ""),72,""))
+                self:_annotation_sync_friendly_reason(failure))
         end
+        lines[#lines+1]=""
+        lines[#lines+1]="可在“需要处理的批注同步”中逐条重新定位，或仅保留本地。"
     end
     self:info(table.concat(lines,"\n"))
     return true
@@ -19966,6 +20226,19 @@ function Plugin:sync_local_annotations_now(force_diagnostic)
     if not self:_capture_local_annotation_snapshot("manual_sync") then
         self:info("保存本地批注状态失败，本次未执行云同步。")
         return false
+    end
+    if not diagnostic_only then
+        local before=LocalAnnotationDatabase.summary(self.store,book_id) or {}
+        local retryable=(tonumber(before.pending or 0) or 0)+(tonumber(before.delete_pending or 0) or 0)
+        local action_required=tonumber(before.action_required or 0) or 0
+        if retryable<=0 and action_required>0 then
+            UIManager:show(ConfirmBox:new{
+                text="本书没有可以自动重试的新任务。\n\n另有 "..tostring(action_required).." 条批注需要重新确认正文位置。",
+                ok_text="查看详情",cancel_text="稍后处理",
+                ok_callback=function() self:show_annotation_sync_issues(book_id) end,
+            })
+            return true
+        end
     end
     local prefs=U.copy(self:_annotation_sync_preferences())
     local book=U.copy(current.book or {})
@@ -20004,14 +20277,14 @@ function Plugin:sync_local_annotations_now(force_diagnostic)
             return
         end
         local lines={
-            "本地批注同步完成",
+            tonumber(result.failed or 0)>0 and "本地批注同步完成，但有记录需要处理" or "本地批注同步完成",
             "",
             "已同步："..tostring(result.synced or 0),
             "已删除："..tostring(result.deleted or 0),
             "云端已存在："..tostring(result.reconciled or 0),
-            "定位失败："..tostring(result.locate_failed or 0),
-            "元数据失败："..tostring(result.metadata_failed or 0),
-            "坐标校验失败："..tostring(result.coord_failed or 0),
+            "正文定位需要处理："..tostring(result.locate_failed or 0),
+            "章节信息需要处理："..tostring(result.metadata_failed or 0),
+            "位置确认需要处理："..tostring(result.coord_failed or 0),
             "结果未知："..tostring(result.unknown or 0),
             "旧坐标已同步："..tostring(result.legacy_synced or 0).."（不会自动重传）",
         }
@@ -20023,10 +20296,9 @@ function Plugin:sync_local_annotations_now(force_diagnostic)
             for index,item in ipairs(result.errors) do
                 if index>6 then break end
                 if type(item)=="table" then
-                    lines[#lines+1]=string.format("- %s [%s] %s",
+                    lines[#lines+1]=string.format("- %s：%s",
                         kind_label[item.kind] or tostring(item.kind or "批注"),
-                        tostring(item.stage or "unknown"),
-                        U.utf8_truncate(tostring(item.error or ""),72,""))
+                        self:_annotation_sync_friendly_reason({kind=item.kind,state=item.state,stage=item.stage,error=item.error}))
                 else
                     lines[#lines+1]="- "..U.utf8_truncate(tostring(item),88,"")
                 end

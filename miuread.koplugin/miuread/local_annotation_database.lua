@@ -5,7 +5,7 @@ local logger = require("logger")
 
 local LocalAnnotationDatabase = {}
 
-LocalAnnotationDatabase.SCHEMA_VERSION = 5
+LocalAnnotationDatabase.SCHEMA_VERSION = 6
 LocalAnnotationDatabase.FILE_NAME = "local_annotations.sqlite3"
 
 local function database_path(store, book_id)
@@ -70,11 +70,12 @@ local function initialize(conn)
     safe_alter(conn, "ALTER TABLE local_annotations ADD COLUMN coord_verify TEXT NOT NULL DEFAULT '';")
     safe_alter(conn, "ALTER TABLE local_annotations ADD COLUMN sync_kind TEXT NOT NULL DEFAULT '';")
 
-    if previous > 0 and previous < LocalAnnotationDatabase.SCHEMA_VERSION then
-        -- 4.5.0 changes coordinate confidence, bookmark recovery and sync-time
-        -- kind inference. Re-evaluate only mutations that are definitely local.
-        -- `unknown`/delete_unknown may already exist remotely and must never be
-        -- reset into a blind retry.
+    if previous < LocalAnnotationDatabase.SCHEMA_VERSION then
+        -- Re-evaluate old local-only failures once after upgrading. This lets a
+        -- newer locator recover beta-era bookmark/highlight failures, but once
+        -- the current version has tried them they stay actionable instead of
+        -- being retried on every ordinary sync. `unknown`/delete_unknown may
+        -- already exist remotely and must never be reset into a blind POST.
         conn:exec([[
             UPDATE local_annotations
                SET sync_state = 'local_only', last_stage = '', last_error = ''
@@ -270,7 +271,7 @@ function LocalAnnotationDatabase.snapshot(store, book_id, annotations, source_pa
             conn:exec([[
                 DELETE FROM local_annotations
                  WHERE present = 0 AND remote_id = ''
-                   AND sync_state IN ('local_only','locate_failed','metadata_failed','coord_failed');
+                   AND sync_state IN ('local_only','locate_failed','metadata_failed','coord_failed','held_local');
             ]])
             -- Anything already known/possibly known by the server is retained until
             -- the cloud side is confirmed gone.
@@ -349,7 +350,7 @@ function LocalAnnotationDatabase.pending(store, book_id, limit)
         local statement = conn:prepare("SELECT " .. SELECT_COLUMNS .. [[
             FROM local_annotations
             WHERE book_id = ? AND sync_state IN
-                ('local_only','locate_failed','metadata_failed','coord_failed','unknown','delete_pending','delete_unknown')
+                ('local_only','unknown','delete_pending','delete_unknown')
             ORDER BY updated_at ASC LIMIT ?
         ]])
         statement:bind(tostring(book_id or ""), math.max(1, tonumber(limit) or 200))
@@ -458,17 +459,89 @@ function LocalAnnotationDatabase.delete_row(store, book_id, local_id)
     return true
 end
 
+function LocalAnnotationDatabase.retry_failure(store, book_id, local_id)
+    if not LocalAnnotationDatabase.exists(store, book_id) then return nil, "annotation database missing" end
+    local conn = open(store, book_id, false)
+    local changed = 0
+    local ok, err = xpcall(function()
+        local statement = conn:prepare([[
+            UPDATE local_annotations
+               SET sync_state = 'local_only', last_stage = '', last_error = '',
+                   last_attempt_at = 0, updated_at = ?
+             WHERE book_id = ? AND local_id = ? AND present = 1 AND remote_id = ''
+               AND sync_state IN ('locate_failed','metadata_failed','coord_failed','held_local')
+        ]])
+        statement:bind(os.time(), tostring(book_id or ""), tostring(local_id or "")):step()
+        statement:close()
+        local query=conn:prepare("SELECT changes()")
+        local row=query:step()
+        changed=row and (tonumber(row[1] or 0) or 0) or 0
+        query:close()
+    end, debug.traceback)
+    pcall(conn.close, conn)
+    if not ok then return nil, tostring(err) end
+    return changed > 0
+end
+
+function LocalAnnotationDatabase.retry_failures(store, book_id)
+    if not LocalAnnotationDatabase.exists(store, book_id) then return 0 end
+    local conn = open(store, book_id, false)
+    local changed = 0
+    local ok, err = xpcall(function()
+        local statement = conn:prepare([[
+            UPDATE local_annotations
+               SET sync_state = 'local_only', last_stage = '', last_error = '',
+                   last_attempt_at = 0, updated_at = ?
+             WHERE book_id = ? AND present = 1 AND remote_id = ''
+               AND sync_state IN ('locate_failed','metadata_failed','coord_failed','held_local')
+        ]])
+        statement:bind(os.time(), tostring(book_id or "")):step()
+        statement:close()
+        local query=conn:prepare("SELECT changes()")
+        local row=query:step()
+        changed=row and (tonumber(row[1] or 0) or 0) or 0
+        query:close()
+    end, debug.traceback)
+    pcall(conn.close, conn)
+    if not ok then return nil, tostring(err) end
+    return changed
+end
+
+function LocalAnnotationDatabase.hold_local(store, book_id, local_id)
+    if not LocalAnnotationDatabase.exists(store, book_id) then return nil, "annotation database missing" end
+    local conn = open(store, book_id, false)
+    local changed = 0
+    local ok, err = xpcall(function()
+        local statement = conn:prepare([[
+            UPDATE local_annotations
+               SET sync_state = 'held_local', last_stage = 'held_local',
+                   last_error = '', updated_at = ?
+             WHERE book_id = ? AND local_id = ? AND present = 1 AND remote_id = ''
+               AND sync_state IN ('local_only','locate_failed','metadata_failed','coord_failed')
+        ]])
+        statement:bind(os.time(), tostring(book_id or ""), tostring(local_id or "")):step()
+        statement:close()
+        local query=conn:prepare("SELECT changes()")
+        local row=query:step()
+        changed=row and (tonumber(row[1] or 0) or 0) or 0
+        query:close()
+    end, debug.traceback)
+    pcall(conn.close, conn)
+    if not ok then return nil, tostring(err) end
+    return changed > 0
+end
+
 function LocalAnnotationDatabase.summary(store, book_id)
     if not LocalAnnotationDatabase.exists(store, book_id) then
         return {total=0, bookmark=0, highlight=0, thought=0, pending=0, synced=0,
             delete_pending=0, locate_failed=0, metadata_failed=0, coord_failed=0,
-            unknown=0, legacy_synced=0}
+            unknown=0, action_required=0, held_local=0, legacy_synced=0}
     end
     local conn = open(store, book_id, false)
     local ok, result = xpcall(function()
         local out = {total=0, bookmark=0, highlight=0, thought=0, pending=0, synced=0,
             delete_pending=0, locate_failed=0, metadata_failed=0, coord_failed=0,
-            unknown=0, legacy_synced=0}
+            unknown=0, action_required=0, held_local=0, legacy_synced=0}
         local statement = conn:prepare([[
             SELECT kind, sync_state, COUNT(*) FROM local_annotations
              WHERE book_id = ? AND (present = 1 OR sync_state IN ('delete_pending','delete_unknown'))
@@ -487,13 +560,15 @@ function LocalAnnotationDatabase.summary(store, book_id)
             elseif state == "delete_pending" or state == "delete_unknown" then
                 out.delete_pending = out.delete_pending + count
             elseif state == "locate_failed" then
-                out.locate_failed = out.locate_failed + count; out.pending = out.pending + count
+                out.locate_failed = out.locate_failed + count; out.action_required = out.action_required + count
             elseif state == "metadata_failed" then
-                out.metadata_failed = out.metadata_failed + count; out.pending = out.pending + count
+                out.metadata_failed = out.metadata_failed + count; out.action_required = out.action_required + count
             elseif state == "coord_failed" then
-                out.coord_failed = out.coord_failed + count; out.pending = out.pending + count
+                out.coord_failed = out.coord_failed + count; out.action_required = out.action_required + count
             elseif state == "unknown" then
                 out.unknown = out.unknown + count; out.pending = out.pending + count
+            elseif state == "held_local" then
+                out.held_local = out.held_local + count
             else
                 out.pending = out.pending + count
             end
@@ -663,15 +738,19 @@ function LocalAnnotationDatabase.search_all(store, query, limit)
 end
 
 function LocalAnnotationDatabase.global_summary(store)
-    local out = {pending=0, failed=0, delete_pending=0, bookmark=0, highlight=0, thought=0, books=0}
+    local out = {pending=0, failed=0, action_required=0, held_local=0,
+        delete_pending=0, bookmark=0, highlight=0, thought=0,
+        action_bookmark=0, action_highlight=0, action_thought=0,
+        books=0, upgrade_recheck=0}
     for _, path in ipairs(database_paths(store)) do
         local ok_conn, conn = pcall(SQLiteStore.open, path, true)
         if ok_conn and conn then
             local ok = pcall(function()
+                local schema_version=tonumber(SQLiteStore.get_text(conn, "local_annotation_schema_version") or 0) or 0
                 local statement = conn:prepare([[
                     SELECT kind, sync_state, COUNT(*) FROM local_annotations
                      WHERE sync_state IN
-                        ('local_only','locate_failed','metadata_failed','coord_failed','unknown','delete_pending','delete_unknown')
+                        ('local_only','locate_failed','metadata_failed','coord_failed','unknown','delete_pending','delete_unknown','held_local')
                      GROUP BY kind, sync_state
                 ]])
                 local touched = false
@@ -681,10 +760,21 @@ function LocalAnnotationDatabase.global_summary(store)
                     local kind, state_name = tostring(row[1] or ""), tostring(row[2] or "")
                     local count = tonumber(row[3] or 0) or 0
                     if count > 0 then touched = true end
-                    out.pending = out.pending + count
-                    if out[kind] ~= nil then out[kind] = out[kind] + count end
+                    if state_name ~= "held_local" and out[kind] ~= nil then out[kind] = out[kind] + count end
                     if state_name == "delete_pending" or state_name == "delete_unknown" then
                         out.delete_pending = out.delete_pending + count
+                        out.pending = out.pending + count
+                    elseif state_name == "held_local" then
+                        out.held_local = out.held_local + count
+                    elseif state_name == "locate_failed" or state_name == "metadata_failed" or state_name == "coord_failed" then
+                        out.action_required = out.action_required + count
+                        local action_key="action_"..kind
+                        if out[action_key]~=nil then out[action_key]=out[action_key]+count end
+                        if schema_version < LocalAnnotationDatabase.SCHEMA_VERSION then
+                            out.upgrade_recheck = out.upgrade_recheck + count
+                        end
+                    else
+                        out.pending = out.pending + count
                     end
                     if FAILURE_STATES[state_name] then out.failed = out.failed + count end
                 end
@@ -706,10 +796,13 @@ function LocalAnnotationDatabase.pending_books(store, limit)
         local ok_conn, conn = pcall(SQLiteStore.open, path, true)
         if ok_conn and conn then
             pcall(function()
+                local schema_version=tonumber(SQLiteStore.get_text(conn, "local_annotation_schema_version") or 0) or 0
+                local states=schema_version < LocalAnnotationDatabase.SCHEMA_VERSION
+                    and "('local_only','locate_failed','metadata_failed','coord_failed','unknown','delete_pending','delete_unknown')"
+                    or "('local_only','unknown','delete_pending','delete_unknown')"
                 local statement = conn:prepare([[
                     SELECT book_id, kind, sync_state, COUNT(*) FROM local_annotations
-                     WHERE sync_state IN
-                        ('local_only','locate_failed','metadata_failed','coord_failed','unknown','delete_pending','delete_unknown')
+                     WHERE sync_state IN ]]..states..[[
                      GROUP BY book_id, kind, sync_state
                 ]])
                 while true do
@@ -750,9 +843,12 @@ function LocalAnnotationDatabase.failures(store, book_id, limit)
     local out = {}
     local ok, err = xpcall(function()
         local statement = conn:prepare([[
-            SELECT kind, sync_state, last_stage, last_error
+            SELECT local_id, kind, sync_state, last_stage, last_error,
+                   text, selected_text, anchor_text, note, chapter_uid,
+                   chapter_idx, updated_at
               FROM local_annotations
-             WHERE book_id = ? AND last_error <> ''
+             WHERE book_id = ?
+               AND sync_state IN ('locate_failed','metadata_failed','coord_failed')
              ORDER BY updated_at DESC LIMIT ?
         ]])
         statement:bind(tostring(book_id or ""), math.max(1, tonumber(limit) or 6))
@@ -760,14 +856,62 @@ function LocalAnnotationDatabase.failures(store, book_id, limit)
             local row = statement:step()
             if not row then break end
             out[#out + 1] = {
-                kind=tostring(row[1] or ""), state=tostring(row[2] or ""),
-                stage=tostring(row[3] or ""), error=tostring(row[4] or ""),
+                local_id=tostring(row[1] or ""), kind=tostring(row[2] or ""),
+                state=tostring(row[3] or ""), stage=tostring(row[4] or ""),
+                error=tostring(row[5] or ""), text=tostring(row[6] or ""),
+                selected_text=tostring(row[7] or ""), anchor_text=tostring(row[8] or ""),
+                note=tostring(row[9] or ""), chapter_uid=tostring(row[10] or ""),
+                chapter_idx=tonumber(row[11]), updated_at=tonumber(row[12] or 0) or 0,
             }
         end
         statement:close()
     end, debug.traceback)
     pcall(conn.close, conn)
     if not ok then return nil, tostring(err) end
+    return out
+end
+
+function LocalAnnotationDatabase.global_failures(store, limit)
+    limit = math.max(1, math.min(500, tonumber(limit) or 100))
+    local out = {}
+    for _, path in ipairs(database_paths(store)) do
+        if #out >= limit then break end
+        local ok_conn, conn = pcall(SQLiteStore.open, path, true)
+        if ok_conn and conn then
+            pcall(function()
+                local statement = conn:prepare([[
+                    SELECT book_id, local_id, kind, sync_state, last_stage, last_error,
+                           text, selected_text, anchor_text, note, chapter_uid,
+                           chapter_idx, updated_at
+                      FROM local_annotations
+                     WHERE sync_state IN ('locate_failed','metadata_failed','coord_failed')
+                     ORDER BY updated_at DESC LIMIT ?
+                ]])
+                statement:bind(limit - #out)
+                while #out < limit do
+                    local row = statement:step()
+                    if not row then break end
+                    out[#out + 1] = {
+                        book_id=tostring(row[1] or ""), local_id=tostring(row[2] or ""),
+                        kind=tostring(row[3] or ""), state=tostring(row[4] or ""),
+                        stage=tostring(row[5] or ""), error=tostring(row[6] or ""),
+                        text=tostring(row[7] or ""), selected_text=tostring(row[8] or ""),
+                        anchor_text=tostring(row[9] or ""), note=tostring(row[10] or ""),
+                        chapter_uid=tostring(row[11] or ""), chapter_idx=tonumber(row[12]),
+                        updated_at=tonumber(row[13] or 0) or 0,
+                    }
+                end
+                statement:close()
+            end)
+            pcall(conn.close, conn)
+        end
+    end
+    table.sort(out, function(a, b)
+        if a.updated_at ~= b.updated_at then return a.updated_at > b.updated_at end
+        if a.book_id ~= b.book_id then return a.book_id < b.book_id end
+        return a.local_id < b.local_id
+    end)
+    while #out > limit do table.remove(out) end
     return out
 end
 
