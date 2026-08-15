@@ -25,6 +25,81 @@ local function clean_text(value)
     return tostring(value or ""):gsub("%s", ""):gsub("%*", "")
 end
 
+-- MiuRead converts WeRead's image footnote markers into visible [N] links in
+-- the generated EPUB. Those digits do not exist in coord_html, so a KOReader
+-- selection spanning one of these markers cannot be found by strict text match.
+-- Keep this fallback narrowly scoped to chapters that really contain the
+-- original qqreader/footnote image marker.
+local function image_footnote_marker_count(html)
+    local lower = tostring(html or ""):lower()
+    if lower == "" then return 0 end
+    local count = 0
+    for tag in lower:gmatch("<img[^>]*>") do
+        if tag:find("qqreader-footnote", 1, true)
+            or tag:find("footnote-icon", 1, true)
+            or tag:find("footnote-ref", 1, true)
+            or tag:find("note-ref", 1, true) then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+local function bracket_number_tokens(value)
+    local text = tostring(value or "")
+    local tokens = {}
+    local from = 1
+    while true do
+        local a, b = text:find("%[%d+%]", from)
+        if not a then break end
+        tokens[#tokens + 1] = {a=a, b=b}
+        from = b + 1
+    end
+    return text, tokens
+end
+
+-- Generate only a small set of display-only candidates. Using subsets instead
+-- of deleting every [N] preserves genuine bracketed numbers when a selection
+-- contains both real prose and one or more generated footnote labels.
+local function footnote_display_variants(value, max_remove)
+    local text, tokens = bracket_number_tokens(value)
+    local n = #tokens
+    max_remove = math.max(0, math.floor(tonumber(max_remove) or 0))
+    if n == 0 or max_remove == 0 or n > 8 then return {} end
+    local out, seen = {}, {}
+    local masks = 2 ^ n
+    for mask = 1, masks - 1 do
+        local removed = 0
+        for i = 1, n do
+            if math.floor(mask / (2 ^ (i - 1))) % 2 == 1 then removed = removed + 1 end
+        end
+        if removed <= max_remove then
+            local parts, cursor = {}, 1
+            for i, token in ipairs(tokens) do
+                if math.floor(mask / (2 ^ (i - 1))) % 2 == 1 then
+                    parts[#parts + 1] = text:sub(cursor, token.a - 1)
+                    cursor = token.b + 1
+                end
+            end
+            parts[#parts + 1] = text:sub(cursor)
+            local candidate = U.trim(table.concat(parts))
+            if candidate ~= "" and not seen[candidate] and U.utf8_len(clean_text(candidate)) >= 8 then
+                seen[candidate] = true
+                out[#out + 1] = {text=candidate, removed=removed}
+            end
+        end
+    end
+    table.sort(out, function(a, b)
+        if a.removed == b.removed then return #a.text > #b.text end
+        return a.removed < b.removed
+    end)
+    return out
+end
+
+local function strip_all_bracket_numbers(value)
+    return tostring(value or ""):gsub("%[%d+%]", "")
+end
+
 -- Official WeRead review abstracts are not guaranteed to be byte-identical to
 -- the shared range. A review may quote only a sub-span of that range. Treat a
 -- sufficiently long containment relationship as supporting evidence instead of
@@ -746,18 +821,71 @@ function AnnotationSync:_locate(row, chapter_ctx)
     if mark_text == "" then return nil, "mark_text_missing" end
 
     local range_key, html_start, html_end_pos = PosMap.locateInjected(bridge, mark_text, opts)
-    if not range_key then return nil, tostring(html_start or "not_found") end
+    local locate_mode = "strict"
+    local locate_error = range_key and nil or tostring(html_start or "not_found")
+    local matched_text = mark_text
+
+    if not range_key then
+        local marker_count = image_footnote_marker_count(chapter_ctx.raw_html or chapter_ctx.html)
+        local variants = footnote_display_variants(mark_text, marker_count)
+        if #variants > 0 then
+            local successes, success_keys = {}, {}
+            local relaxed_opts = {
+                context_before=strip_all_bracket_numbers(opts.context_before),
+                context_after=strip_all_bracket_numbers(opts.context_after),
+            }
+            for _, variant in ipairs(variants) do
+                local candidate_range, candidate_start, candidate_end =
+                    PosMap.locateInjected(bridge, variant.text, relaxed_opts)
+                if candidate_range and not success_keys[candidate_range] then
+                    local candidate_resolved = Coord.resolveRangeOnMap(map, candidate_range)
+                    local candidate_round = Coord.roundTrip(chapter_ctx.html, candidate_range)
+                    if candidate_resolved
+                        and clean_text(candidate_resolved.text) == clean_text(variant.text)
+                        and candidate_round and candidate_round.ok then
+                        success_keys[candidate_range] = true
+                        successes[#successes + 1] = {
+                            range=candidate_range, html_start=candidate_start,
+                            html_end_pos=candidate_end, text=variant.text,
+                            resolved=candidate_resolved, removed=variant.removed,
+                        }
+                    end
+                end
+            end
+            if #successes == 1 then
+                local hit = successes[1]
+                range_key, html_start, html_end_pos = hit.range, hit.html_start, hit.html_end_pos
+                matched_text = hit.text
+                locate_mode = "footnote_display"
+                logger.info("[MiuRead][AnnotationSync] footnote display compatibility matched",
+                    "local=", tostring(row.local_id or ""),
+                    "removed=", tostring(hit.removed or 0),
+                    "range=", tostring(range_key))
+            elseif #successes > 1 then
+                return nil, "footnote_display_ambiguous"
+            elseif #variants > 0 then
+                return nil, "footnote_display_not_found:" .. tostring(locate_error or "not_found")
+            end
+        end
+    end
+
+    if not range_key then return nil, locate_error or "not_found" end
     local resolved = Coord.resolveRangeOnMap(map, range_key)
-    if not resolved or clean_text(resolved.text) ~= clean_text(mark_text) then
-        return nil, "range_verify_failed"
+    if not resolved or clean_text(resolved.text) ~= clean_text(matched_text) then
+        return nil, locate_mode == "footnote_display"
+            and "footnote_display_range_verify_failed" or "range_verify_failed"
     end
     local round = Coord.roundTrip(chapter_ctx.html, range_key)
-    if not (round and round.ok) then return nil, "range_roundtrip_failed" end
+    if not (round and round.ok) then
+        return nil, locate_mode == "footnote_display"
+            and "footnote_display_roundtrip_failed" or "range_roundtrip_failed"
+    end
     -- Upload the text re-extracted from coord_html, not the injected KOReader
     -- selection. This keeps markText/abstract free of local display markers.
     return {range=range_key, mark_text=resolved.text, html_start=html_start,
         html_end_pos=html_end_pos, point=false, coord_version=COORD_VERSION, coord_source=COORD_SOURCE,
-        local_confidence="strong", local_verify="text+context+roundtrip"}
+        local_confidence="strong", local_verify=locate_mode == "footnote_display"
+            and "text+footnote_display+roundtrip" or "text+context+roundtrip"}
 end
 
 local function coordinate_acceptance(located, verification)

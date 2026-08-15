@@ -4932,8 +4932,14 @@ function Plugin:_reader_preferences()
     if type(reader.recent_actions)~="table" or #reader.recent_actions>0 then reader.recent_actions={}; changed=true end
     if reader.edge_guard_enabled==nil then reader.edge_guard_enabled=true; changed=true end
     local edge_percent=tonumber(reader.edge_guard_percent)
-    if edge_percent~=5 and edge_percent~=10 and edge_percent~=15 and edge_percent~=20 then
+    -- beta.13 removes the legacy 5% guard and extends the usable range to 30%.
+    -- Preserve every valid existing choice; only migrate the retired 5% value.
+    if edge_percent==5 then
         reader.edge_guard_percent=10
+        changed=true
+    elseif edge_percent~=10 and edge_percent~=15 and edge_percent~=20
+        and edge_percent~=25 and edge_percent~=30 then
+        reader.edge_guard_percent=15
         changed=true
     end
 
@@ -4981,8 +4987,8 @@ end
 
 function Plugin:_reader_edge_guard_state()
     local reader=self:_reader_preferences()
-    local percent=tonumber(reader.edge_guard_percent) or 10
-    if percent~=5 and percent~=10 and percent~=15 and percent~=20 then percent=10 end
+    local percent=tonumber(reader.edge_guard_percent) or 15
+    if percent~=10 and percent~=15 and percent~=20 and percent~=25 and percent~=30 then percent=15 end
     return reader.edge_guard_enabled~=false,percent
 end
 
@@ -4995,7 +5001,7 @@ end
 
 function Plugin:_reader_set_edge_guard_percent(percent)
     percent=tonumber(percent)
-    if percent~=5 and percent~=10 and percent~=15 and percent~=20 then return false end
+    if percent~=10 and percent~=15 and percent~=20 and percent~=25 and percent~=30 then return false end
     local reader,preferences=self:_reader_preferences()
     reader.edge_guard_percent=percent
     self:_save_reader_preferences(reader,preferences)
@@ -12263,11 +12269,11 @@ function Plugin:_show_reader_edge_guard_panel(back_callback)
                 end},
             }
             local range_rows={}
-            for _,value in ipairs({5,10,15,20}) do
+            for _,value in ipairs({10,15,20,25,30}) do
                 local selected=value
                 range_rows[#range_rows+1]={
                     label=tostring(selected).."%",
-                    value=selected==10 and "推荐" or "左右各占屏幕宽度",
+                    value=selected==15 and "推荐" or "左右各占屏幕宽度",
                     value_bold=percent==selected,
                     checked=percent==selected,
                     enabled=enabled,
@@ -19183,7 +19189,7 @@ function Plugin:_thought_edge_page_turn(ges)
     local width=Device.screen and Device.screen:getWidth()
     if not x or not width or width<=0 then return false end
 
-    local ratio=math.max(.05,math.min(.20,(tonumber(percent) or 10)/100))
+    local ratio=math.max(.10,math.min(.30,(tonumber(percent) or 15)/100))
     local inverse=self.ui and self.ui.view and self.ui.view.inverse_reading_order==true
     local diff
     if x<=width*ratio then
@@ -19200,12 +19206,29 @@ function Plugin:_thought_edge_page_turn(ges)
         and not G_reader_settings:nilOrFalse("page_turns_disable_tap") then
         return false
     end
-    if not self.ui or type(self.ui.handleEvent)~="function" then return false end
+    if not self.ui then return false end
 
-    local ok,handled=pcall(self.ui.handleEvent,self.ui,Event:new("GotoViewRel",diff))
-    if not ok or handled~=true then return false end
+    -- Prefer KOReader's native page-turn module directly. Some ReaderUI builds
+    -- do not propagate a strict boolean from handleEvent even though GotoViewRel
+    -- is handled, which allowed the thought link to open after the page turn path.
+    local native=self.ui.rolling or self.ui.paging
+    local turned=false
+    if native and type(native.onGotoViewRel)=="function" then
+        local ok,result=pcall(native.onGotoViewRel,native,diff)
+        if ok and result~=false then
+            turned=true
+        elseif not ok then
+            logger.warn("[MiuRead][ThoughtPopup] edge page turn failed",tostring(result))
+        end
+    elseif type(self.ui.handleEvent)=="function" then
+        local ok,handled=pcall(self.ui.handleEvent,self.ui,Event:new("GotoViewRel",diff))
+        -- Event dispatch is only a compatibility fallback. Treat any non-false
+        -- successful result as consumed so the underlying comment cannot reopen.
+        turned=ok and handled~=false
+    end
+    if not turned then return false end
     self:_mark_reader_busy(2)
-    logger.dbg("[MiuRead][ThoughtPopup] edge annotation tap converted to page turn",
+    logger.info("[MiuRead][ThoughtPopup] edge annotation tap converted to page turn",
         "percent=",tostring(percent),"direction=",diff<0 and "backward" or "forward")
     return true
 end
