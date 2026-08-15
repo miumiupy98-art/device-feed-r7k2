@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.5.0-beta.16",
+    VERSION = "4.5.0-beta.17",
     SCHEMA = 112,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -108,6 +108,11 @@ local C = {
     DOWNLOAD_NETWORK_RECOVERY_MAX_POLL_SECONDS = 15,
     DOWNLOAD_BACKGROUND_KEEPALIVE_SECONDS = 12,
     DOWNLOAD_BACKGROUND_STALL_SLEEP_SECONDS = 300,
+
+    -- beta.17 power lifecycle: short resumes are diagnosed but never forced
+    -- back to sleep. Resume keeps optional background work quiet briefly.
+    SHORT_WAKE_SECONDS = 5,
+    POWER_RESUME_QUIET_SECONDS = 1.0,
 
     -- Download networking stays automatic by default. A compatibility prompt
     -- is considered only after several genuinely slow responses, then confirmed

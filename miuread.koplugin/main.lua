@@ -19,6 +19,22 @@ local lfs=require("libs/libkoreader-lfs")
 local Config=require("miuread.config")
 local Text=require("miuread.text")
 local U=require("miuread.util")
+local function sanitized_network_list(networks)
+    if type(networks)~="table" then return {} end
+    local out={}
+    for _,network in ipairs(networks) do
+        if type(network)=="table" then
+            local row=U.copy(network)
+            row.ssid=tostring(row.ssid or row.essid or "")
+            row.flags=tostring(row.flags or row.key_mgmt or "")
+            if row.signal_quality==nil then
+                row.signal_quality=tonumber(row.quality or row.signal) or 0
+            end
+            out[#out+1]=row
+        end
+    end
+    return out
+end
 local Json=require("miuread.json")
 local Store=require("miuread.store")
 local Http=require("miuread.http")
@@ -42,6 +58,7 @@ local MemoryMode=require("miuread.memory_mode")
 local PerformanceMode=require("miuread.performance_mode")
 local RuntimePressure=require("miuread.runtime_pressure")
 local BackgroundScheduler=require("miuread.background_scheduler")
+local PowerState=require("miuread.power_state")
 local Library=require("miuread.library")
 local ShelfView=require("miuread.shelf_view")
 local FullShelfView=require("miuread.full_shelf_view")
@@ -3186,6 +3203,8 @@ end
 function Plugin:_background_block_reason(options)
     options=options or {}
     if HOME_EXITING or UIManager._exit_code~=nil then return "exiting" end
+    local power_state=PowerState.state()
+    if power_state~="NORMAL" then return "power_"..power_state:lower() end
     if self._miuread_suspended==true or HOME_SESSION.suspended==true or self._home_suspended==true then return "suspended" end
     if self:_page_transition_active() or reader_close_active() or reader_rebuild_active() then return "reader_transition" end
     if self:_active_reader_ui() then return "reader_active" end
@@ -3233,6 +3252,7 @@ function Plugin:_background_claim(key,options,retry)
     local token,reason=self.background_scheduler:claim(key,options)
     if token then return token,nil,false end
     local retryable=reason~="suspended" and reason~="exiting" and reason~="reader_active" and reason~="reader_transition"
+        and not tostring(reason or ""):find("^power_")
     if retryable and type(retry)=="function" then
         local retry_delay=options.retry_delay or tonumber(Config.BACKGROUND_RETRY_SECONDS) or .9
         if reason=="memory_critical" then retry_delay=math.max(4.0,tonumber(retry_delay) or .9) end
@@ -3301,7 +3321,7 @@ function Plugin:_home_defer_refresh_kind(kind)
 end
 
 function Plugin:_home_background_blocked()
-    return self._home_suspended==true or self._home_resume_barrier==true
+    return PowerState.state()~="NORMAL" or self._home_suspended==true or self._home_resume_barrier==true
         or self:_page_transition_active()
 end
 
@@ -5785,7 +5805,7 @@ function Plugin:_reader_wifi_settings(back_callback)
             if ok_list and type(networks)=="table" then
                 local ok_widget,NetworkSetting=pcall(require,"ui/widget/networksetting")
                 if ok_widget and NetworkSetting and type(NetworkSetting.new)=="function" then
-                    local dialog=NetworkSetting:new{network_list=networks}
+                    local dialog=NetworkSetting:new{network_list=sanitized_network_list(networks)}
                     local original_on_close=dialog.onCloseWidget
                     dialog.onCloseWidget=function(widget)
                         if type(original_on_close)=="function" then
@@ -9465,7 +9485,7 @@ function Plugin:_home_wifi_settings()
                 local ok_widget,NetworkSetting=pcall(require,"ui/widget/networksetting")
                 if ok_widget and NetworkSetting and type(NetworkSetting.new)=="function" then
                     local dialog=NetworkSetting:new{
-                        network_list=networks,
+                        network_list=sanitized_network_list(networks),
                         -- Deliberately omit connect_callback here. KOReader
                         -- auto-dismisses an already-connected network picker
                         -- when that callback is present. The close hook below
@@ -13989,10 +14009,11 @@ function Plugin:_finish_reader_return(generation,reason)
         end
         if elapsed>=5 and READER_CLOSE.foreground_stop_attempted~=true then
             READER_CLOSE.foreground_stop_attempted=true
-            local stopped=self.download_task
-                and self.download_task:stop_for_foreground("return_home_timeout") or false
+            -- Page transition has already paused the worker at a safe boundary.
+            -- Never cancel a resumable background download just because KOReader
+            -- is slow to acknowledge CloseDocument.
             logger.warn("[MiuRead][ReaderClose] foreground recovery requested",
-                "generation=",tostring(generation),"download_stopped=",tostring(stopped))
+                "generation=",tostring(generation),"download_preserved=true")
             self:_request_reader_close(generation,"foreground recovery")
             return true
         end
@@ -20731,6 +20752,29 @@ function Plugin:onAnnotationsModified()
     self:_schedule_local_annotation_snapshot("annotations_modified",2.4)
 end
 function Plugin:onSuspend()
+    if HOME_SESSION.suspended==true and self._miuread_suspended==true then
+        logger.info("[MiuRead][Power] duplicate suspend ignored",
+            "state=",PowerState.state(),"generation=",tostring(PowerState.generation()))
+        return
+    end
+    local download_continue,download_reason=false,"no_download"
+    if self.download_task and type(self.download_task.can_continue_locked)=="function" then
+        local ok,value,reason=pcall(self.download_task.can_continue_locked,self.download_task)
+        if ok then download_continue=value==true; download_reason=tostring(reason or "unknown")
+        else download_reason="check_failed" end
+    end
+    local power_target=download_continue and "DOWNLOAD_LOCKED" or "REAL_SUSPEND"
+    local power=PowerState.transition(power_target,"onSuspend",{
+        download_active=self.download_task and self.download_task:busy() or false,
+        download_continue=download_continue,
+    })
+    self._power_suspend_generation=power.generation
+    logger.info("[MiuRead][Power] suspend transition",
+        "from=",tostring(power.previous),"to=",tostring(power.state),
+        "generation=",tostring(power.generation),
+        "download_continue=",tostring(download_continue),
+        "download_reason=",download_reason)
+
     self._miuread_suspended=true
     HOME_SESSION.suspended=true
     HOME_SESSION.foreground_before_suspend=HOME_SESSION.foreground
@@ -20749,6 +20793,7 @@ function Plugin:onSuspend()
         UIManager:unschedule(self._home_resume_surface_task)
         self._home_resume_surface_task=nil
     end
+    local suspend_sync=self.sync
     if reader_rebuild_active() then
         local owner=READER_REBUILD.owner
         if owner and owner._reader_rebuild_task then
@@ -20756,7 +20801,7 @@ function Plugin:onSuspend()
             owner._reader_rebuild_task=nil
         end
         if owner and owner~=self and owner.sync and type(owner.sync.on_suspend)=="function" then
-            pcall(owner.sync.on_suspend,owner.sync)
+            suspend_sync=owner.sync
         end
         READER_REBUILD.state="suspended_pending"
     end
@@ -20779,16 +20824,13 @@ function Plugin:onSuspend()
     if HomeView.is_shown() and not self:_active_reader_ui() then
         self:_home_freeze_for_suspend()
     end
-    -- Stop the download child at its next safe boundary before KOReader paints
-    -- the lock screen. The process and chapter checkpoints remain intact.
-    if self.download_task then self.download_task:on_suspend() end
     if self._download_resume_task then
         UIManager:unschedule(self._download_resume_task)
         self._download_resume_task=nil
     end
     -- No interaction/helper timer is allowed to wake or poll background work
-    -- after Suspend has taken ownership. DownloadTask:on_suspend() already
-    -- removed all UI-only pause reasons in the same marker write.
+    -- after Suspend has taken ownership. The download marker is normalized
+    -- after these timers are cancelled so no stale callback can re-pause it.
     self._reader_interaction_resume_generation=(tonumber(self._reader_interaction_resume_generation) or 0)+1
     if self._reader_interaction_resume_task then
         UIManager:unschedule(self._reader_interaction_resume_task)
@@ -20804,14 +20846,24 @@ function Plugin:onSuspend()
         HOME_SESSION.post_reader_work_deferred_phase="suspend:"..tostring(HOME_SESSION.post_reader_work_phase or "")
     end
     self:_background_cancel_all("suspend lifecycle",true,false)
-    self:_mark_reader_busy(10)
+    if power_target=="REAL_SUSPEND" then self:_mark_reader_busy(10) end
+    -- Normalize the shared download pause marker LAST. In DOWNLOAD_LOCKED this
+    -- removes page/interaction pauses so the beta.3 keep-awake worker remains
+    -- the only subsystem allowed to keep running behind the lock screen.
+    if self.download_task then
+        self.download_task:on_suspend(power_target,power.generation)
+    end
     self._suspended_at=os.time()
     self:_background_log_state("suspend lifecycle",true)
     logger.info("[MiuRead][Suspend] lifecycle timers cancelled",
-        "rebuild=",tostring(reader_rebuild_active()),"rotation=true","resume=true")
-    self.sync:on_suspend()
+        "rebuild=",tostring(reader_rebuild_active()),"rotation=true","resume=true",
+        "power=",power_target,"generation=",tostring(power.generation))
+    if suspend_sync and type(suspend_sync.on_suspend)=="function" then
+        suspend_sync:on_suspend{power_state=power_target,generation=power.generation}
+    end
 end
 function Plugin:onResume()
+    local previous_power=PowerState.snapshot()
     self._miuread_suspended=false
     HOME_SESSION.suspended=false
     StatusToast.set_blocked(false)
@@ -20828,9 +20880,29 @@ function Plugin:onResume()
     local slept=self._suspended_at and os.time()-self._suspended_at or 0
     self._suspended_at=nil
     HOME_SESSION.last_resume_clock=monotonic_wall_time()
+    local short_wake=slept>0 and slept<(tonumber(Config.SHORT_WAKE_SECONDS) or 5)
+    local power=PowerState.transition("RESUMING","onResume",{
+        download_active=self.download_task and self.download_task:busy() or false,
+        slept=slept,short_wake=short_wake,
+    })
+    logger.info("[MiuRead][Power] resume transition",
+        "from=",tostring(previous_power.state or "-"),"to=RESUMING",
+        "generation=",tostring(power.generation),"slept=",tostring(slept),
+        "abnormal_short_resume=",tostring(short_wake),
+        "previous_download_continue=",tostring(previous_power.download_continue==true))
     self:_background_log_state("resume lifecycle",true)
     self._resume_lifecycle_generation=(tonumber(self._resume_lifecycle_generation) or 0)+1
     local resume_generation=self._resume_lifecycle_generation
+    local power_generation=power.generation
+    UIManager:scheduleIn(math.max(.25,tonumber(Config.POWER_RESUME_QUIET_SECONDS) or 1.0),function()
+        if not PowerState.matches(power_generation,"RESUMING")
+            or HOME_SESSION.suspended==true or self._miuread_suspended==true then return end
+        local normal=PowerState.transition("NORMAL","resume_stable",{
+            download_active=self.download_task and self.download_task:busy() or false,
+        })
+        logger.info("[MiuRead][Power] resume stable",
+            "state=",normal.state,"generation=",tostring(normal.generation))
+    end)
 
     local reader_active=self.ui and self.ui.document
     if reader_rebuild_active() then

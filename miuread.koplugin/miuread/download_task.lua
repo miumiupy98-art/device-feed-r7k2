@@ -225,14 +225,32 @@ function DownloadTask:_replace_transient_pause_reasons(add_suspend)
     return not still_paused
 end
 
-function DownloadTask:on_suspend()
-    -- Install the strong suspend reason and discard UI-only reasons atomically.
-    -- Otherwise an unscheduled interaction timer can leave the worker paused
-    -- forever after wake. Manual/network/auth pauses are intentionally kept.
-    return self:_replace_transient_pause_reasons(true)
+function DownloadTask:on_suspend(mode, generation)
+    self.power_mode = tostring(mode or "REAL_SUSPEND")
+    self.power_generation = tonumber(generation or 0) or 0
+    if self.power_mode == "DOWNLOAD_LOCKED" then
+        -- Preserve beta.3's lock-screen download feature. Only UI/transient
+        -- pauses are removed; manual/auth/network recovery pauses are retained.
+        local resumed = self:_replace_transient_pause_reasons(false)
+        if resumed and self.job then self:_hold_awake() end
+        logger.info("[MiuRead][DownloadTask] power suspend mode",
+            "mode=", self.power_mode, "generation=", tostring(self.power_generation),
+            "continue=", tostring(resumed))
+        return resumed
+    end
+
+    -- A real Kindle suspend is a hard pause boundary for downloads. The child
+    -- process and chapter checkpoints remain intact and resume after wake.
+    local paused = self:_replace_transient_pause_reasons(true)
+    logger.info("[MiuRead][DownloadTask] power suspend mode",
+        "mode=", self.power_mode, "generation=", tostring(self.power_generation),
+        "continue=false")
+    return paused
 end
 
-function DownloadTask:on_resume()
+function DownloadTask:on_resume(generation)
+    self.power_mode = "RESUMING"
+    self.power_generation = tonumber(generation or 0) or 0
     -- Wake is also a cleanup boundary: clear stale interaction/transition
     -- reasons together with suspend, but never override an explicit manual or
     -- recovery pause.
@@ -289,6 +307,43 @@ local function process_exists(pid)
     local state=status:match("[\r\n]State:%s*([A-Z])") or status:match("^State:%s*([A-Z])")
     if state=="Z" or state=="X" then return false end
     return true
+end
+
+function DownloadTask:can_continue_locked()
+    if self.store:preferences().download_keep_awake == false then return false, "disabled" end
+    local task = self:_control_descriptor()
+    if type(task) ~= "table" then return false, "no_task" end
+    local pid = tonumber(task.pid)
+    if pid and process_exists(pid) == false then return false, "worker_stopped" end
+
+    -- UI-only pauses are intentionally ignored here: entering the lock screen
+    -- is the boundary that clears them. Explicit/manual/auth/recovery pauses
+    -- remain authoritative and must never be bypassed just to keep downloading.
+    local reasons = self:_merged_pause_reasons(task.pause_path)
+    for reason in pairs(reasons) do
+        if reason ~= "suspend" and TRANSIENT_PAUSE_REASONS[reason] ~= true then
+            return false, "paused:" .. tostring(reason)
+        end
+    end
+
+    local progress = self.job and self.job.last_progress_state or nil
+    if type(progress) ~= "table" then
+        local path = tostring(task.progress_path or "")
+        if path ~= "" then progress = read_json(path) end
+    end
+    progress = type(progress) == "table" and progress or {}
+    local stage = tostring(progress.stage or "")
+    if stage == "done" or stage == "error" or stage == "cancelled" then
+        return false, stage
+    end
+
+    local now = os.time()
+    local stall = math.max(120, tonumber(Config.DOWNLOAD_BACKGROUND_STALL_SLEEP_SECONDS) or 300)
+    local updated = tonumber(progress.updated_at)
+        or tonumber(self.job and self.job.last_effective_progress_at)
+        or tonumber(task.started_at) or now
+    if now - updated >= stall then return false, "stalled" end
+    return true, "active"
 end
 
 local function usable_recovery_result(result)

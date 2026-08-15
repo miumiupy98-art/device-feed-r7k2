@@ -18,7 +18,7 @@ Sync.__index = Sync
 local legacy_daemon_retired = false
 
 local CONTEXT_MAX_AGE = 15 * 60
-local READ_REPORT_SERVICE_VERSION = 15
+local READ_REPORT_SERVICE_VERSION = 16
 local FIRST_REPORT_DELAY = 10
 local FINAL_REPORT_MIN_SECONDS = 10
 local PRECISE_POSITION_LEAD_SECONDS = 12
@@ -376,7 +376,7 @@ function Sync:new(reader, api, store, host, async, identity_async)
         daemon_restart_count=0, auth_recovery_busy=false, auth_recovery_at=0,
         auto_repair_busy=false, repair_busy=false, repair_book_id=nil, repair_generation=0,
         daemon_auth_retry_at=0, auth_transitioning=false,
-        control_write_task=nil, session_started_at=0,
+        control_write_task=nil, session_started_at=0, suspend_generation=0,
         precise_position_cache={}, precise_due_refreshed=0,
         record_generation=0, record_retry_task=nil, record_checked_path=nil,
         time_enabled=(store:preferences().sync or {}).time_enabled==true,
@@ -1455,7 +1455,6 @@ function Sync:_record_report_issue(book_id, kind, err, options)
             consecutive_failures=0,
             report_state="unconfirmed",
             report_recovery_state=unconfirmed_count>=3 and "refreshing_context" or nil,
-            pending_report_seconds=0,
         })
         self:_clear_noncontext_repair_flag(book_id,session,"unconfirmed_response")
         return false
@@ -1470,7 +1469,6 @@ function Sync:_record_report_issue(book_id, kind, err, options)
         last_error_at=os.time(),
         consecutive_failures=failures,
         report_state=kind,
-        pending_report_seconds=0,
     }
     if kind=="context" then
         context_failures=context_failures+1
@@ -2560,9 +2558,12 @@ function Sync:_import_daemon_status(force)
     if status_book_id~="" then
         self.pending_report_elapsed=0
         self.pending_report_status_at=tonumber(status.completed_at) or os.time()
-        local saved=self.store:session(status_book_id) or {}
-        if tonumber(saved.pending_report_seconds or 0)~=0 then
-            self.store:save_session(status_book_id,{pending_report_seconds=0})
+        -- Suspend carry is consumed only when the worker actually includes it
+        -- in a post-resume request. Merely observing an inactive/waiting status
+        -- must not erase locally preserved reading time.
+        if status.carry_consumed == true then
+            local remaining=math.max(0,math.floor(tonumber(status.carry_remaining) or 0))
+            self.store:save_session(status_book_id,{pending_report_seconds=remaining})
         end
     end
     if status.state == "service_waiting" or status.state == "inactive" then
@@ -2662,7 +2663,6 @@ function Sync:_import_daemon_status(force)
                 consecutive_failures=0,
                 report_state="unconfirmed",
                 report_recovery_state=status.context_refresh_requested==true and "refreshing_context" or nil,
-                pending_report_seconds=0,
             })
             self:_clear_noncontext_repair_flag(status_book_id,saved,"daemon_unconfirmed")
         end
@@ -2858,10 +2858,7 @@ function Sync:_start_daemon(reason)
     end
     self.pending_report_elapsed=0
     self.pending_report_status_at=os.time()
-    if tonumber(session.pending_report_seconds or 0)~=0 then
-        self.store:save_session(book_id,{pending_report_seconds=0})
-        session.pending_report_seconds=0
-    end
+    local carry_elapsed=math.max(0,math.floor(tonumber(session.pending_report_seconds) or 0))
     local existing_job=read_json_file(daemon.paths.job) or {}
     local same_account=tostring(existing_job.login_session_id or "")==login_session_id
         and tostring(existing_job.account_vid or "")==account_vid
@@ -2931,7 +2928,7 @@ function Sync:_start_daemon(reason)
         book_title = record.book.title,
         book_path = record.path,
         book = legacy_book,
-        carry_elapsed = 0,
+        carry_elapsed = carry_elapsed,
         auth = {
             cookies = auth.cookies or {},
             api_key = auth.api_key or "",
@@ -2959,6 +2956,56 @@ function Sync:_start_daemon(reason)
     return true
 end
 
+function Sync:_park_daemon_for_suspend(reason)
+    local daemon=self.daemon
+    if self.control_write_task then
+        UIManager:unschedule(self.control_write_task)
+        self.control_write_task=nil
+    end
+    if self.session_flush_task then
+        UIManager:unschedule(self.session_flush_task)
+        self.session_flush_task=nil
+    end
+    if not daemon then return true end
+
+    -- Suspend is intentionally network-silent. Do not call _write_daemon_control
+    -- here: that helper resolves the current position and can re-enter ReaderUI.
+    -- Reuse the last safe control snapshot and only park the service.
+    local existing=read_json_file(daemon.paths.control) or {}
+    local existing_generation=tonumber(existing.generation or 0) or 0
+    local own_generation=tonumber(daemon.generation or 0) or 0
+    if existing_generation<=own_generation
+        and (existing_generation~=own_generation
+            or tostring(existing.controller_token or "")==""
+            or tostring(existing.controller_token or "")==tostring(self.controller_token)) then
+        existing.active=false
+        existing.generation=own_generation
+        existing.controller_token=tostring(self.controller_token or "")
+        existing.login_session_id=tostring(daemon.login_session_id or existing.login_session_id or "")
+        existing.account_vid=tostring(daemon.account_vid or existing.account_vid or "")
+        existing.book_id=tostring(daemon.book_id or existing.book_id or "")
+        existing.core_map_hash=tostring(daemon.core_map_hash or existing.core_map_hash or "")
+        existing.record_generation=tonumber(daemon.record_generation or existing.record_generation or 0) or 0
+        existing.updated_at=os.time()
+        existing.suspend_parked=true
+        existing.suspend_reason=tostring(reason or "suspend")
+        -- Never synthesize a final flush during Suspend. Existing flush fields
+        -- belong to an earlier explicit close and are removed for this session.
+        existing.flush_seq=0
+        existing.flush_elapsed=nil
+        existing.flush_reason=nil
+        U.atomic_write(daemon.paths.control,Json.encode(existing),true)
+    end
+    daemon.active=false
+    daemon.final_flush_pending=false
+    daemon.final_book_id=nil
+    self.next_due=0
+    self.state="stopped"
+    logger.info("[MiuRead][ReadReport] parked silently",
+        "reason=",tostring(reason or "suspend"),"book=",tostring(daemon.book_id or "-"))
+    return true
+end
+
 function Sync:_stop_daemon_fast(reason, flush_elapsed)
     local daemon = self.daemon
     if self.control_write_task then
@@ -2978,11 +3025,9 @@ function Sync:_stop_daemon_fast(reason, flush_elapsed)
         daemon.final_flush_pending = true
     end
 
-    -- Closing a book or locking the device must not synchronously import the
-    -- worker status and rewrite the full report context. The long-lived worker
-    -- receives one small control-file update and completes the final upload on
-    -- its own. Status/context reconciliation happens after resume or on the
-    -- next normal poll.
+    -- Explicit book close may finish its short tail asynchronously. Device
+    -- Suspend uses _park_daemon_for_suspend instead and never creates a final
+    -- network flush. Status/context reconciliation happens on the next poll.
     daemon.active = false
     self:_write_daemon_control(false, true, extra)
     self.next_due = 0
@@ -3260,29 +3305,59 @@ function Sync:_defer_session_flush(delay)
     UIManager:scheduleIn(math.max(.3, tonumber(delay) or .8), task)
 end
 
-function Sync:on_suspend()
+function Sync:on_suspend(options)
+    options=type(options)=="table" and options or {}
+    local generation=tonumber(options.generation or 0) or 0
+    if generation>0 and generation==tonumber(self.suspend_generation or 0) then return true end
+    if generation>0 then self.suspend_generation=generation end
     self.suspended = true
-    local r = self.current or self:record()
-    local pending_elapsed=math.max(0,math.floor(tonumber(self:_final_elapsed(true)) or 0))
-    if r then
-        local position = self:local_position()
-        local now=os.time()
-        self.store:save_session(r.book.book_id, {
-            pending={
-                percent=position and position.progress or nil,
-                chapter_percent=position and position.chapter_percent or math.floor((self:local_ratio() or 0) * 100 + .5),
-                chapter_uid=position and position.chapter_uid or nil,
-                saved_at=now, reason="suspend",
-            },
-            last_read_at=now,last_read_path=r.path,
-            progress_local_percent=position and position.progress or nil,
-            pending_report_seconds=0,
-        }, false)
-        self:_defer_session_flush(.8)
+
+    local r=self.current
+    local now=os.time()
+    local started=tonumber(self.session_started_at or 0) or 0
+    local uploaded=tonumber(self.last_upload or 0) or 0
+    local observed=tonumber(self.pending_report_status_at or 0) or 0
+    local attempted=tonumber(self.last_attempt or 0) or 0
+    local tail=0
+    if self.time_enabled==true and r and started>0 then
+        -- Do not replay an interval that was already attempted but returned an
+        -- uncertain/failed response. Only preserve fresh time since the most
+        -- recent worker observation/attempt.
+        tail=math.max(0,now-math.max(started,uploaded,observed,attempted))
+        tail=math.min(tail,math.max(FINAL_REPORT_MIN_SECONDS,tonumber(Config.READ_INTERVAL) or 60))
+        if tail<FINAL_REPORT_MIN_SECONDS then tail=0 end
     end
-    -- The background worker may submit only the current 10-60 second tail.
-    -- Failed time is discarded and is never carried into the next session.
-    self:stop_fast("suspend", pending_elapsed)
+
+    if r and r.book and tostring(r.book.book_id or "")~="" then
+        local book_id=tostring(r.book.book_id)
+        local saved=self.store:session(book_id) or {}
+        local prior=math.max(0,math.floor(tonumber(saved.pending_report_seconds) or 0))
+        local maximum=math.max(60,(tonumber(Config.READ_INTERVAL) or 60)*5)
+        local carry=math.min(maximum,prior+tail)
+        local position=type(saved.local_position_snapshot)=="table" and U.copy(saved.local_position_snapshot) or nil
+        local patch={
+            last_read_at=now,last_read_path=r.path,
+            pending_report_seconds=carry,
+            suspend_generation=generation>0 and generation or nil,
+            suspend_power_state=tostring(options.power_state or "REAL_SUSPEND"),
+        }
+        if position then
+            patch.pending={
+                percent=position.progress,
+                chapter_percent=position.chapter_percent,
+                chapter_uid=position.chapter_uid,
+                saved_at=now,reason="suspend_cached",
+            }
+            patch.progress_local_percent=position.progress
+        end
+        -- One small synchronous local write; no delayed post-suspend flush.
+        self.store:save_session(book_id,patch,true)
+        logger.info("[MiuRead][ReadReport] suspend tail cached",
+            "book=",book_id,"tail=",tostring(tail),"carry=",tostring(carry),
+            "position_cached=",tostring(position~=nil),
+            "power=",tostring(options.power_state or "REAL_SUSPEND"))
+    end
+    return self:_park_daemon_for_suspend("suspend")
 end
 
 function Sync:on_resume(_slept)

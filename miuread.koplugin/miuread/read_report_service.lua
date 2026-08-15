@@ -154,6 +154,7 @@ function Service.run(job)
     local consecutive_failures = 0
     local consecutive_unconfirmed = 0
     local blocked = false
+    local carry_remaining = 0
 
     local function reader_busy_until()
         if reader_busy_path == "" then return 0 end
@@ -209,10 +210,15 @@ function Service.run(job)
             consecutive_failures=consecutive_failures+1
             return 0
         end
-        -- Keep every request within one normal reporting interval. Failed
-        -- intervals are never accumulated or replayed later.
-        elapsed = math.max(1, math.min(interval, math.floor(tonumber(elapsed) or interval))
-        )
+        -- Keep every request within one normal reporting interval. A small
+        -- suspend tail may be carried into the first post-resume request. The
+        -- carry is consumed when an attempt is made, matching the existing
+        -- no-replay rule for uncertain/failed intervals.
+        local base_elapsed=math.max(1,math.min(interval,math.floor(tonumber(elapsed) or interval)))
+        local room=math.max(0,interval-base_elapsed)
+        local carry_used=final_flush and 0 or math.min(carry_remaining,room)
+        elapsed=base_elapsed+carry_used
+        carry_remaining=math.max(0,carry_remaining-carry_used)
         sequence = sequence + 1
         local report_book=U.copy(book or {})
         report_book.book_id=tostring(current_job.book_id or "")
@@ -287,19 +293,24 @@ function Service.run(job)
             out.paused = blocked
             local delay = (result.accepted or uncertain) and interval
                 or retry_delay(kind, consecutive_failures, interval)
-            out.retry_delay = delay
             out.consecutive_failures = consecutive_failures
             out.unconfirmed_count = consecutive_unconfirmed
             out.context_refresh_requested = report_job.force_context == true or nil
             out.attempted_at = attempted_at
             out.completed_at = completed_at
             out.elapsed_seconds = elapsed
-            out.carry_elapsed = 0
-            out.carry_consumed = false
-            out.pending_elapsed = 0
+            out.carry_elapsed = carry_used
+            out.carry_consumed = carry_used > 0
+            out.carry_consumed_seconds = carry_used
+            out.carry_remaining = carry_remaining
+            out.pending_elapsed = carry_remaining
             out.recovery_probe = false
             out.final_flush = final_flush == true
             out.flush_reason = reason
+            if not final_flush and carry_remaining>0 and (result.accepted or uncertain) then
+                delay=math.min(delay,10)
+            end
+            out.retry_delay = delay
             out.next_due = final_flush and 0 or (completed_at + delay)
             out.book_id = tostring(current_job.book_id or "")
             out.core_map_hash=tostring(current_job.core_map_hash or "")
@@ -326,9 +337,11 @@ function Service.run(job)
             attempted_at = attempted_at,
             completed_at = completed_at,
             elapsed_seconds = elapsed,
-            carry_elapsed = 0,
-            carry_consumed = false,
-            pending_elapsed = 0,
+            carry_elapsed = carry_used,
+            carry_consumed = carry_used > 0,
+            carry_consumed_seconds = carry_used,
+            carry_remaining = carry_remaining,
+            pending_elapsed = carry_remaining,
             recovery_probe = false,
             final_flush = final_flush == true,
             flush_reason = reason,
@@ -376,6 +389,7 @@ function Service.run(job)
                     auth={}
                     next_due=0
                     last_report_at=os.time()
+                    carry_remaining=0
                     os.remove(context_path)
                     write_service_status({
                         generation=generation,seq=sequence,state="session_reset",next_due=0,
@@ -387,6 +401,7 @@ function Service.run(job)
                     local interval = math.max(10, tonumber(loaded.interval) or tonumber(Config.READ_INTERVAL) or 60)
                     local first_delay = math.max(5, math.min(interval, tonumber(loaded.first_delay) or interval))
                     local now = os.time()
+                    carry_remaining=math.max(0,math.floor(tonumber(loaded.carry_elapsed) or 0))
                     next_due = now + first_delay
                     last_report_at = now
                     write_context()
@@ -397,6 +412,8 @@ function Service.run(job)
                         next_due = next_due,
                         first_delay = first_delay,
                         carry_elapsed = 0,
+                        carry_consumed = false,
+                        carry_remaining = carry_remaining,
                         service_version = tonumber(job.service_version) or 0,
                     })
                 end
