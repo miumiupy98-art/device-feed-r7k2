@@ -1911,13 +1911,21 @@ function Sync:upload(elapsed, callback, options)
         self.busy = false
         self.state = self.progress_hold and "verification_required" or "waiting"
         local current_record=self:record()
-        if generation_snapshot~=tonumber(self.record_generation or 0)
-            or not current_record or tostring(current_record.book.book_id or "")~=book_id
-            or tostring(current_record.path or "")~=path_snapshot then
+        local same_book=current_record
+            and tostring(current_record.book.book_id or "")==book_id
+            and tostring(current_record.path or "")==path_snapshot
+        local generation_changed=generation_snapshot~=tonumber(self.record_generation or 0)
+        local allow_same_book_generation=options.allow_same_book_generation_change==true and same_book
+        if not same_book or (generation_changed and not allow_same_book_generation) then
             logger.warn("[MiuRead][ReadReport] stale book worker result ignored",
                 "book=",book_id,"generation=",tostring(generation_snapshot))
             if callback then callback(false,"书籍已切换，本次旧同步结果已忽略") end
             return
+        end
+        if generation_changed and allow_same_book_generation then
+            logger.info("[MiuRead][ReadingEnd] same-book generation advanced; final result retained",
+                "book=",book_id,"from=",tostring(generation_snapshot),
+                "to=",tostring(self.record_generation or 0))
         end
         self.store:reload()
         local current_auth=self.store:auth()
@@ -2115,6 +2123,7 @@ function Sync:upload_progress(callback, options)
         return self:upload(0,callback,{
             silent=true,progress_only=true,
             position_override=options.position_override,
+            allow_same_book_generation_change=options.reading_end==true,
         })
     end
     local started, resolve_error = self:resolve_local_progress(function(position, err, meta)
@@ -2125,6 +2134,7 @@ function Sync:upload_progress(callback, options)
         self:upload(0,callback,{
             silent=true,progress_only=true,
             position_override=position,
+            allow_same_book_generation_change=options.reading_end==true,
         })
     end,{
         precise=true,
@@ -3209,6 +3219,15 @@ end
 
 function Sync:start(reason)
     self.last_activity = os.time()
+    if (self.host and (self.host._reading_end_barrier_active==true
+            or self.host._reading_end_sync_active==true))
+        or self.reading_end_finalized==true then
+        self.state="stopped"
+        self.last_stage="结束阅读收尾中"
+        logger.info("[MiuRead][ReadReport] start deferred",
+            "reason=reading_end_barrier","requested=",tostring(reason or "start"))
+        return false,"结束阅读收尾中"
+    end
     if reason == "reader_ready" or reason == "resume" or reason == "enabled"
         or tonumber(self.session_started_at or 0) <= 0
     then
@@ -3358,6 +3377,14 @@ end
 
 function Sync:on_reader_ready()
     self:_import_daemon_status(true)
+    if self.host and (self.host._reading_end_barrier_active==true
+        or self.host._reading_end_sync_active==true) then
+        local ending_record=self:record()
+        if ending_record then self.current=ending_record end
+        logger.info("[MiuRead][ReadingEnd] reader-ready deferred until finalizer completes",
+            "book=",tostring(ending_record and ending_record.book and ending_record.book.book_id or "-"))
+        return true
+    end
     local ready_record=self:record()
     local ready_job=self.daemon and read_json_file(self.daemon.paths.job) or {}
     if self.daemon and self.daemon.active and ready_record
@@ -3427,6 +3454,11 @@ function Sync:on_suspend(options)
     if generation>0 and generation==tonumber(self.suspend_generation or 0) then return true end
     if generation>0 then self.suspend_generation=generation end
     self.suspended = true
+    if options.reading_end_active==true then
+        logger.info("[MiuRead][ReadingEnd] suspend barrier keeps final sync owner",
+            "progress_worker=",tostring(self.async and self.async:busy() or false),
+            "final_time=",tostring(self.daemon and self.daemon.final_flush_pending==true or false))
+    end
 
     local r=self.current
     local now=os.time()

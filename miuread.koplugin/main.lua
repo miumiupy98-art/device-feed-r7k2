@@ -7974,19 +7974,24 @@ function Plugin:_show_home_sync_popup(anchor)
             .."  划线 "..tostring(summary.highlight)
             .."  想法 "..tostring(summary.thought)
     end
+    local actions={}
+    if (tonumber(summary.annotation_action_required or 0) or 0)>0 then
+        actions[#actions+1]={icon="warning",label="批注待确认",
+            detail=tostring(summary.annotation_action_required).." 条 · 查看具体书籍和原因",
+            callback=function() self:show_annotation_sync_issues() end}
+    end
+    actions[#actions+1]={icon="⇅",label="同步待处理内容",detail="进度 时间 划线与想法",callback=function() self:_sync_home_pending() end}
+    actions[#actions+1]={icon="i",label="查看同步详情",detail="分别查看四类数据状态",callback=function() self:show_sync_status(false) end}
+    actions[#actions+1]={icon="⚙",label="同步设置",detail="开关 可见范围 提醒与诊断",callback=function()
+        self:_show_standalone_menu("同步设置",self:sync_settings_menu())
+    end}
     ActionSheet.show{
         cache_key="home_sync",
         anchor=anchor,
         preferred_direction="below",
         title="同步",
         subtitle=subtitle,
-        actions={
-            {icon="⇅",label="同步待处理内容",detail="进度 时间 划线与想法",callback=function() self:_sync_home_pending() end},
-            {icon="i",label="查看同步详情",detail="分别查看四类数据状态",callback=function() self:show_sync_status(false) end},
-            {icon="⚙",label="同步设置",detail="开关 可见范围 提醒与诊断",callback=function()
-                self:_show_standalone_menu("同步设置",self:sync_settings_menu())
-            end},
-        },
+        actions=actions,
         wide_last=true,
     }
 end
@@ -17559,7 +17564,10 @@ function Plugin:show_annotation_sync_issues(book_id)
         failures=LocalAnnotationDatabase.global_failures(self.store,100) or {}
     end
     if #failures==0 then
-        self:info("当前没有需要人工处理的批注同步问题。")
+        -- If the header was showing an old global count, clear it immediately
+        -- and rebuild the summary instead of leaving a ghost “1”.
+        self:_invalidate_annotation_sync_summary()
+        self:info("当前没有需要人工处理的批注同步问题。\n\n主页状态已重新检查。")
         return true
     end
     local kind_label={bookmark="书签",highlight="划线",thought="想法"}
@@ -17680,7 +17688,7 @@ function Plugin:_home_sync_status_label(force)
         return "待重新检查 "..tostring(summary.annotation_upgrade_recheck)
     end
     if summary.annotation_action_required>0 then
-        return "需处理 "..tostring(summary.annotation_action_required)
+        return "批注待确认 "..tostring(summary.annotation_action_required)
     end
     if summary.failed>0 then return "失败 "..tostring(summary.failed) end
     if summary.total>0 then return "待同步 "..tostring(summary.total) end
@@ -17868,7 +17876,7 @@ function Plugin:sync_menu()
         {text="同步待处理内容",post_text="进度 划线 想法",callback=function() self:_sync_home_pending() end},
     }
     if (tonumber(summary.annotation_action_required or 0) or 0)>0 then
-        rows[#rows+1]={text="批注同步问题",post_text=tostring(summary.annotation_action_required).." 条需处理",callback=function() self:show_annotation_sync_issues() end}
+        rows[#rows+1]={text="批注待确认",post_text=tostring(summary.annotation_action_required).." 条 · 查看书籍与原因",callback=function() self:show_annotation_sync_issues() end}
     end
     for _,row in ipairs(self:sync_settings_menu()) do rows[#rows+1]=row end
     if self:_current_book_record() then
@@ -20846,8 +20854,20 @@ function Plugin:on_sync_record_ready(current)
         -- memory. Once Sync resolves the canonical book id, backfill that id
         -- without a synchronous disk flush or another delayed timer.
         self:_record_recent_read(path,current.book,current.record)
-        self:_schedule_current_book_repair_check(current,false)
     end
+    -- A late identity result is allowed to finish while the device is locking,
+    -- but it must not restart cloud checks or the 60 s worker after the final
+    -- reading position has already been frozen. This was the beta.3 suspend race.
+    local reading_end_barrier=self._reading_end_barrier_active==true
+        or self._reading_end_sync_active==true
+        or (self.sync and self.sync.reading_end_finalized==true)
+        or self._miuread_suspended==true or HOME_SESSION.suspended==true
+    if reading_end_barrier then
+        logger.info("[MiuRead][ReadingEnd] late reader record accepted without restart",
+            "book=",tostring(current and current.book and current.book.book_id or "-"))
+        return
+    end
+    if current and current.book then self:_schedule_current_book_repair_check(current,false) end
     local sync_prefs=self.store:preferences().sync or {}
     local need_cloud_check=sync_prefs.pull_on_open~=false or self:progress_upload_mode()=="continuous"
     if sync_prefs.time_enabled==true and self:progress_upload_mode()~="continuous" then
@@ -21444,6 +21464,12 @@ function Plugin:_reading_end_sync(reason,options,callback)
     local current=self:_current_book_record()
     if not (current and current.book) then return false end
 
+    -- Establish the barrier before any final-position work. Reader identity,
+    -- progress verification and resume callbacks may complete in the same tick
+    -- as Suspend; none of them may start a new periodic worker from this point.
+    self._reading_end_barrier_active=true
+    self._reading_end_barrier_reason=reason
+
     if self._local_annotation_snapshot_task then
         UIManager:unschedule(self._local_annotation_snapshot_task)
         self._local_annotation_snapshot_task=nil
@@ -21459,6 +21485,13 @@ function Plugin:_reading_end_sync(reason,options,callback)
     if need_progress and self.sync then
         local ok,value=pcall(self.sync._position_for_report,self.sync,nil,true)
         if ok and type(value)=="table" and value.safe==true then position=value end
+    end
+    if position then
+        logger.info("[MiuRead][ReadingEnd] final position captured",
+            "reason=",reason,"book=",tostring(book_id or "-"),
+            "chapter=",tostring(position.chapter_uid or position.chapter_index or "-"),
+            "offset=",tostring(position.offset or position.chapter_offset or "-"),
+            "progress=",tostring(position.progress or "-"))
     end
     local annotation_summary=book_id~="" and (LocalAnnotationDatabase.summary(self.store,book_id) or {}) or {}
     local annotation_retryable=(tonumber(annotation_summary.pending or 0) or 0)+(tonumber(annotation_summary.delete_pending or 0) or 0)
@@ -21477,7 +21510,11 @@ function Plugin:_reading_end_sync(reason,options,callback)
     if not online then need_progress=false; need_annotations=false end
     if need_progress and not position then need_progress=false end
     local tasks=(need_time and 1 or 0)+(need_progress and 1 or 0)+(need_annotations and 1 or 0)
-    if tasks<=0 then return false end
+    if tasks<=0 then
+        self._reading_end_barrier_active=false
+        self._reading_end_barrier_reason=nil
+        return false
+    end
 
     self._reading_end_sync_active=true
     self._reading_end_sync_waiters={}
@@ -21493,7 +21530,11 @@ function Plugin:_reading_end_sync(reason,options,callback)
         if pending>0 then return end
         finished=true
         self._reading_end_sync_active=false
+        self._reading_end_barrier_active=false
+        self._reading_end_barrier_reason=nil
         if timeout_task then UIManager:unschedule(timeout_task); timeout_task=nil end
+        logger.info("[MiuRead][ReadingEnd] finalizer completed",
+            "reason=",reason,"ok=",tostring(not failed))
         local waiters=self._reading_end_sync_waiters or {}
         self._reading_end_sync_waiters=nil
         for _,fn in ipairs(waiters) do pcall(fn,not failed,{failed=failed,local_saved=true}) end
@@ -21504,6 +21545,10 @@ function Plugin:_reading_end_sync(reason,options,callback)
         finished=true
         failed=true
         self._reading_end_sync_active=false
+        self._reading_end_barrier_active=false
+        self._reading_end_barrier_reason=nil
+        logger.warn("[MiuRead][ReadingEnd] finalizer timeout",
+            "reason=",reason,"timeout=",tostring(timeout))
         if self.sync and self.sync.async then pcall(self.sync.async.cancel,self.sync.async,"reading_end_timeout") end
         if self.annotation_async then pcall(self.annotation_async.cancel,self.annotation_async,"reading_end_timeout") end
         local waiters=self._reading_end_sync_waiters or {}
@@ -21562,7 +21607,7 @@ function Plugin:_reading_end_sync(reason,options,callback)
                 end)
             end
             verify_close_progress()
-        end,{position_override=position})
+        end,{position_override=position,reading_end=true})
         if not started then complete_one(false) end
     end
 
@@ -21987,18 +22032,36 @@ function Plugin:onSuspend()
         else download_reason="check_failed" end
     end
     local sync_continue=false
-    if self.ui and self.ui.document and self.sync and self.sync.reading_end_finalized~=true then
-        sync_continue=self:_reading_end_sync("休眠",{show_status=false,timeout=10},function(ok)
+    local sync_candidate=self.ui and self.ui.document and self.sync and self.sync.reading_end_finalized~=true
+    if sync_candidate then
+        -- Hold standby *before* starting the finalizer. beta.3 acquired this lock
+        -- afterwards, leaving a race where Kindle Suspend could park the worker
+        -- between final-position capture and the network request.
+        local hold_ok,hold_result=pcall(UIManager.preventStandby,UIManager)
+        self._reading_end_standby_held=hold_ok==true and hold_result~=false
+        sync_continue=self:_reading_end_sync("休眠",{show_status=false,timeout=8},function(ok)
+            if PowerState.state()=="BACKGROUND_LOCKED" then
+                local final_power=PowerState.transition("REAL_SUSPEND","reading_end_complete",{
+                    download_active=self.download_task and self.download_task:busy() or false,
+                    download_continue=false,sync_continue=false,
+                })
+                logger.info("[MiuRead][Power] reading-end lock released",
+                    "to=",tostring(final_power.state),"generation=",tostring(final_power.generation))
+            end
             if self._reading_end_standby_held then
                 self._reading_end_standby_held=false
                 pcall(UIManager.allowStandby,UIManager)
             end
-            if not ok then logger.warn("[MiuRead][ReadingEnd] suspend sync incomplete; local state retained") end
+            if ok then
+                logger.info("[MiuRead][ReadingEnd] suspend sync completed")
+            else
+                logger.warn("[MiuRead][ReadingEnd] suspend sync incomplete; local state retained")
+            end
         end)==true
-    end
-    if sync_continue then
-        local ok=pcall(UIManager.preventStandby,UIManager)
-        self._reading_end_standby_held=ok==true
+        if not sync_continue and self._reading_end_standby_held then
+            self._reading_end_standby_held=false
+            pcall(UIManager.allowStandby,UIManager)
+        end
     end
     local power_target=download_continue and "DOWNLOAD_LOCKED" or (sync_continue and "BACKGROUND_LOCKED" or "REAL_SUSPEND")
     local power=PowerState.transition(power_target,"onSuspend",{
@@ -22098,7 +22161,8 @@ function Plugin:onSuspend()
         "rebuild=",tostring(reader_rebuild_active()),"rotation=true","resume=true",
         "power=",power_target,"generation=",tostring(power.generation))
     if suspend_sync and type(suspend_sync.on_suspend)=="function" then
-        suspend_sync:on_suspend{power_state=power_target,generation=power.generation,preserve_final_flush=sync_continue}
+        suspend_sync:on_suspend{power_state=power_target,generation=power.generation,
+            preserve_final_flush=sync_continue,reading_end_active=sync_continue}
     end
 end
 function Plugin:onResume()

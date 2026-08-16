@@ -749,8 +749,9 @@ function LocalAnnotationDatabase.global_summary(store)
                 local schema_version=tonumber(SQLiteStore.get_text(conn, "local_annotation_schema_version") or 0) or 0
                 local statement = conn:prepare([[
                     SELECT kind, sync_state, COUNT(*) FROM local_annotations
-                     WHERE sync_state IN
-                        ('local_only','locate_failed','metadata_failed','coord_failed','unknown','delete_pending','delete_unknown','held_local')
+                     WHERE (present = 1 AND sync_state IN
+                        ('local_only','locate_failed','metadata_failed','coord_failed','unknown','held_local'))
+                        OR sync_state IN ('delete_pending','delete_unknown')
                      GROUP BY kind, sync_state
                 ]])
                 local touched = false
@@ -798,11 +799,12 @@ function LocalAnnotationDatabase.pending_books(store, limit)
             pcall(function()
                 local schema_version=tonumber(SQLiteStore.get_text(conn, "local_annotation_schema_version") or 0) or 0
                 local states=schema_version < LocalAnnotationDatabase.SCHEMA_VERSION
-                    and "('local_only','locate_failed','metadata_failed','coord_failed','unknown','delete_pending','delete_unknown')"
-                    or "('local_only','unknown','delete_pending','delete_unknown')"
+                    and "('local_only','locate_failed','metadata_failed','coord_failed','unknown')"
+                    or "('local_only','unknown')"
                 local statement = conn:prepare([[
                     SELECT book_id, kind, sync_state, COUNT(*) FROM local_annotations
-                     WHERE sync_state IN ]]..states..[[
+                     WHERE (present = 1 AND sync_state IN ]]..states..[[)
+                        OR sync_state IN ('delete_pending','delete_unknown')
                      GROUP BY book_id, kind, sync_state
                 ]])
                 while true do
@@ -847,7 +849,7 @@ function LocalAnnotationDatabase.failures(store, book_id, limit)
                    text, selected_text, anchor_text, note, chapter_uid,
                    chapter_idx, updated_at
               FROM local_annotations
-             WHERE book_id = ?
+             WHERE book_id = ? AND present = 1
                AND sync_state IN ('locate_failed','metadata_failed','coord_failed')
              ORDER BY updated_at DESC LIMIT ?
         ]])
@@ -884,7 +886,8 @@ function LocalAnnotationDatabase.global_failures(store, limit)
                            text, selected_text, anchor_text, note, chapter_uid,
                            chapter_idx, updated_at
                       FROM local_annotations
-                     WHERE sync_state IN ('locate_failed','metadata_failed','coord_failed')
+                     WHERE present = 1
+                       AND sync_state IN ('locate_failed','metadata_failed','coord_failed')
                      ORDER BY updated_at DESC LIMIT ?
                 ]])
                 statement:bind(limit - #out)
