@@ -1926,14 +1926,24 @@ function Plugin:_home_mutate_book_rows(book_id,mutator)
     book_id=tostring(book_id or "")
     if book_id=="" or type(mutator)~="function" then return false end
     local changed=false
-    for _,section in pairs(self._home_sections or {}) do
-        for _,book in ipairs(section.rows or {}) do
-            if tostring(book.bookId or book.book_id or "")==book_id then
-                mutator(book)
-                changed=true
-            end
+    local seen={}
+    local function apply(book)
+        if type(book)~="table" or seen[book] then return end
+        if tostring(book.bookId or book.book_id or "")==book_id then
+            seen[book]=true
+            mutator(book)
+            changed=true
         end
     end
+    for _,section in pairs(self._home_sections or {}) do
+        for _,book in ipairs(section.rows or {}) do apply(book) end
+    end
+    -- Cloud pages are hydrated as bounded visible copies. Keep the rendered
+    -- page in sync with live download/status mutations without hydrating the
+    -- rest of the cloud shelf.
+    local current=HomeView.current()
+    for _,book in ipairs(current and current.opts and current.opts.shelf_books or {}) do apply(book) end
+    apply(self._home_hero)
     return changed
 end
 
@@ -4033,6 +4043,8 @@ function Plugin:_home_apply_cover_path(book_id,path)
     for _,section in pairs(self._home_sections or {}) do
         for _,book in ipairs(section.rows or {}) do apply(book) end
     end
+    local current=HomeView.current()
+    for _,book in ipairs(current and current.opts and current.opts.shelf_books or {}) do apply(book) end
     if hero_id==book_id and self._home_hero then
         self:_home_update_lockscreen_session(self._home_hero)
     end
@@ -4297,6 +4309,7 @@ function Plugin:_home_apply_section(section)
         home.page_by_section and home.page_by_section[section],
         self:_home_page_limit()
     )
+    preview=self:_home_prepare_cloud_page(section,preview)
     if not home.page_by_section or tonumber(home.page_by_section[section])~=page then
         local current,preferences=self:_home_preferences()
         current.page_by_section=type(current.page_by_section)=="table" and current.page_by_section or {}
@@ -4461,6 +4474,9 @@ function Plugin:_home_apply_rendered_cover_path(book_id,path)
     for key,section in pairs(self._home_sections or {}) do
         for _,book in ipairs(section.rows or {}) do apply(book,key) end
     end
+    local current=HomeView.current()
+    local active=self._home_active_section or "account"
+    for _,book in ipairs(current and current.opts and current.opts.shelf_books or {}) do apply(book,active) end
     return changed,hero_changed,sections
 end
 
@@ -6602,6 +6618,60 @@ function Plugin:_home_attach_local_record(row)
         if not row.cover_path and record.cover_path then row.cover_path=record.cover_path end
     end
     return row
+end
+
+function Plugin:_home_cloud_rows(remote_rows,source)
+    source=(source=="mp") and "mp" or "account"
+    local rows={}
+    for _,row in ipairs(type(remote_rows)=="table" and remote_rows or {}) do
+        if type(row)=="table" then
+            local id=tostring(row.bookId or row.book_id or "")
+            if id~="" then
+                -- Keep the cached cloud row lightweight. Home page creation only
+                -- needs ordering/count fields here; local state and cover-file
+                -- validation are deferred until this row is actually visible.
+                row.bookId=id
+                row.shelf_section="account"
+                row.source=source
+                row.local_only=false
+                row.in_account_shelf=true
+                row.remote_status_known=true
+                rows[#rows+1]=row
+            end
+        end
+    end
+    return rows
+end
+
+function Plugin:_home_prepare_cloud_page(section,rows)
+    if section~="account" and section~="mp" then return rows or {} end
+    local prepared={}
+    local library_snapshot=self.store:library()
+    local sessions_snapshot=self.store:get("sessions",{})
+    for _,remote in ipairs(type(rows)=="table" and rows or {}) do
+        local id=tostring(type(remote)=="table" and (remote.bookId or remote.book_id) or "")
+        if id~="" then
+            -- Only visible rows pay the cost of examining local variants/files.
+            local local_book=self.library:local_book(id,library_snapshot,sessions_snapshot)
+            local row=self.library:account_row(remote,local_book)
+            if row then
+                row.shelf_section="account"
+                row.source=section
+                self:_home_attach_local_record(row)
+                row.description=row.description or row.intro or row.summary
+                prepared[#prepared+1]=row
+            end
+        end
+    end
+    -- Session progress, active-download state and cached-cover validation are
+    -- intentionally bounded to the current Home page (normally eight books).
+    self:_prepare_shelf_rows(prepared)
+    for _,row in ipairs(prepared) do
+        row.status_text=self:_home_status_text(row,false)
+    end
+    logger.info("[MiuRead][HomePage] cloud page prepared",
+        "section=",tostring(section),"visible=",tostring(#prepared))
+    return prepared
 end
 
 function Plugin:_home_miuread_rows()
@@ -13840,6 +13910,11 @@ end
 
 function Plugin:_home_prepare_hero_book(book)
     if type(book)~="table" then return nil end
+    local source=tostring(book.source or "")
+    if source=="account" or source=="mp" then
+        local prepared=self:_home_prepare_cloud_page(source,{book})
+        if prepared[1] then book=prepared[1] end
+    end
     local hero=U.copy(book)
     hero.heading="最近阅读"
     hero.source_text=self:_home_source_text(hero)
@@ -13940,20 +14015,11 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     cached_books=type(cached_books)=="table" and cached_books or {}
     cached_mp=type(cached_mp)=="table" and cached_mp or {}
 
-    local account_rows=self:_shelf_rows("account",false,cached_books,{},#cached_books>0)
-    self:_prepare_shelf_rows(account_rows)
-    for _,row in ipairs(account_rows) do
-        self:_home_attach_local_record(row)
-        row.source="account"
-        row.description=row.description or row.intro or row.summary
-        row.status_text=self:_home_status_text(row,false)
-    end
-    local mp_rows=self:_shelf_rows("account",true,{},cached_mp,#cached_mp>0)
-    self:_prepare_shelf_rows(mp_rows)
-    for _,row in ipairs(mp_rows) do
-        row.source="mp"
-        row.status_text=self:_home_status_text(row,false)
-    end
+    -- Cloud sections stay as a lightweight cached index. The Home screen no
+    -- longer scans local variants or validates every cached cover up front.
+    -- Those costs are paid only for the eight books on the visible page.
+    local account_rows=self:_home_cloud_rows(cached_books,"account")
+    local mp_rows=self:_home_cloud_rows(cached_mp,"mp")
 
     local home,home_preferences=self:_home_preferences()
     self:_home_apply_recent_read_times(miuread_rows,local_rows,account_rows,mp_rows)
@@ -13985,6 +14051,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     local selected_preview,shelf_page,shelf_pages=self:_home_preview_page(
         selected.rows,hero,home.page_by_section and home.page_by_section[active],preview_limit
     )
+    selected_preview=self:_home_prepare_cloud_page(active,selected_preview)
     home.page_by_section=type(home.page_by_section)=="table" and home.page_by_section or {}
     if tonumber(home.page_by_section[active])~=shelf_page then
         home.page_by_section[active]=shelf_page
