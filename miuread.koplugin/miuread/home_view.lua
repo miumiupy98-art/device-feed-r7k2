@@ -110,7 +110,7 @@ function TapBox:paintTo(bb, x, y)
     self.dimen.x, self.dimen.y = x, y
     if self[1] then self[1]:paintTo(bb, x, y) end
 end
-function TapBox:onTapSelect()
+function TapBox:onTapSelect(_, ges)
     if self._hold_handled then
         self._hold_handled = false
         return true
@@ -118,7 +118,7 @@ function TapBox:onTapSelect()
     local now=os.clock()
     if now<(tonumber(self._miu_tap_block_until) or 0) then return true end
     self._miu_tap_block_until=now+.20
-    if self.callback then self.callback(self.dimen and self.dimen:copy() or nil) end
+    if self.callback then self.callback(self.dimen and self.dimen:copy() or nil, ges) end
     return true
 end
 function TapBox:onHoldSelect()
@@ -601,7 +601,7 @@ local function shelf_book_card(book, width, height, callback, hold_callback)
         }
     end
     return tappable(width, height, CenterContainer:new{dimen = Geom:new{w = width, h = height}, body},
-        function(anchor) if callback then callback(book, anchor) end end,
+        function(anchor,ges) if callback then callback(book, anchor, ges) end end,
         function(anchor) if hold_callback then hold_callback(book, anchor) end end)
 end
 

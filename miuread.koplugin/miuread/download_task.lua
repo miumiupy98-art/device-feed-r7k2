@@ -573,6 +573,16 @@ local HEAVY_STAGES={
     annotation_batch=true,annotation_apply=true,transform=true,
 }
 local STALL_RECOVERABLE_STAGES={prepare=true,catalog=true,content=true,images=true,resume=true}
+
+local function stall_recovery_seconds(backgrounded,stage)
+    if backgrounded==true then
+        return math.max(60,tonumber(Config.DOWNLOAD_STALL_RECOVERY_SECONDS) or 120)
+    end
+    local configured=type(Config.DOWNLOAD_FOREGROUND_STALL_SECONDS)=="table"
+        and tonumber(Config.DOWNLOAD_FOREGROUND_STALL_SECONDS[tostring(stage or "")]) or nil
+    if configured then return math.max(30,configured) end
+    return math.max(60,tonumber(Config.DOWNLOAD_STALL_RECOVERY_SECONDS) or 120)
+end
 function DownloadTask:is_heavy_stage()
     return HEAVY_STAGES[self:stage()]==true
 end
@@ -640,6 +650,7 @@ function DownloadTask:_read_progress(job)
             job.last_effective_progress_at=job.last_progress_at
         end
         job.waiting_notified = false
+        job.stall_suspect_notified = false
         if self.keep_awake_enabled and not self.backgrounded and not self:is_paused()
             and not self.standby_held then self:_hold_awake() end
         if job.on_progress then job.on_progress(state) end
@@ -985,7 +996,8 @@ function DownloadTask:_poll()
         end
         job.unknown_seen_at=nil
         job.rechecking_notified=false
-        if job.cancel_requested_at and now-job.cancel_requested_at>=8 then
+        local cancel_force=math.max(2,tonumber(Config.DOWNLOAD_CANCEL_FORCE_SECONDS) or 4)
+        if job.cancel_requested_at and now-job.cancel_requested_at>=cancel_force then
             pcall(FFIUtil.terminateSubProcess,job.pid)
             self:_finish(job,"下载已取消")
             return
@@ -996,8 +1008,22 @@ function DownloadTask:_poll()
         -- completely silent, stop the old child instead of leaving the whole
         -- device in a pseudo-hung state for many minutes. Network/rate-limit
         -- wait stages are deliberately excluded.
-        local stall_recovery=math.max(60,tonumber(Config.DOWNLOAD_STALL_RECOVERY_SECONDS) or 120)
         local current_stage=tostring(job.last_progress_state and job.last_progress_state.stage or "unknown")
+        local stall_recovery=stall_recovery_seconds(self.backgrounded,current_stage)
+        local foreground_notice=math.max(10,tonumber(Config.DOWNLOAD_FOREGROUND_STALL_NOTICE_SECONDS) or 25)
+        if not self.backgrounded and not self:is_paused()
+            and STALL_RECOVERABLE_STAGES[current_stage]==true
+            and effective_idle>=foreground_notice and effective_idle<stall_recovery
+            and job.stall_suspect_notified~=true then
+            job.stall_suspect_notified=true
+            local state=U.copy(job.last_progress_state or {})
+            state.message="服务器响应较慢，下载仍在等待；持续无进展会自动从断点恢复"
+            state.updated_at=now
+            if job.on_progress then pcall(job.on_progress,state) end
+            logger.info("[MiuRead][DownloadTask] foreground stall suspected",
+                "stage=",current_stage,"idle=",tostring(effective_idle),
+                "recover_at=",tostring(stall_recovery))
+        end
         if not self:is_paused() and effective_idle>=stall_recovery
             and STALL_RECOVERABLE_STAGES[current_stage]==true then
             if not job.stall_recovery_requested_at then
@@ -1171,7 +1197,7 @@ function DownloadTask:attach(descriptor,on_progress,on_done,restart_book,restart
         hibernate_path=descriptor.hibernate_path,network_path=descriptor.network_path,
         worker_settings_path=descriptor.worker_settings_path,
         on_progress=on_progress,on_done=on_done,last_progress_raw=nil,last_progress_state=nil,
-        last_progress_at=nil,last_effective_progress_at=nil,waiting_started_at=nil,last_keepalive=0,started_at=descriptor.started_at,dead_seen_at=nil,stall_recovery_requested_at=nil,stall_terminal=false,
+        last_progress_at=nil,last_effective_progress_at=nil,waiting_started_at=nil,last_keepalive=0,started_at=descriptor.started_at,dead_seen_at=nil,stall_recovery_requested_at=nil,stall_suspect_notified=false,stall_terminal=false,
         unknown_seen_at=nil,waiting_notified=false,rechecking_notified=false,
         task_token=descriptor.task_token,
         restart_count=tonumber(descriptor.restart_count) or 0,
@@ -1596,6 +1622,7 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
         last_keepalive = 0,
         dead_seen_at = nil,
         stall_recovery_requested_at = nil,
+        stall_suspect_notified = false,
         stall_terminal = false,
         unknown_seen_at = nil,
         waiting_notified = false,

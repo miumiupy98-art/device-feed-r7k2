@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.5.0-beta.23",
+    VERSION = "4.5.0-beta.24",
     SCHEMA = 112,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -43,6 +43,10 @@ local C = {
     COVER_RETRY_DELAYS = {30, 120, 600, 1800},
 
     READ_INTERVAL = 60,
+    -- beta.24 never replays historical/suspend reading-time debt. Normal
+    -- reports stay on the established one-minute cadence and every request is
+    -- independently capped, avoiding burst uploads after reconnect/resume.
+    READ_REPORT_MAX_ELAPSED_SECONDS = 60,
     IDLE_TIMEOUT = 600,
     REMOTE_THRESHOLD = 2,
 
@@ -79,6 +83,9 @@ local C = {
     BACKGROUND_LEASE_TIMEOUT_SECONDS = 300,
     HOME_FOREGROUND_BARRIER_SECONDS = 2.2,
     HOME_POST_READER_BARRIER_SECONDS = 4.0,
+    -- Old taps delayed by a real UI stall are discarded instead of being
+    -- replayed against a different book after the screen catches up.
+    HOME_STALE_TAP_MS = 1200,
     HOME_REMOTE_SHELF_TTL_SECONDS = 30 * 60,
     HOME_LOCAL_SHELF_TTL_SECONDS = 60 * 60,
     HOME_REMOTE_COVER_BATCH = 2,
@@ -140,6 +147,14 @@ local C = {
     -- image transfers emit heartbeats, so large healthy archives are not
     -- mistaken for a stall.
     DOWNLOAD_STALL_RECOVERY_SECONDS = 120,
+    -- beta.24 keeps normal downloads unrestricted, but a progress dialog that
+    -- is actually visible uses stage-aware health thresholds. Catalog/prep
+    -- stalls recover sooner; healthy content/image transfers get more room.
+    DOWNLOAD_FOREGROUND_STALL_NOTICE_SECONDS = 25,
+    DOWNLOAD_FOREGROUND_STALL_SECONDS = {
+        prepare = 50, catalog = 45, resume = 50, content = 75, images = 90,
+    },
+    DOWNLOAD_CANCEL_FORCE_SECONDS = 4,
     DOWNLOAD_STALL_RESTART_GRACE_SECONDS = 3,
     DOWNLOAD_STALL_AUTO_RESTARTS = 1,
     DOWNLOAD_TRANSFER_HEARTBEAT_SECONDS = 3,
@@ -153,6 +168,9 @@ local C = {
     HEAVY_NATIVE_HIBERNATE_KB = 96 * 1024,
     HEAVY_NATIVE_CRITICAL_KB = 64 * 1024,
     HEAVY_DOWNLOAD_RESUME_MIN_KB = 72 * 1024,
+    -- Remote cover fetching may coexist with a healthy download. It yields only
+    -- when a heavy download stage and real memory pressure overlap.
+    DOWNLOAD_COVER_COEXIST_MIN_KB = 80 * 1024,
     DOWNLOAD_HIBERNATE_WAIT_SECONDS = 8,
     DOWNLOAD_INTERACTION_RESUME_DELAY = 2.5,
     -- beta.21 foreground arbitration: ordinary UI interaction no longer hard-pauses

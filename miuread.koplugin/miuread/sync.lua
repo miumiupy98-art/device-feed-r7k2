@@ -18,7 +18,7 @@ Sync.__index = Sync
 local legacy_daemon_retired = false
 
 local CONTEXT_MAX_AGE = 15 * 60
-local READ_REPORT_SERVICE_VERSION = 16
+local READ_REPORT_SERVICE_VERSION = 17
 local FIRST_REPORT_DELAY = 10
 local FINAL_REPORT_MIN_SECONDS = 10
 local PRECISE_POSITION_LEAD_SECONDS = 12
@@ -2591,12 +2591,10 @@ function Sync:_import_daemon_status(force)
     if status_book_id~="" then
         self.pending_report_elapsed=0
         self.pending_report_status_at=tonumber(status.completed_at) or os.time()
-        -- Suspend carry is consumed only when the worker actually includes it
-        -- in a post-resume request. Merely observing an inactive/waiting status
-        -- must not erase locally preserved reading time.
+        -- beta.24 never persists report carry. Older status files may still
+        -- advertise carry_consumed after OTA, but they are normalized to zero.
         if status.carry_consumed == true then
-            local remaining=math.max(0,math.floor(tonumber(status.carry_remaining) or 0))
-            self.store:save_session(status_book_id,{pending_report_seconds=remaining})
+            self.store:save_session(status_book_id,{pending_report_seconds=0})
         end
     end
     if status.state == "service_waiting" or status.state == "inactive" then
@@ -2891,7 +2889,13 @@ function Sync:_start_daemon(reason)
     end
     self.pending_report_elapsed=0
     self.pending_report_status_at=os.time()
-    local carry_elapsed=math.max(0,math.floor(tonumber(session.pending_report_seconds) or 0))
+    -- beta.24 does not replay previously cached reading-time debt. Clear any
+    -- beta.17-beta.23 carry that may still exist after OTA and continue from
+    -- fresh reading only.
+    local carry_elapsed=0
+    if math.max(0,math.floor(tonumber(session.pending_report_seconds) or 0))>0 then
+        self.store:save_session(book_id,{pending_report_seconds=0})
+    end
     local existing_job=read_json_file(daemon.paths.job) or {}
     local same_account=tostring(existing_job.login_session_id or "")==login_session_id
         and tostring(existing_job.account_vid or "")==account_vid
@@ -3347,30 +3351,16 @@ function Sync:on_suspend(options)
 
     local r=self.current
     local now=os.time()
-    local started=tonumber(self.session_started_at or 0) or 0
-    local uploaded=tonumber(self.last_upload or 0) or 0
-    local observed=tonumber(self.pending_report_status_at or 0) or 0
-    local attempted=tonumber(self.last_attempt or 0) or 0
-    local tail=0
-    if self.time_enabled==true and r and started>0 then
-        -- Do not replay an interval that was already attempted but returned an
-        -- uncertain/failed response. Only preserve fresh time since the most
-        -- recent worker observation/attempt.
-        tail=math.max(0,now-math.max(started,uploaded,observed,attempted))
-        tail=math.min(tail,math.max(FINAL_REPORT_MIN_SECONDS,tonumber(Config.READ_INTERVAL) or 60))
-        if tail<FINAL_REPORT_MIN_SECONDS then tail=0 end
-    end
 
     if r and r.book and tostring(r.book.book_id or "")~="" then
         local book_id=tostring(r.book.book_id)
         local saved=self.store:session(book_id) or {}
-        local prior=math.max(0,math.floor(tonumber(saved.pending_report_seconds) or 0))
-        local maximum=math.max(60,(tonumber(Config.READ_INTERVAL) or 60)*5)
-        local carry=math.min(maximum,prior+tail)
         local position=type(saved.local_position_snapshot)=="table" and U.copy(saved.local_position_snapshot) or nil
         local patch={
             last_read_at=now,last_read_path=r.path,
-            pending_report_seconds=carry,
+            -- Suspend is network-silent and also debt-silent: no elapsed time is
+            -- queued for post-resume replay. Fresh reading starts a new interval.
+            pending_report_seconds=0,
             suspend_generation=generation>0 and generation or nil,
             suspend_power_state=tostring(options.power_state or "REAL_SUSPEND"),
         }
@@ -3385,9 +3375,8 @@ function Sync:on_suspend(options)
         end
         -- One small synchronous local write; no delayed post-suspend flush.
         self.store:save_session(book_id,patch,true)
-        logger.info("[MiuRead][ReadReport] suspend tail cached",
-            "book=",book_id,"tail=",tostring(tail),"carry=",tostring(carry),
-            "position_cached=",tostring(position~=nil),
+        logger.info("[MiuRead][ReadReport] suspend parked without time replay",
+            "book=",book_id,"position_cached=",tostring(position~=nil),
             "power=",tostring(options.power_state or "REAL_SUSPEND"))
     end
     return self:_park_daemon_for_suspend("suspend")

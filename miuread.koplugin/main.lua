@@ -8,6 +8,7 @@ local UIManager=require("ui/uimanager")
 local Device=require("device")
 local Blitbuffer=require("ffi/blitbuffer")
 local Event=require("ui/event")
+local Time=require("ui/time")
 local WidgetContainer=require("ui/widget/container/widgetcontainer")
 local logger=require("logger")
 local ok_socket,socket=pcall(require,"socket")
@@ -3314,6 +3315,20 @@ function Plugin:_background_claim(key,options,retry)
     key=tostring(key or "background")
     options.blocked_reason=self:_background_block_reason(options)
 
+    -- beta.24 allows visible cover fetching to coexist with a healthy download.
+    -- It yields only when a heavy download stage overlaps with genuine memory
+    -- pressure, avoiding the old all-or-nothing "downloading means no covers"
+    -- trade-off.
+    if not options.blocked_reason and key=="home_cover"
+        and self.download_task and self.download_task:busy() and not self.download_task:is_hibernated()
+        and self.download_task:is_heavy_stage() then
+        local memory=RuntimePressure.memory_snapshot(false)
+        local minimum=math.max(1,tonumber(Config.DOWNLOAD_COVER_COEXIST_MIN_KB) or 80*1024)
+        if memory and tonumber(memory.available_kb or 0)<minimum then
+            options.blocked_reason="download_memory_pressure"
+        end
+    end
+
     -- beta.19 extends the single-heavy-worker rule to the independent download
     -- subprocess. Automatic heavy maintenance simply waits. A user-requested
     -- heavy task asks the downloader to reach a cooperative pause checkpoint;
@@ -3360,7 +3375,8 @@ function Plugin:_background_claim(key,options,retry)
     if retryable and type(retry)=="function" then
         local retry_delay=options.retry_delay or tonumber(Config.BACKGROUND_RETRY_SECONDS) or .9
         if reason=="memory_critical" then retry_delay=math.max(4.0,tonumber(retry_delay) or .9) end
-        if reason=="download_yielding" or reason=="download_hibernating" or reason=="download_heavy" then
+        if reason=="download_yielding" or reason=="download_hibernating" or reason=="download_heavy"
+            or reason=="download_memory_pressure" then
             retry_delay=math.max(.4,math.min(1.5,tonumber(retry_delay) or .9))
         end
         self.background_scheduler:defer(key,retry,{
@@ -4265,6 +4281,7 @@ function Plugin:_home_change_page(delta)
     local target=math.max(1,math.min(total,current+(tonumber(delta) or 0)))
     if target==current then return true end
     home.page_by_section[section]=target
+    self._home_page_changed_at=Time.now()
     self:_home_bump_interaction_generation()
     self:_save_home_preferences_deferred(home,preferences)
     return self:_home_apply_section(section)
@@ -4286,6 +4303,15 @@ function Plugin:_home_apply_section(section)
         current.page_by_section[section]=page
         self:_save_home_preferences_deferred(current,preferences)
     end
+    -- Keep the "visible work" target in sync with the page that is actually
+    -- on screen. beta.23 could continue preparing covers from the previous page
+    -- after a fast page turn, wasting memory and making the new page feel slow.
+    local visible_targets={}
+    if self._home_hero then visible_targets[#visible_targets+1]=self._home_hero end
+    for _,book in ipairs(preview or {}) do visible_targets[#visible_targets+1]=book end
+    self._home_visible_metadata_targets=visible_targets
+    self._home_visible_cover_targets=visible_targets
+
     local started=os.clock()
     local updated=HomeView.update_section{
         tabs=self:_home_build_tabs(section),
@@ -4294,7 +4320,7 @@ function Plugin:_home_apply_section(section)
         shelf_page=page,
         shelf_pages=total_pages,
         empty_text=selected.empty,
-        on_open_book=function(book,anchor) self:_home_open_book(book,anchor) end,
+        on_open_book=function(book,anchor,ges) self:_home_open_book(book,anchor,ges) end,
         on_hold_book=function(book,anchor) self:_home_hold_book(book,anchor) end,
         home_actions=self:_home_action_entries(),
         on_shelf_all=function()
@@ -4321,6 +4347,7 @@ function Plugin:_set_home_section(section)
     local home,preferences=self:_home_preferences()
     if home.active_section==section and self._home_active_section==section then return end
     home.active_section=section
+    self._home_page_changed_at=Time.now()
     self:_home_bump_interaction_generation()
     self:_save_home_preferences_deferred(home,preferences)
     if self:_home_apply_section(section) then
@@ -6818,7 +6845,30 @@ function Plugin:_show_home_book_open_popup(book,anchor)
     return true
 end
 
-function Plugin:_home_open_book(book,anchor)
+function Plugin:_home_open_book(book,anchor,ges)
+    -- A tap carries KOReader's monotonic gesture timestamp. If the touch began
+    -- before the most recent shelf page/section switch but is only dispatched
+    -- afterwards, it belongs to the old surface and must never open the book
+    -- now occupying the same coordinates. Normal taps take this path with zero
+    -- added delay.
+    if ges and ges.time then
+        local stale=false
+        local age_ms=nil
+        local ok_age,value=pcall(function() return Time.to_ms(Time.now()-ges.time) end)
+        if ok_age then age_ms=tonumber(value) end
+        if age_ms and age_ms>math.max(500,tonumber(Config.HOME_STALE_TAP_MS) or 1200) then
+            stale=true
+        elseif self._home_page_changed_at then
+            local ok_page,before_page=pcall(function() return ges.time < self._home_page_changed_at end)
+            stale=ok_page and before_page==true
+        end
+        if stale then
+            logger.warn("[MiuRead][HomeInput] stale book tap discarded",
+                "book=",tostring(book and (book.bookId or book.book_id) or ""),
+                "age_ms=",tostring(age_ms or "unknown"))
+            return true
+        end
+    end
     if book and (book.local_folder==true or book.kind=="folder") then
         local folder_path=LocalLibrary.normalize(book.folder_path or book.path)
         local root_path=LocalLibrary.normalize(book.root_path or folder_path)
@@ -6838,10 +6888,20 @@ function Plugin:_home_open_book(book,anchor)
     self:_home_attach_local_record(book)
     local record=id~="" and self:_preferred_record(id) or nil
     if record and record.file and U.file_exists(record.file) then
+        local now=monotonic_wall_time()
+        local lock=self._home_book_open_lock
+        if type(lock)=="table" and now-(tonumber(lock.started_at) or 0)<4 then
+            logger.warn("[MiuRead][HomeInput] duplicate book open discarded",
+                "requested=",id,"active=",tostring(lock.book_id or ""))
+            return true
+        end
+        self._home_book_open_lock={book_id=id,started_at=now}
         book.file=record.file
         self:_home_update_lockscreen_session(book)
         self:_home_stop_background("opening book")
-        return self:_open_file_direct(record.file)
+        local opened=self:_open_file_direct(record.file)
+        if opened==false then self._home_book_open_lock=nil end
+        return opened
     end
     if id~="" then return self:_show_home_book_open_popup(book,anchor) end
     self:info("本地书籍记录不存在")
@@ -9112,7 +9172,6 @@ function Plugin:_home_schedule_local_metadata(books)
 end
 
 function Plugin:_home_schedule_remote_covers(books)
-    if self._download_runtime~=nil then return false end
     if self:_home_ui_busy() then
         self._home_resume_pending_work=self._home_resume_pending_work or {}
         self._home_resume_pending_work.covers=true
@@ -9173,7 +9232,6 @@ function Plugin:_home_schedule_remote_covers(books)
     end
     local function apply_batch()
         if generation~=self._home_cover_generation or not HomeView.is_shown() or self:_active_reader_ui() then return end
-        if self._download_runtime~=nil then return end
         if changed_count<=0 then return end
         for section in pairs(changed_sections) do self:_home_bump_section_revision(section) end
         local active=self._home_active_section or "account"
@@ -9214,10 +9272,6 @@ function Plugin:_home_schedule_remote_covers(books)
     local function next_cover()
         if generation~=self._home_cover_generation or not HomeView.is_shown() or self:_active_reader_ui() then
             release("cancelled")
-            return
-        end
-        if self._download_runtime~=nil then
-            release("download active")
             return
         end
         if self:_home_ui_busy() then
@@ -13753,6 +13807,7 @@ function Plugin:_complete_reader_close(generation,reason)
     HOME_RETURN_FILE=nil
     persist_home_session()
     self:_set_foreground("home")
+    self._home_book_open_lock=nil
     self:_close_reader_recovery_surface()
     self:_release_reader_transition_guard("home restored after stable close")
     self:_home_enter_post_reader_priority_window(4.0,"stable reader close")
@@ -13801,7 +13856,7 @@ function Plugin:_home_prepare_hero_book(book)
     elseif variant:find("clean",1,true) then
         hero.edition_text="纯净版"
     end
-    hero.on_tap=function(anchor) self:_home_open_book(hero,anchor) end
+    hero.on_tap=function(anchor,ges) self:_home_open_book(hero,anchor,ges) end
     hero.on_refresh_metadata=function() self:_home_refresh_current_network_metadata(hero) end
     return hero
 end
@@ -13943,6 +13998,8 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     self._home_panel_sync_label=self:progress_sync_label()
     self._home_panel_download_detail=""
     self._home_panel_status_text=(home_alerts[1] and tostring(home_alerts[1].title or "")) or ""
+    self._home_page_changed_at=Time.now()
+    self._home_book_open_lock=nil
     local view,err=HomeView.show({
         title="觅阅",
         wifi_text=self:_home_wifi_text(),
@@ -13973,7 +14030,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         on_menu=function() self:show_home_menu() end,
         on_back=function() return self:_home_handle_back() end,
         on_empty_account=function() self:_home_open_section(active) end,
-        on_open_book=function(book,anchor) self:_home_open_book(book,anchor) end,
+        on_open_book=function(book,anchor,ges) self:_home_open_book(book,anchor,ges) end,
         on_hold_book=function(book,anchor) self:_home_hold_book(book,anchor) end,
         home_actions=self:_home_action_entries(),
         on_shelf_all=function()
@@ -14192,6 +14249,7 @@ function Plugin:_restore_home_after_reader_close(attempt,generation)
         HOME_RETURN_FILE=nil
         persist_home_session()
         self:_set_foreground("home")
+        self._home_book_open_lock=nil
         self:_home_schedule_clock()
         self:_close_reader_recovery_surface()
         self:_release_reader_transition_guard("home already visible")
@@ -17975,7 +18033,8 @@ function Plugin:show_sync_status(detail)
     if detail then
         lines[#lines+1]=""
         lines[#lines+1]="详细信息"
-        lines[#lines+1]="单次阅读时间上限：30 秒"
+        lines[#lines+1]="常规阅读时间上报周期：约 60 秒"
+        lines[#lines+1]="历史失败/休眠时长：不补传"
         lines[#lines+1]="后台服务版本："..tostring(s.service_version or "—")
         if s.last_elapsed then lines[#lines+1]="上次提交时长："..tostring(s.last_elapsed).." 秒" end
         if s.last_stage then lines[#lines+1]="当前阶段："..U.first_line(s.last_stage,160) end

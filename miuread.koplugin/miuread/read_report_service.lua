@@ -210,15 +210,15 @@ function Service.run(job)
             consecutive_failures=consecutive_failures+1
             return 0
         end
-        -- Keep every request within one normal reporting interval. A small
-        -- suspend tail may be carried into the first post-resume request. The
-        -- carry is consumed when an attempt is made, matching the existing
-        -- no-replay rule for uncertain/failed intervals.
-        local base_elapsed=math.max(1,math.min(interval,math.floor(tonumber(elapsed) or interval)))
-        local room=math.max(0,interval-base_elapsed)
-        local carry_used=final_flush and 0 or math.min(carry_remaining,room)
-        elapsed=base_elapsed+carry_used
-        carry_remaining=math.max(0,carry_remaining-carry_used)
+        -- beta.24: never turn suspended/failed history into a later burst. Every
+        -- request contains only the fresh interval that led to this attempt and
+        -- is capped independently, even if an older service job still contains
+        -- a legacy carry value after OTA.
+        local maximum=math.max(10,tonumber(Config.READ_REPORT_MAX_ELAPSED_SECONDS) or 60)
+        local base_elapsed=math.max(1,math.min(interval,maximum,math.floor(tonumber(elapsed) or interval)))
+        local carry_used=0
+        elapsed=base_elapsed
+        carry_remaining=0
         sequence = sequence + 1
         local report_book=U.copy(book or {})
         report_book.book_id=tostring(current_job.book_id or "")
@@ -401,7 +401,8 @@ function Service.run(job)
                     local interval = math.max(10, tonumber(loaded.interval) or tonumber(Config.READ_INTERVAL) or 60)
                     local first_delay = math.max(5, math.min(interval, tonumber(loaded.first_delay) or interval))
                     local now = os.time()
-                    carry_remaining=math.max(0,math.floor(tonumber(loaded.carry_elapsed) or 0))
+                    -- Historical suspend debt is intentionally not replayed.
+                    carry_remaining=0
                     next_due = now + first_delay
                     last_report_at = now
                     write_context()
