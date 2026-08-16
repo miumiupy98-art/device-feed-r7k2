@@ -134,6 +134,13 @@ local C = {
     HEAVY_DOWNLOAD_RESUME_MIN_KB = 72 * 1024,
     DOWNLOAD_HIBERNATE_WAIT_SECONDS = 8,
     DOWNLOAD_INTERACTION_RESUME_DELAY = 2.5,
+    -- beta.20 keeps foreground interaction responsive without hard-pausing the
+    -- whole downloader. Home gestures publish a short-lived yield window that
+    -- the worker observes only at safe checkpoints; the timestamp expires on
+    -- its own even if a UI callback is lost.
+    DOWNLOAD_INTERACTION_YIELD_SECONDS = 2.2,
+    DOWNLOAD_INTERACTION_YIELD_MAX_DELAY = 0.35,
+    DOWNLOAD_TRANSIENT_PAUSE_MAX_SECONDS = 10,
     HEAVY_WATCH_SECONDS = 10,
 
     -- beta.17 power lifecycle: short resumes are diagnosed but never forced

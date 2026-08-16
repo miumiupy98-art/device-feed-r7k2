@@ -637,8 +637,6 @@ function Plugin:init()
     self.memory_mode=MemoryMode:new(self.store)
     self.performance_mode=PerformanceMode:new(self.store)
     self.background_scheduler=BackgroundScheduler:new()
-    self._reader_interaction_resume_task=nil
-    self._reader_interaction_resume_generation=0
     self._performance_prompt_pending=nil
     self._performance_prompt_dialog=nil
     self.book_repair=DataMigration:new(self.store)
@@ -3662,7 +3660,14 @@ function Plugin:_home_note_interaction(first,kind)
     if self.home_cover_async and self.home_cover_async:busy() then self.home_cover_async:cancel("home interaction") end
     if self.cover_render_async and self.cover_render_async:busy() then self.cover_render_async:cancel("home interaction") end
     self:_background_cancel_all("home interaction",false,false)
-    if self.download_task and self.download_task:busy() then self.download_task:pause("home_interaction") end
+    if self.download_task and self.download_task:busy() then
+        -- Home interaction no longer hard-pauses the whole download worker.
+        -- Publish a short-lived cooperative yield window instead: networking
+        -- can keep moving, while CPU/memory-heavy checkpoints wait for the UI
+        -- to become quiet. The timestamp expires without a matching callback,
+        -- so opening the download progress surface cannot strand the worker.
+        self.download_task:yield_for_interaction(Config.DOWNLOAD_INTERACTION_YIELD_SECONDS,"home_interaction")
+    end
     self:_home_resume_visible_work_after_idle()
     if first then
         logger.info("[MiuRead][HomePerf] interaction priority","kind=",tostring(kind or "input"))
@@ -10182,34 +10187,6 @@ function Plugin:home_preview_menu()
     }
 end
 
-function Plugin:_schedule_reader_interaction_resume(target)
-    self._reader_interaction_resume_generation=(tonumber(self._reader_interaction_resume_generation) or 0)+1
-    local generation=self._reader_interaction_resume_generation
-    if self._reader_interaction_resume_task then
-        UIManager:unschedule(self._reader_interaction_resume_task)
-        self._reader_interaction_resume_task=nil
-    end
-    local task
-    task=function()
-        if self._reader_interaction_resume_task~=task
-            or generation~=self._reader_interaction_resume_generation then return end
-        if self._miuread_suspended==true or HOME_SESSION.suspended==true then
-            self._reader_interaction_resume_task=nil
-            return
-        end
-        local now=os.time()
-        local deadline=math.max(tonumber(target) or 0,tonumber(self._reader_busy_until or 0) or 0)
-        if deadline>now then
-            UIManager:scheduleIn(math.max(.25,deadline-now+.15),task)
-            return
-        end
-        self._reader_interaction_resume_task=nil
-        if self.download_task then self.download_task:resume("reader_interaction") end
-    end
-    self._reader_interaction_resume_task=task
-    UIManager:scheduleIn(math.max(.25,(tonumber(target) or os.time())-os.time()+.15),task)
-end
-
 function Plugin:_mark_reader_busy(seconds,share_report)
     local path=tostring(self._reader_busy_path or "")
     if path=="" then return false end
@@ -10223,13 +10200,9 @@ function Plugin:_mark_reader_busy(seconds,share_report)
     -- written only when a visible panel gesture specifically asks the report
     -- subprocess to yield, or while a download is already competing for I/O.
     if active_download or share_report==true then wrote=U.atomic_write(path,tostring(target),true)==true end
-    -- Reading interaction always wins over background generation. This used to
-    -- happen only in optional lightweight mode, which is why active downloads
-    -- could still make the first page turn or pull-down panel feel sticky.
-    if active_download and self.download_task then
-        self.download_task:pause("reader_interaction")
-        self:_schedule_reader_interaction_resume(target)
-    end
+    -- beta.20 no longer hard-pauses the complete worker for every page turn.
+    -- This shared busy timestamp expires by itself; the child slows ordinary
+    -- work while CPU/memory-heavy checkpoints wait for the reader to go quiet.
     return wrote
 end
 
@@ -21162,11 +21135,6 @@ function Plugin:onSuspend()
     -- No interaction/helper timer is allowed to wake or poll background work
     -- after Suspend has taken ownership. The download marker is normalized
     -- after these timers are cancelled so no stale callback can re-pause it.
-    self._reader_interaction_resume_generation=(tonumber(self._reader_interaction_resume_generation) or 0)+1
-    if self._reader_interaction_resume_task then
-        UIManager:unschedule(self._reader_interaction_resume_task)
-        self._reader_interaction_resume_task=nil
-    end
     if self._reader_toolbar_state_task then
         UIManager:unschedule(self._reader_toolbar_state_task)
         self._reader_toolbar_state_task=nil
