@@ -1,5 +1,11 @@
 # Changelog
 
+## 4.6.0-beta.6 - 2026-08-17
+
+- 统一手动、结束阅读、休眠与连续模式的精确进度上传路径：自动上传不再使用 `_position_for_report()` 的近似 fallback，优先复用完整 SourcePosition 原生 `wr_data_co` 坐标。
+- 修复云端 `chapterOffset` 被错误按章节 `wordCount` 截断的问题；原生 `co` 保持 raw-XHTML UTF-16 坐标，并在后台反向映射成精确 fractional progress，避免 5993/8325 被误读成 5531。
+- 所有进度提交无论接口是否显式 accepted 都执行云端回读确认；阅读时间 final flush 与阅读进度结果拆分日志/状态，未确认进度保留为 pending，不再被“final upload success”掩盖。
+- 删除“回到阅读处/回到当前位置”及 GoBackLink 入口，原位置改为“返回主页”；连续进度模式只有取得原生精确坐标时才上传进度，否则该周期仅上传阅读时间。
 ## 4.6.0-beta.5 - 2026-08-16
 
 - 修复最近阅读延迟：Reader 确认当前书后立即写入统一会话快照并同步锁屏目标；返回主页前局部替换“最近阅读”卡片，不再依赖整页刷新或后台书架重算。

@@ -193,7 +193,11 @@ function Service.run(job)
         local interval = math.max(10, tonumber(current_job.interval) or tonumber(Config.READ_INTERVAL) or 60)
         -- The service process may be reused across books, but every reporting
         -- request is bound to one generation, book and immutable core map.
-        local time_only=current_job.time_only==true
+        -- A continuous-progress job starts conservatively in time-only mode and
+        -- the foreground controller enables position reporting only after an
+        -- exact native wr_data_co has been captured for this interval.  Honor
+        -- the live control flag instead of freezing the mode at service start.
+        local time_only=current_job.time_only==true or control.time_only==true
         if tostring(control.book_id or "")~=tostring(current_job.book_id or "")
             or tostring(control.core_map_hash or "")~=tostring(current_job.core_map_hash or "")
             or tonumber(control.record_generation or -1)~=tonumber(current_job.record_generation or 0)

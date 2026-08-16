@@ -2019,6 +2019,7 @@ function Store:invalidate_book_sync_context(id,reason,core_map_hash)
         "legacy_report_context","report_context","report_login_session_id","report_core_map_hash",
         "remote_verified","verified_at","verified_reason","verified_local_percent","verified_remote_percent",
         "verification_login_session_id","progress_upload_state","progress_upload_verified_at","progress_upload_source",
+        "pending_progress","progress_upload_error","progress_upload_pending_at",
         "pending_report_seconds"
     }) do row[field]=nil end
     row.sync_context_invalidated_at=os.time()

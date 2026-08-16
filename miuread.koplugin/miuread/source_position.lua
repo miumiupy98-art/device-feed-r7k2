@@ -234,4 +234,110 @@ function M.locate(reader, record, anchor)
     }
 end
 
+local function catalog_row(catalog, wanted_uid, wanted_idx)
+    catalog = type(catalog) == "table" and catalog or {}
+    wanted_uid = tostring(wanted_uid or "")
+    wanted_idx = tonumber(wanted_idx)
+    local selected, before, total = nil, 0, 0
+    for index, row in ipairs(catalog) do
+        local words = chapter_words(row)
+        local uid = chapter_uid(row)
+        local idx = chapter_index(row, index)
+        local matches = wanted_uid ~= "" and uid == wanted_uid
+            or (wanted_uid == "" and wanted_idx ~= nil and (idx == wanted_idx or index == wanted_idx))
+        if not selected and matches then
+            selected = {row=row, index=index, before=before, words=words}
+        end
+        total = total + words
+        if not selected then before = before + words end
+    end
+    if not selected then return nil, "remote_chapter_not_in_catalog" end
+    if selected.words <= 0 or total <= 0 then return nil, "remote_catalog_word_counts_missing" end
+    selected.total = total
+    return selected
+end
+
+local function nearest_text_index(map, html_boundary)
+    local runes = type(map) == "table" and map.runes or nil
+    local html_to_text = type(map) == "table" and map.html_to_text or nil
+    local text_runes = type(map) == "table" and map.text_runes or nil
+    if type(runes) ~= "table" or type(html_to_text) ~= "table"
+        or type(text_runes) ~= "table" or #text_runes == 0 then
+        return nil, "remote_source_text_map_missing"
+    end
+    local boundary = math.max(1, math.min(#runes + 1, math.floor(tonumber(html_boundary) or 1)))
+    for i = boundary, #runes do
+        local t = html_to_text[i]
+        local r = t and text_runes[t] or nil
+        if t and r and not r:match("%s") and r ~= "*" then return t end
+    end
+    for i = math.min(boundary - 1, #runes), 1, -1 do
+        local t = html_to_text[i]
+        local r = t and text_runes[t] or nil
+        if t and r and not r:match("%s") and r ~= "*" then return t end
+    end
+    return nil, "remote_source_text_boundary_missing"
+end
+
+-- Cloud chapterOffset is the Web Reader's raw-XHTML UTF-16 coordinate, not a
+-- wordCount offset. Convert it back through the same source map used by local
+-- uploads before deriving a fractional whole-book progress. The raw `co` is
+-- preserved verbatim for upload verification.
+function M.remoteProgress(reader, record, remote, catalog)
+    remote = type(remote) == "table" and remote or {}
+    local uid = tostring(remote.chapter_uid or remote.chapterUid or "")
+    local idx = tonumber(remote.chapter_idx or remote.chapterIndex)
+    local co = tonumber(remote.offset or remote.chapter_offset or remote.chapterOffset)
+    if uid == "" then return nil, "remote_chapter_uid_missing" end
+    if co == nil then return nil, "remote_chapter_offset_missing" end
+
+    local selected, catalog_error = catalog_row(catalog, uid, idx)
+    if not selected then return nil, catalog_error end
+    local anchor = {
+        chapter_uid = uid,
+        chapter_index = chapter_index(selected.row, idx or selected.index),
+        chapter_title = tostring(selected.row.title or ""),
+        book_version = tonumber(type(record) == "table" and type(record.book) == "table"
+            and (record.book.version or record.book.bookVersion) or nil) or 0,
+    }
+    local coord_html, cache_hit, fetch_error = fetch_coord_html(reader, record, anchor)
+    if not coord_html then return nil, fetch_error end
+    local built_ok, map = pcall(PosMap.build, coord_html)
+    if not built_ok or type(map) ~= "table" then
+        return nil, "remote_source_map_build_failed:" .. tostring(map)
+    end
+    local resolved, resolve_error = WRCo.toMap(map, co)
+    if not resolved then return nil, resolve_error end
+    local text_index, text_error = nearest_text_index(map, resolved.rune_boundary)
+    if not text_index then return nil, text_error end
+    local norm_before = norm_count_before(map, text_index)
+    local norm_total = type(map.norm_map) == "table" and #map.norm_map or 0
+    if norm_before == nil or norm_total <= 0 then return nil, "remote_normalized_text_missing" end
+
+    local within = U.clamp(norm_before / norm_total, 0, 1)
+    local word_offset = math.max(0, math.min(selected.words,
+        math.floor(selected.words * within + 0.5)))
+    local percent = U.clamp(((selected.before + word_offset) / selected.total) * 100, 0, 100)
+    local out = U.copy(remote)
+    out.raw_percent = tonumber(out.raw_percent or out.percent)
+    out.percent = percent
+    out.calculated_percent = percent
+    out.chapter_uid = chapter_uid(selected.row) ~= "" and chapter_uid(selected.row) or uid
+    out.chapter_idx = chapter_index(selected.row, selected.index)
+    out.offset = math.max(0, math.floor(co + 0.5))
+    out.chapter_offset = out.offset
+    out.chapter_word_count = selected.words
+    out.total_word_count = selected.total
+    out.words_before = selected.before
+    out.source_word_offset = word_offset
+    out.chapter_ratio = within
+    out.position_basis = "wr_data_co"
+    out.offset_basis = "wr_data_co"
+    out.native_offset = true
+    out.native_resolved = true
+    out.native_exact = resolved.exact ~= false
+    out.source_cache_hit = cache_hit == true
+    return out
+end
+
 return M
