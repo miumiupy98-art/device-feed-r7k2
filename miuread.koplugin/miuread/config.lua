@@ -10,10 +10,6 @@ local C = {
     UPDATE_CHANNEL = "beta",
     UPDATE_CHANNEL_LABEL = "内测通道",
     UPDATE_MANIFEST = "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/beta-channel/update-beta.json",
-    UPDATE_MANIFESTS = {
-        "https://github.com/miumiupy98-art/device-feed-r7k2/releases/download/beta-channel/update-beta.json",
-        "https://raw.githubusercontent.com/miumiupy98-art/device-feed-r7k2/main/update-beta.json",
-    },
 
     -- 仅作为 GitHub 官方资源访问失败时的回退入口。
     -- 下载后仍会执行大小与 SHA-256 校验，镜像不能改变安装内容。

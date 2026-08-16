@@ -435,3 +435,46 @@ jobs:
             echo "::error::固定 Beta 更新清单尚不可用或内容校验失败。"
             exit 1
           fi
+
+      - name: Sync legacy beta manifest bridge
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # beta.27 and older builds may have remembered main/update-beta.json.
+          # Keep that bridge current until those clients have moved to 4.6+.
+          ENCODED="$(base64 -w 0 "dist/$MANIFEST_NAME")"
+          SHA="$(gh api "repos/$GITHUB_REPOSITORY/contents/$MANIFEST_NAME?ref=main" --jq '.sha' 2>/dev/null || true)"
+          ARGS=(
+            -X PUT
+            -f message="chore: sync beta update manifest for $VERSION"
+            -f content="$ENCODED"
+            -f branch="main"
+          )
+          if [ -n "$SHA" ]; then
+            ARGS+=( -f sha="$SHA" )
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/contents/$MANIFEST_NAME" "${ARGS[@]}" >/dev/null
+
+          EXPECTED="$(sha256sum "dist/$MANIFEST_NAME" | awk '{print $1}')"
+          success=0
+          URL="https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/$MANIFEST_NAME"
+          for attempt in $(seq 1 12); do
+            rm -f dist/legacy-manifest.json
+            if curl --fail --location --silent --show-error \
+                --connect-timeout 20 --max-time 60 \
+                --output dist/legacy-manifest.json "$URL"; then
+              ACTUAL="$(sha256sum dist/legacy-manifest.json | awk '{print $1}')"
+              if [ "$ACTUAL" = "$EXPECTED" ]; then
+                success=1
+                break
+              fi
+            fi
+            sleep 5
+          done
+          if [ "$success" != "1" ]; then
+            echo "::error::旧版 Beta 更新桥接清单同步失败。"
+            exit 1
+          fi

@@ -200,6 +200,8 @@ function Updater:check()
     if #urls==0 then return nil,"更新地址未配置" end
     local errors={}
     local fallback
+    local current_fallback
+    local canonical=tostring(Config.UPDATE_MANIFEST or "")
     for _,url in ipairs(urls) do
         local ok,m=pcall(function()
             return self.http:get_json(url,{
@@ -217,13 +219,13 @@ function Updater:check()
             if valid then
                 local cleaned,text_error=clean_manifest_text(m)
                 if not cleaned then
-                    if not fallback then
+                    if not fallback or U.semver_newer(m.version,fallback.version) then
                         fallback=U.copy(m)
                         fallback._manifest_source_url=url
+                        fallback.notes="更新说明显示异常 可继续下载安装"
+                        fallback.summary=fallback.notes
+                        fallback.name=tostring(m.name or "")
                     end
-                    fallback.notes="更新说明显示异常 可继续下载安装"
-                    fallback.summary=fallback.notes
-                    fallback.name=tostring(m.name or "")
                     errors[#errors+1]=text_error
                     logger.warn("[MiuRead][Updater] manifest text rejected",url,
                         "replacement_chars=",tostring(U.replacement_char_count(m.notes or "")),
@@ -234,11 +236,19 @@ function Updater:check()
                     if cleaned.name~=nil then m.name=cleaned.name end
                     logger.info("[MiuRead][Updater] manifest loaded",url,"version=",tostring(m.version),
                         "notes_utf8_valid=true")
-                    if not U.semver_newer(m.version,self.version) then
-                        return {current=true,version=m.version,name=m.name,notes=m.notes,_manifest_source_url=url}
+                    if U.semver_newer(m.version,self.version) then
+                        m._manifest_source_url=url
+                        return m
                     end
-                    m._manifest_source_url=url
-                    return m
+                    local current={current=true,version=m.version,name=m.name,notes=m.notes,_manifest_source_url=url}
+                    if url==canonical then
+                        return current
+                    end
+                    if not current_fallback or U.semver_newer(m.version,current_fallback.version) then
+                        current_fallback=current
+                    end
+                    logger.warn("[MiuRead][Updater] non-authoritative manifest is not newer; checking canonical route",
+                        url,"version=",tostring(m.version))
                 end
             else
                 errors[#errors+1]=reason
@@ -249,12 +259,13 @@ function Updater:check()
         end
     end
     if fallback then
-        if not U.semver_newer(fallback.version,self.version) then
-            return {current=true,version=fallback.version,name=fallback.name,notes=fallback.notes,
+        if U.semver_newer(fallback.version,self.version) then return fallback end
+        if not current_fallback or U.semver_newer(fallback.version,current_fallback.version) then
+            current_fallback={current=true,version=fallback.version,name=fallback.name,notes=fallback.notes,
                 _manifest_source_url=fallback._manifest_source_url}
         end
-        return fallback
     end
+    if current_fallback then return current_fallback end
     return nil,errors[#errors] or "无法读取更新清单"
 end
 
