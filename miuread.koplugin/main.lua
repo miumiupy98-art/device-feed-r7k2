@@ -3659,7 +3659,7 @@ end
 
 function Plugin:_home_enter_post_reader_priority_window(seconds,reason)
     if not HomeView.is_shown() then return false end
-    local duration=math.max(2.0,tonumber(seconds) or tonumber(Config.HOME_POST_READER_BARRIER_SECONDS) or 4.0)
+    local duration=math.max(1.5,tonumber(seconds) or tonumber(Config.HOME_POST_READER_BARRIER_SECONDS) or 1.8)
     self._home_post_reader_protect_until=math.max(
         tonumber(self._home_post_reader_protect_until) or 0,monotonic_wall_time()+duration)
     -- beta.22: returning to Home is a foreground barrier, not a destructive
@@ -4576,15 +4576,15 @@ function Plugin:_home_schedule_cover_derivatives(books)
     end
     if not self.cover_render_async or not self.cover_render_async:available() then return false end
     local lightweight=self:_lightweight_enabled()
-    local derivative_limit=math.max(1,tonumber(Config.HOME_DERIVATIVE_COVER_BATCH)
-        or tonumber(Config.LIGHTWEIGHT_DERIVATIVE_COVER_QUEUE) or 1)
-    local derivative_gap=math.max(.65,tonumber(Config.HOME_DERIVATIVE_COVER_GAP_SECONDS)
-        or (lightweight and tonumber(Config.LIGHTWEIGHT_DERIVATIVE_GAP)) or 1.0)
+    local derivative_limit=math.max(1,tonumber(lightweight and Config.LIGHTWEIGHT_DERIVATIVE_COVER_QUEUE
+        or Config.HOME_DERIVATIVE_COVER_BATCH) or 1)
+    local derivative_gap=math.max(.40,tonumber(lightweight and Config.LIGHTWEIGHT_DERIVATIVE_GAP
+        or Config.HOME_DERIVATIVE_COVER_GAP_SECONDS) or (lightweight and 1.1 or .50))
 
     local check_started=monotonic_wall_time()
     local sw,sh=Device.screen:getWidth(),Device.screen:getHeight()
     if sw<=0 or sh<=0 then return false end
-    local thumb_w,thumb_h=HomeView.shelf_thumbnail_size(tonumber(Config.HOME_COVER_THUMB_OVERSAMPLE) or 1.12)
+    local thumb_w,thumb_h=HomeView.shelf_thumbnail_size(tonumber(Config.HOME_COVER_THUMB_OVERSAMPLE) or 1.22)
     thumb_w=math.max(96,math.min(360,tonumber(thumb_w) or math.floor(sw*.25+.5)))
     thumb_h=math.max(132,math.min(520,tonumber(thumb_h) or math.floor(thumb_w/.70+.5)))
     local render_dir=self.store.data_dir.."/cover-render-v1"
@@ -4812,7 +4812,7 @@ function Plugin:_home_schedule_cover_derivatives(books)
             "rendered=",tostring(#result.value),"fresh=",tostring(fresh_count),
             "elapsed_ms=",tostring(math.floor((monotonic_wall_time()-render_started)*1000+.5)),
             "lightweight=",tostring(lightweight))
-        -- One derivative per batch. If more visible books still need home3,
+        -- A small derivative batch runs at a time. If more visible books still need home3,
         -- keep the queue alive and continue only after another idle gap.
         if HomeView.is_shown() and not self:_active_reader_ui() then
             self.background_scheduler:defer("home_cover_render",retry,{
@@ -9248,12 +9248,12 @@ function Plugin:_home_schedule_remote_covers(books)
         return false
     end
     local lightweight=self:_lightweight_enabled()
-    local queue_limit=math.max(1,tonumber(Config.HOME_REMOTE_COVER_BATCH)
-        or (lightweight and tonumber(Config.LIGHTWEIGHT_REMOTE_COVER_QUEUE)) or 2)
-    local cover_gap=math.max(.65,tonumber(Config.HOME_REMOTE_COVER_GAP_SECONDS)
-        or (lightweight and tonumber(Config.LIGHTWEIGHT_COVER_GAP)) or 1.15)
-    local derivative_gap=math.max(.65,tonumber(Config.HOME_DERIVATIVE_COVER_GAP_SECONDS)
-        or (lightweight and tonumber(Config.LIGHTWEIGHT_DERIVATIVE_GAP)) or 1.15)
+    local queue_limit=math.max(1,tonumber(lightweight and Config.LIGHTWEIGHT_REMOTE_COVER_QUEUE
+        or Config.HOME_REMOTE_COVER_BATCH) or (lightweight and 2 or 4))
+    local cover_gap=math.max(.35,tonumber(lightweight and Config.LIGHTWEIGHT_COVER_GAP
+        or Config.HOME_REMOTE_COVER_GAP_SECONDS) or (lightweight and 1.0 or .45))
+    local derivative_gap=math.max(.40,tonumber(lightweight and Config.LIGHTWEIGHT_DERIVATIVE_GAP
+        or Config.HOME_DERIVATIVE_COVER_GAP_SECONDS) or (lightweight and 1.1 or .50))
     self._home_cover_inflight=type(self._home_cover_inflight)=="table" and self._home_cover_inflight or {}
     local queue,seen={},{}
     for _,book in ipairs(books or {}) do
@@ -9335,7 +9335,7 @@ function Plugin:_home_schedule_remote_covers(books)
         -- A no-op retry is cheap when every visible cover is already cached.
         if generation==self._home_cover_generation and HomeView.is_shown() and not self:_active_reader_ui() then
             self.background_scheduler:defer("home_cover",retry,{
-                delay=math.max(1.0,cover_gap),priority=25,reason="progressive visible covers"
+                delay=math.max(.45,cover_gap),priority=25,reason="progressive visible covers"
             })
         end
     end

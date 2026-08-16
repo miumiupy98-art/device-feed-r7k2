@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.5.0-beta.25",
+    VERSION = "4.5.0-beta.26",
     SCHEMA = 112,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -66,10 +66,10 @@ local C = {
     PERFORMANCE_WINDOW_SECONDS = 10 * 60,
     PERFORMANCE_REPEAT_COUNT = 2,
     PERFORMANCE_PROMPT_COOLDOWN = 7 * 24 * 60 * 60,
-    -- Repeated measured lag immediately enables a temporary runtime-only
-    -- protection window. The user's persistent lightweight preference is not
-    -- changed; the temporary flag also reaches an already-running downloader.
-    PERFORMANCE_AUTO_PROTECT_SECONDS = 20 * 60,
+    -- Repeated measured lag enables a temporary UI protection window. In
+    -- beta.26 this no longer throttles an already-running downloader; only a
+    -- manual lightweight choice or real memory pressure is global.
+    PERFORMANCE_AUTO_PROTECT_SECONDS = 10 * 60,
     PERFORMANCE_MEMORY_PROTECT_SECONDS = 30 * 60,
 
     -- Automatic home maintenance is serialized on memory-constrained Kindles.
@@ -81,18 +81,18 @@ local C = {
     BACKGROUND_SERIAL_GAP_SECONDS = 0.35,
     BACKGROUND_RETRY_SECONDS = 0.9,
     BACKGROUND_LEASE_TIMEOUT_SECONDS = 300,
-    HOME_FOREGROUND_BARRIER_SECONDS = 2.2,
-    HOME_POST_READER_BARRIER_SECONDS = 4.0,
+    HOME_FOREGROUND_BARRIER_SECONDS = 0.9,
+    HOME_POST_READER_BARRIER_SECONDS = 1.8,
     -- Old taps delayed by a real UI stall are discarded instead of being
     -- replayed against a different book after the screen catches up.
     HOME_STALE_TAP_MS = 1200,
     HOME_REMOTE_SHELF_TTL_SECONDS = 30 * 60,
     HOME_LOCAL_SHELF_TTL_SECONDS = 60 * 60,
-    HOME_REMOTE_COVER_BATCH = 2,
-    HOME_REMOTE_COVER_GAP_SECONDS = 1.15,
-    HOME_DERIVATIVE_COVER_BATCH = 1,
-    HOME_DERIVATIVE_COVER_GAP_SECONDS = 1.15,
-    HOME_COVER_THUMB_OVERSAMPLE = 1.12,
+    HOME_REMOTE_COVER_BATCH = 4,
+    HOME_REMOTE_COVER_GAP_SECONDS = 0.45,
+    HOME_DERIVATIVE_COVER_BATCH = 2,
+    HOME_DERIVATIVE_COVER_GAP_SECONDS = 0.50,
+    HOME_COVER_THUMB_OVERSAMPLE = 1.22,
 
     -- Different user-visible operations have different normal costs.
     -- Only repeated slow samples of the SAME kind are combined. A single
@@ -106,19 +106,19 @@ local C = {
         reader_home = {slow_ms = 4000, extreme_ms = 8000, repeat_count = 2, single_extreme = true},
     },
 
-    -- Lightweight mode does not disable features. It gives the foreground
-    -- longer quiet windows, refreshes automatic sources less often, and
-    -- processes metadata/covers in smaller batches with wider gaps.
+    -- Lightweight mode does not disable features. Standard mode is faster in
+    -- beta.26 now that Home only works on the visible page; lightweight mode
+    -- keeps smaller cover batches and wider gaps as a fallback.
     LIGHTWEIGHT_HOME_REMOTE_TTL = 30 * 60,
     LIGHTWEIGHT_HOME_LOCAL_TTL = 60 * 60,
     LIGHTWEIGHT_HOME_IDLE_DELAY = 6,
     LIGHTWEIGHT_READER_IDLE_SECONDS = 1.5,
     LIGHTWEIGHT_LOCAL_METADATA_QUEUE = 3,
-    LIGHTWEIGHT_REMOTE_COVER_QUEUE = 4,
+    LIGHTWEIGHT_REMOTE_COVER_QUEUE = 2,
     LIGHTWEIGHT_DERIVATIVE_COVER_QUEUE = 1,
     LIGHTWEIGHT_METADATA_GAP = 0.75,
-    LIGHTWEIGHT_COVER_GAP = 0.65,
-    LIGHTWEIGHT_DERIVATIVE_GAP = 1.0,
+    LIGHTWEIGHT_COVER_GAP = 1.0,
+    LIGHTWEIGHT_DERIVATIVE_GAP = 1.1,
 
     -- Online features are verified by their real request. Renewal is recovery,
     -- never a prerequisite. Diagnostics never include account secrets.
@@ -172,11 +172,11 @@ local C = {
     -- when a heavy download stage and real memory pressure overlap.
     DOWNLOAD_COVER_COEXIST_MIN_KB = 80 * 1024,
     DOWNLOAD_HIBERNATE_WAIT_SECONDS = 8,
-    DOWNLOAD_INTERACTION_RESUME_DELAY = 2.5,
+    DOWNLOAD_INTERACTION_RESUME_DELAY = 1.8,
     -- beta.21 foreground arbitration: ordinary UI interaction no longer hard-pauses
     -- the download worker. Heavy local stages yield behind a short absolute
     -- deadline instead, so a lost UI callback can never strand the task.
-    DOWNLOAD_UI_YIELD_SECONDS = 3,
+    DOWNLOAD_UI_YIELD_SECONDS = 2,
     DOWNLOAD_UI_HEAVY_YIELD_MAX_SECONDS = 4,
     DOWNLOAD_INTERACTION_STALE_SECONDS = 12,
     DOWNLOAD_TRANSITION_STALE_SECONDS = 60,

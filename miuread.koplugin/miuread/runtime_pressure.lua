@@ -6,8 +6,14 @@ local RuntimePressure={}
 local KEY="__MIUREAD_RUNTIME_PRESSURE"
 local state=rawget(_G,KEY)
 if type(state)~="table" then
-    state={until_at=0,reason=nil,last_memory=nil,last_memory_at=0,last_log_at=0,manual_enabled=false}
+    state={until_at=0,reason=nil,global_until_at=0,global_reason=nil,last_memory=nil,last_memory_at=0,last_log_at=0,manual_enabled=false}
     rawset(_G,KEY,state)
+else
+    -- Runtime state survives plugin reloads inside one KOReader process. Older
+    -- beta state has no global fields, so add them without promoting an old
+    -- latency-only window into a downloader throttle.
+    state.global_until_at=tonumber(state.global_until_at) or 0
+    state.global_reason=state.global_reason
 end
 
 local function now()
@@ -18,15 +24,33 @@ local function lightweight_flag()
     return tostring(Config.LIGHTWEIGHT_MODE_FLAG or "/tmp/miuread-lightweight-mode.flag")
 end
 
+local function cleanup_expired(current)
+    current=current or now()
+    if (tonumber(state.until_at) or 0)<=current then
+        state.until_at=0
+        state.reason=nil
+    end
+    if (tonumber(state.global_until_at) or 0)<=current then
+        state.global_until_at=0
+        state.global_reason=nil
+    end
+end
+
+local function global_active(current)
+    current=current or now()
+    cleanup_expired(current)
+    return (tonumber(state.global_until_at) or 0)>current
+end
+
 local function sync_flag(manual_enabled)
     state.manual_enabled=manual_enabled==true
-    local active=(tonumber(state.until_at) or 0)>now()
-    if state.manual_enabled or active then
+    local active_global=global_active(now())
+    if state.manual_enabled or active_global then
         U.atomic_write(lightweight_flag(),"1",true)
     else
         os.remove(lightweight_flag())
     end
-    return state.manual_enabled or active
+    return state.manual_enabled or active_global
 end
 
 local function parse_meminfo(raw)
@@ -49,39 +73,64 @@ local function parse_meminfo(raw)
 end
 
 function RuntimePressure.active()
-    if (tonumber(state.until_at) or 0)<=now() then
-        if state.until_at and state.until_at~=0 then
-            state.until_at=0
-            state.reason=nil
-            sync_flag(state.manual_enabled==true)
-        end
-        return false
-    end
-    return true
+    local current=now()
+    cleanup_expired(current)
+    local active_local=(tonumber(state.until_at) or 0)>current
+    local active_global=(tonumber(state.global_until_at) or 0)>current
+    -- A UI-only protection window must never keep a stale global flag alive.
+    -- This is what prevents a Home lag sample from slowing the download child.
+    if not active_global then sync_flag(state.manual_enabled==true) end
+    return active_local or active_global
+end
+
+function RuntimePressure.global_active()
+    local active=global_active(now())
+    if not active then sync_flag(state.manual_enabled==true) end
+    return active
 end
 
 function RuntimePressure.status()
+    local current=now()
+    cleanup_expired(current)
+    local local_until=tonumber(state.until_at) or 0
+    local global_until=tonumber(state.global_until_at) or 0
+    local is_global=global_until>current
+    local until_at=math.max(local_until,global_until)
+    local reason=is_global and state.global_reason or state.reason
+    if global_until<=local_until and local_until>current then reason=state.reason end
     return {
-        active=RuntimePressure.active(),
-        until_at=tonumber(state.until_at) or 0,
-        reason=state.reason,
+        active=until_at>current,
+        global=is_global,
+        until_at=until_at,
+        reason=reason,
         memory=state.last_memory,
     }
 end
 
-function RuntimePressure.activate(reason,seconds)
-    local duration=math.max(60,tonumber(seconds) or tonumber(Config.PERFORMANCE_AUTO_PROTECT_SECONDS) or 15*60)
-    local target=now()+duration
-    local was_active=RuntimePressure.active()
-    if target>(tonumber(state.until_at) or 0) then state.until_at=target end
-    if reason and tostring(reason)~="" then state.reason=tostring(reason) end
-    sync_flag(state.manual_enabled==true)
+function RuntimePressure.activate(reason,seconds,scope)
+    local duration=math.max(60,tonumber(seconds) or tonumber(Config.PERFORMANCE_AUTO_PROTECT_SECONDS) or 10*60)
     local current=now()
+    local target=current+duration
+    local text=tostring(reason or "")
+    local global=scope=="global"
+        or text=="memory_critical" or text=="memory_low"
+        or text:find("worker_memory:",1,true)==1
+    local was_active=RuntimePressure.active()
+    if global then
+        if target>(tonumber(state.global_until_at) or 0) then state.global_until_at=target end
+        if text~="" then state.global_reason=text end
+    else
+        if target>(tonumber(state.until_at) or 0) then state.until_at=target end
+        if text~="" then state.reason=text end
+    end
+    sync_flag(state.manual_enabled==true)
     if not was_active or current-(tonumber(state.last_log_at) or 0)>=30 then
         state.last_log_at=current
+        local status=RuntimePressure.status()
         logger.warn("[MiuRead][RuntimePressure] temporary protection active",
-            "reason=",tostring(state.reason or "performance"),
-            "seconds=",tostring(math.max(0,(tonumber(state.until_at) or current)-current)))
+            "reason=",tostring(text~="" and text or status.reason or "performance"),
+            "scope=",global and "global" or "ui",
+            "seconds=",tostring(math.max(0,target-current)))
     end
     return true
 end
@@ -89,6 +138,8 @@ end
 function RuntimePressure.clear(reason,manual_enabled)
     state.until_at=0
     state.reason=nil
+    state.global_until_at=0
+    state.global_reason=nil
     sync_flag(manual_enabled==true)
     logger.info("[MiuRead][RuntimePressure] temporary protection cleared",tostring(reason or "manual"))
     return true
@@ -119,9 +170,9 @@ function RuntimePressure.memory_snapshot(force)
         or (memory.available_kb<=soft and "low" or "normal")
     state.last_memory=memory
     if memory.level=="critical" then
-        RuntimePressure.activate("memory_critical",tonumber(Config.PERFORMANCE_MEMORY_PROTECT_SECONDS) or 30*60)
+        RuntimePressure.activate("memory_critical",tonumber(Config.PERFORMANCE_MEMORY_PROTECT_SECONDS) or 30*60,"global")
     elseif memory.level=="low" then
-        RuntimePressure.activate("memory_low",tonumber(Config.PERFORMANCE_MEMORY_PROTECT_SECONDS) or 30*60)
+        RuntimePressure.activate("memory_low",tonumber(Config.PERFORMANCE_MEMORY_PROTECT_SECONDS) or 30*60,"global")
     end
     return memory
 end
@@ -133,7 +184,7 @@ function RuntimePressure.note_worker_failure(label,err)
         or text:find("out of memory",1,true)
         or text:find("enomem",1,true) then
         RuntimePressure.activate("worker_memory:"..tostring(label or "unknown"),
-            tonumber(Config.PERFORMANCE_MEMORY_PROTECT_SECONDS) or 30*60)
+            tonumber(Config.PERFORMANCE_MEMORY_PROTECT_SECONDS) or 30*60,"global")
         RuntimePressure.memory_snapshot(true)
         logger.warn("[MiuRead][RuntimePressure] worker allocation failed",
             "label=",tostring(label or "unknown"),"error=",tostring(err or "unknown"))
