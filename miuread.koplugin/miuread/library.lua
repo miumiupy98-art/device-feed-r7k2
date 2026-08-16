@@ -133,7 +133,6 @@ local function book(row,raw_index,archive_map)
         archiveName=archive and archive.archiveName or nil,
         archiveNames=archive and archive.archiveNamesText or nil,
         inArchive=archive~=nil,
-        raw=row,
     }
 end
 
@@ -195,14 +194,46 @@ local function order_cloud_rows(rows)
     return rows
 end
 
+local function archive_allowed(selected,entry)
+    if not entry then return false end
+    for _,name in ipairs(entry.archiveNames or {}) do
+        if selected[name] then return true end
+    end
+    return false
+end
+
+function Library:_shelf_filter_selection(data)
+    local names={}
+    for _,archive in ipairs(archive_entries(data or {})) do
+        local name=tostring(archive.name or archive.title or archive.archiveName or "书单")
+        if name~="" then names[#names+1]=name end
+    end
+    if self.store and self.store.set_deferred and #names>0 then
+        pcall(self.store.set_deferred,self.store,"shelf_archive_names",names)
+    end
+    if self.load_all_once then
+        self.load_all_once=nil
+        return nil
+    end
+    if not (self.store and self.store.preferences) then return nil end
+    local ok,prefs=pcall(self.store.preferences,self.store)
+    if not ok or type(prefs)~="table" then return nil end
+    local filter=type(prefs.shelf_filter)=="table" and prefs.shelf_filter or {}
+    local selected=type(filter.archives)=="table" and filter.archives or {}
+    if filter.enabled~=true or next(selected)==nil then return nil end
+    return selected
+end
+
 function Library:normalize(data)
     data=type(data)=="table" and data or {}
     local books,mp={},{}
     local seen_books,seen_mp={},{}
     local archive_map=build_archive_map(data)
+    local selected_archives=self:_shelf_filter_selection(data)
     local src=data.books or data.bookList or data.updated or {}
     if type(src)~="table" then src={} end
     local raw_index=0
+    local filtered_out=0
     for _,r in ipairs(src) do
         raw_index=raw_index+1
         local b=book(r,raw_index,archive_map)
@@ -210,9 +241,20 @@ function Library:normalize(data)
             if Protocol.is_mp_account(b.bookId) then
                 if not seen_mp[b.bookId] then mp[#mp+1]=b; seen_mp[b.bookId]=true end
             elseif not Protocol.is_mp(b.bookId) and not seen_books[b.bookId] then
-                books[#books+1]=b; seen_books[b.bookId]=true
+                if selected_archives==nil or archive_allowed(selected_archives,archive_map[b.bookId]) then
+                    books[#books+1]=b
+                    seen_books[b.bookId]=true
+                else
+                    filtered_out=filtered_out+1
+                end
             end
         end
+    end
+    if selected_archives~=nil then
+        self.last_shelf_filter={kept=#books,filtered=filtered_out}
+        logger.info("[MiuRead][ShelfFilter] applied","kept=",tostring(#books),"filtered=",tostring(filtered_out))
+    else
+        self.last_shelf_filter=nil
     end
     local extras={data.mp,data.mpBook,data.officialAccounts}
     for _,x in ipairs(extras) do
