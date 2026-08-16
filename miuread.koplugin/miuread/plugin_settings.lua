@@ -8,7 +8,7 @@ end
 function M.sync(plugin)
     local rows={
         {text="同步状态",post_text=plugin:_home_sync_status_label(),callback=function() plugin:show_sync_status(false) end},
-        {text="同步待处理内容",post_text="进度 时间 划线 想法",callback=function() plugin:_sync_home_pending() end},
+        {text="同步待处理内容",post_text="进度 划线 想法",callback=function() plugin:_sync_home_pending() end},
     }
     append(rows,plugin:sync_settings_menu())
     if plugin:_current_book_record() then
@@ -56,9 +56,8 @@ function M.annotation_sync(plugin)
         }
     end
     return {
-        {text="批注同步",post_text="手动 · 阅读页批注中操作",enabled=false},
-        {text="立即同步入口",post_text="阅读页下滑工具栏 · 批注",enabled=false},
-        {text="自动上传",post_text="暂未开启 · 完成真机验证后开放",enabled=false},
+        {text="结束阅读时上传批注",post_text=plugin:_annotation_close_upload_enabled() and "已开启" or "已关闭",checked_func=function() return plugin:_annotation_close_upload_enabled() end,keep_menu_open=true,callback=function() plugin:toggle_annotation_close_upload() end},
+        {text="立即同步本书批注",post_text="阅读页下滑工具栏 · 批注",enabled=false},
         {text="坐标保护",post_text="raw XHTML · 双向校验 · 官方锚点",enabled=false},
         {text="坐标诊断",post_text="打开书籍后在阅读页批注中导出",enabled=false},
         {text="新想法可见范围",post_text=plugin:annotation_sync_visibility_label(),sub_item_table_func=function() return plugin:annotation_sync_visibility_menu() end},

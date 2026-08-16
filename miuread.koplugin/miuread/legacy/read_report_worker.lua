@@ -471,45 +471,50 @@ local function estimate_position(book, progress_ratio)
     return nil,"no safe chapter found for report position"
 end
 
-local function build_payload(book_id, elapsed_seconds, book, progress_ratio)
-    local position, position_error = estimate_position(book, progress_ratio)
-    if not position then return nil, position_error end
+local function build_payload(book_id, elapsed_seconds, book, progress_ratio, time_only)
+    local position, position_error
+    if time_only ~= true then
+        position, position_error = estimate_position(book, progress_ratio)
+        if not position then return nil, position_error end
+    end
     local payload=WeRead.make_read_payload{
         book_id = book_id,
-        chapter_uid = position.chapter_uid,
-        chapter_idx = position.chapter_idx,
-        chapter_offset = position.chapter_offset,
-        progress = position.progress,
+        chapter_uid = position and position.chapter_uid or nil,
+        chapter_idx = position and position.chapter_idx or nil,
+        chapter_offset = position and position.chapter_offset or nil,
+        progress = position and position.progress or nil,
         summary = book.summary or "",
         elapsed_seconds = elapsed_seconds,
         app_id = book.app_id or WeRead.web_app_id(),
         psvts = book.psvts,
         pclts = book.pclts,
         token = book.token,
+        time_only = time_only == true,
     }
     local public={
         ci=tonumber(payload.ci), co=tonumber(payload.co), pr=tonumber(payload.pr), rt=tonumber(payload.rt),
+        time_only=time_only==true,
         has_app_id=tostring(payload.appId or "")~="", has_ps=tostring(payload.ps or "")~="",
         has_pc=tostring(payload.pc or "")~="", has_signature=tostring(payload.s or "")~="",
         token_source=tostring(book.token or "")~="" and "reader_context" or "default",
         pc_source=tostring(book.pclts or "")~="" and "reader_context" or "generated",
-        payload_fields_complete=tostring(payload.appId or "")~="" and tostring(payload.ps or "")~=""
-            and tostring(payload.pc or "")~="" and tostring(payload.s or "")~="",
-        position_source=position.source,
-        report_chapter_uid=position.chapter_uid,
-        report_chapter_idx=position.chapter_idx,
+        payload_fields_complete=tostring(payload.appId or "")~="" and tostring(payload.pc or "")~=""
+            and tostring(payload.s or "")~="",
+        position_source=position and position.source or nil,
+        report_chapter_uid=position and position.chapter_uid or nil,
+        report_chapter_idx=position and position.chapter_idx or nil,
         local_chapter_uid=book.local_chapter_uid,
         local_chapter_idx=book.local_chapter_idx,
         remote_chapter_uid=book.remote_chapter_uid,
         remote_chapter_idx=book.remote_chapter_idx,
-        native_chapter_offset=position.native_offset == true,
-        chapter_offset_basis=position.offset_basis or book.local_chapter_offset_basis,
+        native_chapter_offset=position and position.native_offset == true or false,
+        chapter_offset_basis=position and (position.offset_basis or book.local_chapter_offset_basis) or nil,
     }
     return payload, position, public
 end
 
-local function attempt_report(client, book_id, elapsed_seconds, book, progress_ratio)
-    local payload, position_or_error, payload_public = build_payload(book_id, elapsed_seconds, book, progress_ratio)
+local function attempt_report(client, book_id, elapsed_seconds, book, progress_ratio, time_only)
+    local payload, position_or_error, payload_public = build_payload(book_id, elapsed_seconds, book, progress_ratio, time_only)
     if not payload then
         return false, nil, tostring(position_or_error or "reading position unavailable"), "position", nil,
             {payload_fields_complete=false}
@@ -626,21 +631,28 @@ function Worker.run(job)
         }, context_changed)
     end
 
-    local context_ok, context_or_error, initial_context_changed = pcall(function()
-        return refresh_context(client, book_id, book, job.force_context == true)
-    end)
-    if not context_ok then
-        local message=tostring(context_or_error)
-        local kind=Http.is_auth_error(message) and "authentication"
-            or ((Http.is_network_error and Http.is_network_error(message)) and "transport" or "context")
-        return finish(settings, book, {
-            ok = false,
-            error = message,
-            error_kind = kind,
-        }, context_changed)
+    if job.time_only == true then
+        -- A pure reading-time report needs no chapter catalog, progress read or
+        -- local-position reconstruction. Keep only lightweight signing context.
+        book.reader_url = book.reader_url or WeRead.reader_url(book_id)
+        book.app_id = book.app_id or WeRead.web_app_id()
+    else
+        local context_ok, context_or_error, initial_context_changed = pcall(function()
+            return refresh_context(client, book_id, book, job.force_context == true)
+        end)
+        if not context_ok then
+            local message=tostring(context_or_error)
+            local kind=Http.is_auth_error(message) and "authentication"
+                or ((Http.is_network_error and Http.is_network_error(message)) and "transport" or "context")
+            return finish(settings, book, {
+                ok = false,
+                error = message,
+                error_kind = kind,
+            }, context_changed)
+        end
+        book = context_or_error
+        context_changed = initial_context_changed == true
     end
-    book = context_or_error
-    context_changed = initial_context_changed == true
 
     -- Catalog/context preparation must be possible before progress verification.
     -- In this mode the worker performs only reader-state/catalog reads and never
@@ -657,7 +669,7 @@ function Worker.run(job)
     end
 
     local accepted, result, first_error, first_kind, first_position, first_public, first_meta = attempt_report(
-        client, book_id, elapsed_seconds, book, progress_ratio
+        client, book_id, elapsed_seconds, book, progress_ratio, job.time_only == true
     )
     if accepted then
         return finish(settings, book, {

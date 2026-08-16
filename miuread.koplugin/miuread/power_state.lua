@@ -6,6 +6,7 @@ local KEY = "__MIUREAD_POWER_STATE_V1"
 local VALID = {
     NORMAL = true,
     DOWNLOAD_LOCKED = true,
+    BACKGROUND_LOCKED = true,
     REAL_SUSPEND = true,
     RESUMING = true,
 }
@@ -70,6 +71,7 @@ function M.transition(state, reason, meta)
     value.reason = reason
     value.download_active = type(meta) == "table" and meta.download_active == true or false
     value.download_continue = type(meta) == "table" and meta.download_continue == true or false
+    value.sync_continue = type(meta) == "table" and meta.sync_continue == true or false
     value.slept = type(meta) == "table" and tonumber(meta.slept) or nil
     value.short_wake = type(meta) == "table" and meta.short_wake == true or false
     return U.copy(value)

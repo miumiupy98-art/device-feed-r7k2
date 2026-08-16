@@ -155,11 +155,7 @@ function WeRead.make_read_payload(opts)
     local params = {
         appId = opts.app_id or WeRead.web_app_id(opts.user_agent),
         b = WeRead.e(opts.book_id),
-        c = WeRead.e(opts.chapter_uid or 0),
-        ci = opts.chapter_idx or 0,
-        co = opts.chapter_offset or 0,
         sm = (opts.summary or ""):sub(1, 20),
-        pr = opts.progress or 0,
         rt = opts.elapsed_seconds or 0,
         ts = ts,
         rn = rn,
@@ -168,6 +164,15 @@ function WeRead.make_read_payload(opts)
         ps = opts.psvts or opts.ps or "",
         pc = opts.pclts or opts.pc or WeRead.e(now),
     }
+    -- 4.6.0-beta.2: reading-time-only reports deliberately omit all position
+    -- fields. This keeps the default 60-second timer from changing cloud
+    -- progress or forcing a chapter-position calculation while the user reads.
+    if opts.time_only ~= true then
+        params.c = WeRead.e(opts.chapter_uid or 0)
+        params.ci = opts.chapter_idx or 0
+        params.co = opts.chapter_offset or 0
+        params.pr = opts.progress or 0
+    end
     params.s = WeRead.sign(WeRead.sorted_query(params))
     return params
 end

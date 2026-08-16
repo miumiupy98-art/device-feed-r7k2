@@ -193,11 +193,12 @@ function Service.run(job)
         local interval = math.max(10, tonumber(current_job.interval) or tonumber(Config.READ_INTERVAL) or 60)
         -- The service process may be reused across books, but every reporting
         -- request is bound to one generation, book and immutable core map.
+        local time_only=current_job.time_only==true
         if tostring(control.book_id or "")~=tostring(current_job.book_id or "")
             or tostring(control.core_map_hash or "")~=tostring(current_job.core_map_hash or "")
             or tonumber(control.record_generation or -1)~=tonumber(current_job.record_generation or 0)
-            or control.position_safe~=true
-            or tostring(control.local_chapter_uid or "")=="" then
+            or (not time_only and (control.position_safe~=true
+                or tostring(control.local_chapter_uid or "")=="")) then
             sequence=sequence+1
             blocked=true
             write_service_status({
@@ -205,7 +206,7 @@ function Service.run(job)
                 error="stale or unsafe book context refused before report",
                 paused=true,retry_delay=0,consecutive_failures=consecutive_failures+1,
                 attempted_at=os.time(),completed_at=os.time(),elapsed_seconds=0,
-                final_flush=final_flush==true,flush_reason=reason,next_due=0,
+                final_flush=final_flush==true,flush_reason=reason,next_due=0,time_only=time_only,
             })
             consecutive_failures=consecutive_failures+1
             return 0
@@ -223,19 +224,22 @@ function Service.run(job)
         local report_book=U.copy(book or {})
         report_book.book_id=tostring(current_job.book_id or "")
         report_book.core_map_hash=tostring(current_job.core_map_hash or "")
-        report_book.local_chapter_uid=control.local_chapter_uid
-        report_book.local_chapter_idx=tonumber(control.local_chapter_idx)
-        report_book.local_chapter_offset=tonumber(control.local_chapter_offset) or 0
-        report_book.local_chapter_word_count=tonumber(control.local_chapter_word_count) or 0
-        report_book.local_native_chapter_offset=control.local_native_chapter_offset == true
-        report_book.local_chapter_offset_basis=tostring(control.local_chapter_offset_basis or "")
-        report_book.progress=(tonumber(control.progress_ratio) or 0)*100
+        if not time_only then
+            report_book.local_chapter_uid=control.local_chapter_uid
+            report_book.local_chapter_idx=tonumber(control.local_chapter_idx)
+            report_book.local_chapter_offset=tonumber(control.local_chapter_offset) or 0
+            report_book.local_chapter_word_count=tonumber(control.local_chapter_word_count) or 0
+            report_book.local_native_chapter_offset=control.local_native_chapter_offset == true
+            report_book.local_chapter_offset_basis=tostring(control.local_chapter_offset_basis or "")
+            report_book.progress=(tonumber(control.progress_ratio) or 0)*100
+        end
         local report_job = {
             book_id = tostring(current_job.book_id or ""),
             book_title = tostring(current_job.book_title or current_job.book_id or ""),
             book = report_book,
             core_map_hash=tostring(current_job.core_map_hash or ""),
-            progress_ratio = tonumber(control.progress_ratio) or 0,
+            progress_ratio = time_only and nil or (tonumber(control.progress_ratio) or 0),
+            time_only = time_only,
             elapsed_seconds = elapsed,
             cookies = auth.cookies or {},
             api_key = auth.api_key or "",
@@ -256,7 +260,7 @@ function Service.run(job)
         if ok and type(result) == "table" then
             -- A candidate context only becomes authoritative after WeRead
             -- accepts this exact book/core-map request.
-            if result.accepted and type(result.legacy_context) == "table"
+            if result.accepted and not time_only and type(result.legacy_context) == "table"
                 and tostring(result.legacy_context.book_id or result.legacy_context.bookId or "")==tostring(current_job.book_id or "")
                 and tostring(result.legacy_context.core_map_hash or "")==tostring(current_job.core_map_hash or "") then
                 book = U.copy(result.legacy_context)
@@ -267,6 +271,7 @@ function Service.run(job)
             if result.wr_wrpa_changed then auth.wr_wrpa = result.wr_wrpa or "" end
 
             local out = public_result(result)
+            out.time_only=time_only
             local uncertain = result.uncertain == true or tostring(result.error_kind or "") == "unconfirmed"
             local kind = result.accepted and nil or (uncertain and "unconfirmed" or classify_error(result.error_kind,result.error))
             if result.accepted then
