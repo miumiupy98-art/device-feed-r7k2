@@ -759,6 +759,11 @@ function Plugin:init()
     self._home_interaction_generation=tonumber(HOME_SESSION.home_interaction_generation) or 0
     self._home_data_revision=0
     self._home_section_revisions={account=0,generated=0,["local"]=0,mp=0}
+    self._home_cloud_page_cache={account={},mp={}}
+    self._home_cloud_page_cache_order={account={},mp={}}
+    self._home_book_row_index={}
+    self._home_render_row_index={}
+    self._home_visible_page_generation=0
     self._home_directory_generation=0
     self._home_directory_active_path=nil
     self._home_directory_request_owner=nil
@@ -1922,6 +1927,93 @@ function Plugin:_prepare_shelf_rows(rows)
     return rows
 end
 
+function Plugin:_home_clear_cloud_page_cache(section)
+    self._home_cloud_page_cache=type(self._home_cloud_page_cache)=="table" and self._home_cloud_page_cache or {account={},mp={}}
+    self._home_cloud_page_cache_order=type(self._home_cloud_page_cache_order)=="table" and self._home_cloud_page_cache_order or {account={},mp={}}
+    if section=="account" or section=="mp" then
+        self._home_cloud_page_cache[section]={}
+        self._home_cloud_page_cache_order[section]={}
+    else
+        self._home_cloud_page_cache={account={},mp={}}
+        self._home_cloud_page_cache_order={account={},mp={}}
+    end
+end
+
+function Plugin:_home_index_row(book,section)
+    if type(book)~="table" then return end
+    self._home_book_row_index=type(self._home_book_row_index)=="table" and self._home_book_row_index or {}
+    self._home_render_row_index=type(self._home_render_row_index)=="table" and self._home_render_row_index or {}
+    local id=tostring(book.bookId or book.book_id or "")
+    local id_rows
+    if id~="" then
+        id_rows=self._home_book_row_index[id]
+        if type(id_rows)~="table" then id_rows={}; self._home_book_row_index[id]=id_rows end
+        id_rows[#id_rows+1]={book=book,section=section}
+    end
+    local render_id=self._home_cover_render_id and tostring(self:_home_cover_render_id(book) or "") or ""
+    if render_id~="" then
+        if render_id==id and id_rows then
+            -- Cloud books use bookId as their render id; share one index list
+            -- instead of allocating a duplicate entry for every shelf row.
+            self._home_render_row_index[render_id]=id_rows
+        else
+            local rows=self._home_render_row_index[render_id]
+            if type(rows)~="table" then rows={}; self._home_render_row_index[render_id]=rows end
+            rows[#rows+1]={book=book,section=section}
+        end
+    end
+end
+
+function Plugin:_home_rebuild_row_indexes()
+    self._home_book_row_index={}
+    self._home_render_row_index={}
+    for section,entry in pairs(self._home_sections or {}) do
+        for _,book in ipairs(entry.rows or {}) do self:_home_index_row(book,section) end
+    end
+end
+
+function Plugin:_home_cloud_page_signature(rows)
+    local parts={}
+    for _,book in ipairs(rows or {}) do
+        parts[#parts+1]=tostring(book and (book.bookId or book.book_id) or "")
+    end
+    return table.concat(parts,"|")
+end
+
+function Plugin:_home_cached_cloud_page(section,page,rows)
+    if section~="account" and section~="mp" then return nil end
+    page=math.max(1,tonumber(page) or 1)
+    local cache=self._home_cloud_page_cache and self._home_cloud_page_cache[section]
+    local entry=type(cache)=="table" and cache[page] or nil
+    if type(entry)~="table" then return nil end
+    if entry.signature~=self:_home_cloud_page_signature(rows) then return nil end
+    -- Cloud cache invalidation is explicit on a remote snapshot replacement or
+    -- full Home rebuild. Cover/progress mutations update the visible cached row
+    -- object in place, so a section repaint must not force this page to hydrate
+    -- all eight books again when the user returns to it.
+    return entry.rows
+end
+
+function Plugin:_home_store_cloud_page(section,page,rows,raw_rows)
+    if section~="account" and section~="mp" then return end
+    page=math.max(1,tonumber(page) or 1)
+    self._home_cloud_page_cache=type(self._home_cloud_page_cache)=="table" and self._home_cloud_page_cache or {account={},mp={}}
+    self._home_cloud_page_cache_order=type(self._home_cloud_page_cache_order)=="table" and self._home_cloud_page_cache_order or {account={},mp={}}
+    local cache=self._home_cloud_page_cache[section] or {}; self._home_cloud_page_cache[section]=cache
+    local order=self._home_cloud_page_cache_order[section] or {}; self._home_cloud_page_cache_order[section]=order
+    cache[page]={
+        rows=rows,
+        signature=self:_home_cloud_page_signature(raw_rows),
+        section_revision=tonumber((self._home_section_revisions or {})[section] or 0),
+    }
+    for i=#order,1,-1 do if order[i]==page then table.remove(order,i) end end
+    order[#order+1]=page
+    while #order>8 do
+        local evicted=table.remove(order,1)
+        if evicted~=page then cache[evicted]=nil end
+    end
+end
+
 function Plugin:_home_mutate_book_rows(book_id,mutator)
     book_id=tostring(book_id or "")
     if book_id=="" or type(mutator)~="function" then return false end
@@ -1935,12 +2027,9 @@ function Plugin:_home_mutate_book_rows(book_id,mutator)
             changed=true
         end
     end
-    for _,section in pairs(self._home_sections or {}) do
-        for _,book in ipairs(section.rows or {}) do apply(book) end
-    end
-    -- Cloud pages are hydrated as bounded visible copies. Keep the rendered
-    -- page in sync with live download/status mutations without hydrating the
-    -- rest of the cloud shelf.
+    -- beta.27: frequent download/progress updates use the lightweight id index
+    -- built with the shelf snapshot instead of rescanning every cloud row.
+    for _,entry in ipairs((self._home_book_row_index or {})[book_id] or {}) do apply(entry.book) end
     local current=HomeView.current()
     for _,book in ipairs(current and current.opts and current.opts.shelf_books or {}) do apply(book) end
     apply(self._home_hero)
@@ -4027,9 +4116,11 @@ function Plugin:_home_apply_cover_path(book_id,path)
     path=tostring(path or "")
     if book_id=="" or path=="" then return false end
     local changed=false
+    local seen={}
     local function apply(book)
-        if type(book)=="table" and tostring(book.bookId or book.book_id or "")==book_id
+        if type(book)=="table" and not seen[book] and tostring(book.bookId or book.book_id or "")==book_id
             and tostring(book.cover_path or "")~=path then
+            seen[book]=true
             book.cover_path=path
             -- A new raw source invalidates the small display derivative. The
             -- background renderer will replace it without blocking this view.
@@ -4040,15 +4131,36 @@ function Plugin:_home_apply_cover_path(book_id,path)
     local hero_id=self:_home_cover_render_id(self._home_hero)
     hero_id=tostring(hero_id or "")
     apply(self._home_hero)
-    for _,section in pairs(self._home_sections or {}) do
-        for _,book in ipairs(section.rows or {}) do apply(book) end
-    end
+    for _,entry in ipairs((self._home_book_row_index or {})[book_id] or {}) do apply(entry.book) end
     local current=HomeView.current()
     for _,book in ipairs(current and current.opts and current.opts.shelf_books or {}) do apply(book) end
     if hero_id==book_id and self._home_hero then
         self:_home_update_lockscreen_session(self._home_hero)
     end
     return changed
+end
+
+function Plugin:_home_apply_remote_cache_snapshot()
+    if not self._home_sections or not HomeView.is_shown() or self:_active_reader_ui() then return false end
+    local cached_books,cached_mp=self.library:cached()
+    cached_books=type(cached_books)=="table" and cached_books or {}
+    cached_mp=type(cached_mp)=="table" and cached_mp or {}
+    self._home_sections.account={title="微信书架",rows=self:_home_cloud_rows(cached_books,"account"),empty="这里还没有微信书架内容"}
+    self._home_sections.mp={title="公众号",rows=self:_home_cloud_rows(cached_mp,"mp"),empty="这里还没有公众号内容"}
+    self:_home_clear_cloud_page_cache("account")
+    self:_home_clear_cloud_page_cache("mp")
+    self:_home_bump_section_revision("account")
+    self:_home_bump_section_revision("mp")
+    self:_home_rebuild_row_indexes()
+    local active=self._home_active_section or "account"
+    if active=="account" or active=="mp" then self:_home_cancel_visible_page_work("cloud shelf snapshot replaced") end
+    -- Swapping the remote index updates counts immediately, but hydration is
+    -- still bounded to the current eight visible books. Generated/local rows
+    -- and their caches are not rebuilt by an automatic cloud refresh.
+    local updated=self:_home_apply_section(active)
+    logger.info("[MiuRead][HomeShelf] remote snapshot applied",
+        "books=",tostring(#cached_books),"mp=",tostring(#cached_mp),"active=",tostring(active))
+    return updated==true
 end
 
 function Plugin:_home_refresh_remote(force,user_requested)
@@ -4058,6 +4170,13 @@ function Plugin:_home_refresh_remote(force,user_requested)
         return false
     end
     if self._home_remote_refreshing or self:_active_reader_ui() then return false end
+    local true_background=self.shelf_async and self.shelf_async:available()
+    if force~=true and user_requested~=true and not true_background then
+        -- Automatic refresh must never turn into a synchronous full-shelf
+        -- request on the Home UI thread. Manual/full refresh remains available.
+        logger.info("[MiuRead][HomeShelf] auto refresh skipped","reason=no_subprocess")
+        return false
+    end
     local _,_,updated_at=self.library:cached()
     local now=os.time()
     local age=math.max(0,now-(tonumber(updated_at) or 0))
@@ -4103,7 +4222,7 @@ function Plugin:_home_refresh_remote(force,user_requested)
             return
         end
         if HomeView.is_shown() and not self:_active_reader_ui() then
-            self:_notify_home_data_changed("section")
+            self:_home_apply_remote_cache_snapshot()
         end
         if user_requested then self:toast("书架已刷新",2) end
     end,true)
@@ -4283,6 +4402,32 @@ function Plugin:_home_page_for(section)
     return math.max(1,tonumber(home.page_by_section[section]) or 1)
 end
 
+function Plugin:_home_cancel_visible_page_work(reason)
+    reason=tostring(reason or "visible page changed")
+    self._home_visible_page_generation=(tonumber(self._home_visible_page_generation) or 0)+1
+    self._home_cover_generation=(tonumber(self._home_cover_generation) or 0)+1
+    self._home_cover_render_generation=(tonumber(self._home_cover_render_generation) or 0)+1
+    self._home_cover_inflight={}
+    self._home_cover_render_inflight_signature=nil
+    if self.home_cover_async and self.home_cover_async:busy() then self.home_cover_async:cancel(reason) end
+    if self.cover_render_async and self.cover_render_async:busy() then self.cover_render_async:cancel(reason) end
+    if self.background_scheduler then
+        self.background_scheduler:cancel_key("home_cover",reason,true)
+        self.background_scheduler:cancel_key("home_cover_render",reason,true)
+    end
+    -- Local metadata belongs to the visible page too. Do not cancel explicit
+    -- network metadata for the recent-reading card, which shares the worker.
+    local metadata_job=self.home_metadata_async and self.home_metadata_async.job or nil
+    if metadata_job and tostring(metadata_job.label or "")=="home-local-metadata" then
+        self._home_metadata_generation=(tonumber(self._home_metadata_generation) or 0)+1
+        self.home_metadata_async:cancel(reason)
+        if self.background_scheduler then self.background_scheduler:cancel_key("home_metadata",reason,true) end
+    end
+    logger.info("[MiuRead][HomePage] previous visible work cancelled",
+        "generation=",tostring(self._home_visible_page_generation),"reason=",reason)
+    return self._home_visible_page_generation
+end
+
 function Plugin:_home_change_page(delta)
     local section=self._home_active_section or "account"
     local selected=self._home_sections and self._home_sections[section]
@@ -4294,6 +4439,7 @@ function Plugin:_home_change_page(delta)
     if target==current then return true end
     home.page_by_section[section]=target
     self._home_page_changed_at=Time.now()
+    self:_home_cancel_visible_page_work("home page changed")
     self:_home_bump_interaction_generation()
     self:_save_home_preferences_deferred(home,preferences)
     return self:_home_apply_section(section)
@@ -4309,7 +4455,7 @@ function Plugin:_home_apply_section(section)
         home.page_by_section and home.page_by_section[section],
         self:_home_page_limit()
     )
-    preview=self:_home_prepare_cloud_page(section,preview)
+    preview=self:_home_prepare_cloud_page(section,preview,page)
     if not home.page_by_section or tonumber(home.page_by_section[section])~=page then
         local current,preferences=self:_home_preferences()
         current.page_by_section=type(current.page_by_section)=="table" and current.page_by_section or {}
@@ -4361,6 +4507,7 @@ function Plugin:_set_home_section(section)
     if home.active_section==section and self._home_active_section==section then return end
     home.active_section=section
     self._home_page_changed_at=Time.now()
+    self:_home_cancel_visible_page_work("home section changed")
     self:_home_bump_interaction_generation()
     self:_save_home_preferences_deferred(home,preferences)
     if self:_home_apply_section(section) then
@@ -4471,9 +4618,7 @@ function Plugin:_home_apply_rendered_cover_path(book_id,path)
         apply(self._home_hero)
         hero_changed=true
     end
-    for key,section in pairs(self._home_sections or {}) do
-        for _,book in ipairs(section.rows or {}) do apply(book,key) end
-    end
+    for _,entry in ipairs((self._home_render_row_index or {})[book_id] or {}) do apply(entry.book,entry.section) end
     local current=HomeView.current()
     local active=self._home_active_section or "account"
     for _,book in ipairs(current and current.opts and current.opts.shelf_books or {}) do apply(book,active) end
@@ -4568,6 +4713,7 @@ function Plugin:_home_remove_legacy_rendered_cover(book_id,path)
 end
 
 function Plugin:_home_schedule_cover_derivatives(books)
+    local page_generation=tonumber(self._home_visible_page_generation) or 0
     if self._download_runtime~=nil then return false end
     if self:_home_ui_busy() then
         self._home_resume_pending_work=self._home_resume_pending_work or {}
@@ -4697,7 +4843,10 @@ function Plugin:_home_schedule_cover_derivatives(books)
         return false
     end
     local retry=function()
-        if HomeView.is_shown() and not self:_active_reader_ui() then self:_home_schedule_cover_derivatives(books) end
+        if page_generation==(tonumber(self._home_visible_page_generation) or 0)
+            and HomeView.is_shown() and not self:_active_reader_ui() then
+            self:_home_schedule_cover_derivatives(books)
+        end
     end
     local token,block_reason,deferred=self:_background_claim("home_cover_render",{
         priority=20,retry_delay=derivative_gap,
@@ -4711,6 +4860,10 @@ function Plugin:_home_schedule_cover_derivatives(books)
         return true
     end
 
+    if page_generation~=(tonumber(self._home_visible_page_generation) or 0) then
+        self:_background_release("home_cover_render",token,"stale page")
+        return false
+    end
     self._home_cover_render_inflight_signature=request_signature
     self._home_cover_render_generation=(tonumber(self._home_cover_render_generation) or 0)+1
     local generation=self._home_cover_render_generation
@@ -4752,7 +4905,8 @@ function Plugin:_home_schedule_cover_derivatives(books)
         if self._home_cover_render_inflight_signature==request_signature then
             self._home_cover_render_inflight_signature=nil
         end
-        if generation~=self._home_cover_render_generation then return end
+        if generation~=self._home_cover_render_generation
+            or page_generation~=(tonumber(self._home_visible_page_generation) or 0) then return end
         if not result or result.ok~=true or type(result.value)~="table" then
             self._home_cover_render_failed_signature=request_signature
             self._home_cover_render_failed_clock=os.time()
@@ -6522,6 +6676,7 @@ function Plugin:_home_apply_local_inline_section(refresh_metadata)
     local rows=select(1,self:_home_local_rows())
     self._home_sections["local"]={title="本地书籍",rows=rows,empty=self:_home_local_empty_text()}
     self:_home_bump_section_revision("local")
+    self:_home_rebuild_row_indexes()
     if self._home_active_section~="local" or not HomeView.is_shown() then return true end
     local updated=self:_home_apply_section("local")
     if refresh_metadata and updated then
@@ -6643,8 +6798,14 @@ function Plugin:_home_cloud_rows(remote_rows,source)
     return rows
 end
 
-function Plugin:_home_prepare_cloud_page(section,rows)
+function Plugin:_home_prepare_cloud_page(section,rows,page)
     if section~="account" and section~="mp" then return rows or {} end
+    local cached=page and self:_home_cached_cloud_page(section,page,rows) or nil
+    if cached then
+        logger.info("[MiuRead][HomePage] cloud page reused",
+            "section=",tostring(section),"page=",tostring(page),"visible=",tostring(#cached))
+        return cached
+    end
     local prepared={}
     local library_snapshot=self.store:library()
     local sessions_snapshot=self.store:get("sessions",{})
@@ -6669,8 +6830,9 @@ function Plugin:_home_prepare_cloud_page(section,rows)
     for _,row in ipairs(prepared) do
         row.status_text=self:_home_status_text(row,false)
     end
+    if page then self:_home_store_cloud_page(section,page,prepared,rows) end
     logger.info("[MiuRead][HomePage] cloud page prepared",
-        "section=",tostring(section),"visible=",tostring(#prepared))
+        "section=",tostring(section),"page=",tostring(page or "hero"),"visible=",tostring(#prepared))
     return prepared
 end
 
@@ -7601,14 +7763,13 @@ function Plugin:_home_force_refresh_current_cover(book,on_done)
 
         book.cover_path=path
         self:_home_apply_cover_path(id,path)
-        for key,section in pairs(self._home_sections or {}) do
-            for _,row in ipairs(section.rows or {}) do
-                if tostring(row.bookId or row.book_id or "")==id then
-                    row.cover_path=path
-                    row.home_cover_path=nil
-                    self:_home_bump_section_revision(key)
-                    break
-                end
+        local bumped={}
+        for _,entry in ipairs((self._home_book_row_index or {})[id] or {}) do
+            local row,key=entry.book,entry.section
+            if type(row)=="table" then
+                row.cover_path=path
+                row.home_cover_path=nil
+                if key and not bumped[key] then self:_home_bump_section_revision(key); bumped[key]=true end
             end
         end
 
@@ -9121,6 +9282,7 @@ function Plugin:_home_schedule_network_metadata(book,force,silent,on_done,explic
 end
 
 function Plugin:_home_schedule_local_metadata(books)
+    local page_generation=tonumber(self._home_visible_page_generation) or 0
     if self._download_runtime~=nil then return false end
     if self:_home_ui_busy() then
         self._home_resume_pending_work=self._home_resume_pending_work or {}
@@ -9146,7 +9308,10 @@ function Plugin:_home_schedule_local_metadata(books)
     if #queue==0 then return false end
 
     local retry=function()
-        if HomeView.is_shown() and not self:_active_reader_ui() then self:_home_schedule_local_metadata(books) end
+        if page_generation==(tonumber(self._home_visible_page_generation) or 0)
+            and HomeView.is_shown() and not self:_active_reader_ui() then
+            self:_home_schedule_local_metadata(books)
+        end
     end
     local token,block_reason,deferred=self:_background_claim("home_metadata",{
         priority=30,retry_delay=self:_lightweight_enabled() and 1.4 or .9,
@@ -9195,7 +9360,9 @@ function Plugin:_home_schedule_local_metadata(books)
         index=index+1
     end
     local function next_book()
-        if generation~=self._home_metadata_generation or not HomeView.is_shown() or self:_active_reader_ui() then
+        if generation~=self._home_metadata_generation
+            or page_generation~=(tonumber(self._home_visible_page_generation) or 0)
+            or not HomeView.is_shown() or self:_active_reader_ui() then
             release("cancelled")
             return
         end
@@ -9217,7 +9384,10 @@ function Plugin:_home_schedule_local_metadata(books)
                 local Metadata=require("miuread.local_metadata")
                 return Metadata.read(filepath,cache_dir,{open_document=true,use_bim=true})
             end,function(result)
-                if generation~=self._home_metadata_generation then release("stale") return end
+                if generation~=self._home_metadata_generation
+                    or page_generation~=(tonumber(self._home_visible_page_generation) or 0) then
+                    release("stale") return
+                end
                 if result and result.ok and type(result.value)=="table" then
                     apply_metadata(item,result.value)
                 else
@@ -9242,6 +9412,7 @@ function Plugin:_home_schedule_local_metadata(books)
 end
 
 function Plugin:_home_schedule_remote_covers(books)
+    local page_generation=tonumber(self._home_visible_page_generation) or 0
     if self:_home_ui_busy() then
         self._home_resume_pending_work=self._home_resume_pending_work or {}
         self._home_resume_pending_work.covers=true
@@ -9268,7 +9439,10 @@ function Plugin:_home_schedule_remote_covers(books)
     end
     if #queue==0 or not self.home_cover_async then return false end
     local retry=function()
-        if HomeView.is_shown() and not self:_active_reader_ui() then self:_home_schedule_remote_covers(books) end
+        if page_generation==(tonumber(self._home_visible_page_generation) or 0)
+            and HomeView.is_shown() and not self:_active_reader_ui() then
+            self:_home_schedule_remote_covers(books)
+        end
     end
     local token,block_reason,deferred=self:_background_claim("home_cover",{
         priority=25,retry_delay=lightweight and 1.4 or .9,
@@ -9291,17 +9465,19 @@ function Plugin:_home_schedule_remote_covers(books)
         changed_ids[tostring(book_id or "")]=true
         local hero_id=tostring(self._home_hero and (self._home_hero.bookId or self._home_hero.book_id) or "")
         if hero_id==book_id then hero_changed=true end
-        for key,section in pairs(self._home_sections or {}) do
-            for _,book in ipairs(section.rows or {}) do
-                if tostring(book.bookId or book.book_id or "")==book_id then
-                    changed_sections[key]=true
-                    break
-                end
-            end
+        for _,entry in ipairs((self._home_book_row_index or {})[book_id] or {}) do
+            if entry.section then changed_sections[entry.section]=true end
+        end
+        local active=self._home_active_section or "account"
+        local current=HomeView.current()
+        for _,book in ipairs(current and current.opts and current.opts.shelf_books or {}) do
+            if tostring(book.bookId or book.book_id or "")==book_id then changed_sections[active]=true; break end
         end
     end
     local function apply_batch()
-        if generation~=self._home_cover_generation or not HomeView.is_shown() or self:_active_reader_ui() then return end
+        if generation~=self._home_cover_generation
+            or page_generation~=(tonumber(self._home_visible_page_generation) or 0)
+            or not HomeView.is_shown() or self:_active_reader_ui() then return end
         if changed_count<=0 then return end
         for section in pairs(changed_sections) do self:_home_bump_section_revision(section) end
         local active=self._home_active_section or "account"
@@ -9319,28 +9495,36 @@ function Plugin:_home_schedule_remote_covers(books)
     end
     local function finish()
         release("completed")
-        if changed_count>0 and generation==self._home_cover_generation and HomeView.is_shown() then
+        if changed_count>0 and generation==self._home_cover_generation
+            and page_generation==(tonumber(self._home_visible_page_generation) or 0) and HomeView.is_shown() then
             -- Let the final worker callback leave the input path before one
             -- bounded e-ink update. A later tab switch wins automatically.
             UIManager:scheduleIn(.35,apply_batch)
         end
-        if #rendered_books>0 and generation==self._home_cover_generation then
+        if #rendered_books>0 and generation==self._home_cover_generation
+            and page_generation==(tonumber(self._home_visible_page_generation) or 0) then
             UIManager:scheduleIn(derivative_gap,function()
-                if generation==self._home_cover_generation and HomeView.is_shown() and not self:_active_reader_ui() then
+                if generation==self._home_cover_generation
+                and page_generation==(tonumber(self._home_visible_page_generation) or 0)
+                and HomeView.is_shown() and not self:_active_reader_ui() then
                     self:_home_schedule_cover_derivatives(rendered_books)
                 end
             end)
         end
         -- Process only a tiny visible batch, then give the device an idle gap.
         -- A no-op retry is cheap when every visible cover is already cached.
-        if generation==self._home_cover_generation and HomeView.is_shown() and not self:_active_reader_ui() then
+        if generation==self._home_cover_generation
+            and page_generation==(tonumber(self._home_visible_page_generation) or 0)
+            and HomeView.is_shown() and not self:_active_reader_ui() then
             self.background_scheduler:defer("home_cover",retry,{
                 delay=math.max(.45,cover_gap),priority=25,reason="progressive visible covers"
             })
         end
     end
     local function next_cover()
-        if generation~=self._home_cover_generation or not HomeView.is_shown() or self:_active_reader_ui() then
+        if generation~=self._home_cover_generation
+            or page_generation~=(tonumber(self._home_visible_page_generation) or 0)
+            or not HomeView.is_shown() or self:_active_reader_ui() then
             release("cancelled")
             return
         end
@@ -9392,7 +9576,10 @@ function Plugin:_home_schedule_remote_covers(books)
             if self._home_cover_inflight[item.bookId]==generation then
                 self._home_cover_inflight[item.bookId]=nil
             end
-            if generation~=self._home_cover_generation then release("stale") return end
+            if generation~=self._home_cover_generation
+                or page_generation~=(tonumber(self._home_visible_page_generation) or 0) then
+                release("stale") return
+            end
             if result and result.ok and result.value then
                 self:_cover_retry_succeeded(item)
                 self:_remember_cover_path(item.bookId,result.value)
@@ -13912,7 +14099,7 @@ function Plugin:_home_prepare_hero_book(book)
     if type(book)~="table" then return nil end
     local source=tostring(book.source or "")
     if source=="account" or source=="mp" then
-        local prepared=self:_home_prepare_cloud_page(source,{book})
+        local prepared=self:_home_prepare_cloud_page(source,{book},nil)
         if prepared[1] then book=prepared[1] end
     end
     local hero=U.copy(book)
@@ -14033,6 +14220,9 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     }
     self._home_data_revision=(tonumber(self._home_data_revision) or 0)+1
     self._home_sections=sections
+    self:_home_clear_cloud_page_cache()
+    self:_home_rebuild_row_indexes()
+    self._home_visible_page_generation=(tonumber(self._home_visible_page_generation) or 0)+1
     local visible_keys=self:_home_visible_section_keys(sections,home)
     self._home_visible_keys=visible_keys
     local active=visible_keys[1] or "account"
@@ -14051,7 +14241,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     local selected_preview,shelf_page,shelf_pages=self:_home_preview_page(
         selected.rows,hero,home.page_by_section and home.page_by_section[active],preview_limit
     )
-    selected_preview=self:_home_prepare_cloud_page(active,selected_preview)
+    selected_preview=self:_home_prepare_cloud_page(active,selected_preview,shelf_page)
     home.page_by_section=type(home.page_by_section)=="table" and home.page_by_section or {}
     if tonumber(home.page_by_section[active])~=shelf_page then
         home.page_by_section[active]=shelf_page

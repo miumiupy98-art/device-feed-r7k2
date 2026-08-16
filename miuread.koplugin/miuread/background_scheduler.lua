@@ -219,6 +219,23 @@ function Scheduler:_schedule_pump(delay)
     UIManager:scheduleIn(math.max(.05,tonumber(delay) or .2),task)
 end
 
+function Scheduler:cancel_key(key,reason,include_active)
+    key=tostring(key or "")
+    if key=="" then return false end
+    local changed=false
+    if self.pending and self.pending[key] then self.pending[key]=nil; changed=true end
+    if include_active==true and self.active and tostring(self.active.key)==key then
+        self:force_release(reason or (key.." cancelled"))
+        changed=true
+    elseif changed then
+        self:_schedule_pump(.05)
+    end
+    if changed and reason then
+        logger.info("[MiuRead][Background] key cancelled","key=",key,"reason=",tostring(reason))
+    end
+    return changed
+end
+
 function Scheduler:cancel_pending(reason)
     self.pending={}
     if self.pump_task then UIManager:unschedule(self.pump_task); self.pump_task=nil end
