@@ -19,6 +19,9 @@ function Scheduler:new()
         pending={},
         pump_task=nil,
         last_defer_log={},
+        foreground_barrier_until=0,
+        foreground_barrier_reason=nil,
+        last_barrier_log=0,
     },self)
 end
 
@@ -26,12 +29,51 @@ function Scheduler:snapshot()
     local active=self.active
     local pending=0
     for _ in pairs(self.pending or {}) do pending=pending+1 end
+    local barrier_ms=math.max(0,math.floor(((tonumber(self.foreground_barrier_until) or 0)-monotonic())*1000+.5))
     return {
         active=active and active.key or nil,
         active_user=active and active.user_requested==true or false,
         active_ms=active and math.floor((monotonic()-(active.started or monotonic()))*1000+.5) or 0,
         pending=pending,
+        foreground_barrier_ms=barrier_ms,
+        foreground_barrier_reason=barrier_ms>0 and self.foreground_barrier_reason or nil,
     }
+end
+
+function Scheduler:foreground_barrier_active()
+    local until_at=tonumber(self.foreground_barrier_until) or 0
+    if until_at<=monotonic() then
+        self.foreground_barrier_until=0
+        self.foreground_barrier_reason=nil
+        return false
+    end
+    return true
+end
+
+function Scheduler:set_foreground_barrier(seconds,reason)
+    local duration=math.max(.15,tonumber(seconds) or 0)
+    local until_at=monotonic()+duration
+    if until_at>(tonumber(self.foreground_barrier_until) or 0) then
+        self.foreground_barrier_until=until_at
+        self.foreground_barrier_reason=tostring(reason or "foreground interaction")
+        local now=monotonic()
+        if now-(tonumber(self.last_barrier_log) or 0)>=1.0 then
+            self.last_barrier_log=now
+            logger.info("[MiuRead][Background] foreground barrier",
+                "seconds=",tostring(duration),"reason=",self.foreground_barrier_reason)
+        end
+    end
+    self:_schedule_pump(duration+.05)
+    return true
+end
+
+function Scheduler:clear_foreground_barrier(reason)
+    local active=self:foreground_barrier_active()
+    self.foreground_barrier_until=0
+    self.foreground_barrier_reason=nil
+    if active then logger.info("[MiuRead][Background] foreground barrier cleared",tostring(reason or "manual")) end
+    self:_schedule_pump(.05)
+    return active
 end
 
 function Scheduler:_clear_stale_active()
@@ -51,6 +93,9 @@ function Scheduler:claim(key,options)
     self:_clear_stale_active()
     local blocked=tostring(options.blocked_reason or "")
     if blocked~="" then return nil,blocked end
+    if options.user_requested~=true and self:foreground_barrier_active() then
+        return nil,"foreground_barrier"
+    end
 
     local memory=RuntimePressure.memory_snapshot(false)
     if memory and memory.level=="critical" and options.user_requested~=true then
@@ -145,6 +190,11 @@ function Scheduler:_schedule_pump(delay)
         self:_clear_stale_active()
         if self.active then
             self:_schedule_pump(.5)
+            return
+        end
+        if self:foreground_barrier_active() then
+            local remain=math.max(.15,(tonumber(self.foreground_barrier_until) or monotonic())-monotonic()+.05)
+            self:_schedule_pump(remain)
             return
         end
         local item=self:_next_pending()

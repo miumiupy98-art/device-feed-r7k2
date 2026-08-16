@@ -117,8 +117,8 @@ local unpack_args=unpack or table.unpack
 local SHELF_CACHE_TTL=15*60
 local SHELF_DIRECT_CACHE_TTL=6*60*60
 local COVER_GUARD_WINDOW=6*60*60
-local HOME_LOCAL_CACHE_TTL=20*60
-local HOME_SHELF_REFRESH_TTL=10*60
+local HOME_LOCAL_CACHE_TTL=tonumber(Config.HOME_LOCAL_SHELF_TTL_SECONDS) or 60*60
+local HOME_SHELF_REFRESH_TTL=tonumber(Config.HOME_REMOTE_SHELF_TTL_SECONDS) or 30*60
 local HOME_REMOTE_AUTO_RETRY=5*60
 local HOME_SECTION_ORDER={"account","generated","local","mp"}
 local HOME_QUICK_ITEM_LEGACY_ORDER={"wifi","frontlight","refresh_shelf","full_refresh","settings","koreader_menu","downloads","sync","night","rotate","sleep","restart","quit"}
@@ -741,6 +741,8 @@ function Plugin:init()
     self._home_refreshing=false
     self._home_start_generation=0
     self._home_reader_transition=false
+    self._desktop_frozen=false
+    self._home_legacy_cover_index=nil
     self._home_metadata_generation=0
     self._home_cover_generation=0
     self._home_sections=nil
@@ -3271,6 +3273,7 @@ function Plugin:_background_block_reason(options)
     local power_state=PowerState.state()
     if power_state~="NORMAL" then return "power_"..power_state:lower() end
     if self._miuread_suspended==true or HOME_SESSION.suspended==true or self._home_suspended==true then return "suspended" end
+    if self._desktop_frozen==true then return "desktop_frozen" end
     if self:_page_transition_active() or reader_close_active() or reader_rebuild_active() then return "reader_transition" end
     if self:_active_reader_ui() then return "reader_active" end
     if self.annotation_async and self.annotation_async:busy() then return "annotation_sync" end
@@ -3353,7 +3356,7 @@ function Plugin:_background_claim(key,options,retry)
     local token,reason=self.background_scheduler:claim(key,options)
     if token then return token,nil,false end
     local retryable=reason~="suspended" and reason~="exiting" and reason~="reader_active" and reason~="reader_transition"
-        and not tostring(reason or ""):find("^power_")
+        and reason~="desktop_frozen" and not tostring(reason or ""):find("^power_")
     if retryable and type(retry)=="function" then
         local retry_delay=options.retry_delay or tonumber(Config.BACKGROUND_RETRY_SECONDS) or .9
         if reason=="memory_critical" then retry_delay=math.max(4.0,tonumber(retry_delay) or .9) end
@@ -3421,6 +3424,7 @@ function Plugin:_background_log_state(reason,force_memory)
         "level=",tostring(memory and memory.level or "unknown"),
         "active=",tostring(snapshot.active or "none"),
         "pending=",tostring(snapshot.pending or 0),
+        "barrier_ms=",tostring(snapshot.foreground_barrier_ms or 0),
         "temporary=",tostring(RuntimePressure.active()))
     return memory,snapshot
 end
@@ -3450,7 +3454,7 @@ end
 
 function Plugin:_home_background_blocked()
     return PowerState.state()~="NORMAL" or self._home_suspended==true or self._home_resume_barrier==true
-        or self:_page_transition_active()
+        or self._desktop_frozen==true or self:_page_transition_active()
 end
 
 function Plugin:_home_modal_surface_active()
@@ -3629,19 +3633,19 @@ end
 
 function Plugin:_home_enter_post_reader_priority_window(seconds,reason)
     if not HomeView.is_shown() then return false end
-    local duration=math.max(4.0,tonumber(seconds) or 4.0)
+    local duration=math.max(2.0,tonumber(seconds) or tonumber(Config.HOME_POST_READER_BARRIER_SECONDS) or 4.0)
     self._home_post_reader_protect_until=math.max(
         tonumber(self._home_post_reader_protect_until) or 0,monotonic_wall_time()+duration)
-    self._home_metadata_generation=(tonumber(self._home_metadata_generation) or 0)+1
-    self._home_cover_generation=(tonumber(self._home_cover_generation) or 0)+1
-    self._home_cover_render_generation=(tonumber(self._home_cover_render_generation) or 0)+1
-    if self.home_metadata_async and self.home_metadata_async:busy() then self.home_metadata_async:cancel("post-reader priority") end
-    if self.home_cover_async and self.home_cover_async:busy() then self.home_cover_async:cancel("post-reader priority") end
-    if self.cover_render_async and self.cover_render_async:busy() then self.cover_render_async:cancel("post-reader priority") end
-    self:_background_cancel_all("post-reader priority",false,false)
+    -- beta.22: returning to Home is a foreground barrier, not a destructive
+    -- cancellation. Reader entry already hard-stops Home workers; on return we
+    -- simply keep new maintenance work from starting until the old surface is
+    -- interactive. Pending work stays queued and resumes from cached progress.
+    if self.background_scheduler then
+        self.background_scheduler:set_foreground_barrier(duration,reason or "post-reader home")
+    end
     self:_home_resume_visible_work_after_idle()
     logger.info("[MiuRead][HomePerf] post-reader priority window",
-        "seconds=",tostring(duration),"reason=",tostring(reason or "reader closed"))
+        "seconds=",tostring(duration),"reason=",tostring(reason or "reader closed"),"mode=soft_yield")
     return true
 end
 
@@ -3652,21 +3656,19 @@ function Plugin:_home_bump_interaction_generation()
 end
 
 function Plugin:_home_note_interaction(first,kind)
-    self._home_ui_quiet_until=math.max(tonumber(self._home_ui_quiet_until) or 0,monotonic_wall_time()+2.2)
+    local duration=math.max(.8,tonumber(Config.HOME_FOREGROUND_BARRIER_SECONDS) or 2.2)
+    self._home_ui_quiet_until=math.max(tonumber(self._home_ui_quiet_until) or 0,monotonic_wall_time()+duration)
     self:_home_bump_interaction_generation()
-    -- Stop optional visible-book work immediately; it can be restarted from
-    -- cached targets after the user has been idle for a moment.
-    self._home_metadata_generation=(tonumber(self._home_metadata_generation) or 0)+1
-    self._home_cover_generation=(tonumber(self._home_cover_generation) or 0)+1
-    self._home_cover_render_generation=(tonumber(self._home_cover_render_generation) or 0)+1
-    if self.home_metadata_async and self.home_metadata_async:busy() then self.home_metadata_async:cancel("home interaction") end
-    if self.home_cover_async and self.home_cover_async:busy() then self.home_cover_async:cancel("home interaction") end
-    if self.cover_render_async and self.cover_render_async:busy() then self.cover_render_async:cancel("home interaction") end
-    self:_background_cancel_all("home interaction",false,false)
+    -- beta.22 soft-yield: user input no longer invalidates generations, kills
+    -- cover/metadata workers, or clears the scheduler queue. The active worker
+    -- may finish its current smallest unit; the barrier prevents the next
+    -- automatic heavy job from starting until interaction is quiet.
+    if self.background_scheduler then
+        self.background_scheduler:set_foreground_barrier(duration,"home interaction:"..tostring(kind or "input"))
+    end
     -- Keep the download subprocess alive during ordinary Home interaction.
     -- The child sees a short absolute yield deadline and defers only heavy local
-    -- stages; network/checkpoint work may continue. Unlike a pause marker this
-    -- cannot become stuck when a dialog stays open or a resume callback is lost.
+    -- stages; network/checkpoint work may continue.
     local active_download=(self.download_task and self.download_task:busy()) or self._download_runtime~=nil
     if active_download and self._download_ui_yield_path then
         local until_at=os.time()+math.max(1,tonumber(Config.DOWNLOAD_UI_YIELD_SECONDS) or 3)
@@ -3674,7 +3676,7 @@ function Plugin:_home_note_interaction(first,kind)
     end
     self:_home_resume_visible_work_after_idle()
     if first then
-        logger.info("[MiuRead][HomePerf] interaction priority","kind=",tostring(kind or "input"))
+        logger.info("[MiuRead][HomePerf] interaction priority","kind=",tostring(kind or "input"),"mode=soft_yield")
     end
 end
 
@@ -4469,6 +4471,59 @@ function Plugin:_home_cover_input_stamp(inputs)
     return table.concat(parts,"+")
 end
 
+function Plugin:_home_legacy_rendered_cover(render_dir,book_id)
+    render_dir=tostring(render_dir or "")
+    book_id=tostring(book_id or "")
+    if render_dir=="" or book_id=="" then return nil end
+    local cache=self._home_legacy_cover_index
+    if type(cache)~="table" or cache.dir~=render_dir then
+        cache={dir=render_dir,by_id={}}
+        if lfs.attributes(render_dir,"mode")=="directory" then
+            for name in lfs.dir(render_dir) do
+                if name~="." and name~=".." then
+                    local key=name:match("^(.-)%-home2%-%d+x%d+%.png$")
+                    if key then
+                        local path=render_dir.."/"..name
+                        local entry=cache.by_id[key]
+                        if type(entry)~="table" then entry={best=nil,best_mtime=-1,paths={}}; cache.by_id[key]=entry end
+                        entry.paths[#entry.paths+1]=path
+                        local mt=tonumber(lfs.attributes(path,"modification") or 0) or 0
+                        if not entry.best or mt>=tonumber(entry.best_mtime or -1) then
+                            entry.best=path
+                            entry.best_mtime=mt
+                        end
+                    end
+                end
+            end
+        end
+        self._home_legacy_cover_index=cache
+    end
+    local entry=cache.by_id and cache.by_id[U.id_name(book_id)] or nil
+    local path=type(entry)=="table" and entry.best or entry
+    if path and lfs.attributes(path,"mode")=="file" and (tonumber(U.file_size(path) or 0) or 0)>0 then
+        return path
+    end
+    return nil
+end
+
+function Plugin:_home_remove_legacy_rendered_cover(book_id,path)
+    path=tostring(path or "")
+    if path=="" or not path:find("%-home2%-") then return false end
+    local key=U.id_name(tostring(book_id or ""))
+    local cache=self._home_legacy_cover_index
+    local entry=type(cache)=="table" and type(cache.by_id)=="table" and cache.by_id[key] or nil
+    local paths=type(entry)=="table" and entry.paths or {path}
+    local removed=false
+    for _,old_path in ipairs(paths or {}) do
+        old_path=tostring(old_path or "")
+        if old_path:find("%-home2%-") and lfs.attributes(old_path,"mode")=="file" then
+            removed=os.remove(old_path)==true or removed
+        end
+    end
+    if type(cache)=="table" and type(cache.by_id)=="table" then cache.by_id[key]=nil end
+    return removed
+end
+
 function Plugin:_home_schedule_cover_derivatives(books)
     if self._download_runtime~=nil then return false end
     if self:_home_ui_busy() then
@@ -4478,14 +4533,17 @@ function Plugin:_home_schedule_cover_derivatives(books)
     end
     if not self.cover_render_async or not self.cover_render_async:available() then return false end
     local lightweight=self:_lightweight_enabled()
-    local derivative_limit=lightweight and (tonumber(Config.LIGHTWEIGHT_DERIVATIVE_COVER_QUEUE) or 1) or math.huge
-    local derivative_gap=lightweight and (tonumber(Config.LIGHTWEIGHT_DERIVATIVE_GAP) or 1.0) or .8
+    local derivative_limit=math.max(1,tonumber(Config.HOME_DERIVATIVE_COVER_BATCH)
+        or tonumber(Config.LIGHTWEIGHT_DERIVATIVE_COVER_QUEUE) or 1)
+    local derivative_gap=math.max(.65,tonumber(Config.HOME_DERIVATIVE_COVER_GAP_SECONDS)
+        or (lightweight and tonumber(Config.LIGHTWEIGHT_DERIVATIVE_GAP)) or 1.0)
 
     local check_started=monotonic_wall_time()
     local sw,sh=Device.screen:getWidth(),Device.screen:getHeight()
     if sw<=0 or sh<=0 then return false end
-    local thumb_w=math.max(240,math.min(420,math.floor(sw*.34+.5)))
-    local thumb_h=math.max(340,math.floor(thumb_w/.69+.5))
+    local thumb_w,thumb_h=HomeView.shelf_thumbnail_size(tonumber(Config.HOME_COVER_THUMB_OVERSAMPLE) or 1.12)
+    thumb_w=math.max(96,math.min(360,tonumber(thumb_w) or math.floor(sw*.25+.5)))
+    thumb_h=math.max(132,math.min(520,tonumber(thumb_h) or math.floor(thumb_w/.70+.5)))
     local render_dir=self.store.data_dir.."/cover-render-v1"
     local source_dir=self:_home_local_metadata_dir()
     U.mkdir(render_dir)
@@ -4513,7 +4571,9 @@ function Plugin:_home_schedule_cover_derivatives(books)
                     local inputs={}
                     for _,path in ipairs(sources) do inputs[#inputs+1]=path end
                     if file~="" and U.file_exists(file) and not source_seen[file] then inputs[#inputs+1]=file end
-                    local home_target=render_dir.."/"..U.id_name(id).."-home2-"..tostring(thumb_w).."x"..tostring(thumb_h)..".png"
+                    local home_target=render_dir.."/"..U.id_name(id).."-home3-"..tostring(thumb_w).."x"..tostring(thumb_h)..".png"
+                    local home_fresh=self:_home_cover_target_fresh(home_target,inputs)
+                    local legacy_path=not home_fresh and self:_home_legacy_rendered_cover(render_dir,id) or nil
                     items[#items+1]={
                         id=id,
                         sources=sources,
@@ -4522,8 +4582,9 @@ function Plugin:_home_schedule_cover_derivatives(books)
                         file=file,
                         source_dir=source_dir,
                         home_target=home_target,
+                        legacy_path=legacy_path,
                         home_w=thumb_w,home_h=thumb_h,
-                        home_fresh=self:_home_cover_target_fresh(home_target,inputs),
+                        home_fresh=home_fresh,
                     }
                     if #items>=10 then break end
                 end
@@ -4542,6 +4603,14 @@ function Plugin:_home_schedule_cover_derivatives(books)
         if item.home_fresh then
             fresh_count=fresh_count+1
             local changed,is_hero,sections=self:_home_apply_rendered_cover_path(item.id,item.home_target)
+            fast_changed=fast_changed or changed
+            fast_hero_changed=fast_hero_changed or is_hero
+            if changed then fast_ids[item.id]=true end
+            for section in pairs(sections or {}) do fast_sections[section]=true end
+        elseif item.legacy_path then
+            -- Keep beta.21's sharper home2 thumbnail visible while home3 is
+            -- generated lazily. Never blank the shelf just to migrate caches.
+            local changed,is_hero,sections=self:_home_apply_rendered_cover_path(item.id,item.legacy_path)
             fast_changed=fast_changed or changed
             fast_hero_changed=fast_hero_changed or is_hero
             if changed then fast_ids[item.id]=true end
@@ -4625,7 +4694,7 @@ function Plugin:_home_schedule_cover_derivatives(books)
                 if not CoverRender.is_fresh(home_path,source) then
                     home_path=CoverRender.render_home(source,item.home_target,item.home_w,item.home_h)
                 end
-                out[#out+1]={id=item.id,home_path=home_path,source=source}
+                out[#out+1]={id=item.id,home_path=home_path,source=source,legacy_path=item.legacy_path}
             end
         end
         return out
@@ -4649,14 +4718,26 @@ function Plugin:_home_schedule_cover_derivatives(books)
         end
         self._home_cover_render_failed_signature=nil
         self._home_cover_render_failed_clock=0
-        self._home_cover_render_last_signature=request_signature
-        self._home_cover_render_last_clock=os.time()
-        if self._download_runtime~=nil then
-            -- Rendering may have started just before a download. Keep the files,
-            -- but do not touch the visible shelf until the download finishes.
-            logger.info("[MiuRead][CoverRender] visible apply deferred during download")
+        if self._download_runtime~=nil or self:_home_ui_busy() or self._desktop_frozen==true or self:_active_reader_ui() then
+            -- The file is complete, but foreground interaction owns the display.
+            -- Do not swap image widgets under a long-press/menu gesture; retry
+            -- after the same persistent queue becomes idle.
+            logger.info("[MiuRead][CoverRender] visible apply deferred",
+                "download=",tostring(self._download_runtime~=nil),
+                "ui_busy=",tostring(self:_home_ui_busy()),
+                "frozen=",tostring(self._desktop_frozen==true))
+            self._home_cover_render_last_signature=nil
+            self._home_cover_render_last_clock=0
+            if HomeView.is_shown() and not self:_active_reader_ui() then
+                self.background_scheduler:defer("home_cover_render",retry,{
+                    delay=math.max(derivative_gap,tonumber(Config.HOME_FOREGROUND_BARRIER_SECONDS) or 2.2),
+                    priority=20,reason="visible apply deferred"
+                })
+            end
             return
         end
+        self._home_cover_render_last_signature=request_signature
+        self._home_cover_render_last_clock=os.time()
         local any_changed=false
         local hero_changed=false
         local changed_sections={}
@@ -4668,6 +4749,12 @@ function Plugin:_home_schedule_cover_derivatives(books)
                 hero_changed=hero_changed or is_hero
                 if changed then changed_ids[entry.id]=true end
                 for section in pairs(sections or {}) do changed_sections[section]=true end
+                if entry.legacy_path and entry.legacy_path~=entry.home_path
+                    and self:_home_remove_legacy_rendered_cover(entry.id,entry.legacy_path) then
+                    logger.info("[MiuRead][DesktopPerf] cover migrated",
+                        "book=",tostring(entry.id),"from=home2","to=home3",
+                        "w=",tostring(thumb_w),"h=",tostring(thumb_h))
+                end
             end
         end
         if any_changed and HomeView.is_shown() and not self:_active_reader_ui() then
@@ -4682,12 +4769,12 @@ function Plugin:_home_schedule_cover_derivatives(books)
             "rendered=",tostring(#result.value),"fresh=",tostring(fresh_count),
             "elapsed_ms=",tostring(math.floor((monotonic_wall_time()-render_started)*1000+.5)),
             "lightweight=",tostring(lightweight))
-        if lightweight and HomeView.is_shown() and not self:_active_reader_ui() then
-            UIManager:scheduleIn(derivative_gap,function()
-                if HomeView.is_shown() and not self:_active_reader_ui() and not self:_home_ui_busy() then
-                    self:_home_schedule_cover_derivatives(books)
-                end
-            end)
+        -- One derivative per batch. If more visible books still need home3,
+        -- keep the queue alive and continue only after another idle gap.
+        if HomeView.is_shown() and not self:_active_reader_ui() then
+            self.background_scheduler:defer("home_cover_render",retry,{
+                delay=derivative_gap,priority=20,reason="progressive cover migration"
+            })
         end
     end,55)
     if started~=true then
@@ -9032,9 +9119,12 @@ function Plugin:_home_schedule_remote_covers(books)
         return false
     end
     local lightweight=self:_lightweight_enabled()
-    local queue_limit=lightweight and (tonumber(Config.LIGHTWEIGHT_REMOTE_COVER_QUEUE) or 4) or 10
-    local cover_gap=lightweight and (tonumber(Config.LIGHTWEIGHT_COVER_GAP) or .65) or .08
-    local derivative_gap=lightweight and (tonumber(Config.LIGHTWEIGHT_DERIVATIVE_GAP) or 1.0) or .75
+    local queue_limit=math.max(1,tonumber(Config.HOME_REMOTE_COVER_BATCH)
+        or (lightweight and tonumber(Config.LIGHTWEIGHT_REMOTE_COVER_QUEUE)) or 2)
+    local cover_gap=math.max(.65,tonumber(Config.HOME_REMOTE_COVER_GAP_SECONDS)
+        or (lightweight and tonumber(Config.LIGHTWEIGHT_COVER_GAP)) or 1.15)
+    local derivative_gap=math.max(.65,tonumber(Config.HOME_DERIVATIVE_COVER_GAP_SECONDS)
+        or (lightweight and tonumber(Config.LIGHTWEIGHT_DERIVATIVE_GAP)) or 1.15)
     self._home_cover_inflight=type(self._home_cover_inflight)=="table" and self._home_cover_inflight or {}
     local queue,seen={},{}
     for _,book in ipairs(books or {}) do
@@ -9112,6 +9202,13 @@ function Plugin:_home_schedule_remote_covers(books)
                     self:_home_schedule_cover_derivatives(rendered_books)
                 end
             end)
+        end
+        -- Process only a tiny visible batch, then give the device an idle gap.
+        -- A no-op retry is cheap when every visible cover is already cached.
+        if generation==self._home_cover_generation and HomeView.is_shown() and not self:_active_reader_ui() then
+            self.background_scheduler:defer("home_cover",retry,{
+                delay=math.max(1.0,cover_gap),priority=25,reason="progressive visible covers"
+            })
         end
     end
     local function next_cover()
@@ -9201,7 +9298,7 @@ function Plugin:_home_schedule_remote_covers(books)
     end
     logger.info("[MiuRead][HomeCoverBatch] queued","count=",tostring(#queue),
         "lightweight=",tostring(lightweight))
-    UIManager:scheduleIn(lightweight and math.max(.8,cover_gap) or .12,next_cover)
+    UIManager:scheduleIn(math.max(.35,math.min(.8,cover_gap)),next_cover)
     return true
 end
 
@@ -13539,6 +13636,8 @@ function Plugin:_close_home_for_reader(reason)
         self:_set_foreground("reader")
         return true
     end
+    self._desktop_frozen=true
+    logger.info("[MiuRead][DesktopPerf] desktop freeze","reason=",tostring(reason or "reader active"))
     self:_home_stop_background(reason or "reader active")
     self:_close_miuread_transients()
     if HomeView.is_shown() then
@@ -13576,6 +13675,7 @@ function Plugin:_complete_reader_close(generation,reason)
     if snapshot.lifecycle~="closed" then return false end
     if not snapshot.filemanager and not HomeView.is_shown() then return false end
     READER_CLOSE.state="home_restoring"
+    self._desktop_frozen=false
     self:_ensure_reader_transition_guard("stable reader close")
     self:_close_miuread_transients()
     self:_set_foreground("home_pending")
@@ -13706,6 +13806,10 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     options=type(options)=="table" and options or {}
     sync_home_session()
     if HOME_EXITING or UIManager._exit_code~=nil or HOME_SESSION.suspended==true or self._miuread_suspended==true then return false end
+    if self._desktop_frozen==true and not self:_active_reader_ui() and not (self.ui and self.ui.document) then
+        self._desktop_frozen=false
+        logger.info("[MiuRead][DesktopPerf] desktop thaw","reason=home show")
+    end
     if READER_CLOSE.state~="idle" and READER_CLOSE.state~="completed"
         and READER_CLOSE.state~="failed" and READER_CLOSE.state~="home_restoring" then
         logger.info("[MiuRead][ReaderClose] home rebuild blocked during close",READER_CLOSE.state)
@@ -21528,7 +21632,9 @@ function Plugin:onCloseDocument()
     -- No MiuRead/Home request exists. Treat this first as an internal ReaderUI
     -- rebuild candidate and stay out of Home/FileManager lifecycle until KOReader
     -- either returns a Reader or the bounded deadline proves it really closed.
-    self:_prepare_reader_disappearance("reader rebuild candidate")
+    -- beta.22 deliberately does NOT tear down sync/tap/network state here: that
+    -- cleanup belongs to _finalize_reader_instance_close() only after a real
+    -- close is confirmed. This keeps same-book reloads cheap and invisible.
     local setting_hint=reader_native_setting_active(closing_path)
     local tearing_down=self.ui and self.ui.tearing_down==true
     local internal_hint=tearing_down or setting_hint
@@ -21537,6 +21643,8 @@ function Plugin:onCloseDocument()
         "tearing_down=",tostring(tearing_down),
         "native_setting=",tostring(setting_hint),
         "setting=",setting_hint and tostring(READER_NATIVE_SETTING.label or "") or "")
+    logger.info("[MiuRead][DesktopPerf] reader reload suspected",
+        "book=",tostring(closing_path or ""),"internal_hint=",tostring(internal_hint))
     return self:_start_reader_rebuild_candidate(closing_path,session_generation,
         setting_hint and "KOReader native setting rebuild" or "CloseDocument without explicit return",internal_hint)
 end

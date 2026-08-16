@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.5.0-beta.21",
+    VERSION = "4.5.0-beta.22",
     SCHEMA = 112,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -77,6 +77,15 @@ local C = {
     BACKGROUND_SERIAL_GAP_SECONDS = 0.35,
     BACKGROUND_RETRY_SECONDS = 0.9,
     BACKGROUND_LEASE_TIMEOUT_SECONDS = 300,
+    HOME_FOREGROUND_BARRIER_SECONDS = 2.2,
+    HOME_POST_READER_BARRIER_SECONDS = 4.0,
+    HOME_REMOTE_SHELF_TTL_SECONDS = 30 * 60,
+    HOME_LOCAL_SHELF_TTL_SECONDS = 60 * 60,
+    HOME_REMOTE_COVER_BATCH = 2,
+    HOME_REMOTE_COVER_GAP_SECONDS = 1.15,
+    HOME_DERIVATIVE_COVER_BATCH = 1,
+    HOME_DERIVATIVE_COVER_GAP_SECONDS = 1.15,
+    HOME_COVER_THUMB_OVERSAMPLE = 1.12,
 
     -- Different user-visible operations have different normal costs.
     -- Only repeated slow samples of the SAME kind are combined. A single

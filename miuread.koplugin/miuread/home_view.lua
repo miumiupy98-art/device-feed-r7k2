@@ -509,6 +509,21 @@ local function outlined_badge_text(text, width, height, badge_face)
     return layer
 end
 
+local function shelf_cover_target_size(width, height, oversample)
+    width=math.max(1,tonumber(width) or 1)
+    height=math.max(1,tonumber(height) or 1)
+    local pad=math.max(UiScale.dp(1,0,2),math.floor(width*.004))
+    local inner_w=math.max(1,width-pad*2)
+    local title_h=math.max(UiScale.dp(29,25,40),math.min(UiScale.dp(39,32,47),math.floor(height*.155)))
+    local vgap=UiScale.dp(2,2,4)
+    -- Use the largest normal shelf-cover geometry. Cards with a status/progress
+    -- row render a little smaller, so this remains a safe quality upper bound.
+    local cover_h=math.max(UiScale.dp(78,64,108),height-title_h-vgap)
+    local cover_w=math.max(UiScale.dp(54,46,78),math.min(math.floor(inner_w*.995),math.floor(cover_h*.715)))
+    local scale=math.max(1.0,math.min(1.25,tonumber(oversample) or 1.12))
+    return math.max(1,math.floor(cover_w*scale+.5)),math.max(1,math.floor(cover_h*scale+.5))
+end
+
 local function shelf_book_card(book, width, height, callback, hold_callback)
     if book and (book.local_folder==true or book.kind=="folder") then
         return shelf_folder_card(book,width,height,callback)
@@ -1743,6 +1758,22 @@ function HomeView.update_section(opts)
     if not ok then logger.warn("[MiuRead][Home] section update failed", tostring(err)); return false end
     return true
 end
+function HomeView.shelf_thumbnail_size(oversample)
+    if HomeView.is_shown() and live_widget then
+        local slots=type(live_widget._section_book_slots)=="table" and live_widget._section_book_slots or {}
+        for _,slot in pairs(slots) do
+            if slot and tonumber(slot.w) and tonumber(slot.h) then
+                return shelf_cover_target_size(slot.w,slot.h,oversample)
+            end
+        end
+    end
+    -- Conservative 4-column fallback used before the first shelf slots exist.
+    local sw,sh=Screen:getWidth(),Screen:getHeight()
+    local card_w=math.max(1,math.floor(sw/4))
+    local card_h=math.max(1,math.floor(sh*.30))
+    return shelf_cover_target_size(card_w,card_h,oversample)
+end
+
 function HomeView.update_book(book_id)
     if not HomeView.is_shown() or not live_widget.updateBook then return false end
     local ok, updated = pcall(live_widget.updateBook, live_widget, book_id)
