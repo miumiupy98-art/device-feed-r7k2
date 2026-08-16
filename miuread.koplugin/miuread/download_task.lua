@@ -122,25 +122,6 @@ function DownloadTask:_control_network_path()
     return path~="" and path or nil
 end
 
-function DownloadTask:_control_yield_path()
-    local task=self:_control_descriptor()
-    local path=type(task)=="table" and tostring(task.yield_path or "") or ""
-    return path~="" and path or nil
-end
-
-function DownloadTask:yield_for_interaction(seconds,reason)
-    local path=self:_control_yield_path()
-    if not path then return false end
-    local duration=math.max(.5,tonumber(seconds) or tonumber(Config.DOWNLOAD_INTERACTION_YIELD_SECONDS) or 2.2)
-    local until_at=os.time()+math.max(1,math.ceil(duration))
-    local wrote=U.atomic_write(path,tostring(until_at),true)==true
-    if wrote then
-        logger.dbg("[MiuRead][DownloadTask] interaction yield",
-            "reason=",tostring(reason or "foreground"),"until=",tostring(until_at))
-    end
-    return wrote
-end
-
 function DownloadTask:set_network_mode(mode)
     mode=tostring(mode or "auto")=="ipv4" and "ipv4" or "auto"
     local path=self:_control_network_path()
@@ -226,32 +207,51 @@ local TRANSIENT_PAUSE_REASONS = {
     thought_popup=true, transient_ui=true, heavy_resource=true,
 }
 
-local AUTO_EXPIRING_TRANSIENT_PAUSE_REASONS = {
+local AUTO_EXPIRE_PAUSE_REASONS = {
     home_interaction=true, reader_interaction=true, page_transition=true,
 }
 
-function DownloadTask:_heal_stale_transient_pause(now)
+function DownloadTask:_recover_stale_transient_pauses()
     local path=self:_control_pause_path()
     if not path then return false end
     local raw=U.read_file(path,true)
     if not raw then return false end
     local ok,value=pcall(Json.decode,raw)
     if not ok or type(value)~="table" then return false end
-    local reasons=type(value.reasons)=="table" and value.reasons or {}
-    if #reasons==0 then return false end
-    for _,reason in ipairs(reasons) do
-        if not AUTO_EXPIRING_TRANSIENT_PAUSE_REASONS[tostring(reason or "")] then return false end
+    local updated=tonumber(value.updated_at) or 0
+    if updated<=0 then return false end
+    local age=math.max(0,os.time()-updated)
+    local interaction_timeout=math.max(10,tonumber(Config.DOWNLOAD_INTERACTION_STALE_SECONDS) or 12)
+    local transition_timeout=math.max(30,tonumber(Config.DOWNLOAD_TRANSITION_STALE_SECONDS) or 60)
+
+    local remaining={}
+    local recovered={}
+    for _,reason in ipairs(type(value.reasons)=="table" and value.reasons or {}) do
+        reason=tostring(reason or "")
+        if reason~="" then
+            local timeout=reason=="page_transition" and transition_timeout or interaction_timeout
+            if AUTO_EXPIRE_PAUSE_REASONS[reason]==true and age>=timeout then
+                recovered[#recovered+1]=reason
+            else
+                remaining[reason]=true
+            end
+        end
     end
-    local updated_at=tonumber(value.updated_at or 0) or 0
-    local maximum=math.max(5,tonumber(Config.DOWNLOAD_TRANSIENT_PAUSE_MAX_SECONDS) or 10)
-    now=tonumber(now) or os.time()
-    if updated_at<=0 or now-updated_at<maximum then return false end
-    os.remove(path)
-    self.pause_reasons={}
-    for reason in pairs(AUTO_EXPIRING_TRANSIENT_PAUSE_REASONS) do self:_cancel_deferred_resume(reason) end
-    logger.warn("[MiuRead][DownloadTask] stale transient pause cleared",
-        "age=",tostring(now-updated_at),"reasons=",table.concat(reasons,","))
-    if self.job then self:_schedule() end
+    if #recovered==0 then return false end
+
+    if next(remaining)==nil then
+        os.remove(path)
+    else
+        local ordered={}
+        for reason in pairs(remaining) do ordered[#ordered+1]=reason end
+        table.sort(ordered)
+        U.atomic_write(path,Json.encode({paused=true,reasons=ordered,updated_at=os.time()}),true)
+    end
+    self.pause_reasons=remaining
+    logger.warn("[MiuRead][DownloadTask] stale transient pause recovered",
+        "reasons=",table.concat(recovered,","),"age=",tostring(age),
+        "still_paused=",tostring(next(remaining)~=nil))
+    if next(remaining)==nil and self.job and not self.backgrounded then self:_hold_awake() end
     return true
 end
 
@@ -513,7 +513,7 @@ function DownloadTask:descriptor()
         pid=job.pid,progress_path=job.progress_path,result_path=job.result_path,
         recovery_path=job.recovery_path,diagnostic_path=job.diagnostic_path,
         cancel_path=job.cancel_path,pause_path=job.pause_path,pause_ack_path=job.pause_ack_path,
-        hibernate_path=job.hibernate_path,network_path=job.network_path,yield_path=job.yield_path,
+        hibernate_path=job.hibernate_path,network_path=job.network_path,
         worker_settings_path=job.worker_settings_path,
         started_at=job.started_at,owner_token=self.owner_token,task_token=job.task_token,
         restart_count=tonumber(job.restart_count) or 0,
@@ -740,7 +740,6 @@ function DownloadTask:_finish(job, forced_error)
     if job.pause_ack_path then os.remove(job.pause_ack_path) end
     if job.hibernate_path then os.remove(job.hibernate_path) end
     if job.network_path then os.remove(job.network_path) end
-    if job.yield_path then os.remove(job.yield_path) end
     if job.worker_settings_path then os.remove(job.worker_settings_path) end
     if self:_owns_job() then os.remove(self.owner_path) end
     self.job = nil
@@ -774,7 +773,6 @@ function DownloadTask:_handle_hibernated(job,result)
     if job.pause_ack_path then os.remove(job.pause_ack_path) end
     if job.hibernate_path then os.remove(job.hibernate_path) end
     if job.network_path then os.remove(job.network_path) end
-    if job.yield_path then os.remove(job.yield_path) end
     if job.worker_settings_path then os.remove(job.worker_settings_path) end
     if self:_owns_job() then os.remove(self.owner_path) end
     self.job=nil
@@ -870,7 +868,6 @@ function DownloadTask:_restart_interrupted(job)
     if job.pause_ack_path then os.remove(job.pause_ack_path) end
     if job.hibernate_path then os.remove(job.hibernate_path) end
     if job.network_path then os.remove(job.network_path) end
-    if job.yield_path then os.remove(job.yield_path) end
     if job.worker_settings_path then os.remove(job.worker_settings_path) end
     if self:_owns_job() then os.remove(self.owner_path) end
     self.job=nil
@@ -900,6 +897,11 @@ function DownloadTask:_poll()
     end
 
     self:_read_progress(job)
+    -- A UI pause is allowed to protect a transition, never to become a
+    -- permanent task state. Recover old transient markers independently of UI
+    -- callbacks before evaluating worker liveness. Explicit/manual/recovery
+    -- pauses are untouched.
+    self:_recover_stale_transient_pauses()
     self:_heavy_watch(false)
     if job.token_mismatch then
         self:_finish(job,"后台下载任务身份不匹配；断点已保留，请重新开始下载。")
@@ -926,7 +928,6 @@ function DownloadTask:_poll()
     end
 
     local now=os.time()
-    self:_heal_stale_transient_pause(now)
     local stall_sleep=math.max(120,tonumber(Config.DOWNLOAD_BACKGROUND_STALL_SLEEP_SECONDS) or 300)
     local effective_activity=tonumber(job.last_effective_progress_at or job.started_at) or now
     local effective_idle=math.max(0,now-effective_activity)
@@ -1070,7 +1071,6 @@ function DownloadTask:cancel()
     job.cancel_requested_at = os.time()
     self.pause_reasons={}
     if job.pause_path then os.remove(job.pause_path) end
-    if job.yield_path then os.remove(job.yield_path) end
     U.atomic_write(job.cancel_path, "1", true)
 end
 
@@ -1107,7 +1107,7 @@ function DownloadTask:attach(descriptor,on_progress,on_done,restart_book,restart
         pid=pid,progress_path=descriptor.progress_path,result_path=descriptor.result_path,
         recovery_path=recovery_path,diagnostic_path=diagnostic_path,
         cancel_path=descriptor.cancel_path,pause_path=descriptor.pause_path,pause_ack_path=descriptor.pause_ack_path,
-        hibernate_path=descriptor.hibernate_path,network_path=descriptor.network_path,yield_path=descriptor.yield_path,
+        hibernate_path=descriptor.hibernate_path,network_path=descriptor.network_path,
         worker_settings_path=descriptor.worker_settings_path,
         on_progress=on_progress,on_done=on_done,last_progress_raw=nil,last_progress_state=nil,
         last_progress_at=nil,last_effective_progress_at=nil,waiting_started_at=nil,last_keepalive=0,started_at=descriptor.started_at,dead_seen_at=nil,
@@ -1174,7 +1174,6 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
     local pause_ack_path = self.store.temp_dir .. "/download-pause-ack-" .. stamp .. ".json"
     local hibernate_path = self.store.temp_dir .. "/download-hibernate-" .. stamp .. ".json"
     local network_path = self.store.temp_dir .. "/download-network-" .. stamp
-    local yield_path = self.store.temp_dir .. "/download-yield-" .. stamp
     local worker_settings_path = self.store.temp_dir .. "/download-settings-" .. stamp .. ".lua"
     self.store:flush()
     local copied, copy_error = U.copy_file(self.store.settings_path, worker_settings_path)
@@ -1186,14 +1185,13 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
     clean_options.download_run_id=tostring(clean_options.download_run_id or task_token)
     clean_options.reader_active_path="/tmp/miuread-reader-active.flag"
     clean_options.reader_busy_path="/tmp/miuread-reader-busy.until"
+    clean_options.foreground_yield_path="/tmp/miuread-download-ui-yield.until"
     clean_options.pause_path=pause_path
     clean_options.pause_ack_path=pause_ack_path
     clean_options.hibernate_path=hibernate_path
     clean_options.network_mode=tostring(clean_options.network_mode or "auto")=="ipv4" and "ipv4" or "auto"
     clean_options.network_mode_path=network_path
     clean_options.performance_mode_path=Config.LIGHTWEIGHT_MODE_FLAG
-    clean_options.interaction_yield_path=yield_path
-    clean_options.interaction_yield_max_delay=tonumber(Config.DOWNLOAD_INTERACTION_YIELD_MAX_DELAY) or .35
     local initial_network_control=clean_options.network_suggestion_silent==true and "auto_silent" or clean_options.network_mode
     local network_written,network_error=U.atomic_write(network_path,initial_network_control,true)
     if not network_written then
@@ -1502,7 +1500,6 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
     os.remove(pause_path)
     os.remove(pause_ack_path)
     os.remove(hibernate_path)
-    os.remove(yield_path)
     local ok, pid, err = pcall(FFIUtil.runInSubProcess, child, false, false)
     if not ok or not pid then
         os.remove(worker_settings_path)
@@ -1510,7 +1507,6 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
         os.remove(pause_ack_path)
         os.remove(hibernate_path)
         os.remove(network_path)
-        os.remove(yield_path)
         return false, tostring(err or pid or "无法启动下载子进程")
     end
 
@@ -1525,7 +1521,6 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
         pause_ack_path = pause_ack_path,
         hibernate_path = hibernate_path,
         network_path = network_path,
-        yield_path = yield_path,
         network_mode = clean_options.network_mode,
         worker_settings_path = worker_settings_path,
         on_progress = on_progress,

@@ -555,6 +555,7 @@ function Plugin:init()
     end
     self._reader_active_path="/tmp/miuread-reader-active.flag"
     self._reader_busy_path="/tmp/miuread-reader-busy.until"
+    self._download_ui_yield_path="/tmp/miuread-download-ui-yield.until"
     self._reader_busy_until=tonumber(U.read_file(self._reader_busy_path,true) or 0) or 0
     self._reader_last_interaction_clock=0
     self._home_quick_panel_last_open=0
@@ -637,6 +638,8 @@ function Plugin:init()
     self.memory_mode=MemoryMode:new(self.store)
     self.performance_mode=PerformanceMode:new(self.store)
     self.background_scheduler=BackgroundScheduler:new()
+    self._reader_interaction_resume_task=nil
+    self._reader_interaction_resume_generation=0
     self._performance_prompt_pending=nil
     self._performance_prompt_dialog=nil
     self.book_repair=DataMigration:new(self.store)
@@ -3660,13 +3663,14 @@ function Plugin:_home_note_interaction(first,kind)
     if self.home_cover_async and self.home_cover_async:busy() then self.home_cover_async:cancel("home interaction") end
     if self.cover_render_async and self.cover_render_async:busy() then self.cover_render_async:cancel("home interaction") end
     self:_background_cancel_all("home interaction",false,false)
-    if self.download_task and self.download_task:busy() then
-        -- Home interaction no longer hard-pauses the whole download worker.
-        -- Publish a short-lived cooperative yield window instead: networking
-        -- can keep moving, while CPU/memory-heavy checkpoints wait for the UI
-        -- to become quiet. The timestamp expires without a matching callback,
-        -- so opening the download progress surface cannot strand the worker.
-        self.download_task:yield_for_interaction(Config.DOWNLOAD_INTERACTION_YIELD_SECONDS,"home_interaction")
+    -- Keep the download subprocess alive during ordinary Home interaction.
+    -- The child sees a short absolute yield deadline and defers only heavy local
+    -- stages; network/checkpoint work may continue. Unlike a pause marker this
+    -- cannot become stuck when a dialog stays open or a resume callback is lost.
+    local active_download=(self.download_task and self.download_task:busy()) or self._download_runtime~=nil
+    if active_download and self._download_ui_yield_path then
+        local until_at=os.time()+math.max(1,tonumber(Config.DOWNLOAD_UI_YIELD_SECONDS) or 3)
+        U.atomic_write(self._download_ui_yield_path,tostring(until_at),true)
     end
     self:_home_resume_visible_work_after_idle()
     if first then
@@ -10187,6 +10191,34 @@ function Plugin:home_preview_menu()
     }
 end
 
+function Plugin:_schedule_reader_interaction_resume(target)
+    self._reader_interaction_resume_generation=(tonumber(self._reader_interaction_resume_generation) or 0)+1
+    local generation=self._reader_interaction_resume_generation
+    if self._reader_interaction_resume_task then
+        UIManager:unschedule(self._reader_interaction_resume_task)
+        self._reader_interaction_resume_task=nil
+    end
+    local task
+    task=function()
+        if self._reader_interaction_resume_task~=task
+            or generation~=self._reader_interaction_resume_generation then return end
+        if self._miuread_suspended==true or HOME_SESSION.suspended==true then
+            self._reader_interaction_resume_task=nil
+            return
+        end
+        local now=os.time()
+        local deadline=math.max(tonumber(target) or 0,tonumber(self._reader_busy_until or 0) or 0)
+        if deadline>now then
+            UIManager:scheduleIn(math.max(.25,deadline-now+.15),task)
+            return
+        end
+        self._reader_interaction_resume_task=nil
+        if self.download_task then self.download_task:resume("reader_interaction") end
+    end
+    self._reader_interaction_resume_task=task
+    UIManager:scheduleIn(math.max(.25,(tonumber(target) or os.time())-os.time()+.15),task)
+end
+
 function Plugin:_mark_reader_busy(seconds,share_report)
     local path=tostring(self._reader_busy_path or "")
     if path=="" then return false end
@@ -10200,9 +10232,10 @@ function Plugin:_mark_reader_busy(seconds,share_report)
     -- written only when a visible panel gesture specifically asks the report
     -- subprocess to yield, or while a download is already competing for I/O.
     if active_download or share_report==true then wrote=U.atomic_write(path,tostring(target),true)==true end
-    -- beta.20 no longer hard-pauses the complete worker for every page turn.
-    -- This shared busy timestamp expires by itself; the child slows ordinary
-    -- work while CPU/memory-heavy checkpoints wait for the reader to go quiet.
+    -- Reader interaction still has priority, but no longer hard-pauses the
+    -- download worker. downloader.lua already observes reader_busy_path and now
+    -- lets network/light work continue while deferring heavy transforms/package
+    -- work until this absolute deadline expires.
     return wrote
 end
 
@@ -21135,6 +21168,11 @@ function Plugin:onSuspend()
     -- No interaction/helper timer is allowed to wake or poll background work
     -- after Suspend has taken ownership. The download marker is normalized
     -- after these timers are cancelled so no stale callback can re-pause it.
+    self._reader_interaction_resume_generation=(tonumber(self._reader_interaction_resume_generation) or 0)+1
+    if self._reader_interaction_resume_task then
+        UIManager:unschedule(self._reader_interaction_resume_task)
+        self._reader_interaction_resume_task=nil
+    end
     if self._reader_toolbar_state_task then
         UIManager:unschedule(self._reader_toolbar_state_task)
         self._reader_toolbar_state_task=nil

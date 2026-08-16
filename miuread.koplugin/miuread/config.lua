@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.5.0-beta.20",
+    VERSION = "4.5.0-beta.21",
     SCHEMA = 112,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -134,13 +134,13 @@ local C = {
     HEAVY_DOWNLOAD_RESUME_MIN_KB = 72 * 1024,
     DOWNLOAD_HIBERNATE_WAIT_SECONDS = 8,
     DOWNLOAD_INTERACTION_RESUME_DELAY = 2.5,
-    -- beta.20 keeps foreground interaction responsive without hard-pausing the
-    -- whole downloader. Home gestures publish a short-lived yield window that
-    -- the worker observes only at safe checkpoints; the timestamp expires on
-    -- its own even if a UI callback is lost.
-    DOWNLOAD_INTERACTION_YIELD_SECONDS = 2.2,
-    DOWNLOAD_INTERACTION_YIELD_MAX_DELAY = 0.35,
-    DOWNLOAD_TRANSIENT_PAUSE_MAX_SECONDS = 10,
+    -- beta.21 foreground arbitration: ordinary UI interaction no longer hard-pauses
+    -- the download worker. Heavy local stages yield behind a short absolute
+    -- deadline instead, so a lost UI callback can never strand the task.
+    DOWNLOAD_UI_YIELD_SECONDS = 3,
+    DOWNLOAD_UI_HEAVY_YIELD_MAX_SECONDS = 4,
+    DOWNLOAD_INTERACTION_STALE_SECONDS = 12,
+    DOWNLOAD_TRANSITION_STALE_SECONDS = 60,
     HEAVY_WATCH_SECONDS = 10,
 
     -- beta.17 power lifecycle: short resumes are diagnosed but never forced
