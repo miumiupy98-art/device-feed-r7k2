@@ -430,31 +430,53 @@ local function image_unique_href(used, prefix, index, ext)
     return candidate, index
 end
 
-local function image_tar_assets(blob)
-    local entries = Codec.tar(blob)
-    local names = {}
-    for name in pairs(entries or {}) do names[#names + 1] = name end
-    table.sort(names)
-
-    local assets, source_map, used = {}, {}, {}
-    local index = 0
-    for _, name in ipairs(names) do
-        local data = entries[name]
-        local ext, mime = Codec.media(data, name)
-        if tostring(mime):match("^image/") and data and #data > 0 then
-            index = index + 1
-            local href
-            href, index = image_unique_href(used, "tar", index, ext)
-            assets[#assets + 1] = {href=href, data=data, mime=mime, source=name}
-            local local_src = "../" .. href
-            image_map_add(source_map, name, local_src)
-            image_map_add(source_map, image_basename(name), local_src)
-        end
-    end
-    return assets, source_map
+local function image_work_root(reader,book_id,chapter_uid)
+    local base=tostring(reader and reader.store and reader.store.temp_dir or "")
+    if base=="" then base="/tmp" end
+    local root=base.."/chapter-images-"..Util.id_name(book_id).."-"..Util.id_name(chapter_uid)
+        .."-"..tostring(os.time()).."-"..tostring(math.random(1000,9999))
+    Util.remove_tree(root)
+    if not Util.mkdir(root) then error("无法建立章节图片临时目录") end
+    reader._transient_image_roots=reader._transient_image_roots or {}
+    reader._transient_image_roots[root]=true
+    return root
 end
 
-local function localize_epub_images(reader, xhtml, assets, source_map, state, css)
+local function image_tar_assets_file(archive_path,work_root,opt)
+    local extract_dir=work_root.."/tar"
+    local entries,extract_error=Codec.tar_file(archive_path,extract_dir,function(bytes,count)
+        if opt and type(opt.activity)=="function" then
+            pcall(opt.activity,"image_extract",{bytes=bytes,count=count})
+        end
+    end)
+    if not entries then return nil,nil,extract_error end
+    local names={}
+    for name in pairs(entries) do names[#names+1]=name end
+    table.sort(names)
+
+    local assets,source_map,used={},{},{}
+    local index=0
+    for _,name in ipairs(names) do
+        local item=entries[name]
+        local path=item and item.path
+        local size=item and tonumber(item.size) or 0
+        local ext,mime=Codec.media_file(path,name)
+        if tostring(mime):match("^image/") and path and size>0 then
+            index=index+1
+            local href
+            href,index=image_unique_href(used,"tar",index,ext)
+            assets[#assets+1]={href=href,data_path=path,mime=mime,source=name,_temporary_root=work_root}
+            local local_src="../"..href
+            image_map_add(source_map,name,local_src)
+            image_map_add(source_map,image_basename(name),local_src)
+        elseif path then
+            os.remove(path)
+        end
+    end
+    return assets,source_map
+end
+
+local function localize_epub_images(reader, xhtml, assets, source_map, state, css, opt)
     assets = assets or {}
     source_map = source_map or {}
     local used = image_used_hrefs(assets)
@@ -479,7 +501,14 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
     local function download_remote(url)
         if remote_cache[url] then return remote_cache[url] end
         if remote_failed[url] then return nil end
-        local ok, data = pcall(reader.http.download, reader.http, url, {
+        local root=tostring(state and state.image_work_root or "")
+        if root=="" then
+            remote_failed[url]=true
+            logger.warn("[MiuRead][Reader] remote image work directory missing","url=",Util.redact_url(url))
+            return nil
+        end
+        local target=root.."/remote-"..string.format("%05d",remote_index+1)..".bin"
+        local ok, path_or_error = pcall(reader.http.download_to_file, reader.http, url, target, {
             headers={
                 Referer=(state and state.url) or BASE .. "/",
                 Origin=BASE,
@@ -488,20 +517,28 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
             },
             retries=1,
             timeout={12, 25},
+            on_chunk=function(bytes)
+                if opt and type(opt.activity)=="function" then
+                    pcall(opt.activity,"remote_image_download",{bytes=bytes})
+                end
+            end,
         })
-        if not ok or not data or #data == 0 then
-            if not ok and is_auth_error(data) then
+        if not ok or not path_or_error or not Util.file_exists(path_or_error) then
+            if not ok and is_auth_error(path_or_error) then
                 -- Preserve the original 401/session error so Reader:chapter can
                 -- renew the Web session and rebuild the chapter with fresh
                 -- signed image addresses instead of retrying a stale URL.
-                error(data)
+                error(path_or_error)
             end
+            os.remove(target)
             remote_failed[url] = true
-            logger.warn("[MiuRead][Reader] remote image failed", "url=", Util.redact_url(url), "error=", ok and "empty" or tostring(data))
+            logger.warn("[MiuRead][Reader] remote image failed", "url=", Util.redact_url(url),
+                "error=", ok and "empty" or tostring(path_or_error))
             return nil
         end
-        local ext, mime = Codec.media(data, url)
+        local ext, mime = Codec.media_file(path_or_error, url)
         if not tostring(mime):match("^image/") then
+            os.remove(path_or_error)
             remote_failed[url] = true
             logger.warn("[MiuRead][Reader] remote asset is not an image", "url=", Util.redact_url(url), "mime=", tostring(mime))
             return nil
@@ -509,7 +546,7 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
         remote_index = remote_index + 1
         local href
         href, remote_index = image_unique_href(used, "remote", remote_index, ext)
-        assets[#assets + 1] = {href=href, data=data, mime=mime, source=url}
+        assets[#assets + 1] = {href=href, data_path=path_or_error, mime=mime, source=url, _temporary_root=root}
         remote_cache[url] = href
         image_map_add(source_map, url, "../" .. href)
         summary.remote = summary.remote + 1
@@ -708,7 +745,12 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
 end
 
 function Reader:new(http, store)
-    return setmetatable({http=http, store=store, _renewing_session=false}, self)
+    return setmetatable({http=http, store=store, _renewing_session=false, _transient_image_roots={}}, self)
+end
+
+function Reader:cleanup_transient_images()
+    for root in pairs(self._transient_image_roots or {}) do Util.remove_tree(root) end
+    self._transient_image_roots={}
 end
 
 function Reader:renew()
@@ -900,6 +942,8 @@ function Reader:_epub_once(book, chapter, opt, state)
 
     local assets, source_map = {}, {}
     if opt.images ~= false then
+        local work_root=image_work_root(self,id,uid)
+        state.image_work_root=work_root
         local tar_url = chapter.tar
         state.image_archive_expected = tar_url ~= nil and tostring(tar_url) ~= ""
         state.image_archive_ok = not state.image_archive_expected
@@ -910,18 +954,33 @@ function Reader:_epub_once(book, chapter, opt, state)
             elseif tar_url:sub(1, 1) == "/" then
                 tar_url = BASE .. tar_url
             end
-            local ok_tar, blob = pcall(self.http.download, self.http, tar_url, {
+            local archive_path=work_root.."/chapter-images.tar"
+            local ok_tar, path_or_error = pcall(self.http.download_to_file, self.http, tar_url, archive_path, {
                 headers={Referer=state.url, Origin=BASE, Accept="application/octet-stream,*/*"},
                 retries=3,
+                on_chunk=function(bytes)
+                    if type(opt.activity)=="function" then
+                        pcall(opt.activity,"image_archive_download",{bytes=bytes})
+                    end
+                end,
             })
-            if ok_tar and blob and #blob > 0 then
-                state.image_archive_ok = true
-                local tar_assets, tar_map = image_tar_assets(blob)
-                for _, asset in ipairs(tar_assets) do assets[#assets + 1] = asset end
-                for key, href in pairs(tar_map) do source_map[key] = href end
+            if ok_tar and path_or_error and Util.file_exists(path_or_error) then
+                if type(opt.yield)=="function" then opt.yield("images") end
+                local tar_assets, tar_map, extract_error = image_tar_assets_file(path_or_error,work_root,opt)
+                os.remove(archive_path)
+                if tar_assets then
+                    state.image_archive_ok = true
+                    for _, asset in ipairs(tar_assets) do assets[#assets + 1] = asset end
+                    for key, href in pairs(tar_map) do source_map[key] = href end
+                    collectgarbage("collect")
+                else
+                    logger.warn("[MiuRead][Reader] chapter image archive extract failed", "chapter=", tostring(uid),
+                        "url=", Util.redact_url(tar_url), "error=", tostring(extract_error))
+                end
             else
+                os.remove(archive_path)
                 logger.warn("[MiuRead][Reader] chapter image archive failed", "chapter=", tostring(uid),
-                    "url=", Util.redact_url(tar_url), "error=", ok_tar and "empty" or tostring(blob))
+                    "url=", Util.redact_url(tar_url), "error=", ok_tar and "empty" or tostring(path_or_error))
             end
         end
     end
@@ -946,7 +1005,7 @@ function Reader:_epub_once(book, chapter, opt, state)
             error("decoded EPUB chapter is empty")
         end
     elseif opt.images ~= false then
-        xhtml, assets, state.image_summary, css = localize_epub_images(self, xhtml, assets, source_map, state, css)
+        xhtml, assets, state.image_summary, css = localize_epub_images(self, xhtml, assets, source_map, state, css, opt)
         logger.info("[MiuRead][Reader] chapter images", "chapter=", tostring(uid),
             "tar=", tostring(state.image_summary.tar), "remote=", tostring(state.image_summary.remote),
             "localized=", tostring(state.image_summary.localized), "optional=", tostring(state.image_summary.optional or 0),
@@ -965,6 +1024,11 @@ function Reader:_epub_once(book, chapter, opt, state)
         end
     end
     state.content_format = state.content_format or "epub"
+    if state.image_work_root and #assets==0 then
+        Util.remove_tree(state.image_work_root)
+        if self._transient_image_roots then self._transient_image_roots[state.image_work_root]=nil end
+        state.image_work_root=nil
+    end
     return xhtml, css, assets, state
 end
 
@@ -1001,9 +1065,16 @@ function Reader:chapter(book, chapter, format, opt)
     local last, renewed, empty_count = nil, false, 0
     local uid = chapter.chapterUid or chapter.uid
     for attempt = 1, 3 do
+        self:cleanup_transient_images()
         local ok, a, b, c, d = pcall(self._chapter_once, self, book, chapter, format, opt)
         if ok then return a, b, c, d end
         last = a
+        local control_error=tostring(a or "")
+        if control_error:find("__MIUREAD_HIBERNATE__",1,true)
+            or control_error:lower():find("download cancelled",1,true) then
+            self:cleanup_transient_images()
+            error(a)
+        end
 
         if is_confirmed_empty_error(a) then
             empty_count = empty_count + 1
@@ -1048,6 +1119,7 @@ function Reader:chapter(book, chapter, format, opt)
             end
         end
     end
+    self:cleanup_transient_images()
     error(last or "chapter download failed")
 end
 

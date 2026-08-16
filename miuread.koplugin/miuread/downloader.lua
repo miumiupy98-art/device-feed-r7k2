@@ -504,11 +504,31 @@ end
 local function cache_save_assets(cache, uid, assets)
     local paths = chapter_paths(cache, uid)
     U.mkdir(paths.asset_dir)
-    local meta = {}
+    local meta,temporary_roots = {},{}
+    local function cleanup_temporary_roots()
+        for root in pairs(temporary_roots) do U.remove_tree(root) end
+    end
     for index, asset in ipairs(assets or {}) do
+        local temporary_root=tostring(asset._temporary_root or "")
+        if temporary_root~="" then temporary_roots[temporary_root]=true end
         local file = paths.asset_dir .. "/" .. string.format("%04d.bin", index)
-        local ok, err = U.atomic_write(file, asset.data or "", true)
-        if not ok then error("无法保存章节图片断点：" .. tostring(err)) end
+        local ok, err
+        if tostring(asset.data_path or "")~="" then
+            local stage=file..".stream-"..tostring(os.time()).."-"..tostring(math.random(1000,9999))
+            os.remove(stage)
+            ok,err=U.copy_file_stream(asset.data_path,stage,tonumber(Config.DOWNLOAD_STREAM_CHUNK_BYTES) or 128*1024)
+            if ok then
+                os.remove(file)
+                ok,err=os.rename(stage,file)
+                if not ok then os.remove(stage) end
+            end
+        else
+            ok,err=U.atomic_write(file,asset.data or "",true)
+        end
+        if not ok then
+            cleanup_temporary_roots()
+            error("无法保存章节图片断点：" .. tostring(err))
+        end
         meta[#meta + 1] = {
             href = asset.href,
             mime = asset.mime,
@@ -517,7 +537,11 @@ local function cache_save_assets(cache, uid, assets)
         }
     end
     local ok, err = DownloadDatabase.save_assets(cache.root, uid, meta)
-    if not ok then error("无法保存 SQLite 图片清单：" .. tostring(err)) end
+    if not ok then
+        cleanup_temporary_roots()
+        error("无法保存 SQLite 图片清单：" .. tostring(err))
+    end
+    cleanup_temporary_roots()
 end
 
 local function cache_load_assets(cache, entry)
@@ -525,9 +549,9 @@ local function cache_load_assets(cache, entry)
     if type(meta) ~= "table" then return nil, "图片断点清单缺失" end
     local assets = {}
     for _, item in ipairs(meta) do
-        local data = U.read_file(absolute(cache.root, item.file), true)
-        if data == nil then return nil, "章节图片断点缺失" end
-        assets[#assets + 1] = {href=item.href, mime=item.mime, source=item.source, data=data}
+        local file=absolute(cache.root,item.file)
+        if U.file_size(file)==nil then return nil,"章节图片断点缺失" end
+        assets[#assets + 1] = {href=item.href, mime=item.mime, source=item.source, data_path=file}
     end
     return assets
 end
@@ -1627,8 +1651,25 @@ function Downloader:book(input, opt, progress)
 
         if not body then
             progress("content", index, expected, chapter.title)
+            local last_activity_at,last_activity_bytes=0,0
+            local function chapter_activity(kind,detail)
+                detail=type(detail)=="table" and detail or {}
+                local now=os.time()
+                local bytes=tonumber(detail.bytes) or 0
+                local heartbeat_seconds=math.max(1,tonumber(Config.DOWNLOAD_TRANSFER_HEARTBEAT_SECONDS) or 3)
+                local heartbeat_bytes=math.max(64*1024,tonumber(Config.DOWNLOAD_TRANSFER_HEARTBEAT_BYTES) or 512*1024)
+                if now-last_activity_at<heartbeat_seconds and bytes-last_activity_bytes<heartbeat_bytes then return end
+                last_activity_at=now
+                last_activity_bytes=math.max(last_activity_bytes,bytes)
+                local message=(kind=="image_extract") and "正在低内存整理章节图片" or "正在下载章节图片"
+                progress("content",index,expected,chapter.title,{message=message,activity=kind,transfer_bytes=bytes})
+            end
             local ok, downloaded, downloaded_style, downloaded_assets, state = pcall(
-                self.reader.chapter, self.reader, book, chapter, format, {images=opt.images})
+                self.reader.chapter, self.reader, book, chapter, format, {
+                    images=opt.images,
+                    activity=chapter_activity,
+                    yield=function(stage) respect_reader_priority(stage or "images") end,
+                })
             if not ok then
                 if Http.is_rate_limit_error(downloaded) then error(downloaded) end
                 if Http.is_auth_error(downloaded) then error(downloaded) end
@@ -1676,6 +1717,9 @@ function Downloader:book(input, opt, progress)
                 logger.warn("[MiuRead][Download] chapter body normalization failed",
                     "chapter=",uid,"decoded_bytes=",tostring(#tostring(downloaded or "")),
                     "body_count=",tostring(body_count or 0),"error=",tostring(body_error))
+                if self.reader and type(self.reader.cleanup_transient_images)=="function" then
+                    self.reader:cleanup_transient_images()
+                end
                 return mark_failure(chapter,"正文结构解析失败："..tostring(body_error))
             end
             logger.info("[MiuRead][Download] chapter body normalized",

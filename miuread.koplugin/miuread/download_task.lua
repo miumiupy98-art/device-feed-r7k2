@@ -507,7 +507,7 @@ function DownloadTask:descriptor()
         local h=self.hibernated
         if not h then return nil end
         return {hibernated=true,hibernate_reason=h.reason,stage=h.stage,started_at=h.started_at,
-            restart_count=tonumber(h.restart_count) or 0}
+            restart_count=tonumber(h.restart_count) or 0,stall_restart_count=tonumber(h.stall_restart_count) or 0}
     end
     return {
         pid=job.pid,progress_path=job.progress_path,result_path=job.result_path,
@@ -516,7 +516,7 @@ function DownloadTask:descriptor()
         hibernate_path=job.hibernate_path,network_path=job.network_path,
         worker_settings_path=job.worker_settings_path,
         started_at=job.started_at,owner_token=self.owner_token,task_token=job.task_token,
-        restart_count=tonumber(job.restart_count) or 0,
+        restart_count=tonumber(job.restart_count) or 0,stall_restart_count=tonumber(job.stall_restart_count) or 0,
     }
 end
 
@@ -572,6 +572,7 @@ local HEAVY_STAGES={
     content=true,underlines=true,thoughts=true,footnotes=true,images=true,package=true,
     annotation_batch=true,annotation_apply=true,transform=true,
 }
+local STALL_RECOVERABLE_STAGES={prepare=true,catalog=true,content=true,images=true,resume=true}
 function DownloadTask:is_heavy_stage()
     return HEAVY_STAGES[self:stage()]==true
 end
@@ -756,6 +757,7 @@ function DownloadTask:_handle_hibernated(job,result)
     local network_control=job.network_path and U.read_file(job.network_path,true) or nil
     network_control=tostring(network_control or ""):match("^%s*([%w_%-]+)")
     local options=serializable_copy(job.restart_options or {}) or {}
+    options._stall_restart_count=tonumber(job.stall_restart_count) or tonumber(options._stall_restart_count) or 0
     if network_control=="ipv4" then options.network_mode="ipv4"; options.network_suggestion_silent=nil
     elseif network_control=="auto_silent" then options.network_mode="auto"; options.network_suggestion_silent=true end
     local state=U.copy(job.last_progress_state or {})
@@ -765,8 +767,8 @@ function DownloadTask:_handle_hibernated(job,result)
     state.message="为前台释放资源，下载已安全休眠"
     state.updated_at=os.time()
     local h={book=serializable_copy(job.restart_book),options=options,on_progress=job.on_progress,on_done=job.on_done,
-        restart_count=tonumber(job.restart_count) or 0,backgrounded=self.backgrounded==true,
-        reason=state.hibernate_reason,stage=tostring(result and result.stage or self:stage()),
+        restart_count=tonumber(job.restart_count) or 0,stall_restart_count=tonumber(job.stall_restart_count) or 0,
+        backgrounded=self.backgrounded==true,reason=state.hibernate_reason,stage=tostring(result and result.stage or self:stage()),
         started_at=job.started_at,last_state=U.copy(state)}
     os.remove(job.progress_path); os.remove(job.result_path); if job.recovery_path then os.remove(job.recovery_path) end
     os.remove(job.cancel_path); if job.pause_path then os.remove(job.pause_path) end
@@ -817,7 +819,9 @@ function DownloadTask:resume_hibernated(reason)
         return false,"low_memory"
     end
     self.hibernated=nil
-    local ok,err=self:start(h.book,h.options,h.on_progress,h.on_done,h.restart_count)
+    local options=serializable_copy(h.options or {}) or {}
+    options._stall_restart_count=tonumber(h.stall_restart_count) or tonumber(options._stall_restart_count) or 0
+    local ok,err=self:start(h.book,options,h.on_progress,h.on_done,h.restart_count)
     if not ok then self.hibernated=h; return false,err end
     self.backgrounded=h.backgrounded==true
     if self.backgrounded then self:set_backgrounded(true) end
@@ -827,7 +831,7 @@ function DownloadTask:resume_hibernated(reason)
     return true
 end
 
-function DownloadTask:_restart_interrupted(job)
+function DownloadTask:_restart_interrupted(job,stall_recovery)
     if not job or job.cancel_requested_at then return false end
     local count=tonumber(job.restart_count) or 0
     local maximum=math.max(0,tonumber(Config.DOWNLOAD_AUTO_RESTARTS) or 2)
@@ -836,6 +840,9 @@ function DownloadTask:_restart_interrupted(job)
     end
     local book=serializable_copy(job.restart_book)
     local options=serializable_copy(job.restart_options or {}) or {}
+    local stall_count=tonumber(job.stall_restart_count) or tonumber(options._stall_restart_count) or 0
+    if stall_recovery==true then stall_count=stall_count+1 end
+    options._stall_restart_count=stall_count
     local network_control=job.network_path and U.read_file(job.network_path,true) or nil
     network_control=tostring(network_control or ""):match("^%s*([%w_%-]+)")
     if network_control=="ipv4" then
@@ -983,6 +990,48 @@ function DownloadTask:_poll()
             self:_finish(job,"下载已取消")
             return
         end
+
+        -- beta.23: a healthy streamed image transfer/extraction refreshes the
+        -- progress heartbeat. If a stage that should be making progress stays
+        -- completely silent, stop the old child instead of leaving the whole
+        -- device in a pseudo-hung state for many minutes. Network/rate-limit
+        -- wait stages are deliberately excluded.
+        local stall_recovery=math.max(60,tonumber(Config.DOWNLOAD_STALL_RECOVERY_SECONDS) or 120)
+        local current_stage=tostring(job.last_progress_state and job.last_progress_state.stage or "unknown")
+        if not self:is_paused() and effective_idle>=stall_recovery
+            and STALL_RECOVERABLE_STAGES[current_stage]==true then
+            if not job.stall_recovery_requested_at then
+                job.stall_recovery_requested_at=now
+                local maximum=math.max(0,tonumber(Config.DOWNLOAD_STALL_AUTO_RESTARTS) or 1)
+                job.stall_terminal=(tonumber(job.stall_restart_count) or 0)>=maximum
+                local state=U.copy(job.last_progress_state or {})
+                state.stage="restart"
+                state.message=job.stall_terminal
+                    and "下载长时间没有进展，已停止当前任务；断点已保留，可点击继续"
+                    or "下载长时间没有进展，正在释放旧任务并从断点恢复"
+                state.updated_at=now
+                if job.on_progress then pcall(job.on_progress,state) end
+                diagnostic_append(job.diagnostic_path,{
+                    "time="..tostring(os.date("%Y-%m-%d %H:%M:%S")),
+                    "event=stall_recovery",
+                    "pid="..tostring(job.pid or ""),
+                    "stage="..current_stage,
+                    "effective_idle="..tostring(effective_idle),
+                    "terminal="..tostring(job.stall_terminal==true),
+                })
+                pcall(FFIUtil.terminateSubProcess,job.pid)
+                self:_release_awake()
+                logger.warn("[MiuRead][DownloadTask] stalled worker termination requested",
+                    "pid=",tostring(job.pid),"stage=",current_stage,
+                    "idle=",tostring(effective_idle),"terminal=",tostring(job.stall_terminal==true))
+                self:_schedule()
+                return
+            elseif now-job.stall_recovery_requested_at>=8 then
+                -- A second terminate is harmless and avoids waiting forever on
+                -- firmware that delays the first signal while memory is tight.
+                pcall(FFIUtil.terminateSubProcess,job.pid)
+            end
+        end
         if idle>=120 and not job.waiting_notified then
             job.waiting_notified=true
             local state=U.copy(job.last_progress_state or {})
@@ -1044,6 +1093,17 @@ function DownloadTask:_poll()
     end
 
     job.dead_seen_at=job.dead_seen_at or now
+    if job.stall_recovery_requested_at then
+        local grace=math.max(1,tonumber(Config.DOWNLOAD_STALL_RESTART_GRACE_SECONDS) or 3)
+        if now-job.dead_seen_at<grace then self:_schedule(); return end
+        if job.stall_terminal==true then
+            self:_finish(job,"下载长时间没有进展，已停止当前任务；已完成章节和断点均已保留，可点击继续。")
+            return
+        end
+        if self:_restart_interrupted(job,true) then return end
+        self:_finish(job,"下载长时间没有进展，自动恢复未能启动；断点已保留，可点击继续。")
+        return
+    end
     if not job.rechecking_notified then
         job.rechecking_notified=true
         local state=U.copy(job.last_progress_state or {})
@@ -1081,6 +1141,7 @@ function DownloadTask:attach(descriptor,on_progress,on_done,restart_book,restart
     if descriptor and descriptor.hibernated==true then
         self.hibernated={book=serializable_copy(restart_book),options=serializable_copy(restart_options or {}) or {},
             on_progress=on_progress,on_done=on_done,restart_count=tonumber(descriptor.restart_count) or 0,
+            stall_restart_count=tonumber(descriptor.stall_restart_count) or 0,
             backgrounded=true,reason=tostring(descriptor.hibernate_reason or "recovered"),
             stage=tostring(descriptor.stage or "hibernated"),started_at=descriptor.started_at}
         self.backgrounded=true
@@ -1110,10 +1171,11 @@ function DownloadTask:attach(descriptor,on_progress,on_done,restart_book,restart
         hibernate_path=descriptor.hibernate_path,network_path=descriptor.network_path,
         worker_settings_path=descriptor.worker_settings_path,
         on_progress=on_progress,on_done=on_done,last_progress_raw=nil,last_progress_state=nil,
-        last_progress_at=nil,last_effective_progress_at=nil,waiting_started_at=nil,last_keepalive=0,started_at=descriptor.started_at,dead_seen_at=nil,
+        last_progress_at=nil,last_effective_progress_at=nil,waiting_started_at=nil,last_keepalive=0,started_at=descriptor.started_at,dead_seen_at=nil,stall_recovery_requested_at=nil,stall_terminal=false,
         unknown_seen_at=nil,waiting_notified=false,rechecking_notified=false,
         task_token=descriptor.task_token,
         restart_count=tonumber(descriptor.restart_count) or 0,
+        stall_restart_count=tonumber(descriptor.stall_restart_count) or tonumber(restart_options and restart_options._stall_restart_count) or 0,
         restart_book=serializable_copy(restart_book),
         restart_options=serializable_copy(restart_options),
     }
@@ -1182,6 +1244,7 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
     local task_token = stamp .. "-" .. tostring(math.random(100000,999999))
     local clean_book = serializable_copy(book)
     local clean_options = serializable_copy(options or {})
+    clean_options._stall_restart_count=math.max(0,tonumber(clean_options._stall_restart_count) or 0)
     clean_options.download_run_id=tostring(clean_options.download_run_id or task_token)
     clean_options.reader_active_path="/tmp/miuread-reader-active.flag"
     clean_options.reader_busy_path="/tmp/miuread-reader-busy.until"
@@ -1532,11 +1595,14 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
         waiting_started_at = nil,
         last_keepalive = 0,
         dead_seen_at = nil,
+        stall_recovery_requested_at = nil,
+        stall_terminal = false,
         unknown_seen_at = nil,
         waiting_notified = false,
         rechecking_notified = false,
         task_token = task_token,
         restart_count = tonumber(restart_count) or 0,
+        stall_restart_count = tonumber(clean_options._stall_restart_count) or 0,
         restart_book = serializable_copy(book),
         restart_options = serializable_copy(clean_options),
         started_at = os.time(),

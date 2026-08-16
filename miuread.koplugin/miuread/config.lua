@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.5.0-beta.22",
+    VERSION = "4.5.0-beta.23",
     SCHEMA = 112,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -133,6 +133,18 @@ local C = {
     DOWNLOAD_NETWORK_RECOVERY_MAX_POLL_SECONDS = 15,
     DOWNLOAD_BACKGROUND_KEEPALIVE_SECONDS = 12,
     DOWNLOAD_BACKGROUND_STALL_SLEEP_SECONDS = 300,
+
+    -- beta.23 keeps the five-minute sleep policy for a genuinely offline book,
+    -- but a worker that is still marked as active and produces no heartbeat is
+    -- recovered much earlier from its on-disk chapter checkpoint. Streaming
+    -- image transfers emit heartbeats, so large healthy archives are not
+    -- mistaken for a stall.
+    DOWNLOAD_STALL_RECOVERY_SECONDS = 120,
+    DOWNLOAD_STALL_RESTART_GRACE_SECONDS = 3,
+    DOWNLOAD_STALL_AUTO_RESTARTS = 1,
+    DOWNLOAD_TRANSFER_HEARTBEAT_SECONDS = 3,
+    DOWNLOAD_TRANSFER_HEARTBEAT_BYTES = 512 * 1024,
+    DOWNLOAD_STREAM_CHUNK_BYTES = 128 * 1024,
 
     -- beta.19 heavy-resource arbitration. Ordinary background protection keeps
     -- the beta.16 48/28 MB thresholds; only Native/FileManager transitions use

@@ -165,6 +165,109 @@ function Codec.tar(data)
     end
     return out
 end
+-- Stream a tar archive from disk and extract each regular entry into a
+-- numbered temporary file. This keeps peak Lua memory bounded by one small
+-- chunk instead of materializing both the archive and every image at once.
+function Codec.tar_file(path,destination,on_progress)
+    path=tostring(path or "")
+    destination=tostring(destination or "")
+    if path=="" or destination=="" then return nil,"tar path/destination missing" end
+    if not Util.mkdir(destination) then return nil,"cannot create tar destination" end
+    local input,open_error=io.open(path,"rb")
+    if not input then return nil,open_error end
+    local out={}
+    local long_name,pax_name
+    local index,total_read=0,0
+    local chunk_size=128*1024
+
+    local function close_with_error(message)
+        input:close()
+        Util.remove_tree(destination)
+        return nil,message
+    end
+    local function read_exact(size)
+        if size<=0 then return "" end
+        local data=input:read(size)
+        if type(data)~="string" or #data~=size then return nil,"truncated tar entry" end
+        total_read=total_read+#data
+        return data
+    end
+    local function skip(size)
+        if size<=0 then return true end
+        local moved=input:seek("cur",size)
+        if moved then total_read=total_read+size; return true end
+        local remaining=size
+        while remaining>0 do
+            local data=input:read(math.min(chunk_size,remaining))
+            if not data or #data==0 then return nil,"truncated tar padding" end
+            remaining=remaining-#data
+            total_read=total_read+#data
+        end
+        return true
+    end
+    local function report()
+        if type(on_progress)=="function" then pcall(on_progress,total_read,index) end
+    end
+
+    while true do
+        local header=input:read(512)
+        if not header then break end
+        if #header~=512 then return close_with_error("truncated tar header") end
+        total_read=total_read+512
+        if header:gsub("\0","")=="" then break end
+        local name=tar_text(header:sub(1,100))
+        local prefix=tar_text(header:sub(346,500))
+        if prefix~="" then name=prefix.."/"..name end
+        local size=tar_octal(header:sub(125,136))
+        local kind=header:sub(157,157)
+        local padded=math.ceil(size/512)*512
+
+        if kind=="L" or kind=="x" then
+            local body,read_error=read_exact(size)
+            if not body then return close_with_error(read_error) end
+            if kind=="L" then long_name=tar_text(body) else pax_name=tar_pax_path(body) end
+            local ok,skip_error=skip(padded-size)
+            if not ok then return close_with_error(skip_error) end
+        elseif kind=="0" or kind=="\0" or kind=="" then
+            local final_name=pax_name or long_name or name
+            index=index+1
+            local target=destination.."/entry-"..string.format("%05d",index)..".bin"
+            local output,write_open_error=io.open(target,"wb")
+            if not output then return close_with_error(write_open_error or "cannot create tar entry") end
+            local remaining=size
+            local failed
+            while remaining>0 do
+                local data=input:read(math.min(chunk_size,remaining))
+                if not data or #data==0 then failed="truncated tar entry"; break end
+                total_read=total_read+#data
+                local wrote,write_error=output:write(data)
+                if not wrote then failed=write_error or "tar entry write failed"; break end
+                remaining=remaining-#data
+                report()
+            end
+            local flushed,flush_error=output:flush()
+            output:close()
+            if not failed and flushed==nil then failed=flush_error or "tar entry flush failed" end
+            if failed then os.remove(target); return close_with_error(failed) end
+            local ok,skip_error=skip(padded-size)
+            if not ok then os.remove(target); return close_with_error(skip_error) end
+            if final_name~="" and size>0 then
+                out[final_name]={path=target,size=size}
+            else
+                os.remove(target)
+            end
+            long_name,pax_name=nil,nil
+            report()
+        else
+            local ok,skip_error=skip(padded)
+            if not ok then return close_with_error(skip_error) end
+            report()
+        end
+    end
+    input:close()
+    return out
+end
+
 function Codec.media(data, hint)
     data = tostring(data or "")
     if data:sub(1,8)=="\137PNG\r\n\26\n" then return ".png","image/png" end
@@ -184,5 +287,12 @@ function Codec.media(data, hint)
     }
     if ext and by_ext[ext] then return by_ext[ext][1], by_ext[ext][2] end
     return ".bin","application/octet-stream"
+end
+function Codec.media_file(path,hint)
+    local file=io.open(tostring(path or ""),"rb")
+    if not file then return ".bin","application/octet-stream" end
+    local head=file:read(512) or ""
+    file:close()
+    return Codec.media(head,hint)
 end
 return Codec

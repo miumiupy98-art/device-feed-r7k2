@@ -10258,14 +10258,60 @@ function Plugin:_quit_koreader(confirmed,anchor)
     local active=(self.download_task and self.download_task:busy()) or self._download_runtime~=nil
     local queued=#self.store:download_queue()>0
     local detail=""
-    if active and queued then detail="当前任务会中断，重启后可继续；排队任务会保留。"
-    elseif active then detail="当前任务会中断，重新启动后可继续。"
+    if active and queued then detail="当前下载会先保存断点并释放资源；排队任务会保留。"
+    elseif active then detail="当前下载会先保存断点并释放资源，再退出 KOReader。"
     elseif queued then detail="当前有一个排队任务，重新启动后仍会保留。" end
-    local function do_exit()
+
+    local function exit_now()
+        self._safe_quit_pending=false
         self:_begin_koreader_exit("quit")
         pcall(function() self:onFlushSettings() end)
         if Device and Device.saveSettings then pcall(Device.saveSettings,Device) end
         UIManager:nextTick(function() UIManager:broadcastEvent(Event:new("Exit")) end)
+    end
+
+    local function do_exit()
+        if self._safe_quit_pending then return true end
+        local task=self.download_task
+        if not task or not task:busy() or task:is_hibernated() then
+            exit_now()
+            return true
+        end
+
+        -- On low-memory Kindles, quitting while the download child still owns a
+        -- large Lua heap can make the launcher/system hand-off look like a hard
+        -- freeze. Reuse the same safe checkpoint hibernation as the native
+        -- FileManager transition and abort the exit if the worker cannot yield.
+        self._safe_quit_pending=true
+        self:_home_stop_background("preparing KOReader exit")
+        local requested=task:request_hibernate("koreader_exit")
+        if not requested then
+            self._safe_quit_pending=false
+            self:info("下载暂时无法安全暂停，已取消本次退出。\n\n请稍后再试，或先在下载管理中取消任务。")
+            return false
+        end
+        self:status_toast("正在安全暂停下载","保存断点后再退出 KOReader",3)
+        local started=monotonic_wall_time()
+        local wait_limit=math.max(2,tonumber(Config.DOWNLOAD_HIBERNATE_WAIT_SECONDS) or 8)
+        local waiter
+        waiter=function()
+            if not self._safe_quit_pending or HOME_EXITING or UIManager._exit_code~=nil then return end
+            if not task:busy() or task:is_hibernated() then
+                exit_now()
+                return
+            end
+            if monotonic_wall_time()-started>=wait_limit then
+                self._safe_quit_pending=false
+                task:resume("heavy_resource")
+                self:info("下载正在完成当前安全写入，已取消本次退出。\n\n不会丢失已完成内容；稍后再退出即可。")
+                logger.warn("[MiuRead][HeavyGuard] KOReader exit aborted","reason=hibernate_timeout",
+                    "stage=",tostring(task:stage()))
+                return
+            end
+            UIManager:scheduleIn(.25,waiter)
+        end
+        UIManager:scheduleIn(.05,waiter)
+        return true
     end
     if confirmed==true then do_exit(); return true end
     if HomeView.is_shown() then
