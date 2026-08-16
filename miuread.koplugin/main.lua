@@ -364,6 +364,13 @@ local function install_home_screensaver_patch()
         if image and type(image.free)=="function" then pcall(image.free,image) end
     end
 
+    local function home_native_host()
+        local owner=home_owner()
+        local host=owner and owner.ui or nil
+        if type(host)=="table" and host.bookinfo then return host,owner end
+        return nil,owner
+    end
+
     local function native_cover_for_path(target_path)
         local ReaderUI=require("apps/reader/readerui")
         local FileManager=require("apps/filemanager/filemanager")
@@ -374,12 +381,17 @@ local function install_home_screensaver_patch()
         local path=normalized_reader_file(target_path) or reader_path
         if not path then return nil,nil end
 
+        -- MiuRead Home intentionally lives above FileManager, and KOReader may
+        -- clear FileManager.instance while that Home root is active. Reuse the
+        -- original FileManager host owned by the Home plugin so a recent EPUB
+        -- can still provide its native/custom cover without changing UI state.
         local host=reader or FileManager.instance
+        if not host then host=home_native_host() end
         local bookinfo=host and host.bookinfo or nil
         if not (bookinfo and type(bookinfo.getCoverImage)=="function") then return nil,path end
         local document_arg=(reader_path and reader_path==path) and document or nil
-        local ok,image=pcall(bookinfo.getCoverImage,bookinfo,document_arg,path)
-        if ok and image then return image,path end
+        local cover_ok,image=pcall(bookinfo.getCoverImage,bookinfo,document_arg,path)
+        if cover_ok and image then return image,path end
         return nil,path
     end
 
@@ -398,7 +410,8 @@ local function install_home_screensaver_patch()
             native_image and ("koreader-native:"..tostring(native_path or "current")) or nil)
         release_image(native_image)
         if not image then
-            logger.warn("[MiuRead][Lockscreen] direct render unavailable",tostring(err or "no cover source"))
+            logger.info("[MiuRead][Lockscreen] takeover unavailable",
+                "reason=",tostring(err or "no_cover_source"),"book=",tostring(book_file or ""))
             return false
         end
         if manager.image and manager.image~=image then release_image(manager.image) end
@@ -408,13 +421,54 @@ local function install_home_screensaver_patch()
         manager.screensaver_background="white"
         manager.image=image
         manager.image_file=nil
-        logger.info("[MiuRead][Lockscreen]",
+        logger.info("[MiuRead][Lockscreen] takeover=true",
             "style=",tostring(meta and meta.style or style),
             "source=",tostring(meta and meta.source or ""),
             "source_size=",tostring(meta and meta.source_w or 0).."x"..tostring(meta and meta.source_h or 0),
             "display=",tostring(meta and meta.display_w or 0).."x"..tostring(meta and meta.display_h or 0),
             "screen=",tostring(width).."x"..tostring(height),
             "render=direct")
+        return true
+    end
+
+    -- KOReader's stock Screensaver.setup() requires ReaderUI.instance or
+    -- FileManager.instance. On the MiuRead Home surface both may temporarily be
+    -- nil even though the original FileManager host still exists. Inject that
+    -- host only for the duration of setup(), then restore the global instance.
+    -- This lets KOReader itself honor document_cover/custom image/random image
+    -- and every other native screensaver preference as the fallback path.
+    local function call_original(manager,args,host)
+        local ReaderUI=require("apps/reader/readerui")
+        local FileManager=require("apps/filemanager/filemanager")
+        local injected=false
+        local previous=FileManager.instance
+        if not ReaderUI.instance and not FileManager.instance and host then
+            FileManager.instance=host
+            injected=true
+        end
+        local packed={xpcall(function()
+            return original(manager,unpack_args(args,1,args.n))
+        end,debug.traceback)}
+        if injected then FileManager.instance=previous end
+        if not packed[1] then return false,packed[2] end
+        return true,packed
+    end
+
+    local function emergency_native_fallback(manager,current,host,reason)
+        -- This should only be reached if KOReader's own setup unexpectedly
+        -- cannot run. Never use "disable" here: on e-ink that would preserve
+        -- the bookshelf framebuffer and recreate the frozen-home symptom.
+        manager.ui=host or current
+        manager.show_message=false
+        manager.prefix=""
+        manager.event_message=nil
+        manager.overlay_message=nil
+        manager.image=nil
+        manager.image_file="resources/koreader.png"
+        manager.screensaver_type="random_image"
+        manager.screensaver_background="white"
+        logger.warn("[MiuRead][Lockscreen] fallback=koreader_default",
+            "reason=",tostring(reason or "native_setup_unavailable"))
         return true
     end
 
@@ -439,53 +493,60 @@ local function install_home_screensaver_patch()
             local reader_file=normalized_reader_file(reader_ui.document.file
                 or (reader_ui.document.getFilePath and reader_ui.document:getFilePath()) or nil)
             if reader_file and (not source_file or reader_file~=source_file) then
-                -- The reader changed books without rebuilding the parked home.
-                -- Never show stale sources from the previous book; fall back to
-                -- KOReader's current document cover for this suspend.
+                -- The reader changed books without rebuilding the parked Home.
+                -- Never show stale sources from the previous book; use the
+                -- current Reader document as this suspend's authoritative cover.
                 sources={}
                 source_file=reader_file
             end
         end
-        if not native_ui and args.n==0 and HomeView.is_shown() and current then
-            local owner=home_owner()
-            if HomeView.suspend then pcall(HomeView.suspend) end
-            if owner and type(owner._home_freeze_for_suspend)=="function" then
-                local frozen,freeze_err=pcall(owner._home_freeze_for_suspend,owner)
-                if not frozen then
-                    logger.warn("[MiuRead][Suspend] screensaver prefreeze failed",tostring(freeze_err))
+
+        if not native_ui and HomeView.is_shown() and current then
+            local host,owner=home_native_host()
+            -- Screensaver.setup is presentation-only. Do not suspend Home or
+            -- freeze background producers here; Plugin:onSuspend owns the
+            -- lifecycle transition exactly once after KOReader commits suspend.
+            if args.n==0 and use_home_target then
+                manager.ui=host or current
+                manager.show_message=false
+                manager.prefix=""
+                manager.event_message=nil
+                manager.overlay_message=nil
+                manager.image=nil
+                manager.image_file=nil
+                manager.screensaver_background="white"
+                if apply_direct_cover(manager,sources,style,source_file) then
+                    logger.info("[MiuRead][Lockscreen] home takeover committed",
+                        "book=",tostring(source_file or ""),"host=",host and "filemanager" or "home")
+                    return
                 end
             end
 
-            manager.ui=(owner and owner.ui) or current
-            manager.show_message=false
-            manager.prefix=""
-            manager.event_message=nil
-            manager.overlay_message=nil
-            manager.image=nil
-            manager.image_file=nil
-            manager.screensaver_background="white"
-
-            if use_home_target and apply_direct_cover(manager,sources,style,source_file) then
-                logger.info("[MiuRead][Suspend] screensaver home fallback",
-                    "native_ui=false","target=true","direct=true","prefrozen=",tostring(owner~=nil))
-            else
-                manager.screensaver_type="disable"
-                logger.info("[MiuRead][Suspend] screensaver home fallback",
-                    "native_ui=false","target=false","direct=false","prefrozen=",tostring(owner~=nil))
+            local native_ok,native_result=call_original(manager,args,host)
+            if native_ok and manager.ui then
+                logger.info("[MiuRead][Lockscreen] takeover=false fallback=koreader",
+                    "reason=",enabled and "miuread_cover_unavailable" or "feature_disabled",
+                    "mode=",tostring(manager.screensaver_type or ""),
+                    "host=",host and "filemanager" or "none")
+                return unpack_args(native_result,2,#native_result)
             end
+            emergency_native_fallback(manager,current,host,
+                native_ok and "native_ui_missing" or tostring(native_result or "native_setup_failed"))
             return
         end
 
-        local packed={xpcall(function()
-            return original(manager,unpack_args(args,1,args.n))
-        end,debug.traceback)}
-        if not packed[1] then error(packed[2]) end
-        -- Poweroff/reboot keep KOReader's own screen. Only a normal suspend
-        -- substitutes the recent-reading cover presentation.
+        local native_ok,native_result=call_original(manager,args,nil)
+        if not native_ok then error(native_result) end
+        -- Poweroff/reboot keep KOReader's own screen. Only normal suspend may
+        -- substitute MiuRead's current/recent-reading cover. If rendering fails,
+        -- leave KOReader's already-prepared native screensaver untouched.
         if args.n==0 and use_home_target then
-            apply_direct_cover(manager,sources,style,source_file)
+            if not apply_direct_cover(manager,sources,style,source_file) then
+                logger.info("[MiuRead][Lockscreen] takeover=false fallback=koreader",
+                    "reason=miuread_cover_unavailable","mode=",tostring(manager.screensaver_type or ""))
+            end
         end
-        return unpack_args(packed,2,#packed)
+        return unpack_args(native_result,2,#native_result)
     end
     SCREENSAVER_PATCHED=true
     return true
@@ -6925,6 +6986,62 @@ function Plugin:_home_share_recent_read(book_id,path,stamp)
     return true
 end
 
+
+function Plugin:_home_build_recent_snapshot(book_id,path,stamp,book,record)
+    book_id=tostring(book_id or "")
+    path=LocalLibrary.normalize(path or "")
+    stamp=normalized_home_time(stamp)
+    local stored=book_id~="" and self.store:book(book_id) or nil
+    local snapshot={book_id=book_id,bookId=book_id,file=path,read_at=stamp,local_recent_read_at=stamp}
+    local keys={
+        "title","author","cover_path","description","intro","summary","category","publisher",
+        "published_date","isbn","series","translator","language","pages","wordCount","word_count",
+        "format","variant","annotation_requested","source","shelf_section","local_file","progress",
+        "progress_local_percent","progress_remote_percent","lastReadTime","readUpdateTime","last_read_at",
+    }
+    local function fill(source)
+        if type(source)~="table" then return end
+        for _,key in ipairs(keys) do
+            local value=source[key]
+            if value~=nil and value~="" and (snapshot[key]==nil or snapshot[key]=="") then
+                snapshot[key]=U.copy(value)
+            end
+        end
+    end
+    -- Reader identification is freshest, the library book carries richer
+    -- metadata, and the concrete variant record fills file/cover gaps.
+    fill(book)
+    fill(stored)
+    fill(record)
+    if path~="" then snapshot.file=path end
+    if book_id=="" then
+        snapshot.book_id=tostring(snapshot.book_id or snapshot.bookId or "")
+        snapshot.bookId=snapshot.book_id
+    end
+    if U.trim(tostring(snapshot.title or ""))=="" and path~="" then
+        local title=path:gsub("\\","/"):match("([^/]+)$") or path
+        title=title:gsub("%.[%w%d]+$","")
+        title=title:gsub("%s*%[[^%]]+版%]%s*$","")
+        snapshot.title=title
+    end
+    if U.trim(tostring(snapshot.format or ""))=="" and path~="" then
+        local extension=path:match("%.([%w%d]+)$")
+        if extension then snapshot.format=extension:upper() end
+    end
+    if U.trim(tostring(snapshot.source or ""))=="" then
+        local normalized=path:gsub("\\","/")
+        if normalized:find("/MiuRead/",1,true) or book_id~="" then
+            snapshot.source="miuread"
+            snapshot.shelf_section=snapshot.shelf_section or "generated"
+        else
+            snapshot.source="local"
+            snapshot.local_file=true
+        end
+    end
+    snapshot.local_recent_read_at=stamp
+    snapshot.last_read_at=math.max(normalized_home_time(snapshot.last_read_at),stamp)
+    return snapshot
+end
 function Plugin:_home_recent_read_state()
     local stored
     if self.store.recent_reads then stored=self.store:recent_reads()
@@ -14082,6 +14199,11 @@ function Plugin:_complete_reader_close(generation,reason)
 
     local shown=false
     if HomeView.is_shown() then
+        local recent_owner=home_owner() or self
+        if recent_owner and type(recent_owner._home_apply_recent_snapshot_to_home)=="function" then
+            local ok_recent,recent_err=pcall(recent_owner._home_apply_recent_snapshot_to_home,recent_owner,"reader_close_first_frame")
+            if not ok_recent then logger.warn("[MiuRead][Recent] first-frame apply failed",tostring(recent_err)) end
+        end
         HomeView.unpark(true,{
             on_interaction=function(first,kind) self:_home_note_interaction(first,kind) end,
         })
@@ -14164,6 +14286,66 @@ function Plugin:_home_prepare_hero_book(book)
     hero.on_tap=function(anchor,ges) self:_home_open_book(hero,anchor,ges) end
     hero.on_refresh_metadata=function() self:_home_refresh_current_network_metadata(hero) end
     return hero
+end
+
+function Plugin:_home_apply_recent_snapshot_to_home(reason)
+    local snapshot=HOME_SESSION.recent_read_snapshot
+    if type(snapshot)~="table" or not HomeView.is_shown() then return false end
+    local target_id=tostring(snapshot.book_id or snapshot.bookId or "")
+    local target_file=LocalLibrary.normalize(snapshot.file or "")
+    if target_id=="" and target_file=="" then return false end
+
+    -- Prefer the already-prepared Home row when it represents the same book;
+    -- it has richer cached metadata/cover state and requires no shelf rescan.
+    local matched
+    local sections=self._home_sections or {}
+    for _,section in ipairs({"generated","local","account","mp"}) do
+        local rows=sections[section] and sections[section].rows or {}
+        for _,row in ipairs(type(rows)=="table" and rows or {}) do
+            local row_id=tostring(row.bookId or row.book_id or "")
+            local row_file=LocalLibrary.normalize(row.file or "")
+            if (target_id~="" and row_id==target_id) or (target_file~="" and row_file==target_file) then
+                matched=row
+                break
+            end
+        end
+        if matched then break end
+    end
+
+    local candidate=matched and U.merge(matched,snapshot) or U.copy(snapshot)
+    candidate.local_recent_read_at=normalized_home_time(snapshot.read_at)
+    if target_file~="" then candidate.file=target_file end
+    if target_id~="" then
+        candidate.bookId=tostring(candidate.bookId or candidate.book_id or target_id)
+        candidate.book_id=tostring(candidate.book_id or candidate.bookId or target_id)
+    end
+    local hero=self:_home_prepare_hero_book(candidate)
+    if not hero then return false end
+    local updated=HomeView.update_hero(hero)
+    if updated==false then return false end
+
+    self._home_hero=hero
+    self._home_recent_read_dirty=false
+    HOME_SESSION.recent_read_dirty=false
+    self:_home_update_lockscreen_session(hero)
+
+    local current=HomeView.current()
+    local shelf=(current and current.opts and current.opts.shelf_books) or {}
+    local metadata_targets={hero}
+    local cover_targets={hero}
+    for _,book in ipairs(shelf) do
+        metadata_targets[#metadata_targets+1]=book
+        cover_targets[#cover_targets+1]=book
+    end
+    self._home_visible_metadata_targets=metadata_targets
+    self._home_visible_cover_targets=cover_targets
+
+    logger.info("[MiuRead][Recent] hero applied",
+        "book=",tostring(self:_home_book_key(hero)),
+        "read_at=",tostring(self:_home_book_time(hero)),
+        "phase=",tostring(reason or "snapshot"),
+        "source=",matched and "prepared_row" or "snapshot")
+    return true
 end
 
 function Plugin:_home_refresh_recent_hero_cached()
@@ -14253,7 +14435,18 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
 
     local home,home_preferences=self:_home_preferences()
     self:_home_apply_recent_read_times(miuread_rows,local_rows,account_rows,mp_rows)
-    local hero=self:_home_prepare_hero_book(self:_home_recent_book(miuread_rows,local_rows,account_rows))
+    local recent_candidate=self:_home_recent_book(miuread_rows,local_rows,account_rows)
+    local snapshot=HOME_SESSION.recent_read_snapshot
+    if type(snapshot)=="table" then
+        local snapshot_time=normalized_home_time(snapshot.read_at)
+        local snapshot_key=self:_home_book_key(snapshot)
+        local candidate_key=self:_home_book_key(recent_candidate)
+        if snapshot_time>0 and snapshot_key~=""
+            and (snapshot_key~=candidate_key or snapshot_time>=self:_home_book_time(recent_candidate)) then
+            recent_candidate=snapshot
+        end
+    end
+    local hero=self:_home_prepare_hero_book(recent_candidate)
 
     local sections={
         account={title="微信书架",rows=account_rows,empty="这里还没有微信书架内容"},
@@ -14537,8 +14730,14 @@ function Plugin:_restore_home_after_reader_close(attempt,generation)
             return false
         end
         -- FileManager provides KOReader's docless services and gesture manager,
-        -- but it must stay below the MiuRead root. Restore the parked surface
-        -- with one bounded UI repaint instead of rebuilding and full-refreshing.
+        -- but it must stay below the MiuRead root. Apply the authoritative recent
+        -- snapshot before the first Home repaint, then restore the parked surface
+        -- with one bounded UI repaint instead of rebuilding/full-refreshing.
+        local recent_owner=home_owner() or self
+        if recent_owner and type(recent_owner._home_apply_recent_snapshot_to_home)=="function" then
+            local ok_recent,recent_err=pcall(recent_owner._home_apply_recent_snapshot_to_home,recent_owner,"home_reveal_first_frame")
+            if not ok_recent then logger.warn("[MiuRead][Recent] reveal apply failed",tostring(recent_err)) end
+        end
         HomeView.unpark(true,{
             on_interaction=function(first,kind) self:_home_note_interaction(first,kind) end,
         })
@@ -20823,11 +21022,18 @@ function Plugin:_record_recent_read(path,book,record)
     self:_home_share_recent_read(book_id,path,stamp)
     self._home_recent_read_dirty=true
     HOME_SESSION.recent_read_dirty=true
+
+    -- Keep one authoritative in-memory snapshot for the current session. Home
+    -- Hero and Home lockscreen both consume this same object, so neither waits
+    -- for a shelf rescan or a manual refresh after the Reader closes.
+    local snapshot=self:_home_build_recent_snapshot(book_id,path,stamp,book,record)
+    HOME_SESSION.recent_read_snapshot=snapshot
+
     local owner=home_owner()
     if owner and owner~=self then
-        -- Keep the parked Home instance's in-memory view current too. These are
-        -- deferred settings writes; no synchronous disk I/O is added to
-        -- ReaderReady or the page-turn path.
+        -- Keep the parked Home instance's store and dirty marker current too.
+        -- Store writes remain deferred; no network/shelf scan is introduced on
+        -- ReaderReady or page turns.
         if owner.store and owner.store.record_recent_read then
             owner.store:record_recent_read(book_id,path,stamp)
         elseif owner.store and book_id~="" then
@@ -20835,9 +21041,21 @@ function Plugin:_record_recent_read(path,book,record)
         end
         owner._home_recent_read_dirty=true
     end
-    logger.info("[MiuRead][Recent] reader recorded",
+
+    -- Lockscreen target changes immediately when Reader identifies the book.
+    -- This is local-only and avoids the old window where Home still pointed to
+    -- the previous Hero until its delayed refresh ran.
+    local lock_owner=owner or self
+    if lock_owner and type(lock_owner._home_update_lockscreen_session)=="function" then
+        local ok_lock,lock_err=pcall(lock_owner._home_update_lockscreen_session,lock_owner,snapshot)
+        if not ok_lock then
+            logger.warn("[MiuRead][Recent] lockscreen target update failed",tostring(lock_err))
+        end
+    end
+
+    logger.info("[MiuRead][Recent] committed",
         "book=",book_id~="" and book_id or "local","file=",tostring(path),
-        "shared=true")
+        "read_at=",tostring(stamp),"shared=true","lockscreen=updated")
     return true
 end
 
