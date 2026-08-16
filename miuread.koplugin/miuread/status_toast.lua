@@ -6,7 +6,7 @@ local Geom = require("ui/geometry")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local OverlapGroup = require("ui/widget/overlapgroup")
 local Size = require("ui/size")
-local TextWidget = require("ui/widget/textwidget")
+local TextBoxWidget = require("ui/widget/textboxwidget")
 local UIManager = require("ui/uimanager")
 
 local Screen = Device.screen
@@ -31,12 +31,16 @@ local function repaint(widget, dimen)
     end)
 end
 
-local function one_line(title, text)
-    local left = tostring(title or ""):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-    local right = tostring(text or ""):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+local function clean_line(value)
+    return tostring(value or ""):gsub("[ \t]+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function toast_text(title, text)
+    local left = clean_line(title)
+    local right = tostring(text or ""):gsub("[ \t]+", " "):gsub("^%s+", ""):gsub("%s+$", "")
     if left == "" then return right end
     if right == "" then return left end
-    return left .. " · " .. right
+    return left .. "\n" .. right
 end
 
 function Toast:init()
@@ -47,10 +51,14 @@ function Toast:init()
     local padding_v = math.max(Screen:scaleBySize(6), tonumber(Size.padding.small) or 0)
     local border = math.max(1, tonumber(Size.border.window) or 1)
 
-    local label = TextWidget:new{
-        text = one_line(self.title, self.text),
+    local max_text_w = math.max(Screen:scaleBySize(180), math.floor(screen_w * 0.82))
+    local label = TextBoxWidget:new{
+        text = toast_text(self.title, self.text),
         face = Font:getFace("x_smallinfofont"),
-        padding = 0,
+        width = max_text_w,
+        height_adjust = true,
+        height_overflow_show_ellipsis = true,
+        alignment = "center",
     }
 
     self.frame = FrameContainer:new{

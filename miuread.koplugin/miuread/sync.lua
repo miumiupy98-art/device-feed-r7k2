@@ -3462,11 +3462,19 @@ function Sync:on_suspend(options)
 end
 
 function Sync:on_resume(_slept)
-    self.reading_end_finalized=false
     self:_import_daemon_status(true)
     self.suspended = false
     self.last_upload = 0
     self.session_started_at = os.time()
+    if self.host and self.host._reading_end_sync_active==true then
+        -- A short wake can arrive while the lock-screen final sync is still
+        -- confirming progress. Starting a new 60 s worker here races the old
+        -- book worker and creates stale-result warnings. Let the final sync own
+        -- the session until it finishes.
+        logger.info("[MiuRead][ReadReport] resume deferred", "reason=reading_end_sync_active")
+        return true
+    end
+    self.reading_end_finalized=false
     self:start("resume")
 end
 

@@ -12298,7 +12298,7 @@ function Plugin:_show_reader_sync_diagnostics_panel(back_callback)
                 }},
                 {title="恢复",rows={
                     {label="重置本书阅读进度同步状态",value="不影响书签、划线与想法",callback=diagnostics[7] and diagnostics[7].callback},
-                    {label="重新检查本书批注同步",value="重新定位失败记录",callback=diagnostics[8] and diagnostics[8].callback},
+                    {label="重新检查本书批注同步",value=annotation_action>0 and ("待重新检查 "..tostring(annotation_action).." 条") or "无失败记录",callback=diagnostics[8] and diagnostics[8].callback},
                 }},
             }
         end,
@@ -18021,7 +18021,14 @@ function Plugin:ensure_read_report_progress(reason,automatic)
             local remotep=math.floor((tonumber(remote.percent) or 0)+.5)
             local coordinate_match=self:_remote_matches(remote,local_position)
             local cmp=self.sync:compare(localp,remote)
-            if coordinate_match or cmp=="same" then
+            local local_uid=tostring(local_position.chapter_uid or local_position.chapterUid or "")
+            local remote_uid=tostring(remote.chapter_uid or remote.chapterUid or "")
+            local has_authoritative_coordinates=local_uid~="" and remote_uid~=""
+            -- When both sides expose chapter coordinates, those coordinates are
+            -- authoritative. A similar whole-book percentage must never hide a
+            -- chapter mismatch or a clearly different chapter offset.
+            local aligned=coordinate_match or (not has_authoritative_coordinates and cmp=="same")
+            if aligned then
                 self.sync:mark_verified(id,"positions_aligned",localp,remotep,local_position)
                 self:_save_progress_state(id,"aligned",coordinate_match and "章节位置一致" or "本机与云端位置接近",localp,remotep)
                 self.sync:end_progress_sync("位置已确认")
@@ -20847,17 +20854,27 @@ function Plugin:on_sync_record_ready(current)
         self.sync:start("reader_ready_time_only")
     end
     if need_cloud_check then
-        if self.sync:is_current_verified() then
-            self.sync:end_progress_sync("已恢复本书最近验证成功的阅读位置")
+        local internal_rebuild=self._reader_session_preserved==true
+        if internal_rebuild and self.sync:is_current_verified() then
+            self.sync:end_progress_sync("内部重建沿用本次阅读已确认的位置")
+        elseif self:is_online() then
+            -- A genuine reopen always reads the current WeRead position. Do not
+            -- let the multi-hour verification cache stand in for a fresh cloud
+            -- read; that cache is now only for same-session Reader rebuilds.
+            UIManager:scheduleIn(.05,function()
+                if self.ui and self.ui.document and not reader_close_active() then
+                    self:ensure_read_report_progress("reader_ready",true)
+                end
+            end)
         else
             self:_wait_for_network("reader-ready-progress",function(ready)
                 if ready and self.ui and self.ui.document then
-                    self:ensure_read_report_progress("reader_ready",true)
+                    self:ensure_read_report_progress("reader_ready_network_ready",true)
                 elseif self.ui and self.ui.document then
                     self:_save_progress_state(tostring(current.book.book_id),"waiting_network",
                         "等待 Wi-Fi 恢复后读取云端位置",nil,nil)
                 end
-            end,{minimum_delay=4.0,max_wait=60,interval=2.5})
+            end,{minimum_delay=.2,max_wait=60,interval=1.2})
         end
     end
 end
@@ -21176,6 +21193,10 @@ function Plugin:onReaderReady()
     HOME_SESSION.reader_session_active=true
     HOME_SESSION.reader_session_file=ready_path
     self._reader_session_generation=HOME_SESSION.reader_session_generation
+    -- A preserved Reader session is an internal KOReader rebuild (rotation,
+    -- reflow, etc.), not a genuine reopen. Only that narrow case may reuse a
+    -- freshly verified cloud position; every real book open must re-read WeRead.
+    self._reader_session_preserved=preserve_session==true
     local ready_session=self._reader_session_generation
     self._home_reader_transition=false
     self:_close_reader_recovery_surface()
@@ -21261,20 +21282,16 @@ function Plugin:onReaderReady()
     local task
     task=function()
         if self._reader_sync_ready_task~=task then return end
-        if not self:_reader_background_idle() then
-            UIManager:scheduleIn(.65,task)
-            return
-        end
         self._reader_sync_ready_task=nil
         if self.ui and self.ui.document
             and tonumber(HOME_SESSION.reader_session_generation or 0)==ready_session
             and not reader_close_active() then self.sync:on_reader_ready() end
     end
     self._reader_sync_ready_task=task
-    -- Let KOReader paint the first page and restore input before identity and
-    -- cloud-progress work begins. Local comment taps are already installed by
-    -- the next-tick block above, so this does not delay reading interaction.
-    UIManager:scheduleIn(.60,task)
+    -- Cloud progress is a required open-time check, not optional idle work.
+    -- Start it just after the first page gets priority; user interaction must
+    -- never postpone the check for tens of seconds or minutes.
+    UIManager:scheduleIn(.18,task)
     local device_task
     device_task=function()
         if self._miuread_suspended==true or HOME_SESSION.suspended==true then return end
@@ -21500,12 +21517,51 @@ function Plugin:_reading_end_sync(reason,options,callback)
         if need_progress then parts[#parts+1]="阅读进度" end
         if need_annotations then parts[#parts+1]="批注" end
         if need_time then parts[#parts+1]="阅读时间" end
-        self:status_toast("正在保存本次阅读","正在同步"..table.concat(parts,"、")..(options.after and (" · 完成后将"..tostring(options.after)) or ""),math.min(timeout,5))
+        local detail="正在同步："..table.concat(parts,"、")
+        if options.after then detail=detail.."\n完成后将"..tostring(options.after) end
+        self:status_toast("正在保存本次阅读",detail,math.min(timeout,5))
     end
 
     if need_progress then
-        local started=self.sync:upload_progress(function(ok)
-            complete_one(ok==true)
+        local started=self.sync:upload_progress(function(ok,_result,submitted,value)
+            if ok~=true then complete_one(false); return end
+            local submitted_position=type(submitted)=="table" and submitted or position
+            local uncertain=type(value)=="table" and (value.uncertain==true or tostring(value.error_kind or "")=="unconfirmed")
+            if not uncertain then complete_one(true); return end
+
+            -- Some WeRead responses accept the request without an explicit
+            -- acknowledgement. Verify the cloud coordinate instead of marking
+            -- the close operation failed or blindly replaying the upload.
+            local verify_attempt=0
+            local function verify_close_progress()
+                verify_attempt=verify_attempt+1
+                UIManager:scheduleIn(verify_attempt==1 and .8 or 1.3,function()
+                    if finished then return end
+                    if not (self.ui and self.ui.document) then complete_one(false); return end
+                    self.sync:remote(book_id,function(remote)
+                        local matched,actual,source,meta=self:_remote_matches(remote,submitted_position)
+                        logger.info("[MiuRead][ReadingEnd] progress verify",
+                            "book=",book_id,"attempt=",tostring(verify_attempt),
+                            "matched=",tostring(matched==true),
+                            "source=",tostring(source or "-"),
+                            "co_delta=",tostring(meta and meta.co_delta or "-"))
+                        if matched then
+                            local localp=math.floor((tonumber(submitted_position.progress) or 0)+.5)
+                            local remotep=math.floor((tonumber(actual) or localp)+.5)
+                            self.sync:mark_verified(book_id,"reading_end_verified",localp,remotep,submitted_position)
+                            self:_save_progress_state(book_id,"local_uploaded","结束阅读进度已上传并确认",localp,remotep)
+                            complete_one(true)
+                        elseif verify_attempt<2 then
+                            verify_close_progress()
+                        else
+                            self:_save_progress_state(book_id,"upload_unconfirmed","请求已发送，但云端位置尚未更新",
+                                tonumber(submitted_position.progress),remote and remote.percent)
+                            complete_one(false)
+                        end
+                    end,{force=true})
+                end)
+            end
+            verify_close_progress()
         end,{position_override=position})
         if not started then complete_one(false) end
     end
