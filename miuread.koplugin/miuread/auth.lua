@@ -38,7 +38,7 @@ function Auth:new(http,store,host)
     return setmetatable({
         http=http, store=store, host=host, generation=0, jar={}, dialog=nil,
         retry_dialog=nil, started=0, active=false, closing=false, poll_failures=0,
-        refresh_count=0,
+        refresh_count=0, pending_auth=nil, pending_name="",
     },self)
 end
 local function merge_auth_headers(jar,vid,key)
@@ -72,6 +72,8 @@ function Auth:cancel()
     self.started=0
     self.poll_failures=0
     self.refresh_count=0
+    self.pending_auth=nil
+    self.pending_name=""
 end
 function Auth:_uid()
     local _,code,h=self.http:request{url=BASE.."/r/weread-skills",method="GET",auth=false,headers={Referer=BASE.."/"}}
@@ -89,6 +91,128 @@ function Auth:_poll(uid,otp)
     self.jar=Cookies.session_absorb(self.jar,header_value(headers,"set-cookie"))
     return data
 end
+function Auth:_persisted_auth_matches(expected)
+    if type(self.store.read_persisted)~="function" then return true end
+    local persisted,err=self.store:read_persisted("auth")
+    if type(persisted)~="table" then return false,err or "saved auth missing" end
+    local expected_account=type(expected.account)=="table" and expected.account or {}
+    local persisted_account=type(persisted.account)=="table" and persisted.account or {}
+    local expected_cookies=type(expected.cookies)=="table" and expected.cookies or {}
+    local persisted_cookies=type(persisted.cookies)=="table" and persisted.cookies or {}
+    if tostring(expected.login_session_id or "")==""
+        or tostring(persisted.login_session_id or "")~=tostring(expected.login_session_id or "") then
+        return false,"login session mismatch"
+    end
+    if tostring(persisted_account.vid or "")~=tostring(expected_account.vid or "") then
+        return false,"account mismatch"
+    end
+    if tostring(persisted.api_key or "")~=tostring(expected.api_key or "") then
+        return false,"api key mismatch"
+    end
+    if tostring(persisted_cookies.wr_vid or "")~=tostring(expected_cookies.wr_vid or "")
+        or tostring(persisted_cookies.wr_skey or "")~=tostring(expected_cookies.wr_skey or "") then
+        return false,"core cookie mismatch"
+    end
+    return true
+end
+
+function Auth:_commit_auth(auth)
+    local saved,save_error=self.store:save_auth(auth)
+    if saved~=true then return false,save_error or "settings write failed" end
+    local verified,verify_error=self:_persisted_auth_matches(auth)
+    if verified~=true then
+        if self.store.reload then self.store:reload() end
+        return false,verify_error or "saved auth verification failed"
+    end
+    return true
+end
+
+function Auth:_complete_login(name)
+    local completed_name=tostring(name or self.pending_name or "")
+    logger.info("[MiuRead][Auth] QR login completed")
+    self:cancel()
+    if self.host.on_auth_success then
+        pcall(self.host.on_auth_success,self.host,completed_name)
+    else
+        self.host:info(_("Logged in")..": "..completed_name)
+    end
+end
+
+function Auth:_abandon_pending_commit()
+    self.pending_auth=nil
+    self.pending_name=""
+    if self.host.on_auth_commit_failed then pcall(self.host.on_auth_commit_failed,self.host) end
+end
+
+function Auth:_show_commit_retry(detail)
+    self.active=false
+    self:_close_dialog()
+    self:_close_retry_dialog()
+    self.generation=self.generation+1
+    local message="微信已经确认登录，但设备没有保存登录状态。\n\n可以直接重试保存，无需重新扫码。"
+    local reason=Util.first_line(detail or "",120)
+    if reason~="" then message=message.."\n\n原因："..reason end
+    local dialog
+    dialog=ButtonDialog:new{
+        title=message,title_align="center",
+        close_callback=function()
+            if self.retry_dialog==dialog then self.retry_dialog=nil end
+            if not self.closing then
+                self:_abandon_pending_commit()
+                self:cancel()
+                self.host:toast("登录状态未保存",3)
+            end
+        end,
+        buttons={
+            {{text="重试保存",callback=function()
+                self.closing=true
+                if self.retry_dialog==dialog then self.retry_dialog=nil end
+                UIManager:close(dialog)
+                self.closing=false
+                local pending=Util.copy(self.pending_auth)
+                local pending_name=tostring(self.pending_name or "")
+                if type(pending)~="table" then
+                    self:_abandon_pending_commit()
+                    self:_begin(0)
+                    return
+                end
+                UIManager:scheduleIn(.05,function()
+                    local saved,save_error=self:_commit_auth(pending)
+                    if saved==true then
+                        logger.info("[MiuRead][Auth] pending login state saved after retry")
+                        self.pending_auth=nil
+                        self.pending_name=""
+                        self:_complete_login(pending_name)
+                    else
+                        logger.warn("[MiuRead][Auth] pending login save retry failed",Util.first_line(save_error or "unknown",160))
+                        self.pending_auth=pending
+                        self.pending_name=pending_name
+                        self:_show_commit_retry(save_error)
+                    end
+                end)
+            end}},
+            {{text="重新扫码",callback=function()
+                self.closing=true
+                if self.retry_dialog==dialog then self.retry_dialog=nil end
+                UIManager:close(dialog)
+                self.closing=false
+                self:_abandon_pending_commit()
+                self:_begin(0)
+            end}},
+            {{text=_("Cancel"),callback=function()
+                self.closing=true
+                if self.retry_dialog==dialog then self.retry_dialog=nil end
+                UIManager:close(dialog)
+                self.closing=false
+                self:_abandon_pending_commit()
+                self:cancel()
+            end}},
+        },
+    }
+    self.retry_dialog=dialog
+    UIManager:show(dialog)
+end
+
 function Auth:_finish(data)
     local vid=tostring(data.webLoginVid or ""); local key=tostring(data.accessToken or ""); local refresh=tostring(data.refreshToken or "")
     if vid=="" or key=="" then error("login credentials missing") end
@@ -164,15 +288,23 @@ function Auth:_finish(data)
         local replaced,replace_error=pcall(self.host.on_auth_replacing,self.host,old_auth,new_auth)
         if not replaced then logger.warn("[MiuRead][Auth] pre-commit reset failed",tostring(replace_error)) end
     end
-    self.store:save_auth(new_auth)
+    local committed,commit_error=self:_commit_auth(new_auth)
+    local display_name=account_name~="" and account_name or vid
+    if committed~=true then
+        self.pending_auth=Util.copy(new_auth)
+        self.pending_name=display_name
+        logger.warn("[MiuRead][Auth] QR login confirmed but local commit failed",Util.first_line(commit_error or "unknown",160))
+        return nil,commit_error
+    end
     logger.info("[MiuRead][Auth] QR session finalized",
         "session_cookies=",tostring(cookie_count(session)),
         "persistent_cookies=",tostring(#Cookies.names(jar)),
         "renewal_ok=",tostring(renewal_ok),
         "renewal_succ=",tostring(renewal_succ),
         "ticket=",tostring(wr_ticket~=""),
-        "wrpa=",tostring(wr_wrpa~=""))
-    return account_name~="" and account_name or vid
+        "wrpa=",tostring(wr_wrpa~=""),
+        "persisted=",tostring(true))
+    return display_name
 end
 
 function Auth:_show_retry(message)
@@ -291,14 +423,12 @@ function Auth:_schedule(uid,gen,otp)
         if data.succeed==true then
             self.active=false; self:_close_dialog()
             self.host:online(_("QR login"),function()
-                local name=self:_finish(data)
-                logger.info("[MiuRead][Auth] QR login completed")
-                self:cancel()
-                if self.host.on_auth_success then
-                    pcall(self.host.on_auth_success,self.host,name)
-                else
-                    self.host:info(_("Logged in")..": "..tostring(name))
+                local name,commit_error=self:_finish(data)
+                if not name then
+                    self:_show_commit_retry(commit_error)
+                    return
                 end
+                self:_complete_login(name)
             end)
             return
         end

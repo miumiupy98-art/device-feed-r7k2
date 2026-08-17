@@ -424,9 +424,13 @@ function Http:_jar()
     local jar, changed = Cookies.sanitize(original)
     if changed then
         auth.cookies = jar
-        self.store:save_auth(auth)
-        logger.info("[MiuRead][HTTP] removed temporary cookies from saved login",
-            "names=", table.concat(Cookies.names(jar), ","))
+        local saved,save_error=self.store:save_auth(auth)
+        if saved==true then
+            logger.info("[MiuRead][HTTP] removed temporary cookies from saved login",
+                "names=", table.concat(Cookies.names(jar), ","))
+        else
+            logger.warn("[MiuRead][HTTP] cookie cleanup not persisted",Util.first_line(save_error or "unknown",160))
+        end
     end
     return jar
 end
@@ -441,8 +445,13 @@ function Http:_save_jar(jar, expected_login_session_id)
     local cleaned = Cookies.sanitize(jar or {})
     if not Cookies.same(auth.cookies or {}, cleaned) then
         auth.cookies = cleaned
-        self.store:save_auth(auth)
+        local saved,save_error=self.store:save_auth(auth)
+        if saved~=true then
+            logger.warn("[MiuRead][HTTP] refreshed cookies not persisted",Util.first_line(save_error or "unknown",160))
+            return false,save_error
+        end
     end
+    return true
 end
 
 function Http:_save_response_auth_headers(headers, expected_login_session_id)
@@ -467,7 +476,11 @@ function Http:_save_response_auth_headers(headers, expected_login_session_id)
         changed = true
     end
     if changed then
-        self.store:save_auth(auth)
+        local saved,save_error=self.store:save_auth(auth)
+        if saved~=true then
+            logger.warn("[MiuRead][HTTP] public-account credential not persisted",Util.first_line(save_error or "unknown",160))
+            return false
+        end
         logger.info("[MiuRead][HTTP] public-account credential refreshed",
             "ticket=", tostring(auth.wr_ticket ~= ""), "wrpa=", tostring(auth.wr_wrpa ~= ""))
     end

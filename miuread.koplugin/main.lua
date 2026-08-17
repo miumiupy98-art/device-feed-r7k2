@@ -1620,6 +1620,10 @@ function Plugin:on_auth_replacing(_old_auth,_new_auth)
     if self.store.clear_account_shelf_cache then self.store:clear_account_shelf_cache() end
 end
 
+function Plugin:on_auth_commit_failed()
+    self._auth_transitioning=false
+end
+
 function Plugin:show_account_status()
     if HomeView.is_shown() and not self:_active_reader_ui() then
         local auth=self.store:auth()
@@ -3320,9 +3324,11 @@ end
 function Plugin:_save_home_preferences(home,preferences)
     preferences=preferences or self.store:preferences()
     preferences.home_ui=home
-    self.store:save_preferences(preferences)
+    local saved,err=self.store:save_preferences(preferences)
+    if saved~=true then return false,err end
     UiScale.setDisplayMode(home.display_size or "standard")
     UiScale.setFontName(self:_home_ui_font_name(home))
+    return true
 end
 
 function Plugin:_save_home_preferences_deferred(home,preferences,delay)
@@ -3339,8 +3345,12 @@ function Plugin:_save_home_preferences_deferred(home,preferences,delay)
     UIManager:scheduleIn(tonumber(delay) or 1.20,function()
         if generation~=self._home_state_save_generation or not self._home_state_save_pending then return end
         self._home_state_save_pending=false
-        self.store:flush()
-        logger.info("[MiuRead][HomeState] preferences saved after idle")
+        local saved,err=self.store:flush()
+        if saved==true then
+            logger.info("[MiuRead][HomeState] preferences saved after idle")
+        else
+            logger.warn("[MiuRead][HomeState] preferences save failed after idle",U.first_line(err or "unknown",160))
+        end
     end)
 end
 
@@ -3348,7 +3358,11 @@ function Plugin:_flush_home_preferences()
     if not self._home_state_save_pending then return false end
     self._home_state_save_generation=(tonumber(self._home_state_save_generation) or 0)+1
     self._home_state_save_pending=false
-    self.store:flush()
+    local saved,err=self.store:flush()
+    if saved~=true then
+        logger.warn("[MiuRead][HomeState] preferences save failed before leaving home",U.first_line(err or "unknown",160))
+        return false,err
+    end
     logger.info("[MiuRead][HomeState] preferences saved before leaving home")
     return true
 end
@@ -3421,7 +3435,11 @@ function Plugin:_set_mode_intro_pending(mode,reason)
     intro.pending_mode=mode
     intro.pending_reason=tostring(reason or "user_switch")
     intro.pending_at=os.time()
-    self.store:save_preferences(preferences)
+    local saved,err=self.store:save_preferences(preferences)
+    if saved~=true then
+        logger.warn("[MiuRead][Mode] intro state save failed",U.first_line(err or "unknown",160))
+        return false,err
+    end
     return true
 end
 
@@ -3488,7 +3506,21 @@ function Plugin:_set_home_mode(use_miuread_home)
     end
     home.enabled=enabled
     home.layout_version=23
-    self:_save_home_preferences(home,preferences)
+    local saved,save_error=self:_save_home_preferences(home,preferences)
+    if saved~=true then
+        logger.warn("[MiuRead][Mode] mode preference save failed",U.first_line(save_error or "unknown",180))
+        self:info("运行模式没有保存成功，当前模式不会改变。\n\n请稍后重试；本次不会重启 KOReader。")
+        return false
+    end
+    local persisted,persist_error=self.store:read_persisted("preferences")
+    local persisted_home=type(persisted)=="table" and persisted.home_ui or nil
+    if type(persisted_home)~="table" or persisted_home.enabled~=enabled then
+        logger.warn("[MiuRead][Mode] persisted mode verification failed",U.first_line(persist_error or "value mismatch",180))
+        self.store:reload()
+        self:info("运行模式保存后校验失败，当前模式不会改变。\n\n请稍后重试；本次不会重启 KOReader。")
+        return false
+    end
+    logger.info("[MiuRead][Mode] persisted mode verified","target=",target_mode)
     if self:_home_enabled()==enabled then
         self:_clear_mode_intro_pending()
         self:toast("已取消待切换模式，当前继续使用"..self:_runtime_mode_label(),3)

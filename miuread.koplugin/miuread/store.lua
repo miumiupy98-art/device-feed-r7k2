@@ -68,6 +68,35 @@ local function invalidate_upload_health_table(auth)
     end
     return auth
 end
+local function settings_payload(data,path)
+    -- Match KOReader LuaSettings:flush(): settings files are executable Lua
+    -- chunks that must return the serialized table. dump() itself only emits
+    -- the table expression, so writing it directly would create an invalid
+    -- settings file beginning with "{".
+    return "-- "..tostring(path or "").."\nreturn "..dump(data,nil,true).."\n"
+end
+
+local function settings_payload_valid(payload)
+    local loader,err=loadstring(tostring(payload or ""))
+    if not loader then return false,err end
+    local ok,value=pcall(loader)
+    if not ok then return false,value end
+    if type(value)~="table" then return false,"settings payload did not return a table" end
+    return true
+end
+
+local function settings_file_data(path)
+    if not path or lfs.attributes(path,"mode")~="file" then return nil,"missing" end
+    local size=U.file_size(path) or 0
+    if size<=0 then return nil,"empty" end
+    local loader,err=loadfile(path)
+    if not loader then return nil,err end
+    local ok,value=pcall(loader)
+    if not ok then return nil,value end
+    if type(value)~="table" then return nil,"settings file did not return a table" end
+    return value
+end
+
 local function settings_file_valid(path)
     if not path or lfs.attributes(path,"mode")~="file" then return false,"missing" end
     local size=U.file_size(path) or 0
@@ -1409,7 +1438,10 @@ function Store:migrate()
     end
 end
 function Store:get(k,d) local v=self.db:readSetting(k,nil); return v==nil and U.copy(d) or v end
-function Store:set(k,v) self.db:saveSetting(k,v); return self:flush() end
+function Store:set(k,v)
+    self.db:saveSetting(k,v)
+    return self:flush()
+end
 function Store:set_deferred(k,v) self.db:saveSetting(k,v) end
 local function sanitized_auth(value)
     local auth=U.merge(defaults.auth,value or {})
@@ -1421,7 +1453,7 @@ local function sanitized_auth(value)
     return auth
 end
 function Store:auth() return sanitized_auth(self:get("auth",{})) end
-function Store:save_auth(v) self:set("auth",sanitized_auth(v)) end
+function Store:save_auth(v) return self:set("auth",sanitized_auth(v)) end
 function Store:generate_login_session_id() return generate_login_session_id() end
 function Store:ensure_login_session_id()
     local auth=self:auth()
@@ -1429,7 +1461,8 @@ function Store:ensure_login_session_id()
     if tostring(auth.login_session_id or "")=="" and tostring(account.vid or "")~=""
         and tostring(auth.api_key or "")~="" and next(auth.cookies or {})~=nil then
         auth.login_session_id=generate_login_session_id()
-        self:save_auth(auth)
+        local saved,err=self:save_auth(auth)
+        if saved~=true then return "",err end
     end
     return tostring(auth.login_session_id or "")
 end
@@ -1444,14 +1477,14 @@ function Store:update_auth_health(patch)
     self:save_auth(auth)
     return auth.health
 end
-function Store:clear_auth() self:set("auth",U.copy(defaults.auth)) end
+function Store:clear_auth() return self:set("auth",U.copy(defaults.auth)) end
 function Store:clear_account_shelf_cache()
     local cache=self:shelf_cache()
     cache.books={}; cache.mp={}; cache.updated_at=0
     self:save_shelf_cache(cache)
 end
 function Store:preferences() return U.merge(defaults.preferences,self:get("preferences",{})) end
-function Store:save_preferences(v) self:set("preferences",U.merge(defaults.preferences,v or {})) end
+function Store:save_preferences(v) return self:set("preferences",U.merge(defaults.preferences,v or {})) end
 function Store:save_preferences_deferred(v) self:set_deferred("preferences",U.merge(defaults.preferences,v or {})) end
 function Store:books_root() local p=self:preferences().download_dir; if p=="" then p=self.default_books_dir end; U.mkdir(p); return p end
 function Store:epub_root() return self:books_root() end
@@ -1469,7 +1502,10 @@ local function basename(path) return tostring(path or ""):match("([^/]+)$") end
 function Store:library() return self:get("library",{}) end
 function Store:book(id) return self:library()[tostring(id)] end
 function Store:save_book(id,patch)
-    local all=self:library(); local key=tostring(id); all[key]=U.merge(all[key] or {book_id=key,variants={},chapters={}},patch or {}); self:set("library",all); return all[key]
+    local all=self:library(); local key=tostring(id)
+    all[key]=U.merge(all[key] or {book_id=key,variants={},chapters={}},patch or {})
+    local saved,err=self:set("library",all)
+    return all[key],saved,err
 end
 function Store:clear_book_access(id)
     local all=self:library(); local key=tostring(id)
@@ -2026,7 +2062,16 @@ function Store:invalidate_report_contexts(reason)
     return self:clear_login_bound_sessions(reason)
 end
 function Store:session(id) return self:get("sessions",{})[tostring(id)] end
-function Store:save_session(id,patch,flush_now) local a=self:get("sessions",{}); local k=tostring(id); a[k]=U.merge(a[k] or {},patch or {}); self.db:saveSetting("sessions",a); if flush_now~=false then self:flush() end; return a[k] end
+function Store:save_session(id,patch,flush_now)
+    local a=self:get("sessions",{}); local k=tostring(id)
+    a[k]=U.merge(a[k] or {},patch or {})
+    self.db:saveSetting("sessions",a)
+    if flush_now~=false then
+        local saved,err=self:flush()
+        return a[k],saved,err
+    end
+    return a[k],true
+end
 function Store:invalidate_book_sync_context(id,reason,core_map_hash)
     local sessions=self:get("sessions",{})
     local key=tostring(id or "")
@@ -2050,7 +2095,7 @@ function Store:invalidate_book_sync_context(id,reason,core_map_hash)
 end
 function Store:clear_session(id) local a=self:get("sessions",{}); a[tostring(id)]=nil; self:set("sessions",a) end
 function Store:shelf_cache() return U.merge(defaults.shelf_cache,self:get("shelf_cache",{})) end
-function Store:save_shelf_cache(v) self:set("shelf_cache",U.merge(defaults.shelf_cache,v or {})) end
+function Store:save_shelf_cache(v) return self:set("shelf_cache",U.merge(defaults.shelf_cache,v or {})) end
 function Store:update_cached_progress(id,percent)
     id=tostring(id or "")
     percent=tonumber(percent)
@@ -2073,7 +2118,7 @@ function Store:cover_guard() return U.merge(defaults.cover_guard,self:get("cover
 function Store:save_cover_guard(v) self:set("cover_guard",U.merge(defaults.cover_guard,v or {})) end
 function Store:cover_path(id) return self.covers_dir.."/"..U.id_name(id)..".img" end
 function Store:update_state() return self:get("update_state",{}) end
-function Store:save_update_state(v) self:set("update_state",v or {}) end
+function Store:save_update_state(v) return self:set("update_state",v or {}) end
 function Store:download_state()
     local value=DownloadDatabase.get_download_state(self)
     if type(value)=="table" and next(value)~=nil then return value end
@@ -2192,31 +2237,32 @@ function Store:flush()
         if valid then U.copy_file(self.settings_path,previous_path) end
     end
 
-    -- Serialize completely in memory and atomically replace the target. A
-    -- failed settings write is recoverable application state, not a reason to
-    -- abort KOReader's plugin loader. Keep the previous valid file and report
-    -- failure to the caller instead of throwing out of Plugin:init().
+    -- Serialize exactly like KOReader LuaSettings:flush(): dump() emits only a
+    -- table expression, while a settings file must be a chunk that returns it.
+    -- Validate the complete chunk in memory, atomically replace the target, and
+    -- keep the last valid generation if anything fails.
     local payload
     local ok,err=xpcall(function()
-        payload=dump(self.db.data,nil,true)
-        local loader,parse_error=loadstring(payload)
-        if not loader then error("serialized settings invalid: "..tostring(parse_error)) end
+        payload=settings_payload(self.db.data,self.settings_path)
+        local valid_payload,parse_error=settings_payload_valid(payload)
+        if not valid_payload then error("serialized settings invalid: "..tostring(parse_error)) end
         local written,write_error=U.atomic_write(self.settings_path,payload,true)
         if not written then error("atomic settings write failed: "..tostring(write_error)) end
     end,debug.traceback)
     if not ok then
         logger.err("[MiuRead][Store] settings flush failed; keeping previous settings",tostring(err))
         if not self.isolated then restore_settings_file(self.settings_path,self.settings_backup_path) end
+        local disk_ok=settings_file_valid(self.settings_path)
+        if disk_ok then self.db=LuaSettings:open(self.settings_path) end
         return false,err
     end
 
     local valid,reason=settings_file_valid(self.settings_path)
     if not valid then
         logger.warn("[MiuRead][Store] atomic settings flush produced invalid file","reason=",tostring(reason))
-        if not self.isolated then
-            restore_settings_file(self.settings_path,self.settings_backup_path)
-            self.db=LuaSettings:open(self.settings_path)
-        end
+        if not self.isolated then restore_settings_file(self.settings_path,self.settings_backup_path) end
+        local disk_ok=settings_file_valid(self.settings_path)
+        if disk_ok then self.db=LuaSettings:open(self.settings_path) end
         return false,reason
     end
     if not self.isolated then
@@ -2236,5 +2282,10 @@ function Store:reload()
         if valid then U.copy_file(self.settings_path,self.settings_backup_path) end
     end
     return self
+end
+function Store:read_persisted(key)
+    local data,err=settings_file_data(self.settings_path)
+    if not data then return nil,err end
+    return U.copy(data[key])
 end
 return Store

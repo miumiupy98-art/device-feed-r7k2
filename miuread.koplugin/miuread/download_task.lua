@@ -1263,9 +1263,33 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
     local hibernate_path = self.store.temp_dir .. "/download-hibernate-" .. stamp .. ".json"
     local network_path = self.store.temp_dir .. "/download-network-" .. stamp
     local worker_settings_path = self.store.temp_dir .. "/download-settings-" .. stamp .. ".lua"
-    self.store:flush()
+    local flushed, flush_error = self.store:flush()
+    if flushed~=true then
+        return false, "设备状态暂时无法保存，下载未启动。请稍后重试；无需重新扫码。\n"
+            .. tostring(U.first_line(flush_error or "未知错误",120))
+    end
+    local start_auth=self.store:auth()
+    local start_account=type(start_auth.account)=="table" and start_auth.account or {}
+    local start_cookies=type(start_auth.cookies)=="table" and start_auth.cookies or {}
     local copied, copy_error = U.copy_file(self.store.settings_path, worker_settings_path)
     if not copied then return false, "无法建立安全下载状态副本：" .. tostring(copy_error or "未知错误") end
+    local worker_loader,worker_load_error=loadfile(worker_settings_path)
+    local worker_ok,worker_data=false,nil
+    if worker_loader then worker_ok,worker_data=pcall(worker_loader) end
+    local worker_auth=worker_ok and type(worker_data)=="table" and worker_data.auth or nil
+    local worker_account=type(worker_auth)=="table" and type(worker_auth.account)=="table" and worker_auth.account or {}
+    local worker_cookies=type(worker_auth)=="table" and type(worker_auth.cookies)=="table" and worker_auth.cookies or {}
+    local auth_matches=type(worker_auth)=="table"
+        and tostring(worker_auth.login_session_id or "")==tostring(start_auth.login_session_id or "")
+        and tostring(worker_account.vid or "")==tostring(start_account.vid or "")
+        and tostring(worker_cookies.wr_vid or "")==tostring(start_cookies.wr_vid or "")
+        and tostring(worker_cookies.wr_skey or "")==tostring(start_cookies.wr_skey or "")
+    if not auth_matches then
+        os.remove(worker_settings_path)
+        logger.warn("[MiuRead][DownloadTask] worker auth snapshot verification failed",
+            "load_ok=",tostring(worker_ok),"error=",tostring(worker_load_error or (worker_ok and "value mismatch" or worker_data)))
+        return false,"登录状态没有同步到下载任务，下载未启动。请稍后重试；无需重新扫码。"
+    end
     local worker_data_dir = self.store.data_dir
     local task_token = stamp .. "-" .. tostring(math.random(100000,999999))
     local clean_book = serializable_copy(book)
@@ -1287,8 +1311,6 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
         os.remove(worker_settings_path)
         return false,"无法建立下载网络控制状态："..tostring(network_error or "未知错误")
     end
-    local start_auth=self.store:auth()
-    local start_account=type(start_auth.account)=="table" and start_auth.account or {}
     local auth_snapshot={
         login_session_id=tostring(start_auth.login_session_id or ""),
         vid=tostring(start_account.vid or ""),
