@@ -18,7 +18,7 @@ Sync.__index = Sync
 local legacy_daemon_retired = false
 
 local CONTEXT_MAX_AGE = 15 * 60
-local READ_REPORT_SERVICE_VERSION = 19
+local READ_REPORT_SERVICE_VERSION = 20
 local FIRST_REPORT_DELAY = 60
 local FINAL_REPORT_MIN_SECONDS = 10
 local PRECISE_POSITION_LEAD_SECONDS = 12
@@ -1270,10 +1270,9 @@ function Sync:clear_verified(reason)
 end
 
 function Sync:begin_progress_sync(reason)
-    -- Only continuous progress mode needs to hold reading-time reports while
-    -- local/cloud positions are being compared. Pure time reporting continues
-    -- independently in the default end-of-reading mode.
-    self.progress_hold = self:periodic_progress_enabled()
+    -- Reading-time reporting stays independent from progress comparison in
+    -- beta.8. Progress checks never make the 60-second timer compute positions.
+    self.progress_hold = false
     self.state = "fetching_remote"
     self.last_stage = reason or "读取云端进度"
     return true
@@ -2592,12 +2591,15 @@ end
 function Sync:progress_mode()
     local prefs=self.store:preferences().sync or {}
     local mode=tostring(prefs.progress_mode or "")
-    if mode=="close" or mode=="continuous" or mode=="manual" then return mode end
+    if mode=="continuous" then return "close" end
+    if mode=="close" or mode=="manual" then return mode end
     return prefs.progress_enabled==false and "manual" or "close"
 end
 
 function Sync:periodic_progress_enabled()
-    return self:progress_mode()=="continuous"
+    -- beta.8 keeps the reading-time daemon permanently time-only. Exact cloud
+    -- coordinates are resolved only for manual or end-of-reading submissions.
+    return false
 end
 
 function Sync:_write_daemon_control(active, immediate, extra)
@@ -2779,6 +2781,10 @@ function Sync:_import_daemon_status(force)
         return
     end
     local final_flush = status.final_flush == true
+    local barrier_seq=tonumber(status.writer_barrier_seq or 0) or 0
+    if barrier_seq>0 and tostring(status.state or "")~="reporting" then
+        daemon.writer_barrier_ack_seq=math.max(tonumber(daemon.writer_barrier_ack_seq or 0) or 0,barrier_seq)
+    end
     local stamp = daemon_stamp(status)
     if final_flush and stamp and self.store:is_read_report_consumed(stamp) then
         self.daemon_status_stamp=stamp
@@ -2988,52 +2994,9 @@ function Sync:_import_daemon_status(force)
 end
 
 function Sync:_maybe_refresh_precise_position()
-    if not self:periodic_progress_enabled() then return false end
-    local daemon = self.daemon
-    if not daemon or daemon.active ~= true or self.suspended then return false end
-    local due = tonumber(self.next_due or 0) or 0
-    if due <= 0 or tonumber(self.precise_due_refreshed or 0) == due then return false end
-    if due - os.time() > PRECISE_POSITION_LEAD_SECONDS then return false end
-    if reader_interaction_busy(self.host) then return false end
-
-    -- Never feed an approximate page/wordCount fallback into the continuous
-    -- cloud writer. Until the native source coordinate is ready this interval
-    -- is explicitly time-only, so a coarse position cannot overwrite a more
-    -- precise cloud position.
-    self:_write_daemon_control(true, true, {_time_only=true})
-    self.precise_due_refreshed = due
-
-    -- Source XHTML fetch + PosMap build run only in the subprocess. Page turns
-    -- still only mark activity/control dirty and never scan text.
-    local started, source_error = self:_source_position_async(function(position, err)
-        local current_daemon = self.daemon
-        if not current_daemon or current_daemon.active ~= true or self.suspended then return end
-        local exact_cloud=type(position)=="table" and position.native_offset==true
-            and tostring(position.offset_basis or position.position_basis or "")=="wr_data_co"
-        if exact_cloud then
-            position.precision_level="exact_cloud"
-            position.canonical_offset=tonumber(position.chapter_offset or position.offset)
-            logger.info("[MiuRead][Progress] interval source position",
-                "chapter=", tostring(position.chapter_uid or "-"),
-                "offset=", tostring(position.offset or "-"),
-                "basis=", tostring(position.offset_basis or position.position_basis or "-"),
-                "native=true",
-                "progress=", string.format("%.3f", tonumber(position.progress) or 0),
-                "cache=", tostring(position.source_cache_hit == true))
-            self:_save_local_snapshot(tostring(current_daemon.book_id or ""), position)
-            self:_write_daemon_control(true, true, {_position_override=position})
-        else
-            logger.info("[MiuRead][Progress] interval position skipped; time-only retained",
-                "reason=", tostring(err or "native_cloud_coordinate_unavailable"))
-            self:_write_daemon_control(true, true, {_time_only=true})
-        end
-    end)
-    if started then return true end
-
-    logger.info("[MiuRead][Progress] interval source worker unavailable; time-only retained",
-        "reason=", tostring(source_error or "unknown"))
-    self:_write_daemon_control(true, true, {_time_only=true})
-    return true
+    -- Periodic exact-progress preparation was retired in beta.8. Keep this
+    -- no-op bridge because the long-lived service poll still calls it.
+    return false
 end
 
 function Sync:_schedule_daemon_poll(delay)
@@ -3081,9 +3044,8 @@ function Sync:_start_daemon(reason)
     local book_id = tostring(record.book.book_id or "")
     local core_hash=self:_core_map_hash(record)
     local time_only=not self:periodic_progress_enabled()
-    -- Even in continuous mode, never seed the daemon with a page/wordCount
-    -- approximation.  The first interval is time-only until
-    -- _maybe_refresh_precise_position() supplies an exact native wr_data_co.
+    -- beta.8 daemon jobs are permanently time-only. Exact position work is
+    -- owned by manual and end-of-reading submissions.
     local position_snapshot=nil
     if core_hash=="" then
         self.state="stopped"
@@ -3283,15 +3245,74 @@ function Sync:_park_daemon_for_suspend(reason,preserve_final_flush)
     return true
 end
 
+function Sync:_next_writer_barrier(reason)
+    local daemon=self.daemon
+    if not daemon or not daemon.paths then return nil end
+    local existing=read_json_file(daemon.paths.control) or {}
+    local seq=math.max(
+        tonumber(existing.writer_barrier_seq or 0) or 0,
+        tonumber(daemon.writer_barrier_seq or 0) or 0,
+        tonumber(daemon.writer_barrier_ack_seq or 0) or 0
+    )+1
+    daemon.writer_barrier_seq=seq
+    daemon.writer_barrier_reason=tostring(reason or "writer_barrier")
+    return seq
+end
+
+function Sync:writer_barrier_done(seq)
+    seq=tonumber(seq or 0) or 0
+    if seq<=0 then return true end
+    local daemon=self.daemon
+    if not daemon then return true end
+    self:_import_daemon_status(true)
+    local ack=tonumber(daemon.writer_barrier_ack_seq or 0) or 0
+    local done=ack>=seq and daemon.final_flush_pending~=true
+    if done and daemon.active~=true then daemon.book_id=nil end
+    return done
+end
+
+function Sync:wait_writer_barrier(seq,callback,timeout)
+    callback=type(callback)=="function" and callback or function() end
+    seq=tonumber(seq or 0) or 0
+    if seq<=0 or self:writer_barrier_done(seq) then callback(true); return true end
+    local started=os.time()
+    timeout=math.max(2,tonumber(timeout) or 12)
+    local done=false
+    local poll
+    poll=function()
+        if done then return end
+        if self:writer_barrier_done(seq) then
+            done=true
+            callback(true)
+            return
+        end
+        if os.time()-started>=timeout then
+            done=true
+            logger.warn("[MiuRead][ReadReport] writer barrier timeout",
+                "seq=",tostring(seq),"timeout=",tostring(timeout))
+            callback(false)
+            return
+        end
+        UIManager:scheduleIn(.20,poll)
+    end
+    UIManager:scheduleIn(.12,poll)
+    return true
+end
+
 function Sync:_stop_daemon_fast(reason, flush_elapsed)
     local daemon = self.daemon
     if self.control_write_task then
         UIManager:unschedule(self.control_write_task)
         self.control_write_task = nil
     end
-    if not daemon then return end
+    if not daemon then return nil end
 
     local extra = {}
+    local barrier_seq=self:_next_writer_barrier(reason or "stop_fast")
+    if barrier_seq then
+        extra.writer_barrier_seq=barrier_seq
+        extra.writer_barrier_reason=tostring(reason or "stop_fast")
+    end
     flush_elapsed = math.floor(tonumber(flush_elapsed) or 0)
     if daemon.book_id and flush_elapsed >= FINAL_REPORT_MIN_SECONDS then
         local existing = read_json_file(daemon.paths.control) or {}
@@ -3302,23 +3323,29 @@ function Sync:_stop_daemon_fast(reason, flush_elapsed)
         daemon.final_flush_pending = true
     end
 
-    -- Explicit book close may finish its short tail asynchronously. Device
-    -- Suspend uses _park_daemon_for_suspend instead and never creates a final
-    -- network flush. Status/context reconciliation happens on the next poll.
+    -- beta.8 attaches a writer barrier to every explicit close. The service
+    -- acknowledges it only after any already-running time report and the final
+    -- short flush have left /web/book/read, so final progress can safely write last.
     daemon.active = false
     self:_write_daemon_control(false, true, extra)
     self.next_due = 0
-    if not daemon.final_flush_pending then daemon.book_id = nil end
+    if not daemon.final_flush_pending and not barrier_seq then daemon.book_id = nil end
+    return barrier_seq
 end
 
 function Sync:_stop_daemon(reason, persist, flush_elapsed)
     local daemon = self.daemon
     if self.control_write_task then UIManager:unschedule(self.control_write_task); self.control_write_task=nil end
-    if not daemon then return end
+    if not daemon then return nil end
     self:_import_daemon_status(true)
     if persist ~= false then self:_persist_daemon_session(true) end
 
     local extra = {}
+    local barrier_seq=self:_next_writer_barrier(reason or "stop")
+    if barrier_seq then
+        extra.writer_barrier_seq=barrier_seq
+        extra.writer_barrier_reason=tostring(reason or "stop")
+    end
     flush_elapsed = math.floor(tonumber(flush_elapsed) or 0)
     if daemon.book_id and flush_elapsed >= FINAL_REPORT_MIN_SECONDS then
         local existing = read_json_file(daemon.paths.control) or {}
@@ -3333,12 +3360,9 @@ function Sync:_stop_daemon(reason, persist, flush_elapsed)
     self:_write_daemon_control(false, true, extra)
     self.next_due = 0
 
-    if daemon.final_flush_pending then
-        UIManager:scheduleIn(2, function() self:_import_daemon_status(true) end)
-        UIManager:scheduleIn(6, function() self:_import_daemon_status(true) end)
-    else
-        daemon.book_id = nil
-    end
+    UIManager:scheduleIn(2, function() self:_import_daemon_status(true) end)
+    UIManager:scheduleIn(6, function() self:_import_daemon_status(true) end)
+    return barrier_seq
 end
 
 function Sync:_final_elapsed(skip_status_import)
@@ -3419,22 +3443,26 @@ end
 
 function Sync:stop(reason, flush_elapsed)
     self.time_enabled = (self.store:preferences().sync or {}).time_enabled==true
-    self:_stop_daemon(reason, true, flush_elapsed)
+    local barrier_seq=self:_stop_daemon(reason, true, flush_elapsed)
     self.async:cancel(reason)
     self.busy = false
     self.progress_hold = false
     self.state = "stopped"
-    logger.info("[MiuRead][ReadReport] stopped", "reason=", tostring(reason))
+    logger.info("[MiuRead][ReadReport] stopped", "reason=", tostring(reason),
+        "writer_barrier=",tostring(barrier_seq or "-"))
+    return barrier_seq
 end
 
 function Sync:stop_fast(reason, flush_elapsed)
     self.time_enabled = (self.store:preferences().sync or {}).time_enabled==true
-    self:_stop_daemon_fast(reason, flush_elapsed)
+    local barrier_seq=self:_stop_daemon_fast(reason, flush_elapsed)
     self.async:cancel(reason)
     self.busy = false
     self.progress_hold = false
     self.state = "stopped"
-    logger.info("[MiuRead][ReadReport] stopped fast", "reason=", tostring(reason))
+    logger.info("[MiuRead][ReadReport] stopped fast", "reason=", tostring(reason),
+        "writer_barrier=",tostring(barrier_seq or "-"))
+    return barrier_seq
 end
 
 function Sync:_cancel_record_retry()

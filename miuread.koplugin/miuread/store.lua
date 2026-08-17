@@ -1434,6 +1434,20 @@ function Store:migrate()
             self:save_preferences(current)
             logger.info("[MiuRead][Migration] schema 112 -> 113 done")
         end
+        if schema<114 then
+            logger.info("[MiuRead][Migration] schema 113 -> 114 begin","from=",tostring(schema))
+            -- 4.7.0-beta.8 removes periodic exact-progress uploads. Preserve the
+            -- lightweight 60-second reading-time service and migrate users who
+            -- explicitly selected the old continuous mode to end-of-reading sync.
+            local current=self:preferences()
+            current.sync=type(current.sync)=="table" and current.sync or {}
+            if tostring(current.sync.progress_mode or "")=="continuous" then
+                current.sync.progress_mode="close"
+            end
+            current.sync.progress_enabled=current.sync.progress_mode~="manual"
+            self:save_preferences(current)
+            logger.info("[MiuRead][Migration] schema 113 -> 114 done")
+        end
         self.db:saveSetting("schema",Config.SCHEMA)
     end
 end

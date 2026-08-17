@@ -193,10 +193,9 @@ function Service.run(job)
         local interval = math.max(10, tonumber(current_job.interval) or tonumber(Config.READ_INTERVAL) or 60)
         -- The service process may be reused across books, but every reporting
         -- request is bound to one generation, book and immutable core map.
-        -- A continuous-progress job starts conservatively in time-only mode and
-        -- the foreground controller enables position reporting only after an
-        -- exact native wr_data_co has been captured for this interval.  Honor
-        -- the live control flag instead of freezing the mode at service start.
+        -- beta.8 automatic interval jobs are time-only. Keep the live control
+        -- flag for compatibility with older job files, but never make periodic
+        -- reporting depend on foreground position calculation.
         local time_only=current_job.time_only==true or control.time_only==true
         if tostring(control.book_id or "")~=tostring(current_job.book_id or "")
             or tostring(control.core_map_hash or "")~=tostring(current_job.core_map_hash or "")
@@ -211,6 +210,7 @@ function Service.run(job)
                 paused=true,retry_delay=0,consecutive_failures=consecutive_failures+1,
                 attempted_at=os.time(),completed_at=os.time(),elapsed_seconds=0,
                 final_flush=final_flush==true,flush_reason=reason,next_due=0,time_only=time_only,
+                writer_barrier_seq=tonumber(control.writer_barrier_seq or 0) or 0,
             })
             consecutive_failures=consecutive_failures+1
             return 0
@@ -257,6 +257,12 @@ function Service.run(job)
             force_context = consecutive_unconfirmed >= 2,
         }
         local attempted_at = os.time()
+        write_service_status({
+            generation=generation,seq=sequence,state="reporting",accepted=nil,
+            attempted_at=attempted_at,elapsed_seconds=elapsed,final_flush=final_flush==true,
+            flush_reason=reason,time_only=time_only,next_due=0,
+            writer_barrier_seq=tonumber(control.writer_barrier_seq or 0) or 0,
+        })
         local ok, result = pcall(Adapter.run, report_job)
         local completed_at = os.time()
         last_report_at = completed_at
@@ -276,6 +282,7 @@ function Service.run(job)
 
             local out = public_result(result)
             out.time_only=time_only
+            out.writer_barrier_seq=tonumber(control.writer_barrier_seq or 0) or 0
             local uncertain = result.uncertain == true or tostring(result.error_kind or "") == "unconfirmed"
             local kind = result.accepted and nil or (uncertain and "unconfirmed" or classify_error(result.error_kind,result.error))
             if result.accepted then
@@ -358,6 +365,7 @@ function Service.run(job)
             book_id = tostring(current_job.book_id or ""),
             core_map_hash=tostring(current_job.core_map_hash or ""),
             record_generation=tonumber(current_job.record_generation or 0) or 0,
+            writer_barrier_seq=tonumber(control.writer_barrier_seq or 0) or 0,
         })
         return due
     end
@@ -454,6 +462,8 @@ function Service.run(job)
                             seq = sequence,
                             state = "inactive",
                             book_id = tostring(current_job.book_id or ""),
+                            writer_barrier_seq=tonumber(control.writer_barrier_seq or 0) or 0,
+                            writer_barrier_reason=tostring(control.writer_barrier_reason or ""),
                         })
                     end
                 elseif next_due <= 0 then
@@ -483,6 +493,8 @@ function Service.run(job)
                         flush_reason = tostring(control.flush_reason or "stop"),
                         elapsed_seconds = elapsed,
                         book_id = tostring(current_job.book_id or ""),
+                        writer_barrier_seq=tonumber(control.writer_barrier_seq or 0) or 0,
+                        writer_barrier_reason=tostring(control.writer_barrier_reason or ""),
                     })
                 end
             elseif active and not blocked then
