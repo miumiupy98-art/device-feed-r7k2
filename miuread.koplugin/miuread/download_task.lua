@@ -217,6 +217,10 @@ end
 local TRANSIENT_PAUSE_REASONS = {
     home_interaction=true, reader_interaction=true, page_transition=true,
     thought_popup=true, transient_ui=true, heavy_resource=true,
+    -- beta.12 no longer pauses downloads for reader finalization. Treat any
+    -- marker left by beta.9-11 as transient migration debt and clear it at the
+    -- next lifecycle normalization instead of stranding the download.
+    reader_finalizer=true,
 }
 
 local AUTO_EXPIRE_PAUSE_REASONS = {

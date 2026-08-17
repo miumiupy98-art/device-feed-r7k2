@@ -18353,6 +18353,7 @@ function Plugin:_home_sync_summary(force)
     -- refreshed snapshot.
     local sessions=self.store:get("sessions",{}) or {}
     local progress,time_count,progress_failed,progress_unconfirmed=0,0,0,0
+    local progress_active,progress_waiting=0,0
     local pending_progress_states={
         waiting_network=true,uploading=true,retrying=true,upload_unconfirmed=true,upload_failed=true,
         verifying_upload=true,deferred=true,verification_required=true,remote_jump_unconfirmed=true,
@@ -18363,9 +18364,12 @@ function Plugin:_home_sync_summary(force)
             if pending_progress_states[state] then progress=progress+1 end
             if state=="upload_failed" then
                 progress_failed=progress_failed+1
-            elseif state=="upload_unconfirmed" or state=="verifying_upload"
-                or state=="remote_jump_unconfirmed" or state=="verification_required" then
+            elseif state=="upload_unconfirmed" or state=="remote_jump_unconfirmed" then
                 progress_unconfirmed=progress_unconfirmed+1
+            elseif state=="uploading" or state=="retrying" or state=="verifying_upload" then
+                progress_active=progress_active+1
+            elseif state=="waiting_network" or state=="deferred" or state=="verification_required" then
+                progress_waiting=progress_waiting+1
             end
             if tonumber(session.pending_report_seconds or 0)>0 then time_count=time_count+1 end
         end
@@ -18388,6 +18392,7 @@ function Plugin:_home_sync_summary(force)
         annotation_held_local=tonumber(annotations.held_local or 0) or 0,
         annotation_failed=tonumber(annotations.failed or 0) or 0,
         progress_failed=progress_failed,progress_unconfirmed=progress_unconfirmed,
+        progress_active=progress_active,progress_waiting=progress_waiting,
         failed=progress_failed+(tonumber(annotations.failed or 0) or 0),
         total=total,books=tonumber(annotations.books or 0) or 0,checking=checking,
     }
@@ -18406,8 +18411,14 @@ function Plugin:_home_sync_status_label(force)
         return "批注待确认 "..tostring(summary.annotation_action_required)
     end
     if summary.failed>0 then return "失败 "..tostring(summary.failed) end
+    if (tonumber(summary.progress_active or 0) or 0)>0 then
+        return "进度同步中 "..tostring(summary.progress_active)
+    end
     if (tonumber(summary.progress_unconfirmed or 0) or 0)>0 then
         return "进度待确认 "..tostring(summary.progress_unconfirmed)
+    end
+    if (tonumber(summary.progress_waiting or 0) or 0)>0 then
+        return "进度待同步 "..tostring(summary.progress_waiting)
     end
     if summary.total>0 then return "待同步 "..tostring(summary.total) end
     if self.annotation_async and self.annotation_async:busy() then return "同步中" end
@@ -19162,6 +19173,11 @@ function Plugin:_verify_progress_submission(book_id,submitted_position,options,c
                 "chapter=",tostring(submitted_position.chapter_uid or "-"),
                 "co=",tostring(submitted_position.canonical_offset or submitted_position.chapter_offset or submitted_position.offset or "-"),
                 "remote_co=",tostring(remote and remote.offset or "-"))
+            self._home_sync_summary_cache=nil
+            self._home_sync_summary_cache_at=nil
+            if HomeView.is_shown() and not self:_active_reader_ui() then
+                self:_notify_home_data_changed("header")
+            end
         else
             self:_save_pending_progress(book_id,submitted_position,reason or "cloud_not_confirmed")
         end
@@ -22760,8 +22776,38 @@ function Plugin:_reading_end_sync(reason,options,callback)
         need_annotations=false
     end
     local need_writer_wait=writer_barrier_seq~=nil
-    local tasks=(need_writer_wait and 1 or 0)+(need_progress and 1 or 0)+(need_annotations and 1 or 0)
+    -- beta.12: reading time and final progress are independent close tasks.
+    -- Annotation upload is best-effort background work and must never keep the
+    -- reader finalizer/standby lease open.
+    local function start_annotations_detached()
+        if not need_annotations then return false end
+        local prefs=U.copy(self:_annotation_sync_preferences())
+        local book=U.copy(current.book or {})
+        local record=U.copy(current.record or {})
+        local service=self.annotation_sync
+        if self.annotation_async and self.annotation_async:busy() then
+            logger.info("[MiuRead][ReadingEnd] annotation close sync already busy; local queue retained",
+                "book=",book_id)
+            return false
+        end
+        local started=self.annotation_async and self.annotation_async:run("annotation-reading-end",function()
+            return service:sync_book(book,record,{preferences=prefs,limit=200,diagnostic_only=false})
+        end,function(worker_result)
+            local value=worker_result and worker_result.value or nil
+            if not (worker_result and worker_result.ok==true and type(value)=="table" and value.ok~=false) then
+                logger.warn("[MiuRead][ReadingEnd] annotation close sync incomplete; local queue retained",
+                    "book=",book_id)
+            end
+        end,math.max(15,tonumber(options.timeout) or 12))
+        if not started then
+            logger.info("[MiuRead][ReadingEnd] annotation close sync deferred; local queue retained",
+                "book=",book_id)
+        end
+        return started==true
+    end
+    local tasks=(need_writer_wait and 1 or 0)+(need_progress and 1 or 0)
     if tasks<=0 then
+        start_annotations_detached()
         self._reading_end_barrier_active=false
         self._reading_end_barrier_reason=nil
         return false
@@ -22801,7 +22847,9 @@ function Plugin:_reading_end_sync(reason,options,callback)
         logger.warn("[MiuRead][ReadingEnd] finalizer timeout",
             "reason=",reason,"timeout=",tostring(timeout),"writer_barrier=",tostring(writer_barrier_seq or "-"))
         if self.sync and self.sync.async then pcall(self.sync.async.cancel,self.sync.async,"reading_end_timeout") end
-        if self.annotation_async then pcall(self.annotation_async.cancel,self.annotation_async,"reading_end_timeout") end
+        -- Annotation sync is deliberately detached from the core finalizer in
+        -- beta.12. Its local pending queue remains authoritative if suspend
+        -- cuts the background worker short.
         local waiters=self._reading_end_sync_waiters or {}
         self._reading_end_sync_waiters=nil
         for _,fn in ipairs(waiters) do pcall(fn,false,{timeout=true,local_saved=true}) end
@@ -22812,7 +22860,7 @@ function Plugin:_reading_end_sync(reason,options,callback)
         local parts={}
         if need_time then parts[#parts+1]="阅读时间" end
         if need_progress then parts[#parts+1]="阅读进度" end
-        if need_annotations then parts[#parts+1]="批注" end
+        if need_annotations then parts[#parts+1]="批注（后台）" end
         local detail="正在同步："..table.concat(parts,"、")
         if options.after then detail=detail.."\n完成后将"..tostring(options.after) end
         self:status_toast("正在保存本次阅读",detail,math.min(timeout,5))
@@ -22854,7 +22902,7 @@ function Plugin:_reading_end_sync(reason,options,callback)
                     "basis=",tostring(snapshot.offset_basis or snapshot.position_basis or "-"),
                     "progress=",tostring(snapshot.progress or "-"))
 
-                local function submit_after_time()
+                local function submit_final_progress()
                     if finished then return end
                     local upload_started=self:_submit_progress_snapshot(book_id,snapshot,{
                         reason="reading_end_verified",retry_count=1,reading_end=true,
@@ -22878,24 +22926,10 @@ function Plugin:_reading_end_sync(reason,options,callback)
                     if not upload_started then complete_one(false) end
                 end
 
-                if writer_barrier_seq and not self.sync:writer_barrier_done(writer_barrier_seq) then
-                    self:_save_progress_state(book_id,"deferred",
-                        "最终位置已保存；等待阅读时间上传完全结束后再提交",
-                        tonumber(snapshot.progress),nil,snapshot.progress_sequence)
-                    self.sync:wait_writer_barrier(writer_barrier_seq,function(ok)
-                        if finished then return end
-                        if ok then
-                            submit_after_time()
-                        else
-                            self:_save_progress_state(book_id,"deferred",
-                                "最终位置已保存；阅读时间通道仍在收尾，稍后再提交",
-                                tonumber(snapshot.progress),nil,snapshot.progress_sequence)
-                            complete_one(false)
-                        end
-                    end,math.max(4,timeout-1))
-                else
-                    submit_after_time()
-                end
+                -- beta.12: the final progress request is always rt=0 and uses
+                -- its own compatibility worker. Do not wait for the independent
+                -- rt!=0 reading-time writer; both may finish in parallel.
+                submit_final_progress()
             end,{
                 precise=true,prepare_catalog=true,require_cloud_coordinate=true,
                 on_stage=function(stage,detail)
@@ -22917,23 +22951,7 @@ function Plugin:_reading_end_sync(reason,options,callback)
         resolve_final_position()
     end
 
-    if need_annotations then
-        local prefs=U.copy(self:_annotation_sync_preferences())
-        local book=U.copy(current.book or {})
-        local record=U.copy(current.record or {})
-        local service=self.annotation_sync
-        if self.annotation_async and self.annotation_async:busy() then
-            complete_one(false)
-        else
-            local started=self.annotation_async and self.annotation_async:run("annotation-reading-end",function()
-                return service:sync_book(book,record,{preferences=prefs,limit=200,diagnostic_only=false})
-            end,function(worker_result)
-                local value=worker_result and worker_result.value or nil
-                complete_one(worker_result and worker_result.ok==true and type(value)=="table" and value.ok~=false)
-            end,math.max(15,timeout))
-            if not started then complete_one(false) end
-        end
-    end
+    start_annotations_detached()
     return true
 end
 
@@ -23001,8 +23019,8 @@ function Plugin:_reading_end_detach_for_home(reason)
                 end
                 local snapshot=self:_prepare_progress_snapshot(book_id,position) or position
                 self:_save_pending_progress(book_id,snapshot,"background_final_position_captured")
-                self:_save_progress_state(book_id,"deferred",
-                    "最终精确位置已保存；等待阅读时间通道结束",
+                self:_save_progress_state(book_id,"uploading",
+                    "最终精确位置已保存；正在后台上传",
                     tonumber(snapshot.progress),nil,snapshot.progress_sequence)
                 logger.info("[MiuRead][ReadingEnd] detached final position captured",
                     "book=",book_id,"seq=",tostring(snapshot.progress_sequence or "-"),
@@ -23045,28 +23063,16 @@ function Plugin:_reading_end_detach_for_home(reason)
                     refresh_home_sync_state()
                 end
 
+                -- Home return is fully detached in beta.12: final rt=0
+                -- progress starts immediately while the rt!=0 time flush closes
+                -- independently in the long-lived service.
+                submit_final()
                 if writer_barrier_seq and not self.sync:writer_barrier_done(writer_barrier_seq) then
                     self.sync:wait_writer_barrier(writer_barrier_seq,function(ok)
-                        if ok then
-                            logger.info("[MiuRead][ReadingEnd] reading-time writer barrier released",
-                                "book=",book_id,"barrier=",tostring(writer_barrier_seq))
-                            submit_final()
-                        else
-                            self:_save_progress_state(book_id,"deferred",
-                                "最终精确位置已保存；阅读时间仍在收尾，继续等待",
-                                tonumber(snapshot.progress),nil,snapshot.progress_sequence)
-                            refresh_home_sync_state()
-                            -- Home is already visible, so a slow server does not need
-                            -- to force an unsafe progress write. Keep waiting in the
-                            -- background and submit only after the old time writer exits.
-                            self.sync:wait_writer_barrier(writer_barrier_seq,function(late_ok)
-                                if late_ok then submit_final()
-                                else refresh_home_sync_state() end
-                            end,70)
-                        end
-                    end,18)
-                else
-                    submit_final()
+                        logger.info("[MiuRead][ReadingEnd] detached reading-time writer finished",
+                            "book=",book_id,"barrier=",tostring(writer_barrier_seq),
+                            "ok=",tostring(ok==true))
+                    end,20)
                 end
             end,{
                 precise=true,prepare_catalog=false,require_cloud_coordinate=true,
@@ -23491,12 +23497,6 @@ function Plugin:onAnnotationsModified()
 end
 function Plugin:_finish_suspend_reader_finalizer(ok)
     local still_suspended=HOME_SESSION.suspended==true and self._miuread_suspended==true
-    if self.download_task then
-        -- reader_finalizer is an explicit pause reason, not a transient UI pause.
-        -- Remove it only when the finalizer has actually ended or been bounded
-        -- into pending state.
-        pcall(self.download_task.resume,self.download_task,"reader_finalizer")
-    end
 
     if not still_suspended then
         self._reading_end_standby_held=false
@@ -23524,14 +23524,21 @@ function Plugin:_finish_suspend_reader_finalizer(ok)
         download_continue=download_continue,sync_continue=false,
     })
     self._power_suspend_generation=power.generation
-    -- Acquire the download lease before releasing reader_finalizer so there is
-    -- no zero-lease gap where Kindle can enter deep suspend between the two jobs.
+    -- Download and reader_finalizer leases coexist in beta.12. If a download
+    -- is still active it simply keeps its own lease; no pause/resume handoff is
+    -- needed when final progress/time work ends.
     if self.download_task then
         self.download_task:on_suspend(target,power.generation)
     end
     self._reading_end_standby_held=false
     SuspendWorkLease.release("reader_finalizer")
-    logger.info("[MiuRead][Power] reader finalizer handoff",
+    if PseudoLockscreen.active() and not download_continue then
+        -- If the download already finished while reader finalization was still
+        -- running, this is now the last background lease and the pseudo lock
+        -- may safely commit a real suspend.
+        pcall(PseudoLockscreen.background_task_done,"reader_finalizer")
+    end
+    logger.info("[MiuRead][Power] reader finalizer completed",
         "ok=",tostring(ok==true),"to=",tostring(target),
         "generation=",tostring(power.generation),
         "download_continue=",tostring(download_continue),
@@ -23540,7 +23547,7 @@ function Plugin:_finish_suspend_reader_finalizer(ok)
 end
 
 function Plugin:onSuspend()
-    -- beta.11: while a Kindle pseudo lock is already ACTIVE, a second system
+    -- beta.12: while a Kindle pseudo lock is already ACTIVE, a second system
     -- Suspend is either the user's next power press (unlock) or the deliberate
     -- real-suspend commit after the background task finished. Handle that
     -- before the ordinary duplicate-suspend guard.
@@ -23579,26 +23586,20 @@ function Plugin:onSuspend()
     -- Download-only suspend can arm the shared lease and platform network
     -- intent immediately. This still runs inside KOReader's real Suspend
     -- callback, so ordinary Home remains free to enter the lock screen.
-    if download_continue and not sync_candidate and self.download_task
+    if download_continue and self.download_task
         and type(self.download_task.prepare_suspend_lock)=="function" then
         local ok,prepared,reason=pcall(self.download_task.prepare_suspend_lock,self.download_task)
         logger.info("[MiuRead][Power] early download suspend lock",
             "prepared=",tostring(ok and prepared==true),
             "reason=",tostring(ok and reason or prepared or "error"))
     end
-    local download_paused_for_reader=false
     if sync_candidate then
-        -- If a book download is active, the reader finalizer gets the first
-        -- network window. The child remains alive at its checkpoint and is
-        -- handed back to DOWNLOAD_LOCKED immediately after final time/progress
-        -- work has completed or been bounded into pending state.
-        if download_continue and self.download_task then
-            download_paused_for_reader=self.download_task:pause("reader_finalizer")==true
-                or self.download_task:is_paused()==true
-        end
+        -- beta.12: final progress/time synchronization no longer owns the
+        -- download lane. Both leases are held at the same time and both network
+        -- jobs continue behind the already-painted lock screen.
         local lease_ok=SuspendWorkLease.acquire("reader_finalizer")
         self._reading_end_standby_held=lease_ok==true
-        sync_continue=self:_reading_end_sync("休眠",{show_status=false,timeout=8},function(ok)
+        sync_continue=self:_reading_end_sync("休眠",{show_status=false,timeout=18},function(ok)
             self:_finish_suspend_reader_finalizer(ok)
             if ok then
                 logger.info("[MiuRead][ReadingEnd] suspend sync completed")
@@ -23607,26 +23608,16 @@ function Plugin:onSuspend()
             end
         end)==true
         if not sync_continue then
-            if download_paused_for_reader and self.download_task then
-                self.download_task:resume("reader_finalizer")
-            end
-            -- If finalization completed synchronously, hand the lease to the
-            -- active download before releasing reader_finalizer. Avoid even a
-            -- one-tick zero-lease gap during the system lock transition.
-            if download_continue and self.download_task
-                and type(self.download_task.prepare_suspend_lock)=="function" then
-                pcall(self.download_task.prepare_suspend_lock,self.download_task)
-            end
             self._reading_end_standby_held=false
             SuspendWorkLease.release("reader_finalizer")
         end
     end
-    -- Reader finalization owns Suspend first. A concurrent download is parked
-    -- until the finalizer callback hands the lease directly to DOWNLOAD_LOCKED.
-    local power_target=sync_continue and "BACKGROUND_LOCKED"
-        or (download_continue
-            and ((pseudo_active or PseudoLockscreen.active()) and "PSEUDO_LOCKED" or "DOWNLOAD_LOCKED")
-            or "REAL_SUSPEND")
+    -- A live download keeps its native/pseudo lock mode even while the reader
+    -- finalizer is active. With no download, reader_finalizer alone uses
+    -- BACKGROUND_LOCKED until progress/time finishes or reaches its bound.
+    local power_target=download_continue
+        and ((pseudo_active or PseudoLockscreen.active()) and "PSEUDO_LOCKED" or "DOWNLOAD_LOCKED")
+        or (sync_continue and "BACKGROUND_LOCKED" or "REAL_SUSPEND")
     local power=PowerState.transition(power_target,"onSuspend",{
         download_active=self.download_task and self.download_task:busy() or false,
         download_continue=download_continue,
@@ -23715,9 +23706,9 @@ function Plugin:onSuspend()
     end
     self:_background_cancel_all("suspend lifecycle",true,false)
     if power_target=="REAL_SUSPEND" then self:_mark_reader_busy(10) end
-    -- Normalize the shared download marker last. BACKGROUND_LOCKED leaves the
-    -- reader_finalizer pause intact; PSEUDO_LOCKED keeps the same native sleep
-    -- image visible while the device itself remains awake for the download.
+    -- Normalize the shared download marker last. In beta.12 a concurrent
+    -- download remains in PSEUDO_LOCKED/DOWNLOAD_LOCKED while reader_finalizer
+    -- holds a separate lease; no reader_finalizer pause reason is injected.
     if self.download_task then
         self.download_task:on_suspend(power_target,power.generation)
     end
