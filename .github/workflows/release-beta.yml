@@ -345,24 +345,94 @@ jobs:
           FILE="dist/$PACKAGE_NAME"
           NOTES_FILE="release-notes.md"
 
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release delete-asset "$RELEASE_TAG" "$PACKAGE_NAME" --yes >/dev/null 2>&1 || true
-            gh release upload "$RELEASE_TAG" "$FILE"
-            gh release edit "$RELEASE_TAG" \
-              --title "觅阅 · 微信读书助手 $VERSION 内测版" \
-              --notes-file "$NOTES_FILE" \
-              --prerelease \
-              --latest=false
-          else
-            gh release create "$RELEASE_TAG" "$FILE" \
-              --verify-tag \
-              --title "觅阅 · 微信读书助手 $VERSION 内测版" \
-              --notes-file "$NOTES_FILE" \
-              --prerelease \
-              --latest=false
-          fi
+          retry_gh() {
+            local attempt=1
+            local max_attempts=6
+            local delay=3
+            local output
+            local rc
 
-          COUNT="$(gh release view "$RELEASE_TAG" --json assets --jq '[.assets[] | select(.name == env.PACKAGE_NAME)] | length')"
+            while true; do
+              set +e
+              output="$("$@" 2>&1)"
+              rc=$?
+              set -e
+
+              if [ "$rc" -eq 0 ]; then
+                if [ -n "$output" ]; then
+                  printf '%s\n' "$output"
+                fi
+                return 0
+              fi
+
+              if [ -n "$output" ]; then
+                printf '%s\n' "$output" >&2
+              fi
+
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "::error::GitHub API 连续失败 ${max_attempts} 次：$*" >&2
+                return "$rc"
+              fi
+
+              echo "::warning::GitHub API 请求失败（第 ${attempt}/${max_attempts} 次），${delay} 秒后重试：$*" >&2
+              sleep "$delay"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
+
+          ensure_release() {
+            local attempt=1
+            local max_attempts=6
+            local delay=3
+
+            while [ "$attempt" -le "$max_attempts" ]; do
+              if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+                return 0
+              fi
+
+              if gh release create "$RELEASE_TAG" \
+                  --verify-tag \
+                  --title "觅阅 · 微信读书助手 $VERSION 内测版" \
+                  --notes-file "$NOTES_FILE" \
+                  --prerelease \
+                  --latest=false; then
+                return 0
+              fi
+
+              # Release API 可能已经完成创建，只是客户端收到 502/503。
+              if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+                echo "::warning::Release 已在失败响应后实际创建，继续后续步骤。" >&2
+                return 0
+              fi
+
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "::error::无法创建或读取 Release：$RELEASE_TAG" >&2
+                return 1
+              fi
+
+              echo "::warning::创建 Release 失败（第 ${attempt}/${max_attempts} 次），${delay} 秒后重试。" >&2
+              sleep "$delay"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
+
+          # 创建 Release 与上传资产分离，使 502/503 后的再次执行可安全恢复。
+          ensure_release
+
+          retry_gh gh release edit "$RELEASE_TAG" \
+            --title "觅阅 · 微信读书助手 $VERSION 内测版" \
+            --notes-file "$NOTES_FILE" \
+            --prerelease \
+            --latest=false
+
+          # --clobber 直接覆盖同名资产，不再依赖“先删后传”。
+          retry_gh gh release upload "$RELEASE_TAG" "$FILE" --clobber
+
+          COUNT="$(retry_gh gh release view "$RELEASE_TAG" \
+            --json assets \
+            --jq '[.assets[] | select(.name == env.PACKAGE_NAME)] | length')"
           if [ "$COUNT" != "1" ]; then
             echo "::error::Release 中应有且只有一个 $PACKAGE_NAME。"
             exit 1
@@ -401,22 +471,90 @@ jobs:
         run: |
           set -euo pipefail
 
-          if gh release view "$CHANNEL_TAG" >/dev/null 2>&1; then
-            gh release delete-asset "$CHANNEL_TAG" "$MANIFEST_NAME" --yes >/dev/null 2>&1 || true
-            gh release upload "$CHANNEL_TAG" "dist/$MANIFEST_NAME"
-            gh release edit "$CHANNEL_TAG" \
-              --title "MiuRead Beta Update Channel" \
-              --notes "Machine-readable update manifest for MiuRead Beta. Do not install this release directly." \
-              --prerelease \
-              --latest=false
-          else
-            gh release create "$CHANNEL_TAG" "dist/$MANIFEST_NAME" \
-              --target "$GITHUB_SHA" \
-              --title "MiuRead Beta Update Channel" \
-              --notes "Machine-readable update manifest for MiuRead Beta. Do not install this release directly." \
-              --prerelease \
-              --latest=false
-          fi
+          CHANNEL_NOTES="Machine-readable update manifest for MiuRead Beta. Do not install this release directly."
+
+          retry_gh() {
+            local attempt=1
+            local max_attempts=6
+            local delay=3
+            local output
+            local rc
+
+            while true; do
+              set +e
+              output="$("$@" 2>&1)"
+              rc=$?
+              set -e
+
+              if [ "$rc" -eq 0 ]; then
+                if [ -n "$output" ]; then
+                  printf '%s\n' "$output"
+                fi
+                return 0
+              fi
+
+              if [ -n "$output" ]; then
+                printf '%s\n' "$output" >&2
+              fi
+
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "::error::GitHub API 连续失败 ${max_attempts} 次：$*" >&2
+                return "$rc"
+              fi
+
+              echo "::warning::GitHub API 请求失败（第 ${attempt}/${max_attempts} 次），${delay} 秒后重试：$*" >&2
+              sleep "$delay"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
+
+          ensure_channel_release() {
+            local attempt=1
+            local max_attempts=6
+            local delay=3
+
+            while [ "$attempt" -le "$max_attempts" ]; do
+              if gh release view "$CHANNEL_TAG" >/dev/null 2>&1; then
+                return 0
+              fi
+
+              if gh release create "$CHANNEL_TAG" \
+                  --target "$GITHUB_SHA" \
+                  --title "MiuRead Beta Update Channel" \
+                  --notes "$CHANNEL_NOTES" \
+                  --prerelease \
+                  --latest=false; then
+                return 0
+              fi
+
+              # 同样兼容“服务端成功、客户端收到 502/503”的半成功状态。
+              if gh release view "$CHANNEL_TAG" >/dev/null 2>&1; then
+                echo "::warning::Beta channel Release 已在失败响应后实际创建，继续后续步骤。" >&2
+                return 0
+              fi
+
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "::error::无法创建或读取 Beta channel Release：$CHANNEL_TAG" >&2
+                return 1
+              fi
+
+              echo "::warning::创建 Beta channel Release 失败（第 ${attempt}/${max_attempts} 次），${delay} 秒后重试。" >&2
+              sleep "$delay"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
+
+          ensure_channel_release
+
+          retry_gh gh release edit "$CHANNEL_TAG" \
+            --title "MiuRead Beta Update Channel" \
+            --notes "$CHANNEL_NOTES" \
+            --prerelease \
+            --latest=false
+
+          retry_gh gh release upload "$CHANNEL_TAG" "dist/$MANIFEST_NAME" --clobber
 
           URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$CHANNEL_TAG/$MANIFEST_NAME"
           success=0
