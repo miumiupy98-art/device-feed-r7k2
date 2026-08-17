@@ -152,11 +152,25 @@ function Store:new(options)
         isolated=options.isolated==true,
     },self)
     o.db=LuaSettings:open(o.settings_path)
-    for k,v in pairs(defaults) do if o.db:readSetting(k,nil)==nil then o.db:saveSetting(k,U.copy(v)) end end
+    local startup_dirty=false
+    for k,v in pairs(defaults) do
+        if o.db:readSetting(k,nil)==nil then
+            o.db:saveSetting(k,U.copy(v))
+            startup_dirty=true
+        end
+    end
+    local schema_before=tonumber(o.db:readSetting("schema",1)) or 1
     o:migrate()
-    -- v1.1.45 intentionally disables automatic legacy EPUB relocation. File
-    -- moves must never run during every reader/file-manager transition.
-    o:flush()
+    if schema_before<Config.SCHEMA then startup_dirty=true end
+    -- Do not rewrite miuread.lua on every plugin construction. Persist only a
+    -- real first-run/default/schema migration, and never turn a settings write
+    -- failure into a plugin-load failure.
+    if startup_dirty then
+        local flushed,flush_error=o:flush()
+        if flushed~=true then
+            logger.warn("[MiuRead][Store] startup settings flush skipped after failure",tostring(flush_error or "unknown"))
+        end
+    end
     if not o.isolated then
         local valid=settings_file_valid(o.settings_path)
         if valid then refresh_settings_backup(o.settings_path,o.settings_backup_path) end
@@ -1395,7 +1409,7 @@ function Store:migrate()
     end
 end
 function Store:get(k,d) local v=self.db:readSetting(k,nil); return v==nil and U.copy(d) or v end
-function Store:set(k,v) self.db:saveSetting(k,v); self:flush() end
+function Store:set(k,v) self.db:saveSetting(k,v); return self:flush() end
 function Store:set_deferred(k,v) self.db:saveSetting(k,v) end
 local function sanitized_auth(value)
     local auth=U.merge(defaults.auth,value or {})
@@ -2178,10 +2192,10 @@ function Store:flush()
         if valid then U.copy_file(self.settings_path,previous_path) end
     end
 
-    -- LuaSettings writes directly to the target file. A power/state transition
-    -- during that write can leave a syntactically truncated miuread.lua. Serialize
-    -- completely in memory, validate the Lua chunk, then atomically replace the
-    -- target so readers can only observe the old complete file or the new one.
+    -- Serialize completely in memory and atomically replace the target. A
+    -- failed settings write is recoverable application state, not a reason to
+    -- abort KOReader's plugin loader. Keep the previous valid file and report
+    -- failure to the caller instead of throwing out of Plugin:init().
     local payload
     local ok,err=xpcall(function()
         payload=dump(self.db.data,nil,true)
@@ -2191,8 +2205,9 @@ function Store:flush()
         if not written then error("atomic settings write failed: "..tostring(write_error)) end
     end,debug.traceback)
     if not ok then
+        logger.err("[MiuRead][Store] settings flush failed; keeping previous settings",tostring(err))
         if not self.isolated then restore_settings_file(self.settings_path,self.settings_backup_path) end
-        error(err)
+        return false,err
     end
 
     local valid,reason=settings_file_valid(self.settings_path)
@@ -2205,7 +2220,10 @@ function Store:flush()
         return false,reason
     end
     if not self.isolated then
-        U.copy_file(self.settings_path,self.settings_backup_path)
+        local backed_up,backup_error=U.copy_file(self.settings_path,self.settings_backup_path)
+        if not backed_up then
+            logger.warn("[MiuRead][Store] settings backup refresh failed",tostring(backup_error or "unknown"))
+        end
         os.remove(previous_path)
     end
     return true

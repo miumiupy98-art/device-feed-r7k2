@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.6.0-beta.8",
+    VERSION = "4.7.0-beta.1",
     SCHEMA = 113,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",

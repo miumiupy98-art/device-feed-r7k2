@@ -578,25 +578,19 @@ function Plugin:_reader_provider_supported(path)
     path=normalized_reader_file(path)
     if not path then return false,"文件路径无效" end
     local ok_registry,registry=pcall(require,"document/documentregistry")
-    if not ok_registry or not registry then
+    if not ok_registry or not registry or type(registry.hasProvider)~="function" then
+        -- Do not invent a format verdict if KOReader's own registry is
+        -- unavailable. Defer to ReaderUI so a registry probe failure cannot
+        -- falsely block a format KOReader can actually open.
+        logger.warn("[MiuRead][Reader] document registry unavailable; defer format check to KOReader",tostring(path))
         return true,nil
     end
-    local has_provider=false
-    if type(registry.hasProvider)=="function" then
-        local ok,value=pcall(registry.hasProvider,registry,path)
-        if ok and value==true then has_provider=true end
+    local ok,has_provider=pcall(registry.hasProvider,registry,path)
+    if not ok then
+        logger.warn("[MiuRead][Reader] hasProvider failed; defer format check to KOReader",tostring(has_provider))
+        return true,nil
     end
-    local provider
-    if type(registry.getProvider)=="function" then
-        local ok,value=pcall(registry.getProvider,registry,path)
-        if ok then provider=value end
-    end
-    local ok_reader,ReaderUI=pcall(require,"apps/reader/readerui")
-    if ok_reader and ReaderUI and type(ReaderUI.extendProvider)=="function" then
-        local ok,value=pcall(ReaderUI.extendProvider,ReaderUI,path,provider)
-        if ok and value then provider=value end
-    end
-    if has_provider or provider then return true,nil end
+    if has_provider==true then return true,nil end
     local ext=tostring(path):lower():match("%.([%w]+)$") or "该"
     return false,"当前 KOReader 不支持 "..string.upper(ext).." 格式"
 end
@@ -16996,22 +16990,8 @@ function Plugin:_recover_failed_reader_open(path,generation,reason)
         self:_set_foreground("home_pending")
         self:_restore_home_after_reader_close(1)
     end
-    self:info("书籍暂时无法打开：\n"..U.first_line(reason or "KOReader 未能进入阅读界面",120))
+    self:info("书籍无法打开：\n"..U.first_line(reason or "KOReader 返回打开失败",120))
     return true
-end
-
-function Plugin:_schedule_reader_open_watchdog(path,generation)
-    UIManager:scheduleIn(2.2,function()
-        if generation~=(tonumber(HOME_SESSION.opening_generation) or 0)
-            or normalized_reader_file(HOME_SESSION.opening_file)~=normalized_reader_file(path) then return end
-        if HOME_SESSION.suspended==true or self._miuread_suspended==true then
-            self:_schedule_reader_open_watchdog(path,generation)
-            return
-        end
-        local lifecycle=self:_reader_lifecycle_state()
-        if lifecycle=="active" then return end
-        self:_recover_failed_reader_open(path,generation,"KOReader 未能进入阅读界面")
-    end)
 end
 
 function Plugin:_open_file_direct(path,session_kind,book_id)
@@ -17066,7 +17046,6 @@ function Plugin:_open_file_direct(path,session_kind,book_id)
         local ok,result=xpcall(function() return self.ui:switchDocument(path) end,debug.traceback)
         if not ok then return fail(result) end
         if result==false then return fail("KOReader 拒绝切换到目标书籍") end
-        self:_schedule_reader_open_watchdog(path,opening_generation)
         return result==nil and true or result
     end
     local ReaderUI=require("apps/reader/readerui")
@@ -17076,7 +17055,6 @@ function Plugin:_open_file_direct(path,session_kind,book_id)
     end,debug.traceback)
     if not ok then return fail(result) end
     if result==false then return fail("KOReader 拒绝打开目标书籍") end
-    self:_schedule_reader_open_watchdog(path,opening_generation)
     return result==nil and true or result
 end
 
