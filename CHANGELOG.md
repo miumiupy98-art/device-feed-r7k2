@@ -1,5 +1,13 @@
 # Changelog
 
+## 4.7.0-beta.10 - 2026-08-17
+
+- 完整化原生锁屏下载方案：仍使用 Kindle/Kobo/KOReader 正常锁屏流程，不引入“假壁纸”状态机；下载任务只在真实 Suspend 回调到来后持有后台 lease，主页正常使用时不会被下载阻止熄屏。
+- Kindle 锁屏下载记录当前 SSID，并通过 KOReader `NetworkMgr:authenticateNetwork()` 调用设备原生 `ensureConnection`；进入锁屏立即声明连接需求，连接正常时每 30 秒低频续一次，掉线时 5 秒级重新声明，不再只依赖 HTTP 失败后的 `restoreWifiAsync`。
+- Kobo 不模拟 Kindle 的 `ensureConnection`：进入锁屏时尽早持有 KOReader standby lease，健康 Wi-Fi 不做额外操作；只有确认连接真正丢失时才调用 Kobo/KOReader 自身的恢复路径。
+- 下载专用 lease 提前到 Suspend 处理开头获取；阅读中熄屏且同时下载时仍保持“阅读收尾优先 → 下载接管”，交接过程中不出现零 lease 空档。
+- 保留 beta.9 的断点、长时间离线休眠、低电量保护和唤醒 UI 优先逻辑；断线自动重连继续作为兜底，而不是主要保持方式。
+
 ## 4.7.0-beta.9 - 2026-08-17
 
 - 重做锁屏后台任务接管：主页下载不再持有待机锁或重置 Kindle 待机计时，主页可正常熄屏；进入锁屏后才由统一 lease 保持后台运行。

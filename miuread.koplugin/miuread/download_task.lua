@@ -64,6 +64,11 @@ function DownloadTask:new(store)
         heavy_watch_path = store.temp_dir .. "/download-heavy-watch.json",
         owner_token = tostring(os.time()) .. "-" .. tostring(math.random(100000,999999)),
         last_heavy_watch_at = 0,
+        lockscreen_network_ssid = nil,
+        lockscreen_network_required = false,
+        last_link_guard_at = 0,
+        last_connection_assert_at = 0,
+        last_connection_assert_reason = nil,
     }, self)
     local raw=U.read_file(object.heavy_watch_path,true)
     if raw then
@@ -337,10 +342,16 @@ function DownloadTask:on_suspend(mode, generation)
     self.power_mode = tostring(mode or "REAL_SUSPEND")
     self.power_generation = tonumber(generation or 0) or 0
     if self.power_mode == "DOWNLOAD_LOCKED" then
-        -- Lock-screen download owns the download lease only after the screen has
-        -- already entered Suspend. Home itself never holds this lease.
+        -- The lease may already have been armed at the beginning of onSuspend.
+        -- Keep it across the lock-screen transition and immediately assert the
+        -- platform network policy before the transfer continues.
         local resumed = self:_replace_transient_pause_reasons(false)
-        if resumed then self:_hold_awake() end
+        if resumed then
+            self:_hold_awake()
+            self:_capture_lockscreen_network("download_locked")
+            self:_guard_lockscreen_network(self.job,os.time(),
+                (tonumber(self.last_connection_assert_at) or 0)<=0)
+        end
         logger.info("[MiuRead][DownloadTask] power suspend mode",
             "mode=", self.power_mode, "generation=", tostring(self.power_generation),
             "continue=", tostring(resumed))
@@ -350,6 +361,7 @@ function DownloadTask:on_suspend(mode, generation)
         -- Reader finalization temporarily owns the shared suspend lease. Keep
         -- the download checkpoint parked; Plugin:onSuspend hands it over to
         -- DOWNLOAD_LOCKED only after reading-time/progress writes are finished.
+        self:_clear_lockscreen_network("reader_finalizer")
         self:_release_awake()
         logger.info("[MiuRead][DownloadTask] power suspend mode",
             "mode=", self.power_mode, "generation=", tostring(self.power_generation),
@@ -357,8 +369,9 @@ function DownloadTask:on_suspend(mode, generation)
         return false
     end
 
-    -- A real Kindle suspend is a hard pause boundary for downloads. The child
-    -- process and chapter checkpoints remain intact and resume after wake.
+    -- A real suspend is a hard pause boundary for downloads. The child process
+    -- and chapter checkpoints remain intact and resume after wake.
+    self:_clear_lockscreen_network("real_suspend")
     local paused = self:_replace_transient_pause_reasons(true)
     logger.info("[MiuRead][DownloadTask] power suspend mode",
         "mode=", self.power_mode, "generation=", tostring(self.power_generation),
@@ -384,6 +397,7 @@ function DownloadTask:on_user_resume_begin(generation)
     self.power_generation = tonumber(generation or 0) or 0
     if self.job then self.job.last_keepalive=nil end
     local held=self.standby_held==true
+    self:_clear_lockscreen_network("user_resume")
     self:_release_awake()
     logger.info("[MiuRead][DownloadTask] user resume priority",
         "wake_lock_released=",tostring(held),"pid=",tostring(self.job and self.job.pid or ""))
@@ -557,8 +571,151 @@ function DownloadTask:descriptor()
     }
 end
 
+
+local function device_is(kind)
+    local fn=Device and Device["is"..kind]
+    if type(fn)~="function" then return false end
+    local ok,value=pcall(fn,Device)
+    return ok and value==true
+end
+
+function DownloadTask:_current_network_ssid(manager)
+    if not manager or type(manager.getCurrentNetwork)~="function" then return nil end
+    local ok,current=pcall(manager.getCurrentNetwork,manager)
+    if not ok or type(current)~="table" then return nil end
+    local ssid=tostring(current.ssid or current.name or ""):match("^%s*(.-)%s*$")
+    return ssid~="" and ssid or nil
+end
+
+function DownloadTask:_capture_lockscreen_network(reason)
+    local link=self:_network_link_state()
+    if not link or not link.manager then return false,"manager_unavailable" end
+    local ssid=self:_current_network_ssid(link.manager)
+    if ssid then self.lockscreen_network_ssid=ssid end
+    self.lockscreen_network_required=(link.connected==true or self.lockscreen_network_ssid~=nil)
+    logger.info("[MiuRead][DownloadNetworkLease] captured",
+        "platform=",device_is("Kindle") and "kindle" or (device_is("Kobo") and "kobo" or "generic"),
+        "reason=",tostring(reason or "unknown"),
+        "wifi_on=",tostring(link.wifi_on),"connected=",tostring(link.connected),
+        "ssid=",tostring(self.lockscreen_network_ssid or ""))
+    return self.lockscreen_network_required,link
+end
+
+function DownloadTask:_assert_kindle_connection(link,reason,force)
+    if not device_is("Kindle") then return false,"not_kindle" end
+    if not link or not link.manager then return false,"manager_unavailable" end
+    local ssid=self.lockscreen_network_ssid or self:_current_network_ssid(link.manager)
+    if ssid then self.lockscreen_network_ssid=ssid end
+    if not ssid then return false,"ssid_unavailable" end
+
+    local now=os.time()
+    local connected=link.connected==true
+    local interval=connected
+        and math.max(15,tonumber(Config.DOWNLOAD_KINDLE_ENSURE_REFRESH_SECONDS) or 30)
+        or math.max(3,tonumber(Config.DOWNLOAD_KINDLE_ENSURE_RETRY_SECONDS) or 5)
+    if force~=true and now-(tonumber(self.last_connection_assert_at) or 0)<interval then
+        return false,"cooldown"
+    end
+
+    -- KOReader's Kindle NetworkMgr maps authenticateNetwork() directly to
+    -- com.lab126.cmd ensureConnection. Keep that platform detail in KOReader
+    -- instead of embedding LIPC calls in MiuRead.
+    if type(link.manager.authenticateNetwork)~="function" then
+        return false,"authenticate_unavailable"
+    end
+    local ok,value,err=pcall(link.manager.authenticateNetwork,link.manager,{ssid=ssid})
+    local requested=ok and value~=false
+    if requested then
+        self.last_connection_assert_at=now
+        self.last_connection_assert_reason=tostring(reason or "guard")
+    end
+    logger.info("[MiuRead][DownloadNetworkLease] kindle ensureConnection",
+        "reason=",tostring(reason or "guard"),"ssid=",ssid,
+        "connected=",tostring(link.connected),"requested=",tostring(requested),
+        "error=",tostring((not ok and value) or err or ""))
+    return requested,requested and "ensureConnection" or "ensure_failed"
+end
+
+function DownloadTask:_guard_lockscreen_network(job,now,force)
+    if self.power_mode~="DOWNLOAD_LOCKED" and self.power_mode~="SUSPEND_PENDING" then
+        return false,"not_locked"
+    end
+    now=tonumber(now) or os.time()
+    local gap=math.max(3,tonumber(Config.DOWNLOAD_LOCKSCREEN_LINK_GUARD_SECONDS) or 5)
+    if force~=true and now-(tonumber(self.last_link_guard_at) or 0)<gap then
+        return false,"guard_cooldown"
+    end
+    self.last_link_guard_at=now
+
+    local link=self:_network_link_state()
+    if not link or not link.manager then return false,"manager_unavailable" end
+    if not self.lockscreen_network_required then
+        local ssid=self:_current_network_ssid(link.manager)
+        if ssid then self.lockscreen_network_ssid=ssid end
+        self.lockscreen_network_required=(link.connected==true or self.lockscreen_network_ssid~=nil)
+    end
+
+    if device_is("Kindle") then
+        if link.wifi_on==false and type(link.manager.restoreWifiAsync)=="function" then
+            pcall(link.manager.restoreWifiAsync,link.manager)
+        end
+        -- Assert once on lock entry, then refresh the same connection intent at
+        -- a low cadence while healthy. If the address disappears, retry faster
+        -- without waiting for chapter HTTP failures.
+        return self:_assert_kindle_connection(link,
+            force==true and "lock_entry" or (link.connected==true and "lease_refresh" or "link_lost"),
+            force)
+    end
+
+    -- Kobo has no Kindle-style ensureConnection. While preventStandby keeps the
+    -- device out of deep sleep, leave a healthy association untouched. Only
+    -- invoke KOReader's own restore path after a real link loss.
+    if device_is("Kobo") then
+        if self.lockscreen_network_required and link.connected~=true
+            and type(link.manager.restoreWifiAsync)=="function" then
+            local ok=pcall(link.manager.restoreWifiAsync,link.manager)
+            logger.warn("[MiuRead][DownloadNetworkLease] kobo restore requested",
+                "wifi_on=",tostring(link.wifi_on),"connected=",tostring(link.connected),
+                "requested=",tostring(ok))
+            return ok,ok and "restoreWifiAsync" or "restore_failed"
+        end
+        return false,"link_up"
+    end
+
+    return false,link.connected==true and "link_up" or "generic"
+end
+
+function DownloadTask:_clear_lockscreen_network(reason)
+    if self.lockscreen_network_ssid or self.lockscreen_network_required then
+        logger.info("[MiuRead][DownloadNetworkLease] cleared",
+            "reason=",tostring(reason or "unknown"),
+            "ssid=",tostring(self.lockscreen_network_ssid or ""))
+    end
+    self.lockscreen_network_ssid=nil
+    self.lockscreen_network_required=false
+    self.last_link_guard_at=0
+    self.last_connection_assert_at=0
+    self.last_connection_assert_reason=nil
+end
+
+function DownloadTask:prepare_suspend_lock()
+    if not self.keep_awake_enabled then return false,"disabled" end
+    -- This runs only after KOReader has entered its real Suspend callback, so
+    -- it cannot keep the normal Home surface awake. Arm the lease before the
+    -- rest of MiuRead's suspend work and assert the current network immediately.
+    self.power_mode="SUSPEND_PENDING"
+    local ok=SuspendWorkLease.acquire("download")
+    self.standby_held=ok==true
+    self:_capture_lockscreen_network("suspend_pending")
+    self:_guard_lockscreen_network(self.job,os.time(),true)
+    logger.info("[MiuRead][DownloadTask] suspend lock prepared",
+        "lease=",tostring(ok==true),"ssid=",tostring(self.lockscreen_network_ssid or ""))
+    return ok==true,ok==true and "prepared" or "lease_failed"
+end
+
 function DownloadTask:_lockscreen_keepalive_allowed()
-    return self.keep_awake_enabled == true and self.power_mode == "DOWNLOAD_LOCKED"
+    return self.keep_awake_enabled == true
+        and (self.power_mode == "DOWNLOAD_LOCKED" or self.power_mode == "SUSPEND_PENDING")
 end
 
 function DownloadTask:_reset_device_timeout()
@@ -894,6 +1051,7 @@ function DownloadTask:_finish(job, forced_error)
     if self:_owns_job() then os.remove(self.owner_path) end
     self.job = nil
     os.remove(self.heavy_watch_path)
+    self:_clear_lockscreen_network("download_finished")
     self:_release_awake()
     if job.on_done then
         local callback_ok,callback_error=xpcall(function() job.on_done(result) end,debug.traceback)
@@ -932,6 +1090,7 @@ function DownloadTask:_handle_hibernated(job,result)
     if self:_owns_job() then os.remove(self.owner_path) end
     self.job=nil
     self.hibernated=h
+    self:_clear_lockscreen_network("download_hibernated")
     self:_release_awake()
     U.atomic_write(self.heavy_watch_path,Json.encode({updated_at=os.time(),owner="download",stage=h.stage,
         hibernated=true,reason=h.reason}),true)
@@ -1109,6 +1268,9 @@ function DownloadTask:_poll()
                 "requested=",tostring(requested),"reason=",tostring(reason or ""))
             if requested then return end
         end
+    end
+    if self.power_mode=="DOWNLOAD_LOCKED" then
+        self:_guard_lockscreen_network(job,now,false)
     end
     if network_waiting then
         self:_maybe_restore_network(job,now,network_wait_age)

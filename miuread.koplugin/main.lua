@@ -23551,6 +23551,16 @@ function Plugin:onSuspend()
     local sync_continue=false
     local sync_candidate=self.ui and self.ui.document and self:_reader_session_is_weread()
         and self.sync and self.sync.reading_end_finalized~=true
+    -- Download-only suspend can arm the shared lease and platform network
+    -- intent immediately. This still runs inside KOReader's real Suspend
+    -- callback, so ordinary Home remains free to enter the lock screen.
+    if download_continue and not sync_candidate and self.download_task
+        and type(self.download_task.prepare_suspend_lock)=="function" then
+        local ok,prepared,reason=pcall(self.download_task.prepare_suspend_lock,self.download_task)
+        logger.info("[MiuRead][Power] early download suspend lock",
+            "prepared=",tostring(ok and prepared==true),
+            "reason=",tostring(ok and reason or prepared or "error"))
+    end
     local download_paused_for_reader=false
     if sync_candidate then
         -- If a book download is active, the reader finalizer gets the first
@@ -23574,6 +23584,13 @@ function Plugin:onSuspend()
         if not sync_continue then
             if download_paused_for_reader and self.download_task then
                 self.download_task:resume("reader_finalizer")
+            end
+            -- If finalization completed synchronously, hand the lease to the
+            -- active download before releasing reader_finalizer. Avoid even a
+            -- one-tick zero-lease gap during the system lock transition.
+            if download_continue and self.download_task
+                and type(self.download_task.prepare_suspend_lock)=="function" then
+                pcall(self.download_task.prepare_suspend_lock,self.download_task)
             end
             self._reading_end_standby_held=false
             SuspendWorkLease.release("reader_finalizer")
