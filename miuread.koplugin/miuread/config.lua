@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.7.0-beta.10",
+    VERSION = "4.7.0-beta.11",
     SCHEMA = 114,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -139,10 +139,11 @@ local C = {
     -- ten-minute offline window (or low battery) gives the device back to deep
     -- sleep after preserving the chapter checkpoint.
     DOWNLOAD_NETWORK_GUARD_POLL_SECONDS = 8,
-    -- beta.10 keeps the platform connection intent active while the system
-    -- lock screen is showing. Kindle reasserts KOReader's native
-    -- ensureConnection at a low cadence; Kobo only checks link state and
-    -- leaves a healthy association untouched.
+    -- beta.11 keeps downloads in an ACTIVE pseudo-lock state instead of
+    -- asking Wi-Fi to survive a real system suspend. Kindle still reasserts
+    -- ensureConnection at low cadence; Kobo leaves a healthy association alone
+    -- because its normal pre-suspend Wi-Fi shutdown is bypassed until download
+    -- completion.
     DOWNLOAD_LOCKSCREEN_LINK_GUARD_SECONDS = 5,
     DOWNLOAD_KINDLE_ENSURE_REFRESH_SECONDS = 30,
     DOWNLOAD_KINDLE_ENSURE_RETRY_SECONDS = 5,

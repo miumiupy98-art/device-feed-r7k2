@@ -6,6 +6,7 @@ local KEY = "__MIUREAD_POWER_STATE_V1"
 local VALID = {
     NORMAL = true,
     DOWNLOAD_LOCKED = true,
+    PSEUDO_LOCKED = true,
     BACKGROUND_LOCKED = true,
     REAL_SUSPEND = true,
     RESUMING = true,

@@ -1,5 +1,13 @@
 # Changelog
 
+## 4.7.0-beta.11 - 2026-08-17
+
+- 改用“伪锁屏后台下载”：有下载任务时仍显示 KOReader/觅阅正常锁屏封面，但下载完成前不进入真正的系统深度休眠；下载结束、取消或安全休眠后再把设备交回原生 Suspend。
+- Kindle 进入原生 screensaver 后立即让 Amazon powerd 回到 ACTIVE，同时保留已经显示的睡眠封面并屏蔽普通输入；下载期间继续使用 `ensureConnection` 和低频 T1 保活，避免 beta.9/10 在系统 screensaver 约一分钟后被断开 Wi-Fi。
+- Kindle 再按一次电源键会退出伪锁屏并恢复正常界面；后台任务结束时则自动提交一次真实休眠，不再持续唤醒或循环切换 powerd。
+- Kobo 在电源事件进入 KOReader 时提前截住真实 Suspend：仍使用原生睡眠封面和阅读收尾，但跳过“锁屏前关闭 Wi-Fi”以及内核 suspend 计时，下载全程保持 ACTIVE 网络；下载完成后按 KOReader 原生安全顺序关闭 Wi-Fi并真正休眠。
+- 阅读中同时下载继续保持“阅读时间/最终进度先收尾 → 下载继续”的优先级；伪锁屏由独立 lease 持有，修复 beta.10 提前 acquire 后又瞬间 release 的零 lease 空档。
+
 ## 4.7.0-beta.10 - 2026-08-17
 
 - 完整化原生锁屏下载方案：仍使用 Kindle/Kobo/KOReader 正常锁屏流程，不引入“假壁纸”状态机；下载任务只在真实 Suspend 回调到来后持有后台 lease，主页正常使用时不会被下载阻止熄屏。
