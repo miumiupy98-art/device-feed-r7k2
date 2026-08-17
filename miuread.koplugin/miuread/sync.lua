@@ -642,7 +642,7 @@ function Sync:local_position(ratio)
     return position
 end
 
-function Sync:_prefer_inverse_cloud_mapping(record, position)
+function Sync:_prefer_inverse_cloud_mapping(record, position, ratio_override)
     if type(position) ~= "table" or position.safe ~= true then return position end
     record = record or self:record()
     if not record or type(record.record) ~= "table" then return position end
@@ -661,7 +661,8 @@ function Sync:_prefer_inverse_cloud_mapping(record, position)
         return position
     end
 
-    local ratio = self:local_ratio()
+    local ratio = tonumber(ratio_override)
+    if ratio == nil then ratio = self:local_ratio() end
     if ratio == nil then
         position.inverse_mapping_used = false
         position.inverse_mapping_reason = "local_global_ratio_missing"
@@ -913,13 +914,17 @@ end
 
 function Sync:resolve_local_progress(callback, options)
     options = options or {}
-    local record = self:record()
+    local detached=options.detached==true
+    local record = type(options.record_snapshot)=="table" and U.copy(options.record_snapshot) or self:record()
     if not record then return false, "position_context_missing" end
     local book_id = tostring(record.book and record.book.book_id or "")
-    local generation = tonumber(self.record_generation or 0) or 0
+    local generation = tonumber(options.record_generation_override or self.record_generation or 0) or 0
     local path = tostring(record.path or "")
+    local ratio_snapshot=tonumber(options.ratio_snapshot)
+    if ratio_snapshot==nil then ratio_snapshot=self:local_ratio() end
 
     local function still_current()
+        if detached then return true end
         local current = self:record()
         return generation == tonumber(self.record_generation or 0)
             and current and tostring(current.book and current.book.book_id or "") == book_id
@@ -935,7 +940,7 @@ function Sync:resolve_local_progress(callback, options)
             if callback then callback(nil, "stale_position_result", {error_kind="context"}) end
             return
         end
-        local ratio = self:local_ratio() or 0
+        local ratio = ratio_snapshot or self:local_ratio() or 0
         local position = options.precise == false and self:local_position(ratio)
             or self:_position_for_report(ratio, true)
         if type(position) == "table" and position.safe == true and position.progress ~= nil
@@ -1026,7 +1031,13 @@ function Sync:resolve_local_progress(callback, options)
             return
         end
         complete_fallback(prepared, err)
-    end)
+    end,{
+        detached=detached,
+        record_snapshot=record,
+        record_generation_override=generation,
+        ratio_snapshot=ratio_snapshot,
+        defer_seconds=options.defer_seconds,
+    })
     if started then return true end
     emit("position_fallback", source_error)
     if options.require_cloud_coordinate==true then
@@ -1037,8 +1048,10 @@ function Sync:resolve_local_progress(callback, options)
     return true
 end
 
-function Sync:_source_position_async(callback)
-    local record = self:record()
+function Sync:_source_position_async(callback, options)
+    options=type(options)=="table" and options or {}
+    local detached=options.detached==true
+    local record = type(options.record_snapshot)=="table" and U.copy(options.record_snapshot) or self:record()
     local ui = self.host and self.host.ui or nil
     if not record or not ui or not ui.document then return false, "position_context_missing" end
     -- The source-coordinate path is intentionally subprocess-only. If this
@@ -1051,9 +1064,11 @@ function Sync:_source_position_async(callback)
         ui, record, self:_precision_catalog(record))
     if not anchor then return false, anchor_error end
 
-    local generation = tonumber(self.record_generation or 0) or 0
+    local generation = tonumber(options.record_generation_override or self.record_generation or 0) or 0
     local book_id = tostring(record.book and record.book.book_id or "")
     local path = tostring(record.path or "")
+    local ratio_snapshot=tonumber(options.ratio_snapshot)
+    if ratio_snapshot==nil then ratio_snapshot=self:local_ratio() end
     local reader = self.reader
     local record_snapshot = {
         book = U.copy(record.book or {}),
@@ -1061,27 +1076,54 @@ function Sync:_source_position_async(callback)
         variant = record.variant,
         path = record.path,
     }
-    local started, run_error = self.async:run("progress_source_position", function()
-        return SourcePosition.locate(reader, record_snapshot, anchor)
-    end, function(result)
+    local function on_result(result)
         local current = self:record()
-        if generation ~= tonumber(self.record_generation or 0)
+        if not detached and (generation ~= tonumber(self.record_generation or 0)
             or not current
             or tostring(current.book and current.book.book_id or "") ~= book_id
-            or tostring(current.path or "") ~= path then
+            or tostring(current.path or "") ~= path) then
             if callback then callback(nil, "stale_position_result") end
             return
         end
         if result and result.ok == true and type(result.value) == "table"
             and result.value.safe == true then
-            local adjusted = self:_prefer_inverse_cloud_mapping(current, result.value)
+            local mapping_record=detached and record_snapshot or current
+            local adjusted = self:_prefer_inverse_cloud_mapping(mapping_record, result.value, ratio_snapshot)
             adjusted.captured_at = os.time()
             if callback then callback(adjusted, nil) end
             return
         end
         if callback then callback(nil, tostring(result and result.error or "source_position_failed")) end
-    end, 40)
-    if not started then return false, run_error end
+    end
+    local function launch()
+        if self.async:busy() then return false,"source_worker_busy" end
+        return self.async:run("progress_source_position", function()
+            return SourcePosition.locate(reader, record_snapshot, anchor)
+        end,on_result,40)
+    end
+    local defer_seconds=math.max(0,tonumber(options.defer_seconds) or 0)
+    if detached and defer_seconds>0 then
+        -- Capture the Reader anchor now, but postpone network/source mapping until
+        -- after the close transition. This keeps the first Home frame ahead of
+        -- PosMap building or a source-chapter fetch on single-core Kindles. A
+        -- quickly opened next book may briefly own the sync worker, so retry a
+        -- few times in the background instead of dropping the old book immediately.
+        local attempts=0
+        local function deferred_launch()
+            attempts=attempts+1
+            local started,run_error=launch()
+            if started then return end
+            if tostring(run_error or "")=="source_worker_busy" and attempts<4 then
+                UIManager:scheduleIn(1.2,deferred_launch)
+                return
+            end
+            if callback then callback(nil,tostring(run_error or "source_worker_unavailable")) end
+        end
+        UIManager:scheduleIn(defer_seconds,deferred_launch)
+        return true
+    end
+    local started,run_error=launch()
+    if not started then return false,run_error end
     return true
 end
 
@@ -1888,7 +1930,7 @@ end
 
 function Sync:upload(elapsed, callback, options)
     options = options or {}
-    local record = self:record()
+    local record = type(options.record_override)=="table" and U.copy(options.record_override) or self:record()
     if not record then if callback then callback(false, "未识别到 MiuRead 生成的当前书籍") end; return false end
     if self.progress_hold and not options.progress_only then
         if callback then callback(false, "阅读位置尚未确认") end
@@ -1897,7 +1939,7 @@ function Sync:upload(elapsed, callback, options)
     if self.busy then if callback then callback(false, "同步任务忙") end; return false end
 
     local book_id = tostring(record.book.book_id)
-    local generation_snapshot=tonumber(self.record_generation or 0) or 0
+    local generation_snapshot=tonumber(options.record_generation_override or self.record_generation or 0) or 0
     local path_snapshot=tostring(record.path or "")
     local core_hash=self:_core_map_hash(record)
     local session = self.store:session(book_id) or {}
@@ -1921,7 +1963,9 @@ function Sync:upload(elapsed, callback, options)
         if callback then callback(false,"当前账号登录会话无效，请重新扫码登录") end
         return false
     end
-    local ratio = self:local_ratio() or 0
+    local ratio = type(options.position_override)=="table" and tonumber(options.position_override.progress)
+        and U.clamp((tonumber(options.position_override.progress) or 0)/100,0,1)
+        or self:local_ratio() or 0
     local auth_channel=options.progress_only and "progress" or "read_report"
     local chapters = (record.record and record.record.chapter_map) or record.book.catalog or {}
     -- Keep the old worker's own field names and cached context isolated from
@@ -2221,6 +2265,8 @@ function Sync:upload_progress(callback, options)
         return self:upload(0,callback,{
             silent=true,progress_only=true,
             position_override=options.position_override,
+            record_override=options.record_override,
+            record_generation_override=options.record_generation_override,
             allow_same_book_generation_change=options.reading_end==true,
             allow_book_switch_result=options.reading_end==true,
         })
@@ -3650,7 +3696,12 @@ function Sync:on_close(options)
     -- It simply must not emit a second final upload.
     local finalized=self.reading_end_finalized==true
     if finalized then
-        self:_stop_daemon_fast("close",0)
+        -- A Home return may already have queued the final short time flush. Do
+        -- not rewrite the daemon control file with an empty close command before
+        -- the service has consumed that flush.
+        if not (self.daemon and self.daemon.final_flush_pending==true) then
+            self:_stop_daemon_fast("close",0)
+        end
         if options.preserve_async~=true and self.async then self.async:cancel("document_closed") end
     else
         self:stop_fast("close", duplicate and 0 or self:_final_elapsed(true))

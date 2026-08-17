@@ -15520,9 +15520,7 @@ function Plugin:return_to_miuread_home(reason)
     end
     if self.ui and self.ui.document and self:_reader_session_is_weread()
         and self.sync and self.sync.reading_end_finalized~=true then
-        return self:_reading_end_before_action("返回觅阅主页","返回觅阅主页",function()
-            self:return_to_miuread_home(reason)
-        end)
+        self:_reading_end_detach_for_home("返回觅阅主页")
     end
     self:_cancel_native_menu_guard()
     HOME_SESSION_SUPPRESSED=false
@@ -21896,7 +21894,7 @@ function Plugin:_finalize_reader_instance_close(closing_path,session_generation,
         or normalized_reader_file(HOME_READER_FILE)
     session_generation=tonumber(session_generation) or tonumber(HOME_SESSION.reader_session_generation) or 0
 
-    local detached_sync=self._reading_end_sync_active==true
+    local detached_sync=self._reading_end_sync_active==true or self._reading_end_home_detached==true
     if self.sync and self.sync.reading_end_finalized~=true and self.ui and self.ui.document then
         detached_sync=self:_reading_end_sync(options.reason or "关闭书籍",{show_status=false,timeout=8})==true or detached_sync
     end
@@ -22144,6 +22142,7 @@ function Plugin:onReaderReady()
     -- reflow, etc.), not a genuine reopen. Only that narrow case may reuse a
     -- freshly verified cloud position; every real book open must re-read WeRead.
     self._reader_session_preserved=preserve_session==true
+    if not preserve_session then self._reading_end_home_detached=false end
     local ready_session=self._reader_session_generation
     self._home_reader_transition=false
     self:_close_reader_recovery_surface()
@@ -22629,6 +22628,186 @@ function Plugin:_reading_end_sync(reason,options,callback)
         end
         UIManager:scheduleIn(.25,poll)
     end
+    return true
+end
+
+function Plugin:_reading_end_detach_for_home(reason)
+    reason=tostring(reason or "返回觅阅主页")
+    if not self:_reader_session_is_weread() then return false end
+    if not self.sync or self.sync.reading_end_finalized==true then return false end
+    if self._reading_end_home_detached==true then return true end
+
+    local current=self.sync:record() or self:_current_book_record()
+    if not (current and current.book) then return false end
+    local record_snapshot=U.copy(current)
+    local book_id=tostring(current.book.book_id or current.book.bookId or "")
+    if book_id=="" then return false end
+    local record_generation=tonumber(self.sync.record_generation or 0) or 0
+    local ratio_snapshot=self.sync:local_ratio()
+    local started_at=monotonic_wall_time()
+
+    -- Foreground close owns only local durability. Network work below is
+    -- detached from ReaderUI so a slow WeRead response can never keep Home
+    -- waiting behind a 10-second finalizer barrier.
+    self._reading_end_home_detached=true
+    self._reading_end_barrier_active=true
+    self._reading_end_barrier_reason=reason..":foreground_capture"
+
+    if self._local_annotation_snapshot_task then
+        UIManager:unschedule(self._local_annotation_snapshot_task)
+        self._local_annotation_snapshot_task=nil
+    end
+    pcall(function() self:_capture_local_annotation_snapshot("reading_end:"..reason) end)
+    if self._reader_checkpoint_dirty==true then
+        pcall(function() self:_flush_reader_checkpoint("reading_end:"..reason,true) end)
+    end
+
+    local mode=self:progress_upload_mode()
+    local need_progress=mode~="manual"
+    local annotation_summary=LocalAnnotationDatabase.summary(self.store,book_id) or {}
+    local annotation_retryable=(tonumber(annotation_summary.pending or 0) or 0)
+        +(tonumber(annotation_summary.delete_pending or 0) or 0)
+    local need_annotations=self:_annotation_close_upload_enabled() and annotation_retryable>0
+    local online=self:logged_in() and self:is_online()
+    local final_elapsed=self.sync:_final_elapsed(true)
+
+    -- stop_fast only tells the already-running lightweight service to perform
+    -- its final short time flush; Home no longer polls that network result.
+    self.sync:stop_fast("reading_end:"..reason,final_elapsed or 0)
+    self.sync.reading_end_finalized=true
+
+    local function refresh_home_sync_state()
+        self._home_sync_summary_cache=nil
+        self._home_sync_summary_cache_at=nil
+        if HomeView.is_shown() and not self:_active_reader_ui() then
+            self:_notify_home_data_changed("header")
+        end
+    end
+
+    if need_progress then
+        if not online then
+            self:_save_progress_state(book_id,"waiting_network",
+                "已保存本机阅读位置；等待网络后继续同步",nil,nil)
+        else
+            local local_percent=ratio_snapshot and math.floor(U.clamp(ratio_snapshot,0,1)*100+.5) or nil
+            self:_save_progress_state(book_id,"deferred",
+                "本机位置已保存；正在后台定位最终云端坐标",local_percent,nil)
+            local resolve_started,resolve_error=self.sync:resolve_local_progress(function(position,position_error,meta)
+                if not position then
+                    self:_save_progress_state(book_id,"verification_required",
+                        "本机阅读位置已保存；最终云端坐标需下次打开本书后确认",local_percent,nil)
+                    logger.warn("[MiuRead][ReadingEnd] detached final position unavailable",
+                        "book=",book_id,"error=",tostring(position_error or (meta and meta.error_kind) or "unknown"))
+                    refresh_home_sync_state()
+                    return
+                end
+                position.captured_at=tonumber(position.captured_at) or os.time()
+                self:_save_pending_progress(book_id,position,"background_upload_queued")
+                self:_save_progress_state(book_id,"uploading","正在后台上传结束阅读进度",
+                    tonumber(position.progress),nil)
+                logger.info("[MiuRead][ReadingEnd] detached final position captured",
+                    "book=",book_id,
+                    "chapter=",tostring(position.chapter_uid or position.chapter_index or "-"),
+                    "offset=",tostring(position.canonical_offset or position.chapter_offset or position.offset or "-"),
+                    "basis=",tostring(position.offset_basis or position.position_basis or "-"),
+                    "progress=",tostring(position.progress or "-"))
+
+                local upload_started=self.sync:upload_progress(function(ok,result,submitted)
+                    local submitted_position=type(submitted)=="table" and submitted or position
+                    if ok~=true then
+                        local session=self.store:session(book_id) or {}
+                        local kind=tostring(session.last_error_kind or self.sync.last_error_kind or "")
+                        local state=(kind=="transport" or kind=="server" or kind=="unconfirmed" or kind=="authentication")
+                            and "upload_unconfirmed" or "upload_failed"
+                        self:_save_pending_progress(book_id,submitted_position,tostring(result or kind or "submit_failed"))
+                        self:_save_progress_state(book_id,state,"后台上传暂未完成",
+                            tonumber(submitted_position.progress),nil)
+                        refresh_home_sync_state()
+                        return
+                    end
+                    self:_save_pending_progress(book_id,submitted_position,"awaiting_cloud_confirmation")
+                    self:_save_progress_state(book_id,"verifying_upload","请求已提交，正在后台确认",
+                        tonumber(submitted_position.progress),nil)
+                    self:_verify_progress_submission(book_id,submitted_position,{
+                        reason="reading_end_background_verified",detached=true,
+                        first_delay=.8,second_delay=1.3,record_snapshot=record_snapshot,
+                    },function(verified,remote,verify_error)
+                        if verified then
+                            local localp=math.floor((tonumber(submitted_position.progress) or 0)+.5)
+                            self:_save_progress_state(book_id,"local_uploaded","结束阅读进度已上传并确认",
+                                localp,remote and remote.percent)
+                        else
+                            self:_save_progress_state(book_id,"upload_unconfirmed",
+                                "请求已提交，但云端位置尚未确认",
+                                tonumber(submitted_position.progress),remote and remote.percent)
+                            logger.warn("[MiuRead][ReadingEnd] detached progress remains pending",
+                                "book=",book_id,"reason=",tostring(verify_error or "cloud_not_confirmed"))
+                        end
+                        refresh_home_sync_state()
+                    end)
+                    refresh_home_sync_state()
+                end,{
+                    position_override=position,reading_end=true,
+                    record_override=record_snapshot,
+                    record_generation_override=record_generation,
+                })
+                if not upload_started then
+                    self:_save_pending_progress(book_id,position,"progress_worker_busy")
+                    self:_save_progress_state(book_id,"deferred",
+                        "最终位置已保存；同步任务繁忙，稍后继续处理",
+                        tonumber(position.progress),nil)
+                    refresh_home_sync_state()
+                end
+            end,{
+                precise=true,
+                prepare_catalog=false,
+                require_cloud_coordinate=true,
+                detached=true,
+                record_snapshot=record_snapshot,
+                record_generation_override=record_generation,
+                ratio_snapshot=ratio_snapshot,
+                defer_seconds=1.8,
+            })
+            if not resolve_started then
+                self:_save_progress_state(book_id,"verification_required",
+                    "本机阅读位置已保存；最终云端坐标需下次打开本书后确认",local_percent,nil)
+                logger.warn("[MiuRead][ReadingEnd] detached resolver unavailable",
+                    "book=",book_id,"error=",tostring(resolve_error or "busy"))
+            end
+        end
+    end
+
+    if need_annotations and online then
+        local prefs=U.copy(self:_annotation_sync_preferences())
+        local book=U.copy(current.book or {})
+        local record=U.copy(current.record or {})
+        local service=self.annotation_sync
+        if self.annotation_async and not self.annotation_async:busy() then
+            local annotation_started=self.annotation_async:run("annotation-reading-end-background",function()
+                return service:sync_book(book,record,{preferences=prefs,limit=200,diagnostic_only=false})
+            end,function(worker_result)
+                local value=worker_result and worker_result.value or nil
+                if not (worker_result and worker_result.ok==true and type(value)=="table" and value.ok~=false) then
+                    logger.warn("[MiuRead][ReadingEnd] detached annotation sync incomplete","book=",book_id)
+                end
+                refresh_home_sync_state()
+            end,25)
+            if not annotation_started then
+                logger.info("[MiuRead][ReadingEnd] annotation background sync deferred","book=",book_id)
+            end
+        end
+    end
+
+    self._reading_end_barrier_active=false
+    self._reading_end_barrier_reason=nil
+    logger.info("[MiuRead][ReadingEnd] foreground released; cloud work detached",
+        "book=",book_id,
+        "progress=",tostring(need_progress),
+        "annotations=",tostring(need_annotations),
+        "time=",tostring(final_elapsed~=nil),
+        "online=",tostring(online),
+        "elapsed_ms=",tostring(math.floor((monotonic_wall_time()-started_at)*1000+.5)))
+    refresh_home_sync_state()
     return true
 end
 
