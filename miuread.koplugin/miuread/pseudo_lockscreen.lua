@@ -19,6 +19,7 @@ local function state()
             system_active = false,
             internal_resume_pending = false,
             exit_requested = false,
+            user_exit_pending = false,
             commit_pending = false,
             commit_started_at = 0,
             commit_generation = 0,
@@ -38,6 +39,8 @@ local function state()
             injected_expected_kind = nil,
             injected_reason = nil,
             injected_until = 0,
+            injected_ticket = 0,
+            last_power_injected_ticket = nil,
             pending_user_sleep_origin = nil,
             pending_user_sleep_at = 0,
         }
@@ -102,20 +105,44 @@ local function record_kindle_power_event(kind, source)
     local now = os.time()
     local numeric = tonumber(source)
     local self_injected = false
-    if s.injected_expected_kind == kind and now <= (tonumber(s.injected_until) or 0) then
+    local injected_ticket = nil
+
+    -- A MiuRead powerButton write may authenticate exactly one matching raw
+    -- edge. The ticket is consumed immediately; later BUTTON/HALL events are
+    -- never covered by the same injection window.
+    local expected_raw_source = kind == "wake" and 1 or (kind == "suspend" and 2 or nil)
+    if s.injected_expected_kind == kind and numeric == expected_raw_source
+        and now <= (tonumber(s.injected_until) or 0) then
         self_injected = true
+        injected_ticket = tonumber(s.injected_ticket) or 0
         s.injected_expected_kind = nil
         s.injected_until = 0
     end
+
     s.last_power_kind = tostring(kind or "unknown")
     s.last_power_source = numeric
     s.last_power_source_name = power_source_name(numeric, kind)
     s.last_power_event_at = now
     s.last_power_self_injected = self_injected
-    logger.info("[MiuRead][PseudoLock][PowerEvent]",
+    s.last_power_injected_ticket = injected_ticket
+
+    local classification = "UNKNOWN"
+    if numeric == 6 then
+        classification = "USER_COVER"
+    elseif (numeric == 1 or numeric == 2) and self_injected then
+        classification = "SELF_INJECTED"
+    elseif numeric == 1 or numeric == 2 then
+        classification = "USER_BUTTON"
+    elseif numeric == 4 then
+        classification = "COVER_CLOSE"
+    end
+
+    logger.info("[MiuRead][PseudoLock][RawPower]",
         "kind=", tostring(kind or "unknown"),
         "source=", tostring(s.last_power_source_name),
+        "classification=", classification,
         "self_injected=", tostring(self_injected),
+        "ticket=", tostring(injected_ticket or "-"),
         "active=", tostring(s.active == true),
         "system_active=", tostring(s.system_active == true),
         "generation=", tostring(s.generation or 0),
@@ -155,9 +182,25 @@ local function set_frontlight_hw_off()
 end
 
 local function inhibit_non_power_input()
-    if Device and Device.input and type(Device.input.inhibitInput) == "function" then
-        pcall(Device.input.inhibitInput, Device.input, true)
+    local s = state()
+    if s.exit_requested or s.user_exit_pending then
+        logger.info("[MiuRead][PseudoLock] input inhibit skipped during user exit",
+            "generation=", tostring(s.generation or 0))
+        return false
     end
+    if Device and Device.input and type(Device.input.inhibitInput) == "function" then
+        local ok = pcall(Device.input.inhibitInput, Device.input, true)
+        return ok == true
+    end
+    return false
+end
+
+local function restore_user_input()
+    if Device and Device.input and type(Device.input.inhibitInput) == "function" then
+        local ok = pcall(Device.input.inhibitInput, Device.input, false)
+        return ok == true
+    end
+    return false
 end
 
 local function kindle_power_button(reason)
@@ -168,6 +211,8 @@ local function kindle_power_button(reason)
     else
         s.injected_expected_kind = "wake"
     end
+    s.injected_ticket = (tonumber(s.injected_ticket) or 0) + 1
+    local ticket = s.injected_ticket
     s.injected_reason = why
     s.injected_until = os.time() + 3
     local issued = false
@@ -189,7 +234,7 @@ local function kindle_power_button(reason)
     end
     logger.info("[MiuRead][PseudoLock] kindle power transition requested",
         "reason=", why, "backend=", backend,
-        "issued=", tostring(issued))
+        "issued=", tostring(issued), "ticket=", tostring(ticket))
     if not issued then
         s.injected_expected_kind = nil
         s.injected_reason = nil
@@ -222,6 +267,7 @@ local function clear_runtime(reason)
     s.system_active = false
     s.internal_resume_pending = false
     s.exit_requested = false
+    s.user_exit_pending = false
     s.commit_pending = false
     s.commit_started_at = 0
     s.commit_generation = (tonumber(s.commit_generation) or 0) + 1
@@ -236,6 +282,7 @@ local function clear_runtime(reason)
     s.injected_expected_kind = nil
     s.injected_reason = nil
     s.injected_until = 0
+    s.last_power_injected_ticket = nil
     s.last_reason = tostring(reason or "clear")
     s.generation = (tonumber(s.generation) or 0) + 1
     release_pseudo_lease(reason)
@@ -247,6 +294,7 @@ local function restore_visible_surface(reason)
     -- never swallowed by the Kindle private-wake guard. The safe fallback is a
     -- visible, interactive surface rather than an ambiguous half-suspended one.
     clear_runtime(reason or "commit_fallback_visible")
+    restore_user_input()
     local ok_ss, Screensaver = pcall(require, "ui/screensaver")
     if ok_ss and Screensaver and type(Screensaver.close) == "function" then
         pcall(Screensaver.close, Screensaver)
@@ -277,6 +325,44 @@ local function invalidate_commit(s)
     end
     s.commit_generation = (tonumber(s.commit_generation) or 0) + 1
     return s.commit_generation
+end
+
+local function arm_user_exit_fallback(generation, reason)
+    UIManager:scheduleIn(1.25, function()
+        local current = state()
+        if current.active and current.generation == generation
+            and current.user_exit_pending == true then
+            logger.warn("[MiuRead][PseudoLock][UserExit] visible resume fallback",
+                "reason=", tostring(reason or "unknown"),
+                "generation=", tostring(generation))
+            restore_visible_surface("kindle_user_exit_fallback_" .. tostring(reason or "unknown"))
+        end
+    end)
+end
+
+local function begin_user_exit(reason, ev)
+    local s = state()
+    if not s.active then return false end
+    if s.commit_pending then invalidate_commit(s) end
+    -- Once genuine user intent wins, no older internal injection ticket may
+    -- authenticate a later edge. A BUTTON_SUSPEND exit will create a fresh
+    -- one-shot ticket for its deliberate wake below.
+    s.injected_expected_kind = nil
+    s.injected_reason = nil
+    s.injected_until = 0
+
+    s.exit_requested = true
+    s.user_exit_pending = true
+    local restored = restore_user_input()
+    local generation = tonumber(s.generation or 0) or 0
+    logger.info("[MiuRead][PseudoLock][UserExit]",
+        "source=", tostring(reason or "unknown"),
+        "raw=", tostring(ev and ev.name or "none"),
+        "self_injected=", tostring(ev and ev.self_injected == true or false),
+        "input_restored=", tostring(restored),
+        "generation=", tostring(generation))
+    arm_user_exit_fallback(generation, reason)
+    return true
 end
 
 function M.active()
@@ -312,6 +398,7 @@ function M.snapshot()
         system_active = s.system_active == true,
         internal_resume_pending = s.internal_resume_pending == true,
         exit_requested = s.exit_requested == true,
+        user_exit_pending = s.user_exit_pending == true,
         commit_pending = s.commit_pending == true,
         commit_started_at = tonumber(s.commit_started_at or 0) or 0,
         commit_generation = tonumber(s.commit_generation or 0) or 0,
@@ -325,6 +412,7 @@ function M.snapshot()
         last_power_source = tonumber(s.last_power_source),
         last_power_source_name = s.last_power_source_name,
         last_power_self_injected = s.last_power_self_injected == true,
+        last_power_injected_ticket = tonumber(s.last_power_injected_ticket),
         pending_user_sleep_origin = s.pending_user_sleep_origin,
     }
 end
@@ -354,6 +442,23 @@ function M.set_download_active(value)
     s.download_active = value == true and supported == true
     if not s.download_active and not s.active then
         s.commit_pending = false
+    elseif not s.download_active and s.active then
+        -- Do not let a stale pseudo lock outlive its only background owner.
+        -- The ordinary completion path also calls background_task_done(); this
+        -- delayed check is an idempotent safety net for cancel/hibernate/error
+        -- paths that lose their final UI callback.
+        local generation = tonumber(s.generation or 0) or 0
+        UIManager:scheduleIn(0.30, function()
+            local current = state()
+            if current.active and current.generation == generation
+                and current.download_active ~= true
+                and current.user_exit_pending ~= true then
+                logger.warn("[MiuRead][PseudoLock][FailOpen] no live download owner",
+                    "platform=", tostring(current.platform),
+                    "generation=", tostring(generation))
+                pcall(M.background_task_done, "download_inactive_safety")
+            end
+        end)
     end
     return true
 end
@@ -393,20 +498,21 @@ local function install_kindle_power_source_guard()
             local numeric = tonumber(source)
             if s.active then
                 if numeric == 6 then
-                    -- Cover-open is always a user-visible wake, including the
-                    -- tiny beta.15 automatic-suspend handoff window. User input
-                    -- cancels that handoff instead of allowing a delayed sleep
-                    -- to black the screen again.
-                    if s.commit_pending then invalidate_commit(s) end
-                    s.exit_requested = true
-                    logger.info("[MiuRead][PseudoLock] Kindle cover open requests visible wake")
-                elseif numeric == 1 and not self_injected and not s.internal_resume_pending then
-                    -- A genuine BUTTON_WAKEUP also wins over an in-flight
-                    -- automatic handoff. MiuRead-generated wake edges remain
-                    -- private because they are tagged self_injected.
-                    if s.commit_pending then invalidate_commit(s) end
-                    s.exit_requested = true
-                    logger.info("[MiuRead][PseudoLock] external Kindle button wake requests visible wake")
+                    -- HALL_WAKEUP can only come from opening the cover. It is a
+                    -- hard user-visible wake and must win over every internal
+                    -- pseudo-lock/commit state.
+                    begin_user_exit("HALL_WAKEUP", recent_power_event("wake", 1))
+                elseif numeric == 1 and not self_injected then
+                    -- A raw BUTTON_WAKEUP that was not consumed by MiuRead's
+                    -- one-shot injection ticket is user intent. Do not reject
+                    -- it merely because an older internal resume is still
+                    -- pending; that was the lockout race in beta.13-15.
+                    begin_user_exit("BUTTON_WAKEUP", recent_power_event("wake", 1))
+                elseif numeric == 1 and self_injected then
+                    logger.info("[MiuRead][PseudoLock][InternalWake]",
+                        "reason=self_injected",
+                        "ticket=", tostring(s.last_power_injected_ticket or "-"),
+                        "generation=", tostring(s.generation or 0))
                 end
             end
             return original_out(self, source, ...)
@@ -558,6 +664,11 @@ function M.begin(reason)
     s.system_active = platform == "kobo"
     s.internal_resume_pending = platform == "kindle"
     s.exit_requested = false
+    s.user_exit_pending = false
+    s.injected_expected_kind = nil
+    s.injected_reason = nil
+    s.injected_until = 0
+    s.last_power_injected_ticket = nil
     s.commit_pending = false
     s.commit_started_at = 0
     s.commit_generation = (tonumber(s.commit_generation) or 0) + 1
@@ -586,17 +697,22 @@ end
 
 function M.after_suspend()
     local s = state()
-    if not s.active or s.platform ~= "kindle" or not s.internal_resume_pending then return false end
+    if not s.active or s.platform ~= "kindle" or not s.internal_resume_pending
+        or s.exit_requested or s.user_exit_pending then return false end
     s.wake_attempts = (tonumber(s.wake_attempts) or 0) + 1
     local issued = kindle_power_button("enter_active_pseudo_lock")
     if issued and s.wake_attempts < 2 then
         -- Some firmware ignores a power transition while it is still finishing
         -- the original goingToScreenSaver event. Retry once only if Resume has
-        -- not arrived; this is not a periodic wake loop.
+        -- not arrived; generation matching prevents a stale retry from running
+        -- after a user has already exited the pseudo lock.
+        local generation = tonumber(s.generation or 0) or 0
         UIManager:scheduleIn(0.8, function()
             local current = state()
-            if current.active and current.internal_resume_pending
-                and not current.exit_requested and not current.commit_pending then
+            if current.active and current.generation == generation
+                and current.internal_resume_pending
+                and not current.exit_requested and not current.user_exit_pending
+                and not current.commit_pending then
                 current.wake_attempts = (tonumber(current.wake_attempts) or 0) + 1
                 kindle_power_button("enter_active_pseudo_lock_retry")
             end
@@ -617,7 +733,7 @@ local function install_screensaver_close_guard()
     Screensaver.close = function(self, ...)
         local s = state()
         if s.active and s.platform == "kindle" and s.internal_resume_pending
-            and not s.exit_requested and not s.commit_pending then
+            and not s.exit_requested and not s.user_exit_pending and not s.commit_pending then
             logger.info("[MiuRead][PseudoLock] kept sleep-screen widget during internal Kindle wake")
             return false
         end
@@ -637,7 +753,7 @@ function M.on_resume_event()
     local s = state()
     if not s.active then return "normal" end
 
-    if s.platform == "kindle" and s.exit_requested then
+    if s.platform == "kindle" and (s.exit_requested or s.user_exit_pending) then
         local ev = recent_power_event("wake", 4)
         logger.info("[MiuRead][PseudoLock] user-visible Kindle resume accepted",
             "source=", tostring(ev and ev.name or "explicit_unlock"),
@@ -690,29 +806,36 @@ end
 function M.on_suspend_while_active()
     local s = state()
     if not s.active then return "none" end
+
+    -- Physical Kindle power intent has absolute priority. The initial key that
+    -- entered pseudo lock is seen before M.begin(), so any later unconsumed
+    -- BUTTON_SUSPEND belongs to the user. Handle it before system_active or
+    -- commit state checks so a stale internal_resume_pending flag cannot trap
+    -- the user behind the sleep screen.
+    if s.platform == "kindle" then
+        local ev = recent_power_event("suspend", 3)
+        if ev and ev.source == 2 and not ev.self_injected then
+            begin_user_exit("BUTTON_SUSPEND", ev)
+            s.internal_resume_pending = true
+            s.system_active = false
+            local generation = tonumber(s.generation or 0) or 0
+            UIManager:scheduleIn(0.12, function()
+                local current = state()
+                if current.active and current.generation == generation
+                    and current.user_exit_pending == true
+                    and current.internal_resume_pending == true then
+                    kindle_power_button("user_unlock")
+                end
+            end)
+            return "unlock"
+        end
+    end
+
     if s.commit_pending then
         if s.platform == "kindle" then
             local ev = recent_power_event("suspend", 3)
             s.commit_suspend_seen = true
             s.system_active = false
-            -- During the handoff a second, non-injected BUTTON_SUSPEND is the
-            -- only evidence available that the user also pressed the power key.
-            -- Give that physical action priority and bounce to a visible wake.
-            if ev and ev.source == 2 and not ev.self_injected then
-                local token = invalidate_commit(s)
-                s.exit_requested = true
-                s.internal_resume_pending = true
-                logger.info("[MiuRead][PseudoLock] Kindle user input interrupts automatic suspend",
-                    "source=", tostring(ev.name), "age=", tostring(ev.age),
-                    "generation=", tostring(token))
-                UIManager:scheduleIn(0.12, function()
-                    local current = state()
-                    if current.active and current.exit_requested and current.internal_resume_pending then
-                        kindle_power_button("user_unlock_during_commit")
-                    end
-                end)
-                return "unlock"
-            end
             -- IntoSS only means powerd entered the screensaver transition. Keep
             -- the pseudo state/lease until ReadyToSuspend confirms real sleep.
             logger.info("[MiuRead][PseudoLock] Kindle suspend edge observed; awaiting ReadyToSuspend",
@@ -727,27 +850,9 @@ function M.on_suspend_while_active()
             "generation=", tostring(s.commit_generation or 0))
         return "hold"
     end
+
     if s.platform == "kindle" and s.system_active then
         local ev = recent_power_event("suspend", 3)
-        if ev and ev.source == 2 and not ev.self_injected then
-            -- AutoSuspend is paused for the lifetime of a Kindle pseudo lock,
-            -- so a fresh BUTTON_SUSPEND here is the remaining deliberate
-            -- power-button path. We still log the raw source instead of
-            -- claiming the generic Suspend itself proves a physical key.
-            s.exit_requested = true
-            s.internal_resume_pending = true
-            s.system_active = false
-            logger.info("[MiuRead][PseudoLock] Kindle button suspend requests pseudo unlock",
-                "source=", tostring(ev.name), "age=", tostring(ev.age))
-            UIManager:scheduleIn(0.15, function()
-                local current = state()
-                if current.active and current.exit_requested and current.internal_resume_pending then
-                    kindle_power_button("user_unlock")
-                end
-            end)
-            return "unlock"
-        end
-
         logger.info("[MiuRead][PseudoLock] internal/unknown Kindle suspend held",
             "source=", tostring(ev and ev.name or "none"),
             "self_injected=", tostring(ev and ev.self_injected == true or false),
@@ -756,15 +861,17 @@ function M.on_suspend_while_active()
         if ev then
             -- A raw goingToScreenSaver edge really did move Amazon powerd away
             -- from ACTIVE. Bounce it back just like the initial pseudo-lock
-            -- entry, but keep exit_requested false so the sleep screen stays
-            -- visible and the Resume remains INTERNAL_WAKE. This is important
-            -- for HALL_SUSPEND while a download is already locked.
+            -- entry, but keep user_exit_pending false so the sleep screen stays
+            -- visible and the Resume remains INTERNAL_WAKE.
             s.internal_resume_pending = true
             s.system_active = false
+            local generation = tonumber(s.generation or 0) or 0
             UIManager:scheduleIn(0.15, function()
                 local current = state()
-                if current.active and current.internal_resume_pending
-                    and not current.exit_requested and not current.commit_pending then
+                if current.active and current.generation == generation
+                    and current.internal_resume_pending
+                    and not current.exit_requested and not current.user_exit_pending
+                    and not current.commit_pending then
                     kindle_power_button("internal_suspend_hold")
                 end
             end)
@@ -786,7 +893,7 @@ end
 
 local function commit_if_idle()
     local s = state()
-    if not s.active or s.commit_pending or s.exit_requested then return false end
+    if not s.active or s.commit_pending or s.exit_requested or s.user_exit_pending then return false end
     local busy, reason = other_work_active()
     if busy then
         logger.info("[MiuRead][PseudoLock] real suspend deferred",
@@ -805,7 +912,7 @@ local function commit_if_idle()
         -- Never inject a second power transition while Kindle is already in an
         -- internal screensaver/wake edge. Wait for the pseudo lock to be fully
         -- ACTIVE, which also gives a just-pressed user power key time to win.
-        if s.system_active ~= true or s.internal_resume_pending then
+        if s.system_active ~= true or s.internal_resume_pending or s.user_exit_pending then
             UIManager:scheduleIn(0.35, commit_if_idle)
             return false
         end
