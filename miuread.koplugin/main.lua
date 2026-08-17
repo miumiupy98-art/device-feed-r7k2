@@ -10629,6 +10629,11 @@ function Plugin:_home_sleep()
         if self.ui and self.ui.document then
             self:status_toast("正在保存本次阅读",self:_sleep_action_detail(),2)
         end
+        -- Record intent before UIManager emits the generic Suspend callback.
+        -- This keeps the quick action in the same USER_SLEEP lifecycle as a
+        -- physical power key or cover close without asking sync code to infer
+        -- intent from a later internal Resume/Suspend edge.
+        PseudoLockscreen.mark_user_sleep("miuread_shortcut")
         UIManager:flushSettings()
         UIManager:suspend()
         return true
@@ -23547,13 +23552,17 @@ function Plugin:_finish_suspend_reader_finalizer(ok)
 end
 
 function Plugin:onSuspend()
-    -- beta.12: while a Kindle pseudo lock is already ACTIVE, a second system
-    -- Suspend is either the user's next power press (unlock) or the deliberate
-    -- real-suspend commit after the background task finished. Handle that
-    -- before the ordinary duplicate-suspend guard.
+    -- beta.13: a pseudo-locked Kindle may emit additional internal Suspend
+    -- edges while networking stays ACTIVE. PseudoLockscreen authenticates the
+    -- raw powerd source before deciding whether this is user unlock, a real
+    -- suspend commit, or an internal edge that must remain invisible.
     local pseudo_suspend=PseudoLockscreen.on_suspend_while_active()
     if pseudo_suspend=="unlock" then
         logger.info("[MiuRead][Power] pseudo lock unlock suspend intercepted")
+        return
+    elseif pseudo_suspend=="hold" then
+        logger.info("[MiuRead][Power] internal pseudo-lock suspend held",
+            "generation=",tostring(PowerState.generation()))
         return
     elseif pseudo_suspend=="commit" then
         -- The system is now entering the real sleep that was postponed while
@@ -23561,6 +23570,11 @@ function Plugin:onSuspend()
         self._miuread_suspended=false
         HOME_SESSION.suspended=false
         logger.info("[MiuRead][Power] pseudo lock committed to real suspend")
+    end
+    local sleep_origin=PseudoLockscreen.consume_user_sleep_origin()
+    if sleep_origin then
+        logger.info("[MiuRead][ReadingLifecycle] USER_SLEEP",
+            "origin=",tostring(sleep_origin),"sync=finalize_once")
     end
     if HOME_SESSION.suspended==true and self._miuread_suspended==true then
         logger.info("[MiuRead][Power] duplicate suspend ignored",
@@ -23629,7 +23643,8 @@ function Plugin:onSuspend()
         "generation=",tostring(power.generation),
         "download_continue=",tostring(download_continue),
         "download_reason=",download_reason,
-        "reader_finalizer=",tostring(sync_continue))
+        "reader_finalizer=",tostring(sync_continue),
+        "sleep_origin=",tostring(sleep_origin or "device_or_koreader"))
 
     self._miuread_suspended=true
     HOME_SESSION.suspended=true
@@ -23744,6 +23759,8 @@ function Plugin:onResume()
         end
         logger.info("[MiuRead][Power] internal pseudo-lock resume held",
             "generation=",tostring(power.generation))
+        logger.info("[MiuRead][ReadingLifecycle] INTERNAL_WAKE",
+            "time=ignored","progress=ignored","annotations=ignored")
         return
     end
     if self._reading_end_standby_held or SuspendWorkLease.has("reader_finalizer") then

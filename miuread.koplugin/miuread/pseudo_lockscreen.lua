@@ -3,6 +3,9 @@ local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local SuspendWorkLease = require("miuread.suspend_work_lease")
 
+local ok_pluginshare, PluginShare = pcall(require, "pluginshare")
+if not ok_pluginshare then PluginShare = nil end
+
 local M = {}
 
 local KEY = "__MIUREAD_PSEUDO_LOCK_V1"
@@ -21,10 +24,100 @@ local function state()
             generation = 0,
             wake_attempts = 0,
             download_active = false,
+            autosuspend_pause_previous = nil,
+            autosuspend_pause_owned = false,
+            last_power_kind = nil,
+            last_power_source = nil,
+            last_power_source_name = nil,
+            last_power_event_at = 0,
+            last_power_self_injected = false,
+            injected_expected_kind = nil,
+            injected_reason = nil,
+            injected_until = 0,
+            pending_user_sleep_origin = nil,
+            pending_user_sleep_at = 0,
         }
         rawset(_G, KEY, value)
     end
     return value
+end
+
+local KINDLE_POWER_SOURCES = {
+    [1] = "BUTTON_WAKEUP",
+    [2] = "BUTTON_SUSPEND",
+    [4] = "HALL_SUSPEND",
+    [6] = "HALL_WAKEUP",
+}
+
+local function power_source_name(source, kind)
+    local numeric = tonumber(source)
+    if numeric and KINDLE_POWER_SOURCES[numeric] then return KINDLE_POWER_SOURCES[numeric] end
+    return string.format("UNKNOWN_%s(%s)", tostring(kind or "POWER"):upper(), tostring(source or "nil"))
+end
+
+local function pause_kindle_autosuspend()
+    local s = state()
+    if s.autosuspend_pause_owned or not PluginShare then return false end
+    s.autosuspend_pause_previous = PluginShare.pause_auto_suspend
+    PluginShare.pause_auto_suspend = true
+    s.autosuspend_pause_owned = true
+    logger.info("[MiuRead][PseudoLock] Kindle AutoSuspend paused",
+        "previous=", tostring(s.autosuspend_pause_previous))
+    return true
+end
+
+local function restore_kindle_autosuspend(reason)
+    local s = state()
+    if not s.autosuspend_pause_owned or not PluginShare then return false end
+    PluginShare.pause_auto_suspend = s.autosuspend_pause_previous
+    logger.info("[MiuRead][PseudoLock] Kindle AutoSuspend restored",
+        "value=", tostring(s.autosuspend_pause_previous),
+        "reason=", tostring(reason or "unknown"))
+    s.autosuspend_pause_previous = nil
+    s.autosuspend_pause_owned = false
+    return true
+end
+
+local function recent_power_event(kind, max_age)
+    local s = state()
+    local age = os.time() - (tonumber(s.last_power_event_at) or 0)
+    if age < 0 then age = 999 end
+    if kind and s.last_power_kind ~= kind then return nil end
+    if age > (tonumber(max_age) or 3) then return nil end
+    return {
+        kind = s.last_power_kind,
+        source = tonumber(s.last_power_source),
+        name = tostring(s.last_power_source_name or "unknown"),
+        self_injected = s.last_power_self_injected == true,
+        age = age,
+    }
+end
+
+local function record_kindle_power_event(kind, source)
+    local s = state()
+    local now = os.time()
+    local numeric = tonumber(source)
+    local self_injected = false
+    if s.injected_expected_kind == kind and now <= (tonumber(s.injected_until) or 0) then
+        self_injected = true
+        s.injected_expected_kind = nil
+        s.injected_until = 0
+    end
+    s.last_power_kind = tostring(kind or "unknown")
+    s.last_power_source = numeric
+    s.last_power_source_name = power_source_name(numeric, kind)
+    s.last_power_event_at = now
+    s.last_power_self_injected = self_injected
+    logger.info("[MiuRead][PseudoLock][PowerEvent]",
+        "kind=", tostring(kind or "unknown"),
+        "source=", tostring(s.last_power_source_name),
+        "self_injected=", tostring(self_injected),
+        "active=", tostring(s.active == true),
+        "system_active=", tostring(s.system_active == true),
+        "generation=", tostring(s.generation or 0),
+        "injected_reason=", tostring(s.injected_reason or "none"))
+    if self_injected then s.injected_reason = nil end
+    return self_injected
 end
 
 local function platform_name()
@@ -59,6 +152,15 @@ local function inhibit_non_power_input()
 end
 
 local function kindle_power_button(reason)
+    local s = state()
+    local why = tostring(reason or "unknown")
+    if why == "download_complete_real_suspend" then
+        s.injected_expected_kind = "suspend"
+    else
+        s.injected_expected_kind = "wake"
+    end
+    s.injected_reason = why
+    s.injected_until = os.time() + 3
     local issued = false
     local backend = "none"
     local ok_lipc, lipc = pcall(require, "liblipclua")
@@ -77,8 +179,13 @@ local function kindle_power_button(reason)
         backend = "lipc-cli"
     end
     logger.info("[MiuRead][PseudoLock] kindle power transition requested",
-        "reason=", tostring(reason or "unknown"), "backend=", backend,
+        "reason=", why, "backend=", backend,
         "issued=", tostring(issued))
+    if not issued then
+        s.injected_expected_kind = nil
+        s.injected_reason = nil
+        s.injected_until = 0
+    end
     return issued
 end
 
@@ -101,12 +208,21 @@ end
 
 local function clear_runtime(reason)
     local s = state()
+    restore_kindle_autosuspend(reason)
     s.active = false
     s.system_active = false
     s.internal_resume_pending = false
     s.exit_requested = false
     s.commit_pending = false
     s.wake_attempts = 0
+    s.last_power_kind = nil
+    s.last_power_source = nil
+    s.last_power_source_name = nil
+    s.last_power_event_at = 0
+    s.last_power_self_injected = false
+    s.injected_expected_kind = nil
+    s.injected_reason = nil
+    s.injected_until = 0
     s.last_reason = tostring(reason or "clear")
     s.generation = (tonumber(s.generation) or 0) + 1
     release_pseudo_lease(reason)
@@ -141,7 +257,31 @@ function M.snapshot()
         generation = tonumber(s.generation or 0) or 0,
         wake_attempts = tonumber(s.wake_attempts or 0) or 0,
         download_active = s.download_active == true,
+        last_power_kind = s.last_power_kind,
+        last_power_source = tonumber(s.last_power_source),
+        last_power_source_name = s.last_power_source_name,
+        last_power_self_injected = s.last_power_self_injected == true,
+        pending_user_sleep_origin = s.pending_user_sleep_origin,
     }
+end
+
+function M.mark_user_sleep(origin)
+    local s = state()
+    s.pending_user_sleep_origin = tostring(origin or "miuread")
+    s.pending_user_sleep_at = os.time()
+    logger.info("[MiuRead][PowerEvent] user sleep requested",
+        "origin=", s.pending_user_sleep_origin)
+    return true
+end
+
+function M.consume_user_sleep_origin()
+    local s = state()
+    local origin = s.pending_user_sleep_origin
+    local age = os.time() - (tonumber(s.pending_user_sleep_at) or 0)
+    s.pending_user_sleep_origin = nil
+    s.pending_user_sleep_at = 0
+    if origin and age >= 0 and age <= 5 then return tostring(origin) end
+    return nil
 end
 
 function M.set_download_active(value)
@@ -156,6 +296,58 @@ end
 function M.download_active()
     return state().download_active == true
 end
+
+-- Keep the raw Amazon powerd source before KOReader turns it into generic
+-- Suspend/Resume callbacks. BUTTON_* and HALL_* are materially different for
+-- a pseudo lock: opening a magnetic cover is a real user-visible wake, while
+-- the BUTTON_WAKEUP generated by MiuRead's own powerButton write is private.
+local function install_kindle_power_source_guard()
+    local is_kindle = false
+    if type(Device.isKindle) == "function" then
+        local ok, value = pcall(Device.isKindle, Device)
+        is_kindle = ok and value == true
+    end
+    if not is_kindle then return false end
+
+    if type(Device.intoScreenSaver) == "function"
+        and Device.__miuread_pseudo_into_ss_guard ~= true then
+        local original_into = Device.intoScreenSaver
+        Device.intoScreenSaver = function(self, source, ...)
+            record_kindle_power_event("suspend", source)
+            return original_into(self, source, ...)
+        end
+        Device.__miuread_pseudo_into_ss_guard = true
+    end
+
+    if type(Device.outofScreenSaver) == "function"
+        and Device.__miuread_pseudo_out_ss_guard ~= true then
+        local original_out = Device.outofScreenSaver
+        Device.outofScreenSaver = function(self, source, ...)
+            local self_injected = record_kindle_power_event("wake", source)
+            local s = state()
+            local numeric = tonumber(source)
+            if s.active and not s.commit_pending then
+                if numeric == 6 then
+                    -- HALL_WAKEUP is an explicit cover-open action. It must
+                    -- always escape the pseudo screen or flip-cover users can
+                    -- become stuck behind a perfectly healthy background job.
+                    s.exit_requested = true
+                    logger.info("[MiuRead][PseudoLock] Kindle cover open requests visible wake")
+                elseif numeric == 1 and not self_injected and not s.internal_resume_pending then
+                    -- Compatibility fallback for a genuine wake that arrives
+                    -- while powerd was no longer in our private wake phase.
+                    s.exit_requested = true
+                    logger.info("[MiuRead][PseudoLock] external Kindle button wake requests visible wake")
+                end
+            end
+            return original_out(self, source, ...)
+        end
+        Device.__miuread_pseudo_out_ss_guard = true
+    end
+    return true
+end
+
+install_kindle_power_source_guard()
 
 -- Kobo's generic KOReader power path normally disables Wi-Fi before it emits
 -- Suspend. For a live MiuRead download that would break the very connection we
@@ -253,7 +445,15 @@ function M.begin(reason)
     s.generation = (tonumber(s.generation) or 0) + 1
 
     set_frontlight_hw_off()
-    if platform == "kobo" then cancel_kobo_real_suspend() end
+    if platform == "kobo" then
+        cancel_kobo_real_suspend()
+    elseif platform == "kindle" then
+        -- KOReader restarts AutoSuspend after every Resume. The private wake
+        -- used by PseudoLock is not a user interaction, so letting that timer
+        -- run can manufacture another Suspend a few minutes later. Keep the
+        -- user's original setting and restore it when the pseudo lock ends.
+        pause_kindle_autosuspend()
+    end
     logger.info("[MiuRead][PseudoLock] entered",
         "platform=", platform, "reason=", tostring(reason or "download"),
         "generation=", tostring(s.generation))
@@ -312,6 +512,17 @@ install_screensaver_close_guard()
 function M.on_resume_event()
     local s = state()
     if not s.active then return "normal" end
+
+    if s.platform == "kindle" and s.exit_requested then
+        local ev = recent_power_event("wake", 4)
+        logger.info("[MiuRead][PseudoLock] user-visible Kindle resume accepted",
+            "source=", tostring(ev and ev.name or "explicit_unlock"),
+            "self_injected=", tostring(ev and ev.self_injected == true or false),
+            "generation=", tostring(s.generation))
+        clear_runtime("user_resume")
+        return "exit"
+    end
+
     if s.platform == "kindle" and s.internal_resume_pending
         and not s.exit_requested and not s.commit_pending then
         s.internal_resume_pending = false
@@ -323,18 +534,35 @@ function M.on_resume_event()
         return "hold"
     end
 
+
+    if s.platform == "kindle" and not s.commit_pending then
+        -- A generic Resume with no authenticated BUTTON/HALL wake is not
+        -- enough to expose the UI. Background networking, Amazon powerd and
+        -- KOReader can all generate lifecycle Resume edges while the user has
+        -- never asked to leave the sleep screen.
+        local ev = recent_power_event("wake", 4)
+        s.system_active = true
+        inhibit_non_power_input()
+        set_frontlight_hw_off()
+        logger.info("[MiuRead][PseudoLock] unauthenticated Kindle resume held",
+            "source=", tostring(ev and ev.name or "unknown"),
+            "self_injected=", tostring(ev and ev.self_injected == true or false),
+            "generation=", tostring(s.generation))
+        return "hold"
+    end
+
     logger.info("[MiuRead][PseudoLock] user-visible resume",
         "platform=", tostring(s.platform), "exit_requested=", tostring(s.exit_requested))
     clear_runtime("user_resume")
     return "exit"
 end
 
--- Called before ordinary duplicate-Suspend handling. A second Kindle Suspend
--- while the system is ACTIVE behind the pseudo screen is normally the user's
--- next power-key press. Let powerd enter screenSaver, then immediately bounce
--- it out again, this time allowing Screensaver:close so the real UI is shown.
--- A commit request instead means the download has finished and this Suspend
--- must be allowed to continue into real sleep.
+-- Called before ordinary duplicate-Suspend handling. beta.11/12 assumed every
+-- second Kindle Suspend was a physical power-key press. That is not safe:
+-- KOReader AutoSuspend and other internal powerd edges can produce the same
+-- generic callback. beta.13 only accepts a recent raw BUTTON_SUSPEND as the
+-- user-key path, keeps HALL_SUSPEND/unknown edges locked, and separately lets
+-- HALL_WAKEUP escape through on_resume_event.
 function M.on_suspend_while_active()
     local s = state()
     if not s.active then return "none" end
@@ -345,17 +573,48 @@ function M.on_suspend_while_active()
         return "commit"
     end
     if s.platform == "kindle" and s.system_active then
-        s.exit_requested = true
-        s.internal_resume_pending = true
-        s.system_active = false
-        logger.info("[MiuRead][PseudoLock] Kindle power press requests pseudo unlock")
-        UIManager:scheduleIn(0.15, function()
-            local current = state()
-            if current.active and current.exit_requested and current.internal_resume_pending then
-                kindle_power_button("user_unlock")
-            end
-        end)
-        return "unlock"
+        local ev = recent_power_event("suspend", 3)
+        if ev and ev.source == 2 and not ev.self_injected then
+            -- AutoSuspend is paused for the lifetime of a Kindle pseudo lock,
+            -- so a fresh BUTTON_SUSPEND here is the remaining deliberate
+            -- power-button path. We still log the raw source instead of
+            -- claiming the generic Suspend itself proves a physical key.
+            s.exit_requested = true
+            s.internal_resume_pending = true
+            s.system_active = false
+            logger.info("[MiuRead][PseudoLock] Kindle button suspend requests pseudo unlock",
+                "source=", tostring(ev.name), "age=", tostring(ev.age))
+            UIManager:scheduleIn(0.15, function()
+                local current = state()
+                if current.active and current.exit_requested and current.internal_resume_pending then
+                    kindle_power_button("user_unlock")
+                end
+            end)
+            return "unlock"
+        end
+
+        logger.info("[MiuRead][PseudoLock] internal/unknown Kindle suspend held",
+            "source=", tostring(ev and ev.name or "none"),
+            "self_injected=", tostring(ev and ev.self_injected == true or false),
+            "age=", tostring(ev and ev.age or -1),
+            "generation=", tostring(s.generation))
+        if ev then
+            -- A raw goingToScreenSaver edge really did move Amazon powerd away
+            -- from ACTIVE. Bounce it back just like the initial pseudo-lock
+            -- entry, but keep exit_requested false so the sleep screen stays
+            -- visible and the Resume remains INTERNAL_WAKE. This is important
+            -- for HALL_SUSPEND while a download is already locked.
+            s.internal_resume_pending = true
+            s.system_active = false
+            UIManager:scheduleIn(0.15, function()
+                local current = state()
+                if current.active and current.internal_resume_pending
+                    and not current.exit_requested and not current.commit_pending then
+                    kindle_power_button("internal_suspend_hold")
+                end
+            end)
+        end
+        return "hold"
     end
     return "already_locked"
 end
