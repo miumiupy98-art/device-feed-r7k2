@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.7.0-beta.8",
+    VERSION = "4.7.0-beta.9",
     SCHEMA = 114,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -127,23 +127,23 @@ local C = {
     DOWNLOAD_AUTO_RESTARTS = 2,
     DOWNLOAD_DIAGNOSTIC_KEEP = 3,
 
-    -- beta.3 treats download connectivity as a task-level state instead of
-    -- letting every remaining chapter exhaust its own retry tree. Three
-    -- consecutive chapter-level network failures enter one recovery wait; the
-    -- worker then probes the same host until the route is usable again.
-    DOWNLOAD_NETWORK_FAILURE_BREAKER = 3,
+    -- beta.9 opens the task-level network recovery path after the first full
+    -- chapter request has exhausted HTTP-level retries. Repeating the same
+    -- failing request across several chapters only wastes lock-screen time.
+    DOWNLOAD_NETWORK_FAILURE_BREAKER = 1,
     DOWNLOAD_NETWORK_RECOVERY_POLL_SECONDS = 6,
     DOWNLOAD_NETWORK_RECOVERY_MAX_POLL_SECONDS = 15,
-    -- beta.7 keeps a healthy lock-screen download alive, but actively watches
-    -- the Kindle Wi-Fi link once the worker enters the shared network-wait
-    -- state. A lost radio/association gets a few non-interactive restore
-    -- attempts; prolonged WAN/server failure releases the standby lock first
-    -- and then hibernates the worker from its existing chapter checkpoint.
-    DOWNLOAD_NETWORK_GUARD_POLL_SECONDS = 10,
-    DOWNLOAD_NETWORK_RESTORE_COOLDOWN_SECONDS = 25,
-    DOWNLOAD_NETWORK_RESTORE_MAX_ATTEMPTS = 3,
-    DOWNLOAD_NETWORK_LOCK_MAX_SECONDS = 90,
-    DOWNLOAD_NETWORK_HIBERNATE_SECONDS = 120,
+    -- beta.9 makes the lock-screen lease follow the useful download lifetime.
+    -- Healthy transfers keep Wi-Fi alive until completion. If the association
+    -- is lost, recovery keeps probing without a fixed attempt cap; only a long
+    -- ten-minute offline window (or low battery) gives the device back to deep
+    -- sleep after preserving the chapter checkpoint.
+    DOWNLOAD_NETWORK_GUARD_POLL_SECONDS = 8,
+    DOWNLOAD_NETWORK_RESTORE_COOLDOWN_SECONDS = 20,
+    DOWNLOAD_NETWORK_RESTORE_MAX_ATTEMPTS = 0,
+    DOWNLOAD_NETWORK_LOCK_MAX_SECONDS = 600,
+    DOWNLOAD_NETWORK_HIBERNATE_SECONDS = 620,
+    DOWNLOAD_LOCKSCREEN_MIN_BATTERY_PERCENT = 10,
     DOWNLOAD_BACKGROUND_KEEPALIVE_SECONDS = 12,
     DOWNLOAD_BACKGROUND_STALL_SLEEP_SECONDS = 300,
 

@@ -1678,7 +1678,7 @@ function Downloader:book(input, opt, progress)
                 if Http.is_network_error(downloaded) then
                     network_failure_streak=network_failure_streak+1
                     mark_failure(chapter,downloaded)
-                    local threshold=math.max(2,tonumber(Config.DOWNLOAD_NETWORK_FAILURE_BREAKER) or 3)
+                    local threshold=math.max(1,tonumber(Config.DOWNLOAD_NETWORK_FAILURE_BREAKER) or 1)
                     if network_failure_streak>=threshold then
                         logger.warn("[MiuRead][Download] network circuit breaker opened",
                             "streak=",tostring(network_failure_streak),"chapter=",uid)

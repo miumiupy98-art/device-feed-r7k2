@@ -60,6 +60,7 @@ local PerformanceMode=require("miuread.performance_mode")
 local RuntimePressure=require("miuread.runtime_pressure")
 local BackgroundScheduler=require("miuread.background_scheduler")
 local PowerState=require("miuread.power_state")
+local SuspendWorkLease=require("miuread.suspend_work_lease")
 local Library=require("miuread.library")
 local ShelfView=require("miuread.shelf_view")
 local FullShelfView=require("miuread.full_shelf_view")
@@ -23487,6 +23488,54 @@ function Plugin:onAnnotationsModified()
     -- gesture callback.
     self:_schedule_local_annotation_snapshot("annotations_modified",2.4)
 end
+function Plugin:_finish_suspend_reader_finalizer(ok)
+    local still_suspended=HOME_SESSION.suspended==true and self._miuread_suspended==true
+    if self.download_task then
+        -- reader_finalizer is an explicit pause reason, not a transient UI pause.
+        -- Remove it only when the finalizer has actually ended or been bounded
+        -- into pending state.
+        pcall(self.download_task.resume,self.download_task,"reader_finalizer")
+    end
+
+    if not still_suspended then
+        self._reading_end_standby_held=false
+        SuspendWorkLease.release("reader_finalizer")
+        logger.info("[MiuRead][Power] reader finalizer ended after user wake",
+            "ok=",tostring(ok==true))
+        return true
+    end
+
+    local download_continue,download_reason=false,"no_download"
+    if self.download_task and type(self.download_task.can_continue_locked)=="function" then
+        local checked,value,reason=pcall(self.download_task.can_continue_locked,self.download_task)
+        if checked then
+            download_continue=value==true
+            download_reason=tostring(reason or "unknown")
+        else
+            download_reason="check_failed"
+        end
+    end
+    local target=download_continue and "DOWNLOAD_LOCKED" or "REAL_SUSPEND"
+    local power=PowerState.transition(target,"reading_end_complete",{
+        download_active=self.download_task and self.download_task:busy() or false,
+        download_continue=download_continue,sync_continue=false,
+    })
+    self._power_suspend_generation=power.generation
+    -- Acquire the download lease before releasing reader_finalizer so there is
+    -- no zero-lease gap where Kindle can enter deep suspend between the two jobs.
+    if self.download_task then
+        self.download_task:on_suspend(target,power.generation)
+    end
+    self._reading_end_standby_held=false
+    SuspendWorkLease.release("reader_finalizer")
+    logger.info("[MiuRead][Power] reader finalizer handoff",
+        "ok=",tostring(ok==true),"to=",tostring(target),
+        "generation=",tostring(power.generation),
+        "download_continue=",tostring(download_continue),
+        "download_reason=",download_reason)
+    return true
+end
+
 function Plugin:onSuspend()
     if HOME_SESSION.suspended==true and self._miuread_suspended==true then
         logger.info("[MiuRead][Power] duplicate suspend ignored",
@@ -23502,37 +23551,38 @@ function Plugin:onSuspend()
     local sync_continue=false
     local sync_candidate=self.ui and self.ui.document and self:_reader_session_is_weread()
         and self.sync and self.sync.reading_end_finalized~=true
+    local download_paused_for_reader=false
     if sync_candidate then
-        -- Hold standby *before* starting the finalizer. beta.3 acquired this lock
-        -- afterwards, leaving a race where Kindle Suspend could park the worker
-        -- between final-position capture and the network request.
-        local hold_ok,hold_result=pcall(UIManager.preventStandby,UIManager)
-        self._reading_end_standby_held=hold_ok==true and hold_result~=false
+        -- If a book download is active, the reader finalizer gets the first
+        -- network window. The child remains alive at its checkpoint and is
+        -- handed back to DOWNLOAD_LOCKED immediately after final time/progress
+        -- work has completed or been bounded into pending state.
+        if download_continue and self.download_task then
+            download_paused_for_reader=self.download_task:pause("reader_finalizer")==true
+                or self.download_task:is_paused()==true
+        end
+        local lease_ok=SuspendWorkLease.acquire("reader_finalizer")
+        self._reading_end_standby_held=lease_ok==true
         sync_continue=self:_reading_end_sync("休眠",{show_status=false,timeout=8},function(ok)
-            if PowerState.state()=="BACKGROUND_LOCKED" then
-                local final_power=PowerState.transition("REAL_SUSPEND","reading_end_complete",{
-                    download_active=self.download_task and self.download_task:busy() or false,
-                    download_continue=false,sync_continue=false,
-                })
-                logger.info("[MiuRead][Power] reading-end lock released",
-                    "to=",tostring(final_power.state),"generation=",tostring(final_power.generation))
-            end
-            if self._reading_end_standby_held then
-                self._reading_end_standby_held=false
-                pcall(UIManager.allowStandby,UIManager)
-            end
+            self:_finish_suspend_reader_finalizer(ok)
             if ok then
                 logger.info("[MiuRead][ReadingEnd] suspend sync completed")
             else
                 logger.warn("[MiuRead][ReadingEnd] suspend sync incomplete; local state retained")
             end
         end)==true
-        if not sync_continue and self._reading_end_standby_held then
+        if not sync_continue then
+            if download_paused_for_reader and self.download_task then
+                self.download_task:resume("reader_finalizer")
+            end
             self._reading_end_standby_held=false
-            pcall(UIManager.allowStandby,UIManager)
+            SuspendWorkLease.release("reader_finalizer")
         end
     end
-    local power_target=download_continue and "DOWNLOAD_LOCKED" or (sync_continue and "BACKGROUND_LOCKED" or "REAL_SUSPEND")
+    -- Reader finalization owns Suspend first. A concurrent download is parked
+    -- until the finalizer callback hands the lease directly to DOWNLOAD_LOCKED.
+    local power_target=sync_continue and "BACKGROUND_LOCKED"
+        or (download_continue and "DOWNLOAD_LOCKED" or "REAL_SUSPEND")
     local power=PowerState.transition(power_target,"onSuspend",{
         download_active=self.download_task and self.download_task:busy() or false,
         download_continue=download_continue,
@@ -23543,7 +23593,8 @@ function Plugin:onSuspend()
         "from=",tostring(power.previous),"to=",tostring(power.state),
         "generation=",tostring(power.generation),
         "download_continue=",tostring(download_continue),
-        "download_reason=",download_reason)
+        "download_reason=",download_reason,
+        "reader_finalizer=",tostring(sync_continue))
 
     self._miuread_suspended=true
     HOME_SESSION.suspended=true
@@ -23594,9 +23645,9 @@ function Plugin:onSuspend()
     if self._reader_checkpoint_dirty==true then
         self:_flush_reader_checkpoint("suspend",true)
     end
-    -- Freeze every home producer before KOReader paints the lock screen.  The
-    -- visible home widget is preserved; only stale work and callbacks are
-    -- invalidated, so wake-up never has to rebuild the page before showing it.
+    -- Freeze every home producer before KOReader paints the lock screen. The
+    -- visible widget is preserved; normal Home downloads do not own a standby
+    -- lease until this Suspend lifecycle has already committed.
     if HomeView.is_shown() and not self:_active_reader_ui() then
         self:_home_freeze_for_suspend()
     end
@@ -23604,9 +23655,6 @@ function Plugin:onSuspend()
         UIManager:unschedule(self._download_resume_task)
         self._download_resume_task=nil
     end
-    -- No interaction/helper timer is allowed to wake or poll background work
-    -- after Suspend has taken ownership. The download marker is normalized
-    -- after these timers are cancelled so no stale callback can re-pause it.
     self._reader_interaction_resume_generation=(tonumber(self._reader_interaction_resume_generation) or 0)+1
     if self._reader_interaction_resume_task then
         UIManager:unschedule(self._reader_interaction_resume_task)
@@ -23623,9 +23671,9 @@ function Plugin:onSuspend()
     end
     self:_background_cancel_all("suspend lifecycle",true,false)
     if power_target=="REAL_SUSPEND" then self:_mark_reader_busy(10) end
-    -- Normalize the shared download pause marker LAST. In DOWNLOAD_LOCKED this
-    -- removes page/interaction pauses so the beta.3 keep-awake worker remains
-    -- the only subsystem allowed to keep running behind the lock screen.
+    -- Normalize the shared download marker last. BACKGROUND_LOCKED leaves the
+    -- reader_finalizer pause intact; DOWNLOAD_LOCKED removes only ordinary UI
+    -- pauses and acquires the shared download lease behind the lock screen.
     if self.download_task then
         self.download_task:on_suspend(power_target,power.generation)
     end
@@ -23640,9 +23688,9 @@ function Plugin:onSuspend()
     end
 end
 function Plugin:onResume()
-    if self._reading_end_standby_held then
+    if self._reading_end_standby_held or SuspendWorkLease.has("reader_finalizer") then
         self._reading_end_standby_held=false
-        pcall(UIManager.allowStandby,UIManager)
+        SuspendWorkLease.release("reader_finalizer")
     end
     local previous_power=PowerState.snapshot()
     if self.download_task and type(self.download_task.on_user_resume_begin)=="function" then
