@@ -20,6 +20,10 @@ local function state()
             internal_resume_pending = false,
             exit_requested = false,
             commit_pending = false,
+            commit_started_at = 0,
+            commit_generation = 0,
+            commit_suspend_seen = false,
+            commit_native_returned = false,
             entered_at = 0,
             generation = 0,
             wake_attempts = 0,
@@ -219,6 +223,10 @@ local function clear_runtime(reason)
     s.internal_resume_pending = false
     s.exit_requested = false
     s.commit_pending = false
+    s.commit_started_at = 0
+    s.commit_generation = (tonumber(s.commit_generation) or 0) + 1
+    s.commit_suspend_seen = false
+    s.commit_native_returned = false
     s.wake_attempts = 0
     s.last_power_kind = nil
     s.last_power_source = nil
@@ -231,6 +239,44 @@ local function clear_runtime(reason)
     s.last_reason = tostring(reason or "clear")
     s.generation = (tonumber(s.generation) or 0) + 1
     release_pseudo_lease(reason)
+end
+
+local function restore_visible_surface(reason)
+    -- Used only when an automatic real-suspend handoff fails while the device
+    -- is still awake. Drop the pseudo guards first so Screensaver:close() is
+    -- never swallowed by the Kindle private-wake guard. The safe fallback is a
+    -- visible, interactive surface rather than an ambiguous half-suspended one.
+    clear_runtime(reason or "commit_fallback_visible")
+    local ok_ss, Screensaver = pcall(require, "ui/screensaver")
+    if ok_ss and Screensaver and type(Screensaver.close) == "function" then
+        pcall(Screensaver.close, Screensaver)
+    end
+    local powerd = Device and Device.powerd
+    if powerd and type(powerd.afterResume) == "function" then
+        pcall(powerd.afterResume, powerd)
+    end
+    pcall(UIManager.setDirty, UIManager, "all", "full")
+    logger.warn("[MiuRead][PseudoLock] automatic suspend fell back to visible UI",
+        "reason=", tostring(reason or "unknown"))
+    return true
+end
+
+local function invalidate_commit(s)
+    s = s or state()
+    s.commit_pending = false
+    s.commit_started_at = 0
+    s.commit_suspend_seen = false
+    s.commit_native_returned = false
+    -- If the automatic Kindle powerButton request is cancelled by a cover/key
+    -- event before its synthetic edge is observed, do not let that stale tag
+    -- authenticate a later unrelated power event.
+    if s.injected_reason == "download_complete_real_suspend" then
+        s.injected_expected_kind = nil
+        s.injected_reason = nil
+        s.injected_until = 0
+    end
+    s.commit_generation = (tonumber(s.commit_generation) or 0) + 1
+    return s.commit_generation
 end
 
 function M.active()
@@ -267,6 +313,10 @@ function M.snapshot()
         internal_resume_pending = s.internal_resume_pending == true,
         exit_requested = s.exit_requested == true,
         commit_pending = s.commit_pending == true,
+        commit_started_at = tonumber(s.commit_started_at or 0) or 0,
+        commit_generation = tonumber(s.commit_generation or 0) or 0,
+        commit_suspend_seen = s.commit_suspend_seen == true,
+        commit_native_returned = s.commit_native_returned == true,
         entered_at = tonumber(s.entered_at or 0) or 0,
         generation = tonumber(s.generation or 0) or 0,
         wake_attempts = tonumber(s.wake_attempts or 0) or 0,
@@ -341,16 +391,20 @@ local function install_kindle_power_source_guard()
             local self_injected = record_kindle_power_event("wake", source)
             local s = state()
             local numeric = tonumber(source)
-            if s.active and not s.commit_pending then
+            if s.active then
                 if numeric == 6 then
-                    -- HALL_WAKEUP is an explicit cover-open action. It must
-                    -- always escape the pseudo screen or flip-cover users can
-                    -- become stuck behind a perfectly healthy background job.
+                    -- Cover-open is always a user-visible wake, including the
+                    -- tiny beta.15 automatic-suspend handoff window. User input
+                    -- cancels that handoff instead of allowing a delayed sleep
+                    -- to black the screen again.
+                    if s.commit_pending then invalidate_commit(s) end
                     s.exit_requested = true
                     logger.info("[MiuRead][PseudoLock] Kindle cover open requests visible wake")
                 elseif numeric == 1 and not self_injected and not s.internal_resume_pending then
-                    -- Compatibility fallback for a genuine wake that arrives
-                    -- while powerd was no longer in our private wake phase.
+                    -- A genuine BUTTON_WAKEUP also wins over an in-flight
+                    -- automatic handoff. MiuRead-generated wake edges remain
+                    -- private because they are tagged self_injected.
+                    if s.commit_pending then invalidate_commit(s) end
                     s.exit_requested = true
                     logger.info("[MiuRead][PseudoLock] external Kindle button wake requests visible wake")
                 end
@@ -358,6 +412,29 @@ local function install_kindle_power_source_guard()
             return original_out(self, source, ...)
         end
         Device.__miuread_pseudo_out_ss_guard = true
+    end
+
+    -- IntoSS/BUTTON_SUSPEND is not proof of kernel suspend on Kindle, and the
+    -- upstream Kindle backend explicitly cannot distinguish a real button from
+    -- a synthetic powerButton write. ReadyToSuspend is the later powerd signal
+    -- that the system is actually committing suspend, so beta.15 keeps the
+    -- pseudo lease until this confirmation arrives.
+    if type(Device.readyToSuspend) == "function"
+        and Device.__miuread_pseudo_ready_suspend_guard ~= true then
+        local original_ready = Device.readyToSuspend
+        Device.readyToSuspend = function(self, delay, ...)
+            local result = original_ready(self, delay, ...)
+            local s = state()
+            if s.active and s.platform == "kindle" and s.commit_pending then
+                logger.info("[MiuRead][PseudoLock] Kindle real suspend confirmed",
+                    "delay=", tostring(delay or ""),
+                    "generation=", tostring(s.commit_generation or 0),
+                    "suspend_edge=", tostring(s.commit_suspend_seen == true))
+                clear_runtime("kindle_ready_to_suspend")
+            end
+            return result
+        end
+        Device.__miuread_pseudo_ready_suspend_guard = true
     end
     return true
 end
@@ -399,6 +476,14 @@ local function install_kobo_power_guard()
             if self.is_cover_closed then
                 logger.info("[MiuRead][PseudoLock] Kobo wake ignored while sleep cover remains closed")
                 return
+            end
+            local finishing_real_suspend = shared.commit_native_returned == true
+            if shared.commit_pending or finishing_real_suspend then
+                logger.info("[MiuRead][PseudoLock] Kobo user wake cancels automatic suspend handoff",
+                    "event=", tostring(ev),
+                    "native_returned=", tostring(finishing_real_suspend))
+                clear_runtime(finishing_real_suspend and "kobo_real_suspend_resume" or "kobo_commit_user_resume")
+                shared = state()
             end
             local Screensaver = require("ui/screensaver")
             pcall(UIManager.unschedule, UIManager, self.suspend)
@@ -474,6 +559,10 @@ function M.begin(reason)
     s.internal_resume_pending = platform == "kindle"
     s.exit_requested = false
     s.commit_pending = false
+    s.commit_started_at = 0
+    s.commit_generation = (tonumber(s.commit_generation) or 0) + 1
+    s.commit_suspend_seen = false
+    s.commit_native_returned = false
     s.entered_at = os.time()
     s.wake_attempts = 0
     s.last_reason = tostring(reason or "download")
@@ -602,10 +691,41 @@ function M.on_suspend_while_active()
     local s = state()
     if not s.active then return "none" end
     if s.commit_pending then
-        logger.info("[MiuRead][PseudoLock] real suspend commit reached",
-            "platform=", tostring(s.platform))
-        clear_runtime("commit_suspend")
-        return "commit"
+        if s.platform == "kindle" then
+            local ev = recent_power_event("suspend", 3)
+            s.commit_suspend_seen = true
+            s.system_active = false
+            -- During the handoff a second, non-injected BUTTON_SUSPEND is the
+            -- only evidence available that the user also pressed the power key.
+            -- Give that physical action priority and bounce to a visible wake.
+            if ev and ev.source == 2 and not ev.self_injected then
+                local token = invalidate_commit(s)
+                s.exit_requested = true
+                s.internal_resume_pending = true
+                logger.info("[MiuRead][PseudoLock] Kindle user input interrupts automatic suspend",
+                    "source=", tostring(ev.name), "age=", tostring(ev.age),
+                    "generation=", tostring(token))
+                UIManager:scheduleIn(0.12, function()
+                    local current = state()
+                    if current.active and current.exit_requested and current.internal_resume_pending then
+                        kindle_power_button("user_unlock_during_commit")
+                    end
+                end)
+                return "unlock"
+            end
+            -- IntoSS only means powerd entered the screensaver transition. Keep
+            -- the pseudo state/lease until ReadyToSuspend confirms real sleep.
+            logger.info("[MiuRead][PseudoLock] Kindle suspend edge observed; awaiting ReadyToSuspend",
+                "source=", tostring(ev and ev.name or "none"),
+                "self_injected=", tostring(ev and ev.self_injected == true or false),
+                "generation=", tostring(s.commit_generation or 0))
+            return "hold"
+        end
+        -- Kobo commits through a synchronous Device.suspend call below, so any
+        -- duplicate Suspend edge while the handoff is armed remains visual-only.
+        logger.info("[MiuRead][PseudoLock] Kobo automatic suspend handoff already pending",
+            "generation=", tostring(s.commit_generation or 0))
+        return "hold"
     end
     if s.platform == "kindle" and s.system_active then
         local ev = recent_power_event("suspend", 3)
@@ -666,7 +786,7 @@ end
 
 local function commit_if_idle()
     local s = state()
-    if not s.active or s.commit_pending then return false end
+    if not s.active or s.commit_pending or s.exit_requested then return false end
     local busy, reason = other_work_active()
     if busy then
         logger.info("[MiuRead][PseudoLock] real suspend deferred",
@@ -675,33 +795,123 @@ local function commit_if_idle()
         return false
     end
 
-    s.commit_pending = true
-    s.exit_requested = false
-    s.internal_resume_pending = false
+    -- A completed worker can briefly reacquire its download lease through a
+    -- deferred UI callback even though set_download_active(false) has already
+    -- run. No live download remains at this point, so discard that stale claim
+    -- before handing power control back to the platform.
+    SuspendWorkLease.release("download")
+
     if s.platform == "kindle" then
-        s.system_active = false
-        logger.info("[MiuRead][PseudoLock] download complete; requesting real Kindle suspend")
-        kindle_power_button("download_complete_real_suspend")
+        -- Never inject a second power transition while Kindle is already in an
+        -- internal screensaver/wake edge. Wait for the pseudo lock to be fully
+        -- ACTIVE, which also gives a just-pressed user power key time to win.
+        if s.system_active ~= true or s.internal_resume_pending then
+            UIManager:scheduleIn(0.35, commit_if_idle)
+            return false
+        end
+        s.commit_pending = true
+        s.commit_started_at = os.time()
+        s.commit_suspend_seen = false
+        s.commit_native_returned = false
+        s.commit_generation = (tonumber(s.commit_generation) or 0) + 1
+        local token = s.commit_generation
+        s.exit_requested = false
+        s.internal_resume_pending = false
+        logger.info("[MiuRead][PseudoLock] download complete; requesting confirmed Kindle suspend",
+            "generation=", tostring(token))
+        local issued = kindle_power_button("download_complete_real_suspend")
+        if not issued then
+            invalidate_commit(s)
+            restore_visible_surface("kindle_commit_request_failed")
+            return false
+        end
+
+        -- If powerd never reaches ReadyToSuspend, do not leave the device in an
+        -- ambiguous screenSaver/ACTIVE state. A running timer implies the kernel
+        -- never actually slept; recover to a visible UI instead of retrying
+        -- suspend indefinitely.
+        UIManager:scheduleIn(4.0, function()
+            local current = state()
+            if not current.active or current.platform ~= "kindle"
+                or not current.commit_pending or current.commit_generation ~= token then return end
+            logger.warn("[MiuRead][PseudoLock] Kindle real suspend confirmation timed out",
+                "generation=", tostring(token),
+                "suspend_edge=", tostring(current.commit_suspend_seen == true))
+            local saw_suspend = current.commit_suspend_seen == true
+            invalidate_commit(current)
+            if saw_suspend then
+                current.exit_requested = true
+                current.internal_resume_pending = true
+                current.system_active = false
+                local recovered = kindle_power_button("commit_timeout_visible_recovery")
+                if not recovered then
+                    restore_visible_surface("kindle_commit_timeout_recovery_failed")
+                end
+            else
+                restore_visible_surface("kindle_commit_timeout_no_suspend_edge")
+            end
+        end)
         return true
     elseif s.platform == "kobo" then
-        logger.info("[MiuRead][PseudoLock] download complete; resuming Kobo real suspend")
-        -- KOReader deliberately suspends Kobo with Wi-Fi disabled because some
-        -- boards can fail or deadlock otherwise. We skipped that shutdown only
-        -- while pseudo-locked, so restore the native safety rule at commit.
+        s.commit_pending = true
+        s.commit_started_at = os.time()
+        s.commit_suspend_seen = false
+        s.commit_native_returned = false
+        s.commit_generation = (tonumber(s.commit_generation) or 0) + 1
+        local token = s.commit_generation
+        logger.info("[MiuRead][PseudoLock] download complete; entering confirmed Kobo suspend",
+            "generation=", tostring(token))
+
+        -- Restore KOReader's normal Kobo Wi-Fi-off safety rule immediately
+        -- before the synchronous kernel suspend call.
         local ok_nm, NetworkMgr = pcall(require, "ui/network/manager")
         if ok_nm and NetworkMgr and type(NetworkMgr.isWifiOn) == "function"
             and type(NetworkMgr.disableWifi) == "function" then
             local ok_on, on = pcall(NetworkMgr.isWifiOn, NetworkMgr)
             if ok_on and on == true then pcall(NetworkMgr.disableWifi, NetworkMgr) end
         end
-        clear_runtime("kobo_download_complete")
-        if type(Device.rescheduleSuspend) == "function" then
-            pcall(Device.rescheduleSuspend, Device, 0.2)
-            return true
-        elseif type(Device.suspend) == "function" then
-            UIManager:scheduleIn(0.2, Device.suspend, Device)
-            return true
-        end
+
+        UIManager:scheduleIn(0.05, function()
+            local current = state()
+            if not current.active or current.platform ~= "kobo"
+                or not current.commit_pending or current.commit_generation ~= token then return end
+            if type(Device.suspend) ~= "function" then
+                invalidate_commit(current)
+                restore_visible_surface("kobo_native_suspend_unavailable")
+                return
+            end
+
+            -- Keep the pseudo state until the last possible instant, but release
+            -- preventStandby immediately before the synchronous native call.
+            -- Device.suspend returns only after the kernel has resumed, which is
+            -- the confirmation beta.14 was missing. There is no timer gap here.
+            SuspendWorkLease.release("pseudo_lockscreen")
+            logger.info("[MiuRead][PseudoLock] Kobo native suspend call entered",
+                "generation=", tostring(token))
+            local ok_suspend, err = pcall(Device.suspend, Device)
+            current = state()
+            if not current.active or current.platform ~= "kobo"
+                or current.commit_generation ~= token then return end
+            current.commit_pending = false
+            current.commit_native_returned = true
+            logger.info("[MiuRead][PseudoLock] Kobo native suspend returned",
+                "ok=", tostring(ok_suspend), "generation=", tostring(token),
+                "error=", tostring(ok_suspend and "" or err))
+
+            -- Normally the wake Power/Resume edge closes the sleep screen. Keep
+            -- a short fallback for boards/firmware that return from suspend
+            -- without emitting that edge to KOReader.
+            UIManager:scheduleIn(0.35, function()
+                local after = state()
+                if after.active and after.platform == "kobo"
+                    and after.commit_native_returned == true
+                    and after.commit_generation == token then
+                    restore_visible_surface(ok_suspend and "kobo_resume_event_missing"
+                        or "kobo_native_suspend_failed")
+                end
+            end)
+        end)
+        return true
     end
     return false
 end
@@ -711,7 +921,9 @@ function M.background_task_done(reason)
     if not s.active then return false end
     logger.info("[MiuRead][PseudoLock] background task finished",
         "reason=", tostring(reason or "unknown"), "platform=", tostring(s.platform))
-    UIManager:scheduleIn(0.05, commit_if_idle)
+    -- Small quiet window: if the user presses power/opens the cover exactly as
+    -- the worker finishes, that user event is processed before auto-suspend.
+    UIManager:scheduleIn(0.35, commit_if_idle)
     return true
 end
 
