@@ -31,7 +31,7 @@ local function shell_quote(value)
     return "'" .. value:gsub("'", "'\\''") .. "'"
 end
 
-local function command_output(command)
+local function raw_command_output(command)
     local handle = io.popen(command .. " 2>/dev/null", "r")
     if not handle then return nil end
     local output = handle:read("*a") or ""
@@ -40,13 +40,51 @@ local function command_output(command)
 end
 
 local function command_exists(name)
-    local output = command_output("command -v " .. tostring(name))
+    -- `command -v` is a shell-local lookup and does not contact a system
+    -- service. Keep it outside the timeout wrapper so we can discover the
+    -- wrapper itself without recursion.
+    local output = raw_command_output("command -v " .. tostring(name))
     return output ~= nil and output:match("%S") ~= nil
 end
 
-local function shell_success(command)
-    local a, _, c = os.execute(command .. " >/dev/null 2>&1")
-    return a == true or a == 0 or c == 0
+local TIMEOUT_RUNNER = command_exists("timeout") and "timeout"
+    or (command_exists("busybox") and "busybox timeout" or nil)
+local timeout_warning_logged = false
+
+local function timeout_command(command, seconds)
+    if not TIMEOUT_RUNNER then
+        if not timeout_warning_logged then
+            timeout_warning_logged = true
+            logger.warn("[MiuRead][Bluetooth] bounded shell runner unavailable; external Bluetooth commands disabled")
+        end
+        return nil
+    end
+    seconds = math.max(1, math.floor(tonumber(seconds) or 3))
+    return TIMEOUT_RUNNER .. " " .. tostring(seconds) .. " sh -c " .. shell_quote(command)
+end
+
+local function command_output(command, seconds)
+    local wrapped = timeout_command(command, seconds)
+    if not wrapped then return nil end
+    local handle = io.popen(wrapped .. " 2>/dev/null", "r")
+    if not handle then return nil end
+    local output = handle:read("*a") or ""
+    local a, _, c = handle:close()
+    local ok = a == true or a == 0 or c == 0
+    if not ok then
+        logger.warn("[MiuRead][Bluetooth] command timed out or failed", tostring(command))
+        return nil
+    end
+    return output
+end
+
+local function shell_success(command, seconds)
+    local wrapped = timeout_command(command, seconds)
+    if not wrapped then return false end
+    local a, _, c = os.execute(wrapped .. " >/dev/null 2>&1")
+    local ok = a == true or a == 0 or c == 0
+    if not ok then logger.warn("[MiuRead][Bluetooth] command timed out or failed", tostring(command)) end
+    return ok
 end
 
 local function kindle_with_lipc(callback)
@@ -192,7 +230,7 @@ end
 
 local function bluez_show()
     if not command_exists("bluetoothctl") then return nil end
-    local output = command_output("bluetoothctl show")
+    local output = command_output("bluetoothctl show", 2)
     if not output or not output:match("Controller%s+[%x:]+") then return nil end
     return output
 end
@@ -205,7 +243,7 @@ end
 
 local function bluez_set(enabled)
     if not command_exists("bluetoothctl") then return false end
-    return shell_success("bluetoothctl power " .. (enabled and "on" or "off"))
+    return shell_success("bluetoothctl power " .. (enabled and "on" or "off"), 4)
 end
 
 local function parse_bluetoothctl_devices(output, source, target)
@@ -218,9 +256,9 @@ local function parse_bluetoothctl_devices(output, source, target)
 end
 
 local function bluez_devices()
-    local all = parse_bluetoothctl_devices(command_output("bluetoothctl devices"), "discovered")
-    local paired = parse_bluetoothctl_devices(command_output("bluetoothctl devices Paired"), "paired")
-    local connected = parse_bluetoothctl_devices(command_output("bluetoothctl devices Connected"), "connected")
+    local all = parse_bluetoothctl_devices(command_output("bluetoothctl devices", 2), "discovered")
+    local paired = parse_bluetoothctl_devices(command_output("bluetoothctl devices Paired", 2), "paired")
+    local connected = parse_bluetoothctl_devices(command_output("bluetoothctl devices Connected", 2), "connected")
     return merge_devices{
         { source = "connected", devices = connected },
         { source = "paired", devices = paired },
@@ -254,6 +292,24 @@ function M.peek()
         can_pair = cache.can_pair == true,
         checked_at = cache.checked_at,
     }
+end
+
+-- Async probes run in a subprocess so they cannot stall KOReader's event loop.
+-- Adopt only the small capability snapshot in the parent process.
+function M.adopt(state)
+    if type(state) ~= "table" then return M.peek() end
+    cache.probed = state.known == true or state.probed == true
+    cache.supported = state.supported == true
+    cache.enabled = state.enabled == true
+    cache.backend = tostring(state.backend or "none")
+    cache.can_list = state.can_list == true
+    cache.can_scan = state.can_scan == true
+    cache.can_pair = state.can_pair == true
+    cache.checked_at = tonumber(state.checked_at) or os.time()
+    logger.info("[MiuRead][Bluetooth] async capability adopted",
+        "backend=", cache.backend, "supported=", tostring(cache.supported),
+        "enabled=", tostring(cache.enabled))
+    return M.peek()
 end
 
 function M.probe(force)
@@ -345,7 +401,7 @@ function M.connect(device)
     if not state.supported or not address then return false, "invalid device" end
     if state.backend == "kindle-lipc" then return kindle_set_string("Connect", address) end
     if state.backend == "kobo-bluez" or state.backend == "bluez" then
-        return shell_success("bluetoothctl connect " .. shell_quote(address))
+        return shell_success("bluetoothctl connect " .. shell_quote(address), 8)
     end
     return false, "unsupported"
 end
@@ -356,7 +412,7 @@ function M.disconnect(device)
     if not state.supported or not address then return false, "invalid device" end
     if state.backend == "kindle-lipc" then return kindle_set_string("Disconnect", address) end
     if state.backend == "kobo-bluez" or state.backend == "bluez" then
-        return shell_success("bluetoothctl disconnect " .. shell_quote(address))
+        return shell_success("bluetoothctl disconnect " .. shell_quote(address), 6)
     end
     return false, "unsupported"
 end
@@ -367,7 +423,7 @@ function M.pair(device)
     if not state.supported or not address then return false, "invalid device" end
     if state.backend == "kindle-lipc" then return kindle_set_string("Bond", address) end
     if state.backend == "kobo-bluez" or state.backend == "bluez" then
-        return shell_success("bluetoothctl pair " .. shell_quote(address))
+        return shell_success("bluetoothctl pair " .. shell_quote(address), 15)
     end
     return false, "unsupported"
 end

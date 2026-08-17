@@ -1368,6 +1368,7 @@ function Store:migrate()
             self:save_preferences(current)
         end
         if schema<113 then
+            logger.info("[MiuRead][Migration] schema 112 -> 113 begin","from=",tostring(schema))
             -- 4.6.0-beta.2 separates reading time, in-reading progress and
             -- end-of-reading progress. Existing explicit off choices remain off;
             -- installs that used the old single progress switch move to the new
@@ -1387,6 +1388,7 @@ function Store:migrate()
             local raw_annotations=type(previous.annotation_sync)=="table" and previous.annotation_sync or {}
             if raw_annotations.close_upload_enabled==nil then current.annotation_sync.close_upload_enabled=true end
             self:save_preferences(current)
+            logger.info("[MiuRead][Migration] schema 112 -> 113 done")
         end
         self.db:saveSetting("schema",Config.SCHEMA)
     end

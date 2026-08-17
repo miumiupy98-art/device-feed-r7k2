@@ -3,6 +3,7 @@ local Digests=require("miuread.digests")
 local U=require("miuread.util")
 local logger=require("logger")
 local Updater={}; Updater.__index=Updater
+local BOOT_SESSION_KEY="__MIUREAD_UPDATE_BOOT_SESSION"
 
 function Updater:new(http,store,version,plugin_root)
     return setmetatable({http=http,store=store,version=version,plugin_root=plugin_root},self)
@@ -420,6 +421,8 @@ function Updater:install(path,manifest)
         backup=backup,
         package=path,
         installed_at=os.time(),
+        startup_attempts=0,
+        startup_confirmed=false,
     })
     logger.info("[MiuRead][Updater] update installed",
         "version=",tostring(manifest.version),
@@ -428,31 +431,149 @@ function Updater:install(path,manifest)
     return true
 end
 
-function Updater:startup()
-    local s=self.store:update_state()
-    if not s.pending then
-        self:_cleanup_update_artifacts()
-        return nil
+local function valid_plugin_tree(root)
+    root=tostring(root or "")
+    if root=="" then return false end
+    return U.file_exists(root.."/main.lua")
+        and U.file_exists(root.."/_meta.lua")
+        and U.file_exists(root.."/miuread/config.lua")
+end
+
+function Updater:_restore_backup(state,reason)
+    state=type(state)=="table" and state or {}
+    local backup=tostring(state.backup or "")
+    if backup=="" or not path_inside(self.store.updates_dir,backup) or not valid_plugin_tree(backup) then
+        logger.err("[MiuRead][Updater] rollback unavailable",
+            "reason=",tostring(reason or "startup failure"),
+            "backup=",backup~="" and backup or "missing")
+        return nil,"rollback unavailable"
     end
 
-    if tostring(s.expected)==tostring(self.version) then
+    local failed=self.plugin_root..".failed-"..tostring(os.time()).."-"..tostring(math.random(1000,9999))
+    U.remove_tree(failed)
+    local live_exists=valid_plugin_tree(self.plugin_root)
+    if live_exists then
+        local parked,park_error=os.rename(self.plugin_root,failed)
+        if not parked then
+            local copied,copy_error=U.copy_tree(self.plugin_root,failed)
+            if not copied then
+                return nil,"unable to preserve failed plugin: "..tostring(copy_error or park_error)
+            end
+            local removed,remove_error=U.remove_tree(self.plugin_root)
+            if not removed then
+                U.remove_tree(failed)
+                return nil,"unable to replace failed plugin: "..tostring(remove_error)
+            end
+        end
+    else
+        U.remove_tree(self.plugin_root)
+    end
+
+    local restored,restore_error=os.rename(backup,self.plugin_root)
+    if not restored then
+        restored,restore_error=U.copy_tree(backup,self.plugin_root)
+    end
+    if not restored or not valid_plugin_tree(self.plugin_root) then
+        U.remove_tree(self.plugin_root)
+        if live_exists and valid_plugin_tree(failed) then os.rename(failed,self.plugin_root) end
+        return nil,"rollback restore failed: "..tostring(restore_error or "invalid backup")
+    end
+
+    U.remove_tree(backup)
+    U.remove_tree(failed)
+    if state.package then self:_remove_download(state.package) end
+    self.store:save_update_state({})
+    self:_cleanup_update_artifacts()
+    logger.warn("[MiuRead][Updater] previous version restored after unconfirmed startup",
+        "expected=",tostring(state.expected),
+        "reason=",tostring(reason or "startup failure"))
+    return true
+end
+
+-- Called immediately after Store:new(), before optional device probes or UI
+-- setup. A freshly installed version gets exactly one trial startup. If KOReader
+-- had to be force-restarted before that trial was confirmed, the next launch
+-- restores the saved plugin tree before any non-essential startup work runs.
+function Updater:begin_startup()
+    local s=self.store:update_state()
+    if not s.pending then return nil end
+
+    local expected=tostring(s.expected or "")
+    local running=tostring(self.version or "")
+    -- FileManager and ReaderUI may instantiate the plugin more than once in the
+    -- same KOReader process. Count a trial only once per process; otherwise a
+    -- fast context switch could look like a failed reboot and trigger rollback.
+    local boot_session=rawget(_G,BOOT_SESSION_KEY)
+    if type(boot_session)=="table"
+        and tostring(boot_session.expected or "")==expected
+        and tostring(boot_session.running or "")==running then
+        return boot_session.state
+    end
+    if expected~=running then
+        -- The user has already put an older plugin tree back in place. Do not
+        -- leave the stale pending marker blocking all future updates. Only the
+        -- updater artifacts are removed; account/library data are untouched.
         if s.backup then U.remove_tree(s.backup) end
         if s.package then self:_remove_download(s.package) end
         self.store:save_update_state({})
         self:_cleanup_update_artifacts()
-        logger.info("[MiuRead][Updater] update confirmed; rollback files removed",
-            "version=",tostring(self.version))
-        return "updated"
+        logger.warn("[MiuRead][Updater] stale pending state cleared after external rollback",
+            "expected=",expected,"running=",running)
+        rawset(_G,BOOT_SESSION_KEY,{expected=expected,running=running,state="recovered"})
+        return "recovered"
     end
 
-    local protected={}
-    if type(s.backup)=="string" and s.backup~="" then protected[s.backup]=true end
-    if type(s.package)=="string" and s.package~="" then protected[s.package]=true end
-    self:_cleanup_update_artifacts(protected)
-    logger.warn("[MiuRead][Updater] update still pending",
-        "expected=",tostring(s.expected),
-        "running=",tostring(self.version))
-    return "mismatch"
+    local attempts=tonumber(s.startup_attempts or 0) or 0
+    if s.startup_confirmed~=true and attempts>=1 then
+        local ok,err=self:_restore_backup(s,"previous startup was not confirmed")
+        if ok then
+            rawset(_G,BOOT_SESSION_KEY,{expected=expected,running=running,state="rolled_back"})
+            return "rolled_back"
+        end
+        logger.err("[MiuRead][Updater] automatic rollback failed",tostring(err))
+        return "rollback_failed"
+    end
+
+    s.startup_attempts=attempts+1
+    s.startup_confirmed=false
+    s.startup_started_at=os.time()
+    self.store:save_update_state(s)
+    logger.info("[MiuRead][Updater] trial startup armed",
+        "version=",running,"attempt=",tostring(s.startup_attempts))
+    rawset(_G,BOOT_SESSION_KEY,{expected=expected,running=running,state="trial"})
+    return "trial"
+end
+
+-- Confirmation is deliberately separate from begin_startup(). main.lua calls
+-- this only after KOReader has returned to its event loop, so a plugin that
+-- hangs during init never loses its rollback copy.
+function Updater:confirm_startup()
+    local s=self.store:update_state()
+    if not s.pending or tostring(s.expected or "")~=tostring(self.version or "") then return nil end
+    s.startup_confirmed=true
+    s.startup_confirmed_at=os.time()
+    self.store:save_update_state(s)
+    if s.backup then U.remove_tree(s.backup) end
+    if s.package then self:_remove_download(s.package) end
+    self.store:save_update_state({})
+    self:_cleanup_update_artifacts()
+    logger.info("[MiuRead][Updater] update confirmed after responsive startup",
+        "version=",tostring(self.version))
+    rawset(_G,BOOT_SESSION_KEY,{expected=tostring(s.expected or ""),running=tostring(self.version or ""),state="updated"})
+    return "updated"
+end
+
+function Updater:cleanup_idle()
+    local s=self.store:update_state()
+    if s.pending then return false end
+    self:_cleanup_update_artifacts()
+    return true
+end
+
+-- Compatibility entry point for callers outside main.lua. It no longer
+-- confirms an update synchronously during Plugin:init().
+function Updater:startup()
+    return self:begin_startup()
 end
 
 return Updater

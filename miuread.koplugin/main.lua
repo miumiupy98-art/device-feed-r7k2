@@ -568,20 +568,29 @@ end
 function Plugin:init()
     math.randomseed(os.time()+math.floor(collectgarbage("count")))
     sync_home_session()
+    logger.info("[MiuRead][Startup] begin","version=",tostring(Config.VERSION))
+    logger.info("[MiuRead][Startup] store begin")
     self.store=Store:new()
-    -- Probe Bluetooth once for the whole KOReader session, just like a device
-    -- capability flag. Pull-down rendering only reads the shared memory cache.
-    local bluetooth_startup_state=Bluetooth.probe(false)
-    self:_bluetooth_migrate_panel(bluetooth_startup_state)
-    local lockscreen_direct_version=tonumber(self.store:get("lockscreen_direct_version",0)) or 0
-    if lockscreen_direct_version<1 then
-        -- beta.10 no longer writes pre-rendered sleep-screen PNGs. Remove only
-        -- MiuRead's obsolete derivatives; raw covers and KOReader data stay intact.
-        U.remove_tree(self.store.data_dir.."/lockscreen")
-        U.remove_tree(self.store.data_dir.."/lockscreen-source")
-        self.store:set("lockscreen_direct_version",1)
-        logger.info("[MiuRead][Lockscreen] legacy derivative cache removed")
+    logger.info("[MiuRead][Startup] store ready")
+
+    -- OTA safety must run before Bluetooth, cache cleanup, network setup or any
+    -- other optional startup work. A newly installed build gets one trial boot;
+    -- an unconfirmed second boot restores the previous plugin tree and restarts
+    -- KOReader before the risky build can execute the rest of Plugin:init().
+    self.updater=Updater:new(nil,self.store,Config.VERSION,ROOT)
+    self._update_boot_state=self.updater:begin_startup()
+    logger.info("[MiuRead][Startup] updater boot state",tostring(self._update_boot_state or "none"))
+    if self._update_boot_state=="rolled_back" then
+        logger.warn("[MiuRead][Startup] restored previous plugin; restarting KOReader")
+        UIManager:scheduleIn(.05,function() UIManager:quit(85) end)
+        return
     end
+
+    -- Do not probe Bluetooth here. On Kobo the BlueZ service may be absent or
+    -- unresponsive immediately after a restart. Startup only reads the in-memory
+    -- cache; the real probe is deferred to a bounded subprocess after the UI is
+    -- responsive. Legacy lockscreen derivative cleanup is deferred for the same
+    -- reason: neither task is required to enter KOReader.
     local runtime_mode=rawget(_G,RUNTIME_MODE_KEY)
     if runtime_mode~="desktop" and runtime_mode~="plugin" then
         local configured=((self.store:preferences().home_ui or {}).enabled~=false)
@@ -709,6 +718,7 @@ function Plugin:init()
         "schema=", tostring(Config.SCHEMA), "root=", tostring(ROOT))
     sanitize_saved_auth(self.store)
     self.http=Http:new(self.store)
+    self.updater.http=self.http
     self.reader=Reader:new(self.http,self.store)
     self.api=Api:new(self.http,self.store,self.reader)
     self.mp=MP:new(self.reader,self.http,self.store,self.api)
@@ -754,6 +764,9 @@ function Plugin:init()
     -- Update manifest/package network I/O must never occupy the UI loop.
     -- Installation itself stays foreground because it replaces the live plugin tree.
     self.updater_async=Async:new(self.store,{poll_interval=.30,allow_android=true,disable_fallback=true})
+    -- Bluetooth capability discovery touches platform services. Keep it in a
+    -- separate bounded subprocess so Kobo/BlueZ can never stall the UI loop.
+    self.bluetooth_async=Async:new(self.store,{poll_interval=.20,allow_android=true,disable_fallback=true})
     -- Summary scans may touch one SQLite cache per annotated book. Keep them
     -- out of every home tap and pull-down path.
     self.sync_summary_async=Async:new(self.store,{poll_interval=.45,allow_android=true,disable_fallback=true})
@@ -777,7 +790,6 @@ function Plugin:init()
     end
     self.auth_flow=Auth:new(self.http,self.store,self)
     self.sync=Sync:new(self.reader,self.api,self.store,self,self.async,self.identity_async)
-    self.updater=Updater:new(self.http,self.store,self.version,ROOT)
     self._suspended_at=nil
     self._cover_generation=0
     self._cover_refresh_task=nil
@@ -885,13 +897,38 @@ function Plugin:init()
     end
     self.ui.menu:registerToMainMenu(self)
     if self._reader_context and self:_home_enabled() then self:_install_reader_home_bridge() end
+
+    -- Do not confirm a freshly installed build from inside Plugin:init(). The
+    -- callback below only runs after control has returned to UIManager, proving
+    -- that startup reached a responsive event loop. Until then the old plugin
+    -- backup remains available for automatic rollback on the next launch.
+    if self._update_boot_state=="trial" then
+        UIManager:scheduleIn(1.25,function()
+            if not self.updater then return end
+            local state=self.updater:confirm_startup()
+            if state=="updated" then
+                logger.info("[MiuRead][Startup] responsive startup confirmed")
+                self:status_toast("更新完成","当前运行版本 "..tostring(self.version),4)
+            end
+        end)
+    elseif self._update_boot_state=="recovered" then
+        UIManager:scheduleIn(1.0,function()
+            self:status_toast("更新状态已恢复","已清除上次失败更新的残留状态",4)
+        end)
+    elseif self._update_boot_state=="rollback_failed" then
+        UIManager:scheduleIn(1.0,function()
+            self:info("检测到上次更新启动未完成，但自动恢复旧版本失败。\n\n当前版本不会被标记为更新成功，请保留日志并手动恢复插件文件。")
+        end)
+    end
+
+    self:_schedule_bluetooth_startup_probe(1.8)
+    UIManager:scheduleIn(3.0,function() self:_cleanup_legacy_lockscreen_derivatives() end)
+    UIManager:scheduleIn(4.0,function()
+        if self.updater then self.updater:cleanup_idle() end
+    end)
+    logger.info("[MiuRead][Startup] core ready")
+
     if not self._reader_context then
-        local state=self.updater:startup()
-        if state=="updated" then
-            UIManager:scheduleIn(1,function() self:status_toast("更新完成","当前运行版本 "..tostring(self.version),4) end)
-        elseif state=="mismatch" then
-            UIManager:scheduleIn(1,function() self:info("更新文件已经替换，但当前运行版本与目标版本不一致。\n\n请完整退出并重新启动 KOReader。\n当前运行："..tostring(self.version)) end)
-        end
         UIManager:scheduleIn(.8,function() if not self:_current_document_path() then self:_install_pending_downloads(false) end end)
         UIManager:scheduleIn(1.4,function() self:_show_auth_notice() end)
         UIManager:scheduleIn(5.0,function() self:maybe_auto_check_update(false) end)
@@ -2681,6 +2718,58 @@ function Plugin:show_shelf(mp_mode,force_remote,section)
     end,force_remote,section)
 end
 
+
+function Plugin:_cleanup_legacy_lockscreen_derivatives()
+    if not self.store then return end
+    local lockscreen_direct_version=tonumber(self.store:get("lockscreen_direct_version",0)) or 0
+    if lockscreen_direct_version>=1 then return end
+    local ok,err=pcall(function()
+        U.remove_tree(self.store.data_dir.."/lockscreen")
+        U.remove_tree(self.store.data_dir.."/lockscreen-source")
+        self.store:set("lockscreen_direct_version",1)
+    end)
+    if ok then
+        logger.info("[MiuRead][Lockscreen] legacy derivative cache removed after startup")
+    else
+        logger.warn("[MiuRead][Lockscreen] deferred legacy cache cleanup failed",tostring(err))
+    end
+end
+
+function Plugin:_schedule_bluetooth_startup_probe(delay)
+    if self._bluetooth_startup_probe_scheduled then return end
+    self._bluetooth_startup_probe_scheduled=true
+    local cached=Bluetooth.peek()
+    if cached.known==true then
+        self:_bluetooth_migrate_panel(cached)
+        return
+    end
+    delay=tonumber(delay) or 1.8
+    logger.info("[MiuRead][Bluetooth] startup probe deferred","delay=",tostring(delay))
+    UIManager:scheduleIn(delay,function()
+        if not self.bluetooth_async or not self.bluetooth_async:available() then
+            logger.warn("[MiuRead][Bluetooth] async probe unavailable; leaving capability unknown")
+            return
+        end
+        if self.bluetooth_async:busy() then return end
+        local started,err=self.bluetooth_async:run("bluetooth-capability",function()
+            return Bluetooth.probe(true)
+        end,function(result)
+            if not result or result.ok~=true or type(result.value)~="table" then
+                logger.warn("[MiuRead][Bluetooth] deferred probe failed",
+                    tostring(result and result.error or "no result"))
+                return
+            end
+            local state=Bluetooth.adopt(result.value)
+            self:_bluetooth_migrate_panel(state)
+            logger.info("[MiuRead][Bluetooth] deferred probe complete",
+                "supported=",tostring(state.supported==true),
+                "backend=",tostring(state.backend or "none"))
+        end,6)
+        if not started then
+            logger.warn("[MiuRead][Bluetooth] unable to start deferred probe",tostring(err))
+        end
+    end)
+end
 
 function Plugin:_bluetooth_migrate_panel(state)
     state=type(state)=="table" and state or Bluetooth.peek()
