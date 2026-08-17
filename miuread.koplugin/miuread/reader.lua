@@ -414,6 +414,14 @@ local function image_remote_url(value)
     if url:match("^https?://") then return url end
 end
 
+local function image_is_font_reference(value)
+    local clean=image_trim(value):lower():gsub("[?#].*$", "")
+    return clean:match("%.woff2?$") ~= nil
+        or clean:match("%.ttf$") ~= nil
+        or clean:match("%.otf$") ~= nil
+        or clean:match("%.eot$") ~= nil
+end
+
 local function image_used_hrefs(assets)
     local used = {}
     for _, asset in ipairs(assets or {}) do used[tostring(asset.href or "")] = true end
@@ -444,12 +452,12 @@ end
 
 local function image_tar_assets_file(archive_path,work_root,opt)
     local extract_dir=work_root.."/tar"
-    local entries,extract_error=Codec.tar_file(archive_path,extract_dir,function(bytes,count)
+    local entries,extract_error,extract_status=Codec.tar_file(archive_path,extract_dir,function(bytes,count)
         if opt and type(opt.activity)=="function" then
             pcall(opt.activity,"image_extract",{bytes=bytes,count=count})
         end
     end)
-    if not entries then return nil,nil,extract_error end
+    if not entries then return nil,nil,extract_error,extract_status end
     local names={}
     for name in pairs(entries) do names[#names+1]=name end
     table.sort(names)
@@ -473,7 +481,7 @@ local function image_tar_assets_file(archive_path,work_root,opt)
             os.remove(path)
         end
     end
-    return assets,source_map
+    return assets,source_map,extract_error,extract_status
 end
 
 local function localize_epub_images(reader, xhtml, assets, source_map, state, css, opt)
@@ -485,9 +493,23 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
     local summary = {
         tar=#assets,remote=0,discovered=0,localized=0,optional=0,recovered=0,stale=0,missing=0,
         required_discovered=0,required_localized=0,required_missing=0,
-        optional_dropped=0,stale_dropped=0,embedded=0,
+        optional_dropped=0,stale_dropped=0,embedded=0,fonts_skipped=0,
     }
     local text_length = readable_text_length(xhtml)
+
+    -- WeRead chapter CSS may reference remote web fonts. Fonts are presentation
+    -- resources, not正文 images: a dead font CDN must never make a chapter
+    -- incomplete. Remove @font-face blocks so the EPUB cleanly falls back to
+    -- KOReader's local fonts and never depends on the network while reading.
+    local function strip_font_faces(value)
+        return tostring(value or ""):gsub("@[fF][oO][nN][tT]%-[fF][aA][cC][eE]%s*%b{}",function(block)
+            local _,count=tostring(block):gsub("[uU][rR][lL]%s*%(","")
+            summary.fonts_skipped=summary.fonts_skipped+math.max(1,count)
+            return ""
+        end)
+    end
+    xhtml=strip_font_faces(xhtml)
+    css=strip_font_faces(css)
     local used_local_src, pending = {}, {}
 
     local function normalize_asset_href(value)
@@ -665,6 +687,12 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
             end
             if clean:lower():match("^data:") then
                 summary.embedded=summary.embedded+1
+                return "url("..tostring(source or "")..")"
+            end
+            if image_is_font_reference(clean) then
+                summary.fonts_skipped=summary.fonts_skipped+1
+                logger.dbg("[MiuRead][Reader] CSS font reference ignored for chapter completeness",
+                    "src=",Util.redact_url(clean))
                 return "url("..tostring(source or "")..")"
             end
             summary.discovered=summary.discovered+1
@@ -970,12 +998,20 @@ function Reader:_epub_once(book, chapter, opt, state)
             })
             if ok_tar and path_or_error and Util.file_exists(path_or_error) then
                 if type(opt.yield)=="function" then opt.yield("images") end
-                local tar_assets, tar_map, extract_error = image_tar_assets_file(path_or_error,work_root,opt)
+                local tar_assets, tar_map, extract_error, extract_status = image_tar_assets_file(path_or_error,work_root,opt)
                 os.remove(archive_path)
                 if tar_assets then
-                    state.image_archive_ok = true
+                    local partial=type(extract_status)=="table" and extract_status.partial==true
+                    state.image_archive_partial=partial
+                    state.image_archive_error=partial and tostring(extract_status.error or extract_error or "") or nil
+                    state.image_archive_ok = not partial
                     for _, asset in ipairs(tar_assets) do assets[#assets + 1] = asset end
                     for key, href in pairs(tar_map) do source_map[key] = href end
+                    if partial then
+                        logger.warn("[MiuRead][Reader] chapter image archive partially recovered",
+                            "chapter=",tostring(uid),"url=",Util.redact_url(tar_url),
+                            "images=",tostring(#tar_assets),"error=",tostring(state.image_archive_error))
+                    end
                     collectgarbage("collect")
                 else
                     logger.warn("[MiuRead][Reader] chapter image archive extract failed", "chapter=", tostring(uid),
@@ -1001,7 +1037,7 @@ function Reader:_epub_once(book, chapter, opt, state)
             state.image_summary = {
                 tar=#assets,remote=0,discovered=#assets,localized=#assets,optional=0,recovered=0,stale=0,missing=0,
                 required_discovered=#assets,required_localized=#assets,required_missing=0,
-                optional_dropped=0,stale_dropped=0,embedded=0,
+                optional_dropped=0,stale_dropped=0,embedded=0,fonts_skipped=0,
             }
             logger.info("[MiuRead][Reader] empty text chapter preserved as image-only page",
                 "chapter=", tostring(uid), "title=", tostring(chapter.title or ""), "images=", tostring(#assets))
@@ -1013,10 +1049,12 @@ function Reader:_epub_once(book, chapter, opt, state)
         logger.info("[MiuRead][Reader] chapter images", "chapter=", tostring(uid),
             "tar=", tostring(state.image_summary.tar), "remote=", tostring(state.image_summary.remote),
             "localized=", tostring(state.image_summary.localized), "optional=", tostring(state.image_summary.optional or 0),
+            "fonts_skipped=",tostring(state.image_summary.fonts_skipped or 0),
             "recovered=", tostring(state.image_summary.recovered or 0), "stale=", tostring(state.image_summary.stale or 0),
-            "missing=", tostring(state.image_summary.missing))
-        if tonumber(state.image_summary.missing or 0) > 0 then
-            error("正文图片未完整获取：" .. tostring(state.image_summary.missing) .. " 个真实资源仍缺失")
+            "required_missing=", tostring(state.image_summary.required_missing or 0),
+            "archive_partial=",tostring(state.image_archive_partial==true))
+        if tonumber(state.image_summary.required_missing or 0) > 0 then
+            error("正文图片未完整获取：" .. tostring(state.image_summary.required_missing) .. " 个真实资源仍缺失")
         end
         if not has_readable_content(xhtml, true) then
             xhtml = structure_xhtml(chapter.title or "")

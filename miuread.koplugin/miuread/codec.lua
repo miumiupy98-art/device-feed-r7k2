@@ -177,13 +177,25 @@ function Codec.tar_file(path,destination,on_progress)
     if not input then return nil,open_error end
     local out={}
     local long_name,pax_name
-    local index,total_read=0,0
+    local index,total_read,completed=0,0,0
     local chunk_size=128*1024
 
     local function close_with_error(message)
         input:close()
         Util.remove_tree(destination)
-        return nil,message
+        return nil,message,{partial=false,error=message,entries=completed,bytes=total_read}
+    end
+    local function close_partial(message)
+        input:close()
+        return out,nil,{partial=true,error=message,entries=completed,bytes=total_read}
+    end
+    local function truncated(message)
+        -- Preserve fully extracted entries when only the tail/current entry is
+        -- truncated. The caller still validates every required image reference before the
+        -- chapter is accepted, so partial extraction cannot silently lose an
+        -- image that is actually required.
+        if completed>0 then return close_partial(message) end
+        return close_with_error(message)
     end
     local function read_exact(size)
         if size<=0 then return "" end
@@ -212,7 +224,7 @@ function Codec.tar_file(path,destination,on_progress)
     while true do
         local header=input:read(512)
         if not header then break end
-        if #header~=512 then return close_with_error("truncated tar header") end
+        if #header~=512 then return truncated("truncated tar header") end
         total_read=total_read+512
         if header:gsub("\0","")=="" then break end
         local name=tar_text(header:sub(1,100))
@@ -224,10 +236,10 @@ function Codec.tar_file(path,destination,on_progress)
 
         if kind=="L" or kind=="x" then
             local body,read_error=read_exact(size)
-            if not body then return close_with_error(read_error) end
+            if not body then return truncated(read_error) end
             if kind=="L" then long_name=tar_text(body) else pax_name=tar_pax_path(body) end
             local ok,skip_error=skip(padded-size)
-            if not ok then return close_with_error(skip_error) end
+            if not ok then return truncated(skip_error) end
         elseif kind=="0" or kind=="\0" or kind=="" then
             local final_name=pax_name or long_name or name
             index=index+1
@@ -248,11 +260,12 @@ function Codec.tar_file(path,destination,on_progress)
             local flushed,flush_error=output:flush()
             output:close()
             if not failed and flushed==nil then failed=flush_error or "tar entry flush failed" end
-            if failed then os.remove(target); return close_with_error(failed) end
+            if failed then os.remove(target); return truncated(failed) end
             local ok,skip_error=skip(padded-size)
-            if not ok then os.remove(target); return close_with_error(skip_error) end
+            if not ok then os.remove(target); return truncated(skip_error) end
             if final_name~="" and size>0 then
                 out[final_name]={path=target,size=size}
+                completed=completed+1
             else
                 os.remove(target)
             end
@@ -260,12 +273,12 @@ function Codec.tar_file(path,destination,on_progress)
             report()
         else
             local ok,skip_error=skip(padded)
-            if not ok then return close_with_error(skip_error) end
+            if not ok then return truncated(skip_error) end
             report()
         end
     end
     input:close()
-    return out
+    return out,nil,{partial=false,entries=completed,bytes=total_read}
 end
 
 function Codec.media(data, hint)

@@ -864,7 +864,21 @@ function Http:download_to_file(url,path,opt)
         os.remove(path)
         error("download returned empty content")
     end
-    return path,headers,final,{length=size,preview=preview}
+    local expected=tonumber(hget(headers,"content-length") or "")
+    if expected and expected>=0 and size~=expected then
+        os.remove(path)
+        local attempt=math.max(1,tonumber(request_opt._integrity_attempt) or 1)
+        local maximum=math.max(1,tonumber(request_opt.integrity_attempts) or 2)
+        logger.warn("[MiuRead][HTTP] streamed download length mismatch",
+            "url=",Util.redact_url(url),"expected=",tostring(expected),"received=",tostring(size),
+            "attempt=",tostring(attempt),"maximum=",tostring(maximum))
+        if attempt<maximum then
+            request_opt._integrity_attempt=attempt+1
+            return self:download_to_file(url,path,request_opt)
+        end
+        error("download incomplete: expected "..tostring(expected).." bytes, received "..tostring(size))
+    end
+    return path,headers,final,{length=size,expected_length=expected,preview=preview}
 end
 
 Http.auth_error_code = auth_error_code
