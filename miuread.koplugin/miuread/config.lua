@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.7.0-beta.6",
+    VERSION = "4.7.0-beta.7",
     SCHEMA = 113,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -134,6 +134,16 @@ local C = {
     DOWNLOAD_NETWORK_FAILURE_BREAKER = 3,
     DOWNLOAD_NETWORK_RECOVERY_POLL_SECONDS = 6,
     DOWNLOAD_NETWORK_RECOVERY_MAX_POLL_SECONDS = 15,
+    -- beta.7 keeps a healthy lock-screen download alive, but actively watches
+    -- the Kindle Wi-Fi link once the worker enters the shared network-wait
+    -- state. A lost radio/association gets a few non-interactive restore
+    -- attempts; prolonged WAN/server failure releases the standby lock first
+    -- and then hibernates the worker from its existing chapter checkpoint.
+    DOWNLOAD_NETWORK_GUARD_POLL_SECONDS = 10,
+    DOWNLOAD_NETWORK_RESTORE_COOLDOWN_SECONDS = 25,
+    DOWNLOAD_NETWORK_RESTORE_MAX_ATTEMPTS = 3,
+    DOWNLOAD_NETWORK_LOCK_MAX_SECONDS = 90,
+    DOWNLOAD_NETWORK_HIBERNATE_SECONDS = 120,
     DOWNLOAD_BACKGROUND_KEEPALIVE_SECONDS = 12,
     DOWNLOAD_BACKGROUND_STALL_SLEEP_SECONDS = 300,
 

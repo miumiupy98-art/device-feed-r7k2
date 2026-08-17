@@ -363,6 +363,21 @@ function DownloadTask:on_resume(generation)
     return self:_replace_transient_pause_reasons(false)
 end
 
+function DownloadTask:on_user_resume_begin(generation)
+    -- The user's power-key wake always wins over a lock-screen download. Drop
+    -- MiuRead's preventStandby claim before any resume bookkeeping or network
+    -- recovery runs. A healthy worker may reacquire it later, after the visible
+    -- surface has already returned.
+    self.power_mode = "RESUMING"
+    self.power_generation = tonumber(generation or 0) or 0
+    if self.job then self.job.last_keepalive=nil end
+    local held=self.standby_held==true
+    self:_release_awake()
+    logger.info("[MiuRead][DownloadTask] user resume priority",
+        "wake_lock_released=",tostring(held),"pid=",tostring(self.job and self.job.pid or ""))
+    return true
+end
+
 function DownloadTask:stop_for_foreground(reason)
     reason=tostring(reason or "foreground_recovery")
     local task=self:_control_descriptor()
@@ -445,6 +460,13 @@ function DownloadTask:can_continue_locked()
     end
 
     local now = os.time()
+    local network_waiting=stage=="waiting_network" or progress.waiting_network==true
+    local network_wait_started=tonumber(progress.network_wait_started_at)
+        or tonumber(self.job and self.job.waiting_started_at)
+    local network_lock_max=math.max(45,tonumber(Config.DOWNLOAD_NETWORK_LOCK_MAX_SECONDS) or 90)
+    if network_waiting and network_wait_started and now-network_wait_started>=network_lock_max then
+        return false,"network_wait_timeout"
+    end
     local stall = math.max(120, tonumber(Config.DOWNLOAD_BACKGROUND_STALL_SLEEP_SECONDS) or 300)
     local updated = tonumber(progress.updated_at)
         or tonumber(self.job and self.job.last_effective_progress_at)
@@ -550,6 +572,67 @@ function DownloadTask:_release_awake()
     logger.info("[MiuRead][DownloadTask] standby lock released")
 end
 
+function DownloadTask:_network_link_state()
+    local ok,NetworkMgr=pcall(require,"ui/network/manager")
+    if not ok or not NetworkMgr then return nil end
+    if type(NetworkMgr.queryNetworkState)=="function" then
+        pcall(NetworkMgr.queryNetworkState,NetworkMgr)
+    end
+    local wifi_on,connected=nil,nil
+    if type(NetworkMgr.isWifiOn)=="function" then
+        local good,value=pcall(NetworkMgr.isWifiOn,NetworkMgr)
+        if good then wifi_on=value==true end
+    end
+    if type(NetworkMgr.isConnected)=="function" then
+        local good,value=pcall(NetworkMgr.isConnected,NetworkMgr)
+        if good then connected=value==true end
+    end
+    return {manager=NetworkMgr,wifi_on=wifi_on,connected=connected}
+end
+
+function DownloadTask:_maybe_restore_network(job,now,wait_age)
+    if not job or wait_age<=0 then return false,"not_waiting" end
+    local initial=math.max(5,tonumber(Config.DOWNLOAD_NETWORK_GUARD_POLL_SECONDS) or 10)
+    if wait_age<initial then return false,"grace" end
+    local cooldown=math.max(10,tonumber(Config.DOWNLOAD_NETWORK_RESTORE_COOLDOWN_SECONDS) or 25)
+    local last=tonumber(job.last_network_restore_at) or 0
+    if now-last<cooldown then return false,"cooldown" end
+    local maximum=math.max(1,tonumber(Config.DOWNLOAD_NETWORK_RESTORE_MAX_ATTEMPTS) or 3)
+    local attempts=tonumber(job.network_restore_attempts) or 0
+    if attempts>=maximum then return false,"attempt_limit" end
+
+    local link=self:_network_link_state()
+    if not link or not link.manager then return false,"manager_unavailable" end
+    -- If the Kindle still has an address, this is a WAN/server failure rather
+    -- than a local Wi-Fi drop. Do not churn a healthy association.
+    if link.wifi_on==true and link.connected==true then return false,"link_up" end
+    if link.manager.pending_connection==true then return false,"connection_pending" end
+
+    job.last_network_restore_at=now
+    job.network_restore_attempts=attempts+1
+    local restored=false
+    local method="none"
+    if type(link.manager.restoreWifiAsync)=="function" then
+        local called=pcall(link.manager.restoreWifiAsync,link.manager)
+        restored=called==true
+        method="restoreWifiAsync"
+    elseif type(link.manager.enableWifi)=="function" then
+        local called,value=pcall(link.manager.enableWifi,link.manager,nil,false)
+        restored=called==true and value~=false
+        method="enableWifi"
+    elseif type(link.manager.turnOnWifi)=="function" then
+        local called,value=pcall(link.manager.turnOnWifi,link.manager,nil,false)
+        restored=called==true and value~=false
+        method="turnOnWifi"
+    end
+    logger.warn("[MiuRead][DownloadTask] network link recovery requested",
+        "attempt=",tostring(job.network_restore_attempts),
+        "method=",method,"wifi_on=",tostring(link.wifi_on),
+        "connected=",tostring(link.connected),"wait=",tostring(wait_age),
+        "requested=",tostring(restored))
+    return restored,method
+end
+
 function DownloadTask:available()
     return type(FFIUtil.runInSubProcess) == "function"
         and type(FFIUtil.isSubProcessDone) == "function"
@@ -561,6 +644,10 @@ end
 
 function DownloadTask:is_hibernated()
     return self.hibernated ~= nil
+end
+
+function DownloadTask:hibernated_reason()
+    return self.hibernated and tostring(self.hibernated.reason or "") or nil
 end
 
 function DownloadTask:stage()
@@ -605,14 +692,17 @@ function DownloadTask:_heavy_watch(force)
         return false
     end
     self.last_heavy_watch_at=now
+    local progress_at=tonumber(job.last_effective_progress_at or job.last_progress_at or job.started_at) or now
     local snapshot={updated_at=now,owner="download",stage=stage,pid=job.pid,
         memory_kb=memory and memory.available_kb or nil,paused=self:is_paused(),
-        pause_ack=self:worker_pause_acknowledged(),wake_lock=self.standby_held==true}
+        pause_ack=self:worker_pause_acknowledged(),wake_lock=self.standby_held==true,
+        last_progress_age=math.max(0,now-progress_at)}
     U.atomic_write(self.heavy_watch_path,Json.encode(snapshot),true)
     logger.info("[MiuRead][HeavyWatch]",
         "owner=download","stage=",stage,"memory_kb=",tostring(snapshot.memory_kb or "unknown"),
         "pid=",tostring(job.pid or ""),"paused=",tostring(snapshot.paused),
-        "pause_ack=",tostring(snapshot.pause_ack),"wake_lock=",tostring(snapshot.wake_lock))
+        "pause_ack=",tostring(snapshot.pause_ack),"wake_lock=",tostring(snapshot.wake_lock),
+        "last_progress_age=",tostring(snapshot.last_progress_age))
     return true
 end
 
@@ -644,9 +734,14 @@ function DownloadTask:_read_progress(job)
         job.last_progress_state = state
         job.last_progress_at = tonumber(state.updated_at) or file_mtime(job.progress_path) or os.time()
         if state.stage=="waiting_network" or state.waiting_network==true then
-            job.waiting_started_at=job.waiting_started_at or job.last_progress_at
+            job.waiting_started_at=tonumber(state.network_wait_started_at)
+                or job.waiting_started_at or job.last_progress_at
         else
             job.waiting_started_at=nil
+            job.network_restore_attempts=0
+            job.last_network_restore_at=nil
+            job.network_sleep_notified=nil
+            job.network_hibernate_requested_at=nil
             job.last_effective_progress_at=job.last_progress_at
         end
         job.waiting_notified = false
@@ -775,7 +870,9 @@ function DownloadTask:_handle_hibernated(job,result)
     state.stage="hibernated"
     state.hibernated=true
     state.hibernate_reason=tostring(result and result.reason or "heavy_resource")
-    state.message="为前台释放资源，下载已安全休眠"
+    state.message=state.hibernate_reason=="network_offline"
+        and "网络长时间不可用，下载断点已保存；联网后继续"
+        or "为前台释放资源，下载已安全休眠"
     state.updated_at=os.time()
     local h={book=serializable_copy(job.restart_book),options=options,on_progress=job.on_progress,on_done=job.on_done,
         restart_count=tonumber(job.restart_count) or 0,stall_restart_count=tonumber(job.stall_restart_count) or 0,
@@ -946,6 +1043,44 @@ function DownloadTask:_poll()
     end
 
     local now=os.time()
+    local progress_state=job.last_progress_state or {}
+    local network_waiting=progress_state.stage=="waiting_network" or progress_state.waiting_network==true
+    local network_wait_started=tonumber(progress_state.network_wait_started_at)
+        or tonumber(job.waiting_started_at)
+    local network_wait_age=network_waiting and network_wait_started
+        and math.max(0,now-network_wait_started) or 0
+    if network_waiting then
+        self:_maybe_restore_network(job,now,network_wait_age)
+        local lock_max=math.max(45,tonumber(Config.DOWNLOAD_NETWORK_LOCK_MAX_SECONDS) or 90)
+        if network_wait_age>=lock_max then
+            if self.standby_held then self:_release_awake() end
+            if job.network_sleep_notified~=true then
+                job.network_sleep_notified=true
+                local state=U.copy(progress_state)
+                state.message="网络暂未恢复，已允许设备正常休眠；下载断点不会丢失"
+                state.network_wait_seconds=network_wait_age
+                state.updated_at=now
+                if job.on_progress then pcall(job.on_progress,state) end
+                logger.warn("[MiuRead][DownloadTask] offline download released standby",
+                    "pid=",tostring(job.pid),"wait=",tostring(network_wait_age))
+            end
+        end
+        local hibernate_after=math.max(lock_max+15,tonumber(Config.DOWNLOAD_NETWORK_HIBERNATE_SECONDS) or 120)
+        if network_wait_age>=hibernate_after and not job.network_hibernate_requested_at then
+            job.network_hibernate_requested_at=now
+            local state=U.copy(progress_state)
+            state.message="网络长时间不可用，正在保存断点并暂停后台下载"
+            state.network_wait_seconds=network_wait_age
+            state.updated_at=now
+            if job.on_progress then pcall(job.on_progress,state) end
+            local requested,reason=self:request_hibernate("network_offline")
+            logger.warn("[MiuRead][DownloadTask] offline download hibernate",
+                "pid=",tostring(job.pid),"wait=",tostring(network_wait_age),
+                "requested=",tostring(requested),"reason=",tostring(reason or ""))
+            if requested then return end
+        end
+    end
+
     local stall_sleep=math.max(120,tonumber(Config.DOWNLOAD_BACKGROUND_STALL_SLEEP_SECONDS) or 300)
     local effective_activity=tonumber(job.last_effective_progress_at or job.started_at) or now
     local effective_idle=math.max(0,now-effective_activity)
@@ -1531,6 +1666,8 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                         percent = percent,
                         message = detail.message,
                         waiting_network = detail.waiting_network==true or stage=="waiting_network" or nil,
+                        network_wait_started_at = detail.network_wait_started_at,
+                        network_wait_seconds = detail.network_wait_seconds,
                     }
                 end)
                 return {

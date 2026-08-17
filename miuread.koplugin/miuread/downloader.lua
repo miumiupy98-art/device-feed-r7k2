@@ -1520,6 +1520,8 @@ function Downloader:book(input, opt, progress)
             progress("waiting_network",index,expected,chapter.title,{
                 message="网络连接中断，已保存进度，等待网络恢复",
                 waiting_network=true,
+                network_wait_started_at=started,
+                network_wait_seconds=math.max(0,os.time()-started),
             })
             local ready,detail=false,nil
             if self.http and type(self.http.probe_download_recovery)=="function" then

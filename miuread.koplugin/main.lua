@@ -14372,13 +14372,28 @@ function Plugin:_schedule_hibernated_download_resume(reason)
             or state=="suspended" or state=="opening_reader" or state=="closing_reader" then
             return
         end
+        local hibernate_reason=type(self.download_task.hibernated_reason)=="function"
+            and self.download_task:hibernated_reason() or nil
+        if hibernate_reason=="network_offline" and not self:is_online() then
+            logger.info("[MiuRead][DownloadTask] network-hibernated task remains parked",
+                "reason=offline","navigation=",state)
+            self:_schedule_hibernated_download_resume("network restored")
+            return
+        end
         local ok,err=self.download_task:resume_hibernated(reason or "foreground stable")
         if not ok and err=="low_memory" then
             self:_schedule_hibernated_download_resume(reason or "foreground stable")
+        elseif not ok then
+            logger.warn("[MiuRead][DownloadTask] hibernated resume failed",
+                "reason=",tostring(hibernate_reason or "unknown"),"error=",tostring(err or "unknown"))
         end
     end
     self._hibernated_download_resume_task=task
-    UIManager:scheduleIn(math.max(2.0,tonumber(Config.DOWNLOAD_INTERACTION_RESUME_DELAY) or 2.5),task)
+    local hibernate_reason=type(self.download_task.hibernated_reason)=="function"
+        and self.download_task:hibernated_reason() or nil
+    local delay=hibernate_reason=="network_offline" and 8
+        or math.max(2.0,tonumber(Config.DOWNLOAD_INTERACTION_RESUME_DELAY) or 2.5)
+    UIManager:scheduleIn(delay,task)
     return true
 end
 
@@ -16274,7 +16289,14 @@ function Plugin:_on_download_progress(runtime,state)
     elseif state and state.stage=="restart" then
         self:_update_open_shelf_download_status(runtime.book.bookId,"从断点自动恢复")
     elseif state and state.stage=="hibernated" then
-        self:_update_open_shelf_download_status(runtime.book.bookId,"已安全释放资源 · 稍后继续")
+        if state.hibernate_reason=="network_offline" then
+            self:_update_open_shelf_download_status(runtime.book.bookId,"网络暂停 · 联网后继续")
+            if HOME_SESSION.suspended~=true and self._miuread_suspended~=true then
+                self:_schedule_hibernated_download_resume("network restored")
+            end
+        else
+            self:_update_open_shelf_download_status(runtime.book.bookId,"已安全释放资源 · 稍后继续")
+        end
     elseif state and (state.waiting_network==true or state.stage=="waiting_network") then
         self:_update_open_shelf_download_status(runtime.book.bookId,"等待网络 · 已保存进度")
     end
@@ -16446,7 +16468,9 @@ function Plugin:_recover_download_state()
         book=U.copy(state.book or {bookId=state.book_id,title=state.title}),
         options=U.copy(state.options or {}),
         last_state={stage=state.stage,current=state.current,total=state.total,percent=state.percent,
-            chapter=state.chapter,message=state.message},
+            chapter=state.chapter,message=state.message,waiting_network=state.waiting_network,
+            network_wait_started_at=state.network_wait_started_at,network_wait_seconds=state.network_wait_seconds,
+            hibernate_reason=state.hibernate_reason},
         background=true,dialog=nil,started_at=state.started_at,task=U.copy(state.task),
         open_after=false,done=nil,recovered=true,
     }
@@ -16514,6 +16538,9 @@ function Plugin:_download_status_label()
             return wait>0 and ("后台下载 · 请求受限，"..tostring(wait).."秒后继续") or "后台下载 · 请求受限，等待恢复"
         end
         if state.stage=="restart" then return "后台下载 · 正在从断点恢复" end
+        if state.stage=="hibernated" and state.hibernate_reason=="network_offline" then
+            return "后台下载 · 网络暂停，联网后继续"
+        end
         if state.waiting_network==true or state.stage=="waiting_network" then return "后台下载 · 等待网络，已保存进度" end
         local title=U.utf8_truncate(state.title or "未命名",9)
         return "后台下载：《"..title.."》 "..tostring(self:_download_percent(state)).."%"
@@ -16558,6 +16585,9 @@ function Plugin:_active_download_payload(runtime,state)
         chapter=state and state.chapter or "",
         message=state and state.message or "",
         waiting_network=state and (state.waiting_network==true or state.stage=="waiting_network") or nil,
+        network_wait_started_at=state and state.network_wait_started_at or nil,
+        network_wait_seconds=state and state.network_wait_seconds or nil,
+        hibernate_reason=state and state.hibernate_reason or nil,
         wait_seconds=state and state.wait_seconds or nil,
         rate_limit_code=state and state.rate_limit_code or nil,
         started_at=runtime.started_at,
@@ -23375,6 +23405,10 @@ function Plugin:onResume()
         pcall(UIManager.allowStandby,UIManager)
     end
     local previous_power=PowerState.snapshot()
+    if self.download_task and type(self.download_task.on_user_resume_begin)=="function" then
+        local ok,err=pcall(self.download_task.on_user_resume_begin,self.download_task,PowerState.generation())
+        if not ok then logger.warn("[MiuRead][Power] download wake-priority release failed",tostring(err)) end
+    end
     self._miuread_suspended=false
     HOME_SESSION.suspended=false
     StatusToast.set_blocked(false)
@@ -23483,6 +23517,7 @@ function Plugin:onResume()
         self._reader_resume_surface_task=repaint_task
         UIManager:scheduleIn(.12,repaint_task)
         self:_schedule_download_resume_after_wake(3.5)
+        self:_schedule_hibernated_download_resume("resume into reader")
     end
     if not close_pending and not native_menu_pending and not reader_active and HomeView.is_shown() then
         self:_set_foreground("home")
@@ -23499,6 +23534,7 @@ function Plugin:onResume()
                 self:_resume_pending_post_reader_work("resume home",2.0)
             end
         end)
+        self:_schedule_hibernated_download_resume("resume home")
         return
     end
 
