@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.7.0-beta.3",
+    VERSION = "4.7.0-beta.4",
     SCHEMA = 113,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -164,6 +164,16 @@ local C = {
     HEAVY_NATIVE_HIBERNATE_KB = 96 * 1024,
     HEAVY_NATIVE_CRITICAL_KB = 64 * 1024,
     HEAVY_DOWNLOAD_RESUME_MIN_KB = 72 * 1024,
+
+    -- beta.4 coalesces repeated typography taps into one KOReader reflow. On a
+    -- low-memory/heavy-download overlap, let the downloader checkpoint first
+    -- instead of stacking layout work until the native renderer crashes.
+    TYPOGRAPHY_APPLY_DEBOUNCE_SECONDS = 0.42,
+    TYPOGRAPHY_REBUILD_HINT_SECONDS = 12,
+    TYPOGRAPHY_HIBERNATE_MEMORY_KB = 72 * 1024,
+    TYPOGRAPHY_CRITICAL_MEMORY_KB = 48 * 1024,
+    TYPOGRAPHY_HEAVY_WAIT_SECONDS = 8,
+    TYPOGRAPHY_DOWNLOAD_RESUME_DELAY_SECONDS = 2.2,
     -- Remote cover fetching may coexist with a healthy download. It yields only
     -- when a heavy download stage and real memory pressure overlap.
     DOWNLOAD_COVER_COEXIST_MIN_KB = 80 * 1024,

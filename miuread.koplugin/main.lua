@@ -11150,28 +11150,259 @@ function Plugin:_reader_jump_percent(delta)
     return true
 end
 
+local function typography_heavy_stage(stage)
+    stage=tostring(stage or "")
+    return stage=="transform" or stage=="package"
+        or stage=="annotation_batch" or stage=="annotation_apply"
+end
+
+function Plugin:_reader_typography_pending_value(key)
+    local pending=self._reader_typography_pending
+    if type(pending)~="table" then return nil end
+    local current=normalized_reader_file(self:_current_document_path())
+    if pending.file and current and pending.file~=current then return nil end
+    return tonumber(pending[key])
+end
+
+function Plugin:_reader_typography_cancel(reason)
+    local pending=self._reader_typography_pending
+    local guard_mode=type(pending)=="table" and pending.guard_mode or nil
+    if self._reader_typography_apply_task then
+        UIManager:unschedule(self._reader_typography_apply_task)
+        self._reader_typography_apply_task=nil
+    end
+    if type(pending)=="table" then
+        pending.generation=(tonumber(pending.generation) or 0)+1
+        logger.info("[MiuRead][Typography] pending changes cancelled",
+            "reason=",tostring(reason or "cancelled"),"file=",tostring(pending.file or "-"))
+    end
+    self._reader_typography_pending=nil
+    if guard_mode then self:_reader_typography_release_download_guard(guard_mode) end
+    return true
+end
+
+function Plugin:_reader_typography_release_download_guard(mode)
+    local task=self.download_task
+    if not task then return end
+    if mode=="hibernate" then
+        if task:is_hibernated() then
+            self:_schedule_hibernated_download_resume("typography stable")
+            return
+        end
+        -- A hibernate request is cooperative. If the typography operation was
+        -- cancelled while the worker was still checkpointing, keep watching
+        -- until the checkpoint lands and then use the normal low-memory-aware
+        -- resume path instead of leaving the download parked indefinitely.
+        local started=monotonic_wall_time()
+        local watcher
+        watcher=function()
+            if self.download_task~=task then return end
+            if task:is_hibernated() then
+                self:_schedule_hibernated_download_resume("typography stable")
+                return
+            end
+            if monotonic_wall_time()-started<10 and task:busy() then
+                UIManager:scheduleIn(.35,watcher)
+            end
+        end
+        UIManager:scheduleIn(.35,watcher)
+    elseif mode=="pause" then
+        UIManager:scheduleIn(math.max(1.0,tonumber(Config.TYPOGRAPHY_DOWNLOAD_RESUME_DELAY_SECONDS) or 2.2),function()
+            if self.download_task==task then task:resume("heavy_resource") end
+        end)
+    end
+end
+
+function Plugin:_reader_typography_apply_now(generation,guard_mode)
+    local pending=self._reader_typography_pending
+    if type(pending)~="table" then
+        self:_reader_typography_release_download_guard(guard_mode)
+        return false
+    end
+    if generation~=(tonumber(pending.generation) or 0) then return false end
+    self._reader_typography_apply_task=nil
+    local current=normalized_reader_file(self:_current_document_path())
+    if not (self.ui and self.ui.document) or (pending.file and current and pending.file~=current) then
+        self:_reader_typography_cancel("reader changed before apply")
+        return false
+    end
+
+    local font=self.ui and self.ui.font or nil
+    if not font then
+        self:_reader_typography_cancel("font controller unavailable")
+        return false
+    end
+
+    local hint_seconds=math.max(6,tonumber(Config.TYPOGRAPHY_REBUILD_HINT_SECONDS) or 12)
+    self:_reader_native_setting_begin("Typography batch",hint_seconds)
+    self:_mark_reader_busy(math.ceil(hint_seconds),true)
+    if collectgarbage then pcall(collectgarbage,"collect") end
+
+    local started=monotonic_wall_time()
+    local applied=0
+    local errors={}
+    -- Clear the pending queue before invoking KOReader. A synchronous reflow can
+    -- recreate ReaderUI/plugin state; the native-setting hint above survives
+    -- that rebuild globally and keeps CloseDocument out of the real-close path.
+    self._reader_typography_pending=nil
+
+    if pending.font_size~=nil then
+        local target=math.max(12,math.min(72,tonumber(pending.font_size) or 22))
+        local ok,err=false,nil
+        if type(font.onSetFontSize)=="function" then ok,err=pcall(font.onSetFontSize,font,target) end
+        if not ok and self.ui and type(self.ui.handleEvent)=="function" then
+            ok,err=pcall(self.ui.handleEvent,self.ui,Event:new("SetFontSize",target))
+        end
+        if ok then applied=applied+1 else errors[#errors+1]="font_size:"..tostring(err or "unsupported") end
+    end
+    if pending.font_weight~=nil then
+        local target=math.max(-1,math.min(3,tonumber(pending.font_weight) or 0))
+        target=math.floor(target*4+.5)/4
+        local ok,err=false,nil
+        if type(font.onSetFontBaseWeight)=="function" then ok,err=pcall(font.onSetFontBaseWeight,font,target) end
+        if ok then applied=applied+1 else errors[#errors+1]="font_weight:"..tostring(err or "unsupported") end
+    end
+    if pending.line_spacing~=nil then
+        local target=math.max(50,math.min(200,math.floor((tonumber(pending.line_spacing) or 100)+.5)))
+        local ok,err=false,nil
+        if type(font.onSetLineSpace)=="function" then ok,err=pcall(font.onSetLineSpace,font,target) end
+        if ok then applied=applied+1 else errors[#errors+1]="line_spacing:"..tostring(err or "unsupported") end
+    end
+
+    logger.info("[MiuRead][Typography] batch applied",
+        "changes=",tostring(applied),"guard=",tostring(guard_mode or "none"),
+        "elapsed_ms=",tostring(math.floor((monotonic_wall_time()-started)*1000+.5)),
+        "errors=",#errors>0 and table.concat(errors," | ") or "none")
+    self:_reader_typography_release_download_guard(guard_mode)
+    if applied==0 and #errors>0 then self:status_toast("排版调整","本次排版未能应用，请稍后重试",3) end
+    return applied>0
+end
+
+function Plugin:_reader_typography_wait_for_guard(generation,started,mode)
+    local pending=self._reader_typography_pending
+    if type(pending)~="table" or generation~=(tonumber(pending.generation) or 0) then return false end
+    local task=self.download_task
+    if not task or not task:busy() or task:is_hibernated() then
+        return self:_reader_typography_apply_now(generation,mode)
+    end
+    local elapsed=monotonic_wall_time()-started
+    local wait_limit=math.max(2,tonumber(Config.TYPOGRAPHY_HEAVY_WAIT_SECONDS) or 8)
+    if elapsed>=wait_limit then
+        local memory=RuntimePressure.memory_snapshot(true)
+        local available=memory and tonumber(memory.available_kb) or nil
+        local critical=math.max(1,tonumber(Config.TYPOGRAPHY_CRITICAL_MEMORY_KB) or 48*1024)
+        if available and available<critical then
+            logger.warn("[MiuRead][Typography] apply deferred for safety",
+                "reason=low_memory","memory_kb=",tostring(available),"stage=",tostring(task:stage() or "unknown"))
+            self:_reader_typography_cancel("critical low memory")
+            self:status_toast("暂缓排版","当前内存较低，后台下载正在释放资源；稍后再调整可避免阅读器崩溃",4)
+            return false
+        end
+        logger.warn("[MiuRead][Typography] heavy guard timeout; applying after pause",
+            "memory_kb=",tostring(available or "unknown"),"stage=",tostring(task:stage() or "unknown"))
+        return self:_reader_typography_apply_now(generation,mode)
+    end
+    local waiter
+    waiter=function()
+        if self._reader_typography_apply_task~=waiter then return end
+        self._reader_typography_apply_task=nil
+        self:_reader_typography_wait_for_guard(generation,started,mode)
+    end
+    self._reader_typography_apply_task=waiter
+    UIManager:scheduleIn(.18,waiter)
+    return true
+end
+
+function Plugin:_reader_typography_apply(generation)
+    local pending=self._reader_typography_pending
+    if type(pending)~="table" or generation~=(tonumber(pending.generation) or 0) then return false end
+    self._reader_typography_apply_task=nil
+    if not (self.ui and self.ui.document) then return self:_reader_typography_cancel("reader unavailable") end
+
+    local task=self.download_task
+    local existing_guard=tostring(pending.guard_mode or "")
+    if existing_guard=="hibernate" then
+        if task and task:is_hibernated() then
+            return self:_reader_typography_apply_now(generation,"hibernate")
+        end
+        if task and task:busy() then
+            return self:_reader_typography_wait_for_guard(generation,
+                tonumber(pending.guard_started_clock) or monotonic_wall_time(),"hibernate")
+        end
+        pending.guard_mode=nil
+        pending.guard_started_clock=nil
+    elseif existing_guard=="pause" then
+        return self:_reader_typography_apply_now(generation,"pause")
+    end
+
+    local memory=RuntimePressure.memory_snapshot(true)
+    local available=memory and tonumber(memory.available_kb) or nil
+    local critical=math.max(1,tonumber(Config.TYPOGRAPHY_CRITICAL_MEMORY_KB) or 48*1024)
+    if available and available<critical and (not task or not task:busy()) then
+        if collectgarbage then pcall(collectgarbage,"collect") end
+        memory=RuntimePressure.memory_snapshot(true)
+        available=memory and tonumber(memory.available_kb) or available
+        if available and available<critical then
+            logger.warn("[MiuRead][Typography] apply skipped for safety",
+                "reason=critical_low_memory","memory_kb=",tostring(available))
+            self:_reader_typography_cancel("critical low memory without active download")
+            self:status_toast("暂缓排版","当前可用内存过低；已取消这次重排，避免阅读器崩溃",4)
+            return false
+        end
+    end
+
+    if task and task:busy() and not task:is_hibernated() then
+        local hibernate_line=math.max(1,tonumber(Config.TYPOGRAPHY_HIBERNATE_MEMORY_KB) or 72*1024)
+        local stage=tostring(task:stage() or "unknown")
+        if typography_heavy_stage(stage) or (available and available<hibernate_line) then
+            local requested=task:request_hibernate((available and available<hibernate_line)
+                and "typography_low_memory" or "typography_heavy_stage")
+            local mode=requested and "hibernate" or "pause"
+            if not requested then task:pause("heavy_resource") end
+            pending.guard_mode=mode
+            pending.guard_started_clock=monotonic_wall_time()
+            logger.info("[MiuRead][Typography] heavy guard engaged",
+                "mode=",mode,"stage=",stage,"memory_kb=",tostring(available or "unknown"))
+            return self:_reader_typography_wait_for_guard(generation,pending.guard_started_clock,mode)
+        end
+    end
+    return self:_reader_typography_apply_now(generation,nil)
+end
+
+function Plugin:_reader_queue_typography(key,value)
+    if not (self.ui and self.ui.document) then return false end
+    local path=normalized_reader_file(self:_current_document_path())
+    local pending=self._reader_typography_pending
+    if type(pending)~="table" or (pending.file and path and pending.file~=path) then
+        if self._reader_typography_apply_task then UIManager:unschedule(self._reader_typography_apply_task) end
+        pending={file=path,generation=0}
+        self._reader_typography_pending=pending
+    end
+    pending[key]=tonumber(value)
+    pending.generation=(tonumber(pending.generation) or 0)+1
+    local generation=pending.generation
+    if self._reader_typography_apply_task then UIManager:unschedule(self._reader_typography_apply_task) end
+    local apply_task
+    apply_task=function()
+        if self._reader_typography_apply_task~=apply_task then return end
+        self._reader_typography_apply_task=nil
+        self:_reader_typography_apply(generation)
+    end
+    self._reader_typography_apply_task=apply_task
+    UIManager:scheduleIn(math.max(.20,tonumber(Config.TYPOGRAPHY_APPLY_DEBOUNCE_SECONDS) or .42),apply_task)
+    logger.dbg("[MiuRead][Typography] queued",key,"=",tostring(value),"generation=",tostring(generation))
+    return true
+end
+
 function Plugin:_reader_adjust_font_size(delta)
-    local ui=self.ui
-    local font=ui and ui.font
-    local configurable=ui and ui.document and ui.document.configurable or nil
-    local current=font and tonumber(font.font_size)
-        or (ui and ui.rolling and tonumber(ui.rolling.font_size))
-        or (configurable and tonumber(configurable.font_size))
+    local current=self:_reader_font_size_value()
     if not current then
         self:info("当前文档暂时无法直接调整字号")
         return false
     end
     local target=math.max(12,math.min(72,current+(tonumber(delta) or 0)))
-    self:_mark_reader_busy(5)
-    if font and type(font.onSetFontSize)=="function" then
-        local ok=pcall(font.onSetFontSize,font,target)
-        if ok then return true end
-    end
-    if ui and type(ui.handleEvent)=="function" then
-        ui:handleEvent(Event:new("SetFontSize",target))
-        return true
-    end
-    return false
+    self:_mark_reader_busy(4)
+    return self:_reader_queue_typography("font_size",target)
 end
 
 function Plugin:_reader_goto_percent(target)
@@ -11329,6 +11560,8 @@ function Plugin:_show_reader_toc(back_callback)
 end
 
 function Plugin:_reader_line_spacing_value()
+    local pending=self:_reader_typography_pending_value("line_spacing")
+    if pending~=nil then return pending end
     local ui=self.ui
     local font=ui and ui.font or nil
     local configurable=ui and ui.document and ui.document.configurable or nil
@@ -11338,15 +11571,13 @@ function Plugin:_reader_line_spacing_value()
 end
 
 function Plugin:_reader_set_line_spacing(value)
-    local font=self.ui and self.ui.font or nil
-    local target=math.max(50,math.min(200,math.floor((tonumber(value) or 100)+.5)))
-    if font and type(font.onSetLineSpace)=="function" then
-        self:_mark_reader_busy(5)
-        local ok=pcall(font.onSetLineSpace,font,target)
-        if ok then return true end
+    if not (self.ui and self.ui.font) then
+        self:info("当前文档暂时无法直接调整行距")
+        return false
     end
-    self:info("当前文档暂时无法直接调整行距")
-    return false
+    local target=math.max(50,math.min(200,math.floor((tonumber(value) or 100)+.5)))
+    self:_mark_reader_busy(4)
+    return self:_reader_queue_typography("line_spacing",target)
 end
 
 function Plugin:_reader_adjust_line_spacing(delta)
@@ -11354,6 +11585,8 @@ function Plugin:_reader_adjust_line_spacing(delta)
 end
 
 function Plugin:_reader_font_weight_value()
+    local pending=self:_reader_typography_pending_value("font_weight")
+    if pending~=nil then return pending end
     local ui=self.ui
     local font=ui and ui.font or nil
     local configurable=ui and ui.document and ui.document.configurable or nil
@@ -11370,16 +11603,14 @@ function Plugin:_reader_font_weight_label()
 end
 
 function Plugin:_reader_set_font_weight(value)
-    local font=self.ui and self.ui.font or nil
+    if not (self.ui and self.ui.font) then
+        self:info("当前文档暂时无法直接调整字体粗细")
+        return false
+    end
     local target=math.max(-1,math.min(3,tonumber(value) or 0))
     target=math.floor(target*4+.5)/4
-    if font and type(font.onSetFontBaseWeight)=="function" then
-        self:_mark_reader_busy(5)
-        local ok=pcall(font.onSetFontBaseWeight,font,target)
-        if ok then return true end
-    end
-    self:info("当前文档暂时无法直接调整字体粗细")
-    return false
+    self:_mark_reader_busy(4)
+    return self:_reader_queue_typography("font_weight",target)
 end
 
 function Plugin:_reader_adjust_font_weight(delta)
@@ -11599,6 +11830,8 @@ function Plugin:_reader_font_label()
 end
 
 function Plugin:_reader_font_size_value()
+    local pending=self:_reader_typography_pending_value("font_size")
+    if pending~=nil then return pending end
     local ui=self.ui
     local font=ui and ui.font
     local configurable=ui and ui.document and ui.document.configurable or nil
@@ -15254,6 +15487,11 @@ function Plugin:_request_reader_close(generation,source)
     logger.info("[MiuRead][ReaderClose] close command",
         "generation=",tostring(generation),"attempt=",tostring(READER_CLOSE.close_attempts),
         "source=",tostring(source or "direct"))
+    local local_session=self:_reader_session_is_local()
+    if local_session then
+        logger.info("[MiuRead][ReaderClose] local close command enter",
+            "generation=",tostring(generation),"file=",tostring(READER_CLOSE.reader_file or "-"))
+    end
     pcall(function() active:handleEvent(Event:new("CloseReaderMenu")) end)
     pcall(function() active:handleEvent(Event:new("CloseConfigMenu")) end)
     local ok_close,err_close=xpcall(function() active:onClose(false) end,debug.traceback)
@@ -15262,6 +15500,10 @@ function Plugin:_request_reader_close(generation,source)
         self:_schedule_reader_return_finish(generation,.18,"close request failed")
         return false
     end
+    if local_session then
+        logger.info("[MiuRead][ReaderClose] local close command returned",
+            "generation=",tostring(generation))
+    end
     self:_schedule_reader_return_finish(generation,.10,"close requested")
     return true
 end
@@ -15269,6 +15511,13 @@ end
 function Plugin:return_to_miuread_home(reason)
     sync_home_session()
     if HOME_EXITING or UIManager._exit_code~=nil then return false end
+    local local_session=self.ui and self.ui.document and self:_reader_session_is_local()
+    if self._reader_typography_pending then self:_reader_typography_cancel("return home") end
+    if local_session then
+        logger.info("[MiuRead][ReaderClose] local home tap",
+            "file=",tostring(self:_current_document_path() or HOME_SESSION.reader_session_file or "-"),
+            "reason=",tostring(reason or "reader surface"))
+    end
     if self.ui and self.ui.document and self:_reader_session_is_weread()
         and self.sync and self.sync.reading_end_finalized~=true then
         return self:_reading_end_before_action("返回觅阅主页","返回觅阅主页",function()
@@ -15288,6 +15537,10 @@ function Plugin:return_to_miuread_home(reason)
         local file=self:_reader_file(readerui,HOME_RETURN_FILE)
         local generation,started=self:_begin_reader_return(reason or "explicit return",file,true)
         if not started then return true end
+        if local_session then
+            logger.info("[MiuRead][ReaderClose] local close state created",
+                "generation=",tostring(generation),"session=",tostring(HOME_SESSION.reader_session_generation or 0))
+        end
         -- The transition and its shared download pause are already active before
         -- closing any transient reader widget. This keeps the action independent
         -- from ReaderToolbar:onCloseWidget and gives foreground navigation priority.
@@ -23281,17 +23534,19 @@ function Plugin:onCloseDocument()
     -- cleanup belongs to _finalize_reader_instance_close() only after a real
     -- close is confirmed. This keeps same-book reloads cheap and invisible.
     local setting_hint=reader_native_setting_active(closing_path)
+    local typography_hint=setting_hint and tostring(READER_NATIVE_SETTING.label or ""):match("^Typography")~=nil
     local tearing_down=self.ui and self.ui.tearing_down==true
     local internal_hint=tearing_down or setting_hint
     logger.info("[MiuRead][Lifecycle] document disappeared","cause=unknown",
         "book=",tostring(closing_path or ""),"session=",tostring(session_generation),
         "tearing_down=",tostring(tearing_down),
-        "native_setting=",tostring(setting_hint),
+        "native_setting=",tostring(setting_hint),"typography=",tostring(typography_hint),
         "setting=",setting_hint and tostring(READER_NATIVE_SETTING.label or "") or "")
     logger.info("[MiuRead][DesktopPerf] reader reload suspected",
         "book=",tostring(closing_path or ""),"internal_hint=",tostring(internal_hint))
     return self:_start_reader_rebuild_candidate(closing_path,session_generation,
-        setting_hint and "KOReader native setting rebuild" or "CloseDocument without explicit return",internal_hint)
+        typography_hint and "Typography internal rebuild"
+            or (setting_hint and "KOReader native setting rebuild" or "CloseDocument without explicit return"),internal_hint)
 end
 
 function Plugin:onFlushSettings()

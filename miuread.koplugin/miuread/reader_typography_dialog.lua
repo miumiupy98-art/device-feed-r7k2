@@ -91,6 +91,7 @@ local Dialog = InputContainer:extend{
     opts = nil,
     closed = false,
     pending_action = nil,
+    rebuild_task = nil,
 }
 function Dialog:handleEvent(event) return InputContainer.handleEvent(self, event) end
 
@@ -120,9 +121,21 @@ function Dialog:_run(row, held)
         local ok, err = pcall(callback)
         if not ok then logger.warn("[MiuRead][TypographyDialog] action failed", tostring(err)) end
     end
-    UIManager:scheduleIn(.035, function()
+    self:_schedule_rebuild(.09)
+    return true
+end
+
+function Dialog:_schedule_rebuild(delay)
+    if self.closed then return false end
+    if self.rebuild_task then UIManager:unschedule(self.rebuild_task) end
+    local task
+    task=function()
+        if self.rebuild_task~=task then return end
+        self.rebuild_task=nil
         if not self.closed then self:_rebuild() end
-    end)
+    end
+    self.rebuild_task=task
+    UIManager:scheduleIn(math.max(.05,tonumber(delay) or .09),task)
     return true
 end
 
@@ -365,6 +378,10 @@ end
 
 function Dialog:onCloseWidget()
     if live_dialog == self then live_dialog = nil end
+    if self.rebuild_task then
+        UIManager:unschedule(self.rebuild_task)
+        self.rebuild_task=nil
+    end
     local action = self.pending_action
     self.pending_action = nil
     if action then UIManager:nextTick(action) end
