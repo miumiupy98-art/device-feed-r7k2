@@ -10618,9 +10618,11 @@ function Plugin:_sleep_action_detail()
         download=ok and value==true
     end
     local reading=self.ui and self.ui.document and self.sync and self.sync.reading_end_finalized~=true
+    local suspend_background_supported=PseudoLockscreen.background_supported()==true
     if download and reading then return "锁屏后同步并继续下载" end
     if download then return "锁屏后继续下载" end
-    if reading then return "锁屏后完成阅读同步" end
+    if reading and suspend_background_supported then return "锁屏后完成阅读同步" end
+    if reading then return "保存阅读状态后休眠" end
     return "立即休眠"
 end
 
@@ -23588,7 +23590,9 @@ function Plugin:onSuspend()
         else download_reason="check_failed" end
     end
     local sync_continue=false
-    local sync_candidate=self.ui and self.ui.document and self:_reader_session_is_weread()
+    local suspend_background_supported=PseudoLockscreen.background_supported()==true
+    local sync_candidate=suspend_background_supported
+        and self.ui and self.ui.document and self:_reader_session_is_weread()
         and self.sync and self.sync.reading_end_finalized~=true
     local pseudo_active=false
     if download_continue then

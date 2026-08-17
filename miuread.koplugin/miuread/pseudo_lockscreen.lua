@@ -120,16 +120,21 @@ local function record_kindle_power_event(kind, source)
     return self_injected
 end
 
+local function device_flag(name)
+    local fn = Device and Device[name]
+    if type(fn) ~= "function" then return false end
+    local ok, yes = pcall(fn, Device)
+    return ok and yes == true
+end
+
 local function platform_name()
-    if type(Device.isKindle) == "function" then
-        local ok, yes = pcall(Device.isKindle, Device)
-        if ok and yes == true then return "kindle" end
-    end
-    if type(Device.isKobo) == "function" then
-        local ok, yes = pcall(Device.isKobo, Device)
-        if ok and yes == true then return "kobo" end
-    end
-    return "other"
+    local kindle = device_flag("isKindle")
+    local kobo = device_flag("isKobo")
+    -- Special suspend handling is intentionally fail-closed. If a future port
+    -- reports an ambiguous identity, treat it as a generic device rather than
+    -- risking Kindle/Kobo power operations on the wrong platform.
+    if kindle == kobo then return "other" end
+    return kindle and "kindle" or "kobo"
 end
 
 local function set_frontlight_hw_off()
@@ -236,6 +241,15 @@ function M.platform()
     return tostring(state().platform or "other")
 end
 
+function M.device_platform()
+    return platform_name()
+end
+
+function M.background_supported()
+    local platform = platform_name()
+    return platform == "kindle" or platform == "kobo", platform
+end
+
 function M.system_active()
     return state().system_active == true
 end
@@ -286,7 +300,8 @@ end
 
 function M.set_download_active(value)
     local s = state()
-    s.download_active = value == true
+    local supported = M.background_supported()
+    s.download_active = value == true and supported == true
     if not s.download_active and not s.active then
         s.commit_pending = false
     end
@@ -357,16 +372,25 @@ install_kindle_power_source_guard()
 -- Suspend callback fails to establish the pseudo lock, fall back to KOReader's
 -- normal safe Wi-Fi-off + delayed suspend behavior.
 local function install_kobo_power_guard()
-    local is_kobo = false
-    if type(Device.isKobo) == "function" then
-        local ok, value = pcall(Device.isKobo, Device)
-        is_kobo = ok and value == true
-    end
+    local is_kobo = platform_name() == "kobo"
     if not is_kobo or type(Device.onPowerEvent) ~= "function" then return false end
     if Device.__miuread_pseudo_power_guard == true then return true end
     local original = Device.onPowerEvent
     Device.onPowerEvent = function(self, ev)
         local shared = state()
+
+        -- A Kobo pseudo lock never entered kernel suspend. Repeated Suspend
+        -- edges (AutoSuspend, a still-closed cover, or duplicate device events)
+        -- must therefore stay visual-only; handing one to the native path would
+        -- shut Wi-Fi down underneath the live download.
+        if shared.active == true and shared.platform == "kobo"
+            and self.screen_saver_mode == true and ev == "Suspend" then
+            cancel_kobo_real_suspend()
+            logger.info("[MiuRead][PseudoLock] repeated Kobo suspend held",
+                "generation=", tostring(shared.generation or 0))
+            return
+        end
+
         -- The pseudo Kobo screen is visual only; no kernel suspend actually
         -- happened. Handle the next Power/Resume as a pure UI unlock instead of
         -- calling the hardware resume path on a device that never slept.
@@ -383,31 +407,42 @@ local function install_kobo_power_guard()
             logger.info("[MiuRead][PseudoLock] Kobo pseudo screen unlocked without hardware resume")
             return
         end
+
         if shared.download_active == true and self.screen_saver_mode ~= true
             and (ev == "Power" or ev == "Suspend") then
-            local Screensaver = require("ui/screensaver")
-            logger.info("[MiuRead][PseudoLock] Kobo pre-suspend intercepted", "event=", tostring(ev))
-            Screensaver:setup()
-            Screensaver:show()
-            if type(self.needsScreenRefreshAfterResume) == "function" and self:needsScreenRefreshAfterResume() then
-                self.screen:refreshFull(0, 0, self.screen:getWidth(), self.screen:getHeight())
+            -- beta.13 waited for Plugin:onSuspend to call begin(), but Kobo's
+            -- device handler reaches its Wi-Fi/suspend decision before plugin
+            -- listeners finish that same event. Arm the lease first, before any
+            -- screensaver or power side effect, so the decision is deterministic.
+            local entered, reason = M.begin("kobo_pre_suspend")
+            if entered ~= true then
+                logger.warn("[MiuRead][PseudoLock] Kobo pre-suspend arm failed; using native suspend",
+                    "event=", tostring(ev), "reason=", tostring(reason or "unknown"))
+                return original(self, ev)
             end
-            UIManager:forceRePaint()
-            self.powerd:beforeSuspend()
-            if state().active then
-                logger.info("[MiuRead][PseudoLock] Kobo kept ACTIVE with native sleep screen")
-                return
+
+            local ok, err = xpcall(function()
+                local Screensaver = require("ui/screensaver")
+                logger.info("[MiuRead][PseudoLock] Kobo pre-suspend armed", "event=", tostring(ev))
+                Screensaver:setup()
+                Screensaver:show()
+                if type(self.needsScreenRefreshAfterResume) == "function" and self:needsScreenRefreshAfterResume() then
+                    self.screen:refreshFull(0, 0, self.screen:getWidth(), self.screen:getHeight())
+                end
+                UIManager:forceRePaint()
+                self.powerd:beforeSuspend()
+                cancel_kobo_real_suspend()
+                set_frontlight_hw_off()
+            end, debug.traceback)
+            if not ok then
+                logger.warn("[MiuRead][PseudoLock] Kobo pseudo suspend setup failed; using native suspend",
+                    tostring(err))
+                M.force_clear("kobo_pre_suspend_setup_failed")
+                return original(self, ev)
             end
-            logger.warn("[MiuRead][PseudoLock] Kobo pseudo lock unavailable; falling back to real suspend")
-            local ok_nm, NetworkMgr = pcall(require, "ui/network/manager")
-            if ok_nm and NetworkMgr and type(NetworkMgr.isWifiOn) == "function"
-                and type(NetworkMgr.disableWifi) == "function" then
-                local ok_on, on = pcall(NetworkMgr.isWifiOn, NetworkMgr)
-                if ok_on and on == true then pcall(NetworkMgr.disableWifi, NetworkMgr) end
-            end
-            if type(self.rescheduleSuspend) == "function" then
-                self:rescheduleSuspend(self.screensaver_suspend_wait_timeout)
-            end
+
+            logger.info("[MiuRead][PseudoLock] Kobo kept ACTIVE with native sleep screen",
+                "generation=", tostring(state().generation or 0))
             return
         end
         return original(self, ev)

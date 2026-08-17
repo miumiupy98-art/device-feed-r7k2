@@ -1,9 +1,25 @@
 local UIManager = require("ui/uimanager")
+local Device = require("device")
 local logger = require("logger")
 
 local M = {}
 
 local KEY = "__MIUREAD_SUSPEND_WORK_LEASE_V1"
+
+local function special_suspend_supported()
+    local function flag(name)
+        local fn = Device and Device[name]
+        if type(fn) ~= "function" then return false end
+        local ok, yes = pcall(fn, Device)
+        return ok and yes == true
+    end
+    local kindle, kobo = flag("isKindle"), flag("isKobo")
+    return kindle ~= kobo and (kindle or kobo)
+end
+
+function M.supported()
+    return special_suspend_supported()
+end
 
 local function shared()
     local value = rawget(_G, KEY)
@@ -40,6 +56,11 @@ end
 function M.acquire(reason)
     reason = tostring(reason or "background")
     local value = shared()
+    if not special_suspend_supported() then
+        logger.info("[MiuRead][SuspendLease] unsupported platform; acquire skipped",
+            "reason=", reason)
+        return false, M.snapshot(), "unsupported_platform"
+    end
     if value.reasons[reason] == true then return true, M.snapshot() end
     value.reasons[reason] = true
     value.generation = value.generation + 1

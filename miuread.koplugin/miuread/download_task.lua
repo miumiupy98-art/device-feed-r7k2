@@ -350,6 +350,11 @@ end
 function DownloadTask:on_suspend(mode, generation)
     self.power_mode = tostring(mode or "REAL_SUSPEND")
     self.power_generation = tonumber(generation or 0) or 0
+    if background_lock_mode(self.power_mode) and PseudoLockscreen.background_supported() ~= true then
+        logger.warn("[MiuRead][DownloadTask] unsupported suspend platform downgraded",
+            "requested=", self.power_mode, "to=REAL_SUSPEND")
+        self.power_mode = "REAL_SUSPEND"
+    end
     if background_lock_mode(self.power_mode) then
         -- The lease may already have been armed at the beginning of onSuspend.
         -- Keep it across the lock-screen transition and immediately assert the
@@ -466,6 +471,9 @@ local function process_exists(pid)
 end
 
 function DownloadTask:can_continue_locked()
+    if PseudoLockscreen.background_supported() ~= true then
+        return false, "unsupported_suspend_platform"
+    end
     if self.hibernated then return false,"hibernated" end
     if self.store:preferences().download_keep_awake == false then return false, "disabled" end
     local task = self:_control_descriptor()
@@ -708,6 +716,9 @@ function DownloadTask:_clear_lockscreen_network(reason)
 end
 
 function DownloadTask:prepare_suspend_lock()
+    if PseudoLockscreen.background_supported() ~= true then
+        return false, "unsupported_suspend_platform"
+    end
     if not self.keep_awake_enabled then return false,"disabled" end
     -- This runs only after KOReader has entered its real Suspend callback, so
     -- it cannot keep the normal Home surface awake. Arm the lease before the
@@ -757,6 +768,10 @@ function DownloadTask:_battery_allows_locked()
 end
 
 function DownloadTask:_hold_awake()
+    if PseudoLockscreen.background_supported() ~= true then
+        self:_release_awake()
+        return false
+    end
     if not self:_lockscreen_keepalive_allowed() then
         self:_release_awake()
         return false
@@ -800,6 +815,7 @@ function DownloadTask:_network_link_state()
 end
 
 function DownloadTask:_maybe_restore_network(job,now,wait_age)
+    if self.power_mode == "REAL_SUSPEND" then return false,"real_suspend" end
     if not job or wait_age<=0 then return false,"not_waiting" end
     local initial=math.max(5,tonumber(Config.DOWNLOAD_NETWORK_GUARD_POLL_SECONDS) or 10)
     if wait_age<initial then return false,"grace" end
