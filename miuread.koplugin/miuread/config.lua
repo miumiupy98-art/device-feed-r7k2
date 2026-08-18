@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.7.0-beta.17",
+    VERSION = "4.7.0-beta.18",
     SCHEMA = 114,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -171,15 +171,28 @@ local C = {
     -- image transfers emit heartbeats, so large healthy archives are not
     -- mistaken for a stall.
     DOWNLOAD_STALL_RECOVERY_SECONDS = 120,
-    -- beta.24 keeps normal downloads unrestricted, but a progress dialog that
-    -- is actually visible uses stage-aware health thresholds. Catalog/prep
-    -- stalls recover sooner; healthy content/image transfers get more room.
+    -- beta.18 makes every stage that can keep a lock-screen download alive
+    -- participate in the same health model. Expensive annotation/package
+    -- stages get wider silence windows; any emitted progress heartbeat resets
+    -- the timer, so a large but healthy book is never killed merely for being
+    -- slow.
+    DOWNLOAD_BACKGROUND_STALL_SECONDS = {
+        prepare = 120, catalog = 120, resume = 120, content = 150, images = 180,
+        underlines = 180, thoughts = 180, footnotes = 180,
+        annotation_batch = 180, annotation_apply = 240, transform = 240, package = 300,
+    },
+    -- Foreground notices remain earlier than recovery. Heavy local stages still
+    -- use generous bounds to avoid turning a large comment set into a false
+    -- positive.
     DOWNLOAD_FOREGROUND_STALL_NOTICE_SECONDS = 25,
     DOWNLOAD_FOREGROUND_STALL_SECONDS = {
-        prepare = 50, catalog = 45, resume = 50, content = 75, images = 90,
+        prepare = 50, catalog = 60, resume = 50, content = 90, images = 120,
+        underlines = 150, thoughts = 180, footnotes = 150,
+        annotation_batch = 180, annotation_apply = 240, transform = 240, package = 300,
     },
     DOWNLOAD_CANCEL_FORCE_SECONDS = 4,
     DOWNLOAD_STALL_RESTART_GRACE_SECONDS = 3,
+    DOWNLOAD_STALL_FAIL_OPEN_SECONDS = 12,
     DOWNLOAD_STALL_AUTO_RESTARTS = 1,
     DOWNLOAD_TRANSFER_HEARTBEAT_SECONDS = 3,
     DOWNLOAD_TRANSFER_HEARTBEAT_BYTES = 512 * 1024,

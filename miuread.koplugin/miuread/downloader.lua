@@ -1502,6 +1502,7 @@ function Downloader:book(input, opt, progress)
         if detail_message then
             progress("resume",index,expected,chapter.title,{message=detail_message})
         end
+        progress("transform",index,expected,chapter.title,{message="正在整理章节结构"})
         progress("footnotes", index, expected, chapter.title)
         local content_format = entry and entry.content_format or format
         local original_body = body
@@ -1825,6 +1826,7 @@ function Downloader:book(input, opt, progress)
             end
             local extra_css,apply_stats
             respect_reader_priority("annotation_apply")
+            progress("annotation_apply",index,expected,chapter.title,{message="正在定位划线与想法"})
             body,extra_css,apply_stats=self.annotations:apply(body,annotation,coord_body)
             entry.annotation_fallback=tonumber(apply_stats and apply_stats.fallback or 0) or 0
             entry.annotation_official=tonumber(apply_stats and apply_stats.official or 0) or 0

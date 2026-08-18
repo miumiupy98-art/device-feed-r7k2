@@ -176,7 +176,7 @@ if type(HOME_SESSION)~="table" then
     HOME_SESSION={suppressed=false,native_visit=false,expected_close=false,exiting=false,return_file=nil,reader_origin=false,reader_file=nil,
         foreground="native",suspended=false,reader_session_generation=0,reader_session_file=nil,reader_session_active=false,
         reader_session_kind="none",reader_session_book_id="",opening_kind="",opening_book_id="",opening_generation=0,
-        return_requested=false,return_session_generation=0,return_request_file=nil}
+        return_requested=false,return_session_generation=0,return_request_file=nil,return_target=nil}
     rawset(_G,"__MIUREAD_HOME_SESSION",HOME_SESSION)
 end
 -- ReaderUI and FileManager transition asynchronously and may use different
@@ -247,6 +247,7 @@ HOME_SESSION.reader_session_book_id=tostring(HOME_SESSION.reader_session_book_id
 HOME_SESSION.opening_kind=tostring(HOME_SESSION.opening_kind or "")
 HOME_SESSION.opening_book_id=tostring(HOME_SESSION.opening_book_id or "")
 HOME_SESSION.opening_generation=tonumber(HOME_SESSION.opening_generation) or 0
+if HOME_SESSION.return_target~=nil then HOME_SESSION.return_target=tostring(HOME_SESSION.return_target) end
 local function reader_close_active()
     local state=tostring(READER_CLOSE.state or "idle")
     return state~="idle" and state~="completed" and state~="failed"
@@ -3887,7 +3888,11 @@ function Plugin:_home_schedule_clock()
         self._home_clock_task=nil
     end
     if not HomeView.is_shown() or self:_active_reader_ui() then return false end
-    HomeView.update_time(self:_display_time("%H:%M"))
+    HomeData.quick_power_state(true)
+    HomeView.update_header{
+        time_text=self:_display_time("%H:%M"),
+        battery_text=self:_home_battery_text(),
+    }
     local task
     task=function()
         if generation~=self._home_clock_generation or self._home_clock_task~=task then return end
@@ -3896,7 +3901,15 @@ function Plugin:_home_schedule_clock()
             return
         end
         if self._home_suspended~=true and HOME_SESSION.suspended~=true and not self:_active_reader_ui() then
-            HomeView.update_time(self:_display_time("%H:%M"))
+            -- Reading the KOReader power device is cheap and does not redraw by
+            -- itself. HomeView invalidates only the tiny fields that actually
+            -- changed, so a stable battery percentage costs no extra e-ink
+            -- refresh and never reloads the shelf.
+            HomeData.quick_power_state(true)
+            HomeView.update_header{
+                time_text=self:_display_time("%H:%M"),
+                battery_text=self:_home_battery_text(),
+            }
         end
         local now=os.time()
         UIManager:scheduleIn(math.max(10,60-(now%60)+.12),task)
@@ -14765,6 +14778,7 @@ function Plugin:_complete_reader_close(generation,reason)
     HOME_SESSION.return_requested=false
     HOME_SESSION.return_session_generation=0
     HOME_SESSION.return_request_file=nil
+    HOME_SESSION.return_target=nil
     HOME_READER_ORIGIN=false
     HOME_READER_FILE=nil
     HOME_RETURN_FILE=nil
@@ -15374,6 +15388,8 @@ function Plugin:_begin_reader_return(reason,file,request_close,session_generatio
     HOME_SESSION.return_requested=true
     HOME_SESSION.return_session_generation=expected_session
     HOME_SESSION.return_request_file=READER_CLOSE.reader_file
+    HOME_SESSION.return_target="home"
+    persist_home_session()
     local path=READER_CLOSE.reader_file
     HOME_RETURN_FILE=path or HOME_RETURN_FILE
     if path then mark_reader_origin(path) end
@@ -15401,6 +15417,7 @@ function Plugin:_clear_reader_return(generation,reason)
     HOME_SESSION.return_requested=false
     HOME_SESSION.return_session_generation=0
     HOME_SESSION.return_request_file=nil
+    HOME_SESSION.return_target=nil
     READER_CLOSE.state="idle"
     READER_CLOSE.session_generation=0
     READER_CLOSE.reader_file=nil
@@ -23665,6 +23682,73 @@ function Plugin:_finish_suspend_reader_finalizer(ok)
     return true
 end
 
+local function suspend_lease_names(snapshot)
+    local names={}
+    for reason,enabled in pairs(type(snapshot)=="table" and snapshot.reasons or {}) do
+        if enabled==true then names[#names+1]=tostring(reason) end
+    end
+    table.sort(names)
+    return #names>0 and table.concat(names,",") or "none"
+end
+
+function Plugin:_power_diagnostic(kind,power_state,download_continue,download_reason)
+    local device=HomeData.quick_power_state(true) or {}
+    local leases=SuspendWorkLease.snapshot()
+    local pseudo=PseudoLockscreen.snapshot()
+    local memory=RuntimePressure.memory_snapshot(false)
+    local stage=self.download_task and type(self.download_task.stage)=="function"
+        and self.download_task:stage() or "none"
+    logger.info("[MiuRead]["..tostring(kind or "PowerDiagnostic").."]",
+        "battery=",tostring(device.battery or "unknown"),
+        "charging=",tostring(device.charging==true),
+        "power=",tostring(power_state or PowerState.state()),
+        "download=",tostring(download_continue==true),
+        "download_reason=",tostring(download_reason or "unknown"),
+        "stage=",tostring(stage or "none"),
+        "pseudo_lock=",tostring(pseudo.active==true),
+        "leases=",suspend_lease_names(leases),
+        "memory_kb=",tostring(memory and memory.available_kb or "unknown"),
+        "return_target=",tostring(HOME_SESSION.return_target or "none"))
+    return true
+end
+
+function Plugin:_reconcile_power_leases(context)
+    local power=PowerState.state()
+    if not PseudoLockscreen.active() and SuspendWorkLease.has("pseudo_lockscreen") then
+        logger.warn("[MiuRead][SuspendLease] orphan pseudo lease released",
+            "context=",tostring(context or "unknown"),"power=",tostring(power))
+        SuspendWorkLease.release("pseudo_lockscreen")
+    end
+    if not PseudoLockscreen.active() and SuspendWorkLease.has("download")
+        and power~="PSEUDO_LOCKED" and power~="DOWNLOAD_LOCKED" and power~="SUSPEND_PENDING" then
+        logger.warn("[MiuRead][SuspendLease] orphan download lease released",
+            "context=",tostring(context or "unknown"),"power=",tostring(power))
+        SuspendWorkLease.release("download")
+    end
+    return true
+end
+
+function Plugin:_refresh_home_power_header(reason)
+    HomeData.quick_power_state(true)
+    if HomeView.is_shown() and not self:_active_reader_ui()
+        and HOME_SESSION.suspended~=true and self._miuread_suspended~=true then
+        HomeView.update_header{battery_text=self:_home_battery_text()}
+        logger.info("[MiuRead][HomeBattery] refreshed",
+            "reason=",tostring(reason or "power_event"),
+            "value=",tostring(self:_home_battery_text()))
+        return true
+    end
+    return false
+end
+
+function Plugin:onCharging()
+    return self:_refresh_home_power_header("charging")
+end
+
+function Plugin:onNotCharging()
+    return self:_refresh_home_power_header("not_charging")
+end
+
 function Plugin:onSuspend()
     -- beta.13: a pseudo-locked Kindle may emit additional internal Suspend
     -- edges while networking stays ACTIVE. PseudoLockscreen authenticates the
@@ -23695,6 +23779,7 @@ function Plugin:onSuspend()
             "state=",PowerState.state(),"generation=",tostring(PowerState.generation()))
         return
     end
+    self:_reconcile_power_leases("pre_suspend")
     local download_continue,download_reason=false,"no_download"
     if self.download_task and type(self.download_task.can_continue_locked)=="function" then
         local ok,value,reason=pcall(self.download_task.can_continue_locked,self.download_task)
@@ -23761,6 +23846,7 @@ function Plugin:onSuspend()
         "download_reason=",download_reason,
         "reader_finalizer=",tostring(sync_continue),
         "sleep_origin=",tostring(sleep_origin or "device_or_koreader"))
+    self:_power_diagnostic("SleepDiagnostic",power_target,download_continue,download_reason)
 
     self._miuread_suspended=true
     HOME_SESSION.suspended=true
@@ -23799,10 +23885,14 @@ function Plugin:onSuspend()
         READER_REBUILD.state="suspended_pending"
     end
     if HomeView.suspend then HomeView.suspend() end
-    if READER_CLOSE.state=="idle" then
+    if READER_CLOSE.state=="idle" and HOME_SESSION.return_target~="home" then
         HOME_SESSION.return_requested=false
         HOME_SESSION.return_session_generation=0
         HOME_SESSION.return_request_file=nil
+    elseif HOME_SESSION.return_target=="home" then
+        logger.info("[MiuRead][ReaderClose] home target preserved across suspend",
+            "session=",tostring(HOME_SESSION.return_session_generation or 0),
+            "file=",tostring(HOME_SESSION.return_request_file or ""))
     end
     if self._reader_dimension_task then
         UIManager:unschedule(self._reader_dimension_task)
@@ -23888,6 +23978,7 @@ function Plugin:onResume()
         local ok,err=pcall(self.download_task.on_user_resume_begin,self.download_task,PowerState.generation())
         if not ok then logger.warn("[MiuRead][Power] download wake-priority release failed",tostring(err)) end
     end
+    self:_reconcile_power_leases("user_resume")
     self._miuread_suspended=false
     HOME_SESSION.suspended=false
     StatusToast.set_blocked(false)
@@ -23914,6 +24005,33 @@ function Plugin:onResume()
         "generation=",tostring(power.generation),"slept=",tostring(slept),
         "abnormal_short_resume=",tostring(short_wake),
         "previous_download_continue=",tostring(previous_power.download_continue==true))
+    self:_power_diagnostic("WakeDiagnostic","RESUMING",
+        previous_power.download_continue==true,tostring(previous_power.state or "unknown"))
+    UIManager:scheduleIn(.08,function()
+        if HOME_SESSION.suspended==true or self._miuread_suspended==true then return end
+        HomeData.quick_power_state(true)
+        if HomeView.is_shown() and not self:_active_reader_ui() then
+            HomeView.update_header{battery_text=self:_home_battery_text()}
+        end
+    end)
+    if HOME_SESSION.return_target=="home" then
+        UIManager:scheduleIn(.12,function()
+            if HOME_SESSION.suspended==true or self._miuread_suspended==true
+                or HOME_SESSION.return_target~="home" or HomeView.is_shown() then return end
+            local lifecycle=self:_reader_lifecycle_state()
+            logger.warn("[MiuRead][ReaderClose] restoring pending home target after resume",
+                "lifecycle=",tostring(lifecycle),
+                "session=",tostring(HOME_SESSION.return_session_generation or 0))
+            if lifecycle=="active" then
+                self:return_to_miuread_home("resume pending home target")
+            else
+                local generation=self:_begin_reader_return("resume pending home target",
+                    HOME_SESSION.return_request_file or HOME_RETURN_FILE,false,
+                    HOME_SESSION.return_session_generation)
+                self:_schedule_reader_return_finish(generation,.05,"resume pending home target")
+            end
+        end)
+    end
     self:_background_log_state("resume lifecycle",true)
     self._resume_lifecycle_generation=(tonumber(self._resume_lifecycle_generation) or 0)+1
     local resume_generation=self._resume_lifecycle_generation

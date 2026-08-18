@@ -475,6 +475,7 @@ function DownloadTask:can_continue_locked()
         return false, "unsupported_suspend_platform"
     end
     if self.hibernated then return false,"hibernated" end
+    if self.job and self.job.fail_open_done==true then return false,"fail_open" end
     if self.store:preferences().download_keep_awake == false then return false, "disabled" end
     local task = self:_control_descriptor()
     if type(task) ~= "table" then return false, "no_task" end
@@ -796,6 +797,33 @@ function DownloadTask:_release_awake()
     if held then logger.info("[MiuRead][DownloadTask] standby lease released") end
 end
 
+function DownloadTask:_fail_open_locked_download(job,reason)
+    if not job or self.job~=job or job.fail_open_done==true then return false end
+    if not background_lock_mode(self.power_mode) and not PseudoLockscreen.active() then return false end
+    reason=tostring(reason or "unhealthy_worker")
+    job.fail_open_done=true
+    job.fail_open_at=os.time()
+    -- Never reacquire preventStandby after this boundary. The worker may still
+    -- need a moment to die, but the device is no longer allowed to depend on it
+    -- for power-state correctness.
+    self.power_mode="FAIL_OPEN"
+    self:_clear_lockscreen_network("fail_open:"..reason)
+    self:_release_awake()
+    PseudoLockscreen.set_download_active(false)
+    pcall(PseudoLockscreen.background_task_done,"download_fail_open:"..reason)
+    diagnostic_append(job.diagnostic_path,{
+        "time="..tostring(os.date("%Y-%m-%d %H:%M:%S")),
+        "event=lockscreen_fail_open",
+        "pid="..tostring(job.pid or ""),
+        "stage="..tostring((job.last_progress_state or {}).stage or "unknown"),
+        "reason="..reason,
+    })
+    logger.warn("[MiuRead][DownloadTask][FailOpen] lock-screen download released",
+        "pid=",tostring(job.pid or ""),"stage=",tostring((job.last_progress_state or {}).stage or "unknown"),
+        "reason=",reason)
+    return true
+end
+
 function DownloadTask:_network_link_state()
     local ok,NetworkMgr=pcall(require,"ui/network/manager")
     if not ok or not NetworkMgr then return nil end
@@ -884,14 +912,20 @@ local HEAVY_STAGES={
     content=true,underlines=true,thoughts=true,footnotes=true,images=true,package=true,
     annotation_batch=true,annotation_apply=true,transform=true,
 }
-local STALL_RECOVERABLE_STAGES={prepare=true,catalog=true,content=true,images=true,resume=true}
+local STALL_RECOVERABLE_STAGES={
+    prepare=true,catalog=true,resume=true,content=true,images=true,
+    underlines=true,thoughts=true,footnotes=true,annotation_batch=true,
+    annotation_apply=true,transform=true,package=true,
+}
 
 local function stall_recovery_seconds(backgrounded,stage)
-    if backgrounded==true then
-        return math.max(60,tonumber(Config.DOWNLOAD_STALL_RECOVERY_SECONDS) or 120)
+    stage=tostring(stage or "")
+    local configured
+    if backgrounded==true and type(Config.DOWNLOAD_BACKGROUND_STALL_SECONDS)=="table" then
+        configured=tonumber(Config.DOWNLOAD_BACKGROUND_STALL_SECONDS[stage])
+    elseif backgrounded~=true and type(Config.DOWNLOAD_FOREGROUND_STALL_SECONDS)=="table" then
+        configured=tonumber(Config.DOWNLOAD_FOREGROUND_STALL_SECONDS[stage])
     end
-    local configured=type(Config.DOWNLOAD_FOREGROUND_STALL_SECONDS)=="table"
-        and tonumber(Config.DOWNLOAD_FOREGROUND_STALL_SECONDS[tostring(stage or "")]) or nil
     if configured then return math.max(30,configured) end
     return math.max(60,tonumber(Config.DOWNLOAD_STALL_RECOVERY_SECONDS) or 120)
 end
@@ -1348,7 +1382,7 @@ function DownloadTask:_poll()
     local waiting_too_long=waiting_since and now-waiting_since>=stall_sleep
         and not lockscreen_network_hold
     local stalled_too_long=effective_idle>=stall_sleep and not network_waiting
-    if not self:is_paused() and not waiting_too_long and not stalled_too_long then
+    if job.fail_open_done~=true and not self:is_paused() and not waiting_too_long and not stalled_too_long then
         local keepalive_gap=self.backgrounded
             and math.max(8,tonumber(Config.DOWNLOAD_BACKGROUND_KEEPALIVE_SECONDS) or 12) or 5
         if not job.last_keepalive or now-job.last_keepalive>=keepalive_gap then
@@ -1443,15 +1477,23 @@ function DownloadTask:_poll()
                 })
                 pcall(FFIUtil.terminateSubProcess,job.pid)
                 self:_release_awake()
+                if job.stall_terminal==true then
+                    job.fail_open_deadline=now+math.max(4,tonumber(Config.DOWNLOAD_STALL_FAIL_OPEN_SECONDS) or 12)
+                end
                 logger.warn("[MiuRead][DownloadTask] stalled worker termination requested",
                     "pid=",tostring(job.pid),"stage=",current_stage,
-                    "idle=",tostring(effective_idle),"terminal=",tostring(job.stall_terminal==true))
+                    "idle=",tostring(effective_idle),"terminal=",tostring(job.stall_terminal==true),
+                    "fail_open_deadline=",tostring(job.fail_open_deadline or ""))
                 self:_schedule()
                 return
             elseif now-job.stall_recovery_requested_at>=8 then
                 -- A second terminate is harmless and avoids waiting forever on
                 -- firmware that delays the first signal while memory is tight.
                 pcall(FFIUtil.terminateSubProcess,job.pid)
+            end
+            if job.stall_terminal==true and tonumber(job.fail_open_deadline)
+                and now>=tonumber(job.fail_open_deadline) then
+                self:_fail_open_locked_download(job,"terminal_stall")
             end
         end
         if idle>=120 and not job.waiting_notified then
@@ -1732,6 +1774,7 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
         local LoggerChild = require("logger")
         local current_stage="bootstrap"
         local last_emitted_state={}
+        local heartbeat_seq=0
         local network_suggestion_detail
 
         local function write_direct(path,data)
@@ -1810,7 +1853,9 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                     state.network_trigger_baseline=tonumber(network_suggestion_detail.trigger_baseline)
                 end
             end
+            heartbeat_seq=heartbeat_seq+1
             state.task_token = task_token
+            state.heartbeat_seq = heartbeat_seq
             state.updated_at = os.time()
             last_emitted_state=serializable_copy(state) or {}
             local wrote,write_error=write_json(progress_path,state,"progress")
@@ -1931,6 +1976,10 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                         waiting_network = detail.waiting_network==true or stage=="waiting_network" or nil,
                         network_wait_started_at = detail.network_wait_started_at,
                         network_wait_seconds = detail.network_wait_seconds,
+                        activity = detail.activity,
+                        transfer_bytes = detail.transfer_bytes,
+                        processed = detail.processed,
+                        process_total = detail.process_total,
                     }
                 end)
                 return {
@@ -2042,6 +2091,8 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
         last_effective_progress_at = nil,
         waiting_started_at = nil,
         last_keepalive = 0,
+        fail_open_deadline = nil,
+        fail_open_done = false,
         dead_seen_at = nil,
         stall_recovery_requested_at = nil,
         stall_suspect_notified = false,

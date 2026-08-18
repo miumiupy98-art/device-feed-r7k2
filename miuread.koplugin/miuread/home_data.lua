@@ -83,23 +83,54 @@ function HomeData.cached_device_state()
     return device_cache and device_cache.value or nil
 end
 
+local function read_power_state()
+    local result={battery=nil,charging=false}
+    local ok_power,power=pcall(Device.getPowerDevice,Device)
+    if ok_power and power then
+        if type(power.getCapacity)=="function" then
+            local ok,capacity=pcall(power.getCapacity,power)
+            if ok and tonumber(capacity) then result.battery=clamp_number(capacity,0,100) end
+        end
+        if type(power.isCharging)=="function" then
+            local ok,charging=pcall(power.isCharging,power)
+            if ok then result.charging=charging==true end
+        end
+    end
+    return result
+end
+
+-- Refresh battery/charging without touching Wi-Fi, storage or shelf state.
+-- Home's minute clock uses this path so an e-ink device can keep a truthful
+-- battery number without rebuilding the page or polling the network.
+function HomeData.quick_power_state(force)
+    local now=os.time()
+    if not force and device_cache and tonumber(device_cache.power_at)
+        and now-tonumber(device_cache.power_at)<60 then
+        local cached=device_cache.value or {}
+        return {battery=cached.battery,charging=cached.charging==true}
+    end
+    local power=read_power_state()
+    local state={}
+    for key,value in pairs(device_cache and device_cache.value or {}) do state[key]=value end
+    state.battery=power.battery
+    state.charging=power.charging==true
+    device_cache={
+        at=device_cache and tonumber(device_cache.at) or 0,
+        power_at=now,
+        value=state,
+    }
+    return power
+end
+
 function HomeData.quick_device_state(force)
     local now = os.time()
     if not force and device_cache and now - device_cache.at < 60 then
         return device_cache.value
     end
     local state = {online = nil, wifi_on = nil, wifi_name = nil, battery = nil, charging = false}
-    local ok_power, power = pcall(Device.getPowerDevice, Device)
-    if ok_power and power then
-        if type(power.getCapacity) == "function" then
-            local ok, capacity = pcall(power.getCapacity, power)
-            if ok and tonumber(capacity) then state.battery = clamp_number(capacity, 0, 100) end
-        end
-        if type(power.isCharging) == "function" then
-            local ok, charging = pcall(power.isCharging, power)
-            if ok then state.charging = charging == true end
-        end
-    end
+    local power=read_power_state()
+    state.battery=power.battery
+    state.charging=power.charging==true
     local ok_network, network = pcall(require, "ui/network/manager")
     if ok_network and network then
         if type(network.isWifiOn) == "function" then
@@ -118,7 +149,7 @@ function HomeData.quick_device_state(force)
             end
         end
     end
-    device_cache = {at = now, value = state}
+    device_cache = {at = now, power_at=now, value = state}
     return state
 end
 

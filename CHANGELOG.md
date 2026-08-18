@@ -1,5 +1,12 @@
 # Changelog
 
+## 4.7.0-beta.18 - 2026-08-18
+
+- 补齐熄屏下载健康检测：`underlines/thoughts/footnotes/annotation_apply/transform/package` 等重任务全部纳入阶段化卡死恢复；worker 每次进度写入独立 heartbeat，大书慢处理不会只因耗时被误判。
+- 下载自动恢复后再次卡死时增加 fail-open：停止继续维持下载/伪锁屏 lease，交回 Kindle/Kobo 正常休眠；用户主动唤醒仍优先恢复可见界面。
+- 返回觅阅主页的目标在休眠/唤醒过程中持续保留，Resume 后发现未完成返回会继续恢复主页，降低 Reader 已关闭但 Home 未接上的白屏风险。
+- 主页电量改为复用每分钟时钟读取 KOReader 真实电量，只在数值变化时局部刷新；新增 Sleep/Wake 电量、休眠模式、下载阶段和 lease 诊断日志。
+
 ## 4.7.0-beta.17 - 2026-08-18
 
 - 修复目录请求被误判为下载卡死：`chapterInfos` 首次传输失败后立即进入明确的网络等待状态，网络恢复后在同一任务中重新获取目录；真正无响应的 worker 仍保留一次断点自动恢复。
