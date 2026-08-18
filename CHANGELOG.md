@@ -1,5 +1,11 @@
 # Changelog
 
+## 4.7.0-beta.19 - 2026-08-18
+
+- 内测发布迁移到统一仓库：本版本仍由旧 `device-feed-r7k2` 分发，但安装后后续内测更新主入口改为 `miuread-koreader` 的 `beta-channel`。
+- 保留旧 beta 通道作为迁移期临时回退，避免新仓库首个内测版本尚未发布或 GitHub 短时不可用时立即失去更新入口；beta.20 起移除旧仓库回退。
+- 不改下载、同步、休眠、锁屏、阅读和书架行为，完整保留 beta.18 功能，仅承担现有内测用户迁移。
+
 ## 4.7.0-beta.18 - 2026-08-18
 
 - 补齐熄屏下载健康检测：`underlines/thoughts/footnotes/annotation_apply/transform/package` 等重任务全部纳入阶段化卡死恢复；worker 每次进度写入独立 heartbeat，大书慢处理不会只因耗时被误判。

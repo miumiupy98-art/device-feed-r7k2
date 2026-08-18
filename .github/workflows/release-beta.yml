@@ -89,7 +89,7 @@ jobs:
               sys.exit(1)
 
           expected_manifest = (
-              "https://github.com/miumiupy98-art/device-feed-r7k2/"
+              "https://github.com/miumiupy98-art/miuread-koreader/"
               "releases/download/beta-channel/update-beta.json"
           )
           manifest = re.search(r'\bUPDATE_MANIFEST\s*=\s*["\']([^"\']+)["\']', config)
