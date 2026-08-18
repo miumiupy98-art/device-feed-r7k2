@@ -675,9 +675,19 @@ function Http:request(opt)
             if not code and attempt > retries then
                 error("network request failed: " .. tostring(err or "unknown"))
             end
+            local retry_delay=math.min(2.5, 0.35 * (2 ^ (attempt - 1)))
+            if type(opt.on_retry)=="function" then
+                local retry_detail={
+                    attempt=attempt, next_attempt=attempt+1, maximum=retries+1,
+                    url=Util.redact_url(url or opt.url), code=tonumber(code),
+                    error=tostring(err or ""), wait_seconds=retry_delay,
+                }
+                local cb_ok,cb_err=pcall(opt.on_retry,retry_detail)
+                if not cb_ok then logger.warn("[MiuRead][HTTP] retry callback failed",tostring(cb_err)) end
+            end
             logger.warn("[MiuRead][HTTP] retry", "attempt=", tostring(attempt), "url=", Util.redact_url(url or opt.url),
                 "status=", tostring(code or err or "network"))
-            pause(math.min(2.5, 0.35 * (2 ^ (attempt - 1))))
+            pause(retry_delay)
         end
 
         if not limited_code then

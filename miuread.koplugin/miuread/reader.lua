@@ -881,14 +881,19 @@ function Reader:state(book_id,chapter_uid)
     return load_reader_context(self,book_id,chapter_uid,true)
 end
 
-function Reader:catalog(book_id)
+function Reader:catalog(book_id, request_options)
+    request_options=type(request_options)=="table" and request_options or {}
     local function load_catalog()
         -- Catalog is a small control request. beta.24 avoids multiplying a
         -- transient socket stall into minutes of foreground 0% waiting: one
         -- transport retry is enough, and auth recovery still gets its own clean
         -- retry below. The download-task watchdog remains the final fallback.
-        local data = self.http:post_json(BASE .. "/web/book/chapterInfos", {bookIds={tostring(book_id)}},
-            {headers={Origin=BASE, Referer=Protocol.reader_url(book_id)}, retries=1, timeout={10,22}})
+        local http_options={
+            headers={Origin=BASE, Referer=Protocol.reader_url(book_id)},
+            retries=1, timeout={10,22},
+        }
+        if type(request_options.on_retry)=="function" then http_options.on_retry=request_options.on_retry end
+        local data = self.http:post_json(BASE .. "/web/book/chapterInfos", {bookIds={tostring(book_id)}},http_options)
         local records = catalog_records(data)
         for _, record in ipairs(records or {}) do
             if tostring(record.bookId or "") == tostring(book_id) then return record end

@@ -721,8 +721,8 @@ local function txt_catalog_title(title, chapter_idx)
         or ("第" .. tostring(idx) .. "章 " .. title)
 end
 
-function Downloader:catalog(id)
-    local catalog = self.reader:catalog(id)
+function Downloader:catalog(id, request_options)
+    local catalog = self.reader:catalog(id, request_options)
     local source = catalog.updated or catalog.chapterInfos or catalog.chapters or {}
     -- chapterInfos does not reliably expose the book format. Use the reader
     -- page context when available; on failure keep the source titles unchanged.
@@ -1216,7 +1216,78 @@ function Downloader:book(input, opt, progress)
 
     respect_reader_priority("catalog")
     progress("catalog", 0, 1, book.title)
-    local catalog, all = self:catalog(book.bookId)
+
+    -- beta.17: the catalog request is a network operation, not evidence that
+    -- the worker itself has stalled. After the first transport failure, publish
+    -- an explicit waiting_network heartbeat so the parent watchdog will not
+    -- kill a healthy HTTP retry at the old 45-second catalog threshold. If the
+    -- request fully exhausts its retries, keep the chapter checkpoint intact,
+    -- wait for the route to recover, and retry the catalog in the same worker.
+    local catalog_wait_started=nil
+    local catalog_wait_attempts=0
+    local function catalog_wait_progress(message)
+        catalog_wait_started=catalog_wait_started or os.time()
+        progress("waiting_network",0,1,book.title,{
+            message=message or "网络连接暂时不可用，正在等待恢复",
+            waiting_network=true,
+            network_wait_started_at=catalog_wait_started,
+            network_wait_seconds=math.max(0,os.time()-catalog_wait_started),
+        })
+    end
+    local function catalog_retry_notice(detail)
+        detail=type(detail)=="table" and detail or {}
+        catalog_wait_progress("服务器响应较慢，正在重试获取目录")
+        logger.warn("[MiuRead][Download] catalog request retry",
+            "attempt=",tostring(detail.attempt or "-"),
+            "next=",tostring(detail.next_attempt or "-"),
+            "maximum=",tostring(detail.maximum or "-"),
+            "status=",tostring(detail.code or detail.error or "network"))
+    end
+    local function fetch_catalog_with_recovery()
+        local poll=math.max(3,tonumber(Config.DOWNLOAD_NETWORK_RECOVERY_POLL_SECONDS) or 6)
+        local max_poll=math.max(poll,tonumber(Config.DOWNLOAD_NETWORK_RECOVERY_MAX_POLL_SECONDS) or 15)
+        while true do
+            if opt.cancelled and opt.cancelled() then error("download cancelled") end
+            local ok,catalog,all=pcall(self.catalog,self,book.bookId,{on_retry=catalog_retry_notice})
+            if ok then
+                if catalog_wait_started then
+                    progress("resume",0,1,book.title,{message="网络已恢复，正在继续读取目录"})
+                    logger.info("[MiuRead][Download] catalog network recovered",
+                        "wait=",tostring(math.max(0,os.time()-catalog_wait_started)),
+                        "probes=",tostring(catalog_wait_attempts))
+                end
+                return catalog,all
+            end
+            if not Http.is_network_error(catalog) then error(catalog) end
+            catalog_wait_progress("网络连接中断，下载断点已保留，等待网络恢复")
+            while true do
+                if opt.cancelled and opt.cancelled() then error("download cancelled") end
+                respect_reader_priority("network_wait")
+                catalog_wait_attempts=catalog_wait_attempts+1
+                catalog_wait_progress("网络连接中断，下载断点已保留，等待网络恢复")
+                local ready,detail=false,nil
+                if self.http and type(self.http.probe_download_recovery)=="function" then
+                    local probe_ok,value,info=pcall(self.http.probe_download_recovery,self.http)
+                    if probe_ok then ready=value==true; detail=info end
+                end
+                if ready then
+                    logger.info("[MiuRead][Download] catalog route probe recovered",
+                        "wait=",tostring(math.max(0,os.time()-catalog_wait_started)),
+                        "attempts=",tostring(catalog_wait_attempts),
+                        "mode=",tostring(detail and detail.mode or "unknown"))
+                    progress("resume",0,1,book.title,{message="网络已恢复，正在重新获取目录"})
+                    respect_reader_priority("catalog")
+                    break
+                end
+                logger.warn("[MiuRead][Download] catalog network recovery wait",
+                    "attempt=",tostring(catalog_wait_attempts),
+                    "waited=",tostring(math.max(0,os.time()-catalog_wait_started)),
+                    "error=",tostring(catalog))
+                pause(math.min(max_poll,poll+math.max(0,catalog_wait_attempts-1)*2))
+            end
+        end
+    end
+    local catalog, all = fetch_catalog_with_recovery()
     local full_catalog_map={}
     for index,chapter in ipairs(all or {}) do
         full_catalog_map[#full_catalog_map+1]={

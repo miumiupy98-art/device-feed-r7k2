@@ -1413,7 +1413,7 @@ function DownloadTask:_poll()
             and job.stall_suspect_notified~=true then
             job.stall_suspect_notified=true
             local state=U.copy(job.last_progress_state or {})
-            state.message="服务器响应较慢，下载仍在等待；持续无进展会自动从断点恢复"
+            state.message="下载任务暂时没有新的进展，正在检查任务状态"
             state.updated_at=now
             if job.on_progress then pcall(job.on_progress,state) end
             logger.info("[MiuRead][DownloadTask] foreground stall suspected",
@@ -1429,8 +1429,8 @@ function DownloadTask:_poll()
                 local state=U.copy(job.last_progress_state or {})
                 state.stage="restart"
                 state.message=job.stall_terminal
-                    and "下载长时间没有进展，已停止当前任务；断点已保留，可点击继续"
-                    or "下载长时间没有进展，正在释放旧任务并从断点恢复"
+                    and "下载任务没有响应，已停止当前任务；断点已保留，可点击继续"
+                    or "下载任务没有响应，正在释放旧任务并从断点恢复"
                 state.updated_at=now
                 if job.on_progress then pcall(job.on_progress,state) end
                 diagnostic_append(job.diagnostic_path,{
@@ -1457,8 +1457,7 @@ function DownloadTask:_poll()
         if idle>=120 and not job.waiting_notified then
             job.waiting_notified=true
             local state=U.copy(job.last_progress_state or {})
-            state.waiting_network=true
-            state.message="等待网络或服务器响应"
+            state.message="下载任务仍在处理中，正在继续检查状态"
             state.updated_at=now
             if job.on_progress then job.on_progress(state) end
         end
@@ -1520,11 +1519,11 @@ function DownloadTask:_poll()
         local grace=math.max(1,tonumber(Config.DOWNLOAD_STALL_RESTART_GRACE_SECONDS) or 3)
         if now-job.dead_seen_at<grace then self:_schedule(); return end
         if job.stall_terminal==true then
-            self:_finish(job,"下载长时间没有进展，已停止当前任务；已完成章节和断点均已保留，可点击继续。")
+            self:_finish(job,"下载任务没有响应，已停止当前任务；已完成章节和断点均已保留，可点击继续。")
             return
         end
         if self:_restart_interrupted(job,true) then return end
-        self:_finish(job,"下载长时间没有进展，自动恢复未能启动；断点已保留，可点击继续。")
+        self:_finish(job,"下载任务没有响应，自动恢复未能启动；断点已保留，可点击继续。")
         return
     end
     if not job.rechecking_notified then

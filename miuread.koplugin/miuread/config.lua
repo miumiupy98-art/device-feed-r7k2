@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.7.0-beta.16",
+    VERSION = "4.7.0-beta.17",
     SCHEMA = 114,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -82,6 +82,16 @@ local C = {
     -- Old taps delayed by a real UI stall are discarded instead of being
     -- replayed against a different book after the screen catches up.
     HOME_STALE_TAP_MS = 1200,
+
+    -- Reader discovery and stale-touch protection. The same MiuRead reader
+    -- toolbar can be opened by the existing downward swipe or by a deliberate
+    -- tap in the top-center band. Short-lived taps carried across the Home ->
+    -- Reader transition are consumed before they can become KOReader corner
+    -- actions (for example an unintended bookmark).
+    READER_OPEN_GESTURE_GUARD_SECONDS = 0.75,
+    READER_TOP_MENU_X_MIN = 0.25,
+    READER_TOP_MENU_X_MAX = 0.75,
+    READER_TOP_MENU_Y_MAX = 0.10,
     HOME_REMOTE_SHELF_TTL_SECONDS = 30 * 60,
     HOME_LOCAL_SHELF_TTL_SECONDS = 60 * 60,
     HOME_REMOTE_COVER_BATCH = 4,
